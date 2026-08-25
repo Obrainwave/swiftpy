@@ -37,20 +37,24 @@ from swiftpy.database.orm import Model, HasMany
 
 app = Application()
 
+
 class User(Model):
     name: str
     email: str
     posts = HasMany("Post")
 
+
 @app.get("/users/{user_id}")
 async def show_user(user_id: int) -> UserOut:
     return await User.find(user_id)
+
 
 @app.post("/chat/stream")
 async def chat_stream(body: ChatRequest):
     async def tokens():
         async for chunk in AI.chat("claude-sonnet-4-6").user(body.message).stream():
             yield chunk
+
     return stream(tokens())
 ```
 

@@ -73,7 +73,7 @@ async def read_request_body(receive) -> bytes:
     return b"".join(chunks)
 
 
-async def application(scope, receive, send):
+async def app(scope, receive, send):
     """
     Minimal ASGI application.
 
