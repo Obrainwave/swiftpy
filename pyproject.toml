@@ -4,4 +4,11 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.4",
+    "uvicorn[standard]>=0.52.4",
+]
+[project]
+name = "SwiftPY"
+version = "0.1.0"
+dependencies = [
+    "uvicorn[standard]>=0.52.4",
 ]
