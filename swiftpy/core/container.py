@@ -31,6 +31,8 @@ PRIMITIVE_TYPES: tuple[type[Any], ...] = (
     bytes,
 )
 
+_DI_RESOLVING_KEY = "__swiftpy_di_resolving__"
+
 
 class Scope(StrEnum):
     TRANSIENT = "transient"
@@ -60,20 +62,37 @@ class Container:
         self._singletons: dict[type[Any], Any] = {}
         self._resolving: list[type[Any]] = []
 
+        self.instance(Container, self)
+
     def bind(
         self,
         interface: type[T],
-        factory: Factory | None = None,
+        factory: Factory | type[T] | None = None,
         scope: Scope = Scope.TRANSIENT,
     ) -> None:
-        """Register a binding in the container."""
+        """
+        Register a binding.
+        """
 
         if factory is None:
-            factory = lambda container: container.resolve(interface)
+            factory = interface
+
+        resolved_factory: Factory
+
+        if inspect.isclass(factory):
+            target_cls = factory
+
+            def class_factory(container: Container) -> Any:
+                return container._auto_wire(target_cls)
+
+            resolved_factory = class_factory
+
+        else:
+            resolved_factory = factory
 
         self._bindings[interface] = Binding(
             interface=interface,
-            factory=factory,
+            factory=resolved_factory,
             scope=scope,
         )
 
@@ -125,6 +144,7 @@ class Container:
         Registered bindings are resolved according to their configured
         lifetime. Unregistered concrete classes are auto-wired.
         """
+        resolving_stack = Context.get(_DI_RESOLVING_KEY, [])
 
         if target in PRIMITIVE_TYPES:
             raise PrimitiveResolutionError(
@@ -137,22 +157,26 @@ class Container:
             item = self._singletons[target]
             return cast(T, item)
 
-        if target in self._resolving:
-            chain = " -> ".join(dependency.__name__ for dependency in self._resolving)
+        if target in resolving_stack:
+            chain = " -> ".join(dependency.__name__ for dependency in resolving_stack)
 
             raise CircularDependencyError(
                 f"Circular dependency detected: {chain} -> {target.__name__}"
             )
 
-        self._resolving.append(target)
+        Context.push(_DI_RESOLVING_KEY, target)
 
         try:
             binding = self._bindings.get(target)
 
             if binding is not None:
-                instance = binding.factory(self)
-
                 if binding.scope is Scope.SINGLETON:
+                    cached = self._singletons.get(target)
+
+                    if cached is not None:
+                        return cast(T, cached)
+
+                    instance = binding.factory(self)
                     self._singletons[target] = instance
 
                     return cast(T, instance)
@@ -163,13 +187,14 @@ class Container:
                     )
 
                     if Context.has(context_key):
-                        item = Context.get(context_key)
-                        return cast(T, item)
+                        return cast(T, Context.get(context_key))
 
                     instance = binding.factory(self)
                     Context.set(context_key, instance)
 
                     return cast(T, instance)
+
+                return cast(T, binding.factory(self))
 
             if inspect.isclass(target):
                 return self._auto_wire(target)
@@ -177,7 +202,7 @@ class Container:
             raise BindingNotFoundError(f"No binding registered for '{target}'.")
 
         finally:
-            self._resolving.pop()
+            Context.pop(_DI_RESOLVING_KEY)
 
     def call(
         self,
@@ -247,6 +272,8 @@ class Container:
                 try:
                     resolved_kwargs[name] = self.resolve(parameter_type)
                     continue
+                except CircularDependencyError:
+                    raise
                 except ResolutionError:
                     if parameter.default is not inspect.Parameter.empty:
                         resolved_kwargs[name] = parameter.default

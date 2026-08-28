@@ -45,3 +45,15 @@ Transfer/sec:    482.06KB
   1. No cross-task leakage across concurrent `asyncio.gather` workers.
   2. Immutability of parent context when child tasks call `Context.set()`.
   3. Clean fallback behavior when retrieving unset context keys (`default=None`).
+
+---
+
+## Week 4 - The DI Container
+
+### Status: PASSED
+* **Test Suite:** `tests/concurrency/test_resolution2.py`
+* **Results:** 3/3 tests passed in 0.04s (WSL2 / Python 3.12.14 / pytest-asyncio).
+* **Verified Guarantees:**
+1. No cross-task leakage across 200 concurrent `asyncio.gather` worker tasks resolving `Scope.SCOPED` bindings simultaneously.
+2. Complete task-scoped instance identity consistency within the same execution context (`inst_a is inst_b`).
+3. Dynamic provider registration and idempotent deferred booting in `Application` without locking out late-registered service providers.

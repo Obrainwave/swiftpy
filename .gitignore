@@ -1,0 +1,8 @@
+__pycache__/
+.env
+storage/cache/
+storage/logs/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

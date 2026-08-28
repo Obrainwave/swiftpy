@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+class Response:
+    def __init__(
+        self,
+        content: bytes | str = b"",
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.content = content
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    async def send(self, send: Any) -> None:
+        headers = [
+            (
+                k.encode(),
+                v.encode(),
+            )
+            for k, v in self.headers.items()
+        ]
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": headers,
+            }
+        )
+
+        await send(
+            {
+                "type": "http.response.body",
+                "body": self.content,
+            }
+        )
+
+
+def json_response(
+    data: Any,
+    status_code: int = 200,
+) -> Response:
+    return Response(
+        content=json.dumps(data).encode(),
+        status_code=status_code,
+        headers={
+            "content-type": "application/json",
+        },
+    )
+
+
+def created(data: Any) -> Response:
+    return json_response(
+        data,
+        status_code=201,
+    )
+
+
+def not_found(message: str = "Not Found") -> Response:
+    return json_response(
+        {"detail": message},
+        status_code=404,
+    )
+
+
+def unprocessable(
+    errors: Any,
+) -> Response:
+    return json_response(
+        {"errors": errors},
+        status_code=422,
+    )

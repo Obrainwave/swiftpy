@@ -62,3 +62,20 @@ class Context:
     def clear() -> None:
         """Reset the current task context."""
         _context.set(None)
+
+    @staticmethod
+    def push(key: str, value: Any) -> None:
+        stack = Context.get(key, [])
+        Context.set(key, [*stack, value])
+
+    @staticmethod
+    def pop(key: str) -> Any:
+        stack = Context.get(key, [])
+
+        if not stack:
+            return None
+
+        value = stack[-1]
+        Context.set(key, stack[:-1])
+
+        return value
