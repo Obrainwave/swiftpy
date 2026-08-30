@@ -479,7 +479,7 @@ wheels = [
 [[package]]
 name = "swiftpy"
 version = "1.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "uvicorn", extra = ["standard"] },
 ]

@@ -57,3 +57,15 @@ Transfer/sec:    482.06KB
 1. No cross-task leakage across 200 concurrent `asyncio.gather` worker tasks resolving `Scope.SCOPED` bindings simultaneously.
 2. Complete task-scoped instance identity consistency within the same execution context (`inst_a is inst_b`).
 3. Dynamic provider registration and idempotent deferred booting in `Application` without locking out late-registered service providers.
+
+---
+
+## Week 5 - Router, Middleware, Request and Response
+
+### Status: PASSED
+* **Test Suite:** `tests/http/test_http_pipeline.py`
+* **Results:** 4/4 tests passed in 0.06s (WSL2 / Python 3.12.14 / pytest-asyncio).
+* **Verified Guarantees:**
+1. Accurate route parameter pattern matching and annotation-driven type coercion `(user_id: int)`.
+2. Isolated middleware pipeline execution with in-flight request mutation and JIT container resolution.
+3. Seamless route parameter tunneling `(*args, **kwargs)` through middleware adapter closures without arity mismatches.

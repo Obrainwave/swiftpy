@@ -5,6 +5,7 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.4",
 ]
+
 [project]
 name = "SwiftPY"
 version = "1.0.0"
@@ -12,5 +13,16 @@ requires-python = ">=3.12"
 dependencies = [
     "uvicorn[standard]>=0.52.4",
 ]
+
 [tool.mypy]
 strict = true
+
+[project.scripts]
+swiftpy = "swiftpy.console.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true

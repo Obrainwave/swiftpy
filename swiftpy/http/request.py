@@ -1,35 +1,30 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 
 class Request:
-    def __init__(
-        self,
-        scope: dict[str, Any],
-        receive: Any,
-    ) -> None:
+    def __init__(self, scope: dict[str, Any], receive: Any) -> None:
         self.scope = scope
         self._receive = receive
 
         self._body: bytes | None = None
         self._json: Any = None
 
+        self.state: dict[str, Any] = {}
+
     @property
     def method(self) -> str:
-        return self.scope["method"]
+        return cast(str, self.scope["method"])
 
     @property
     def path(self) -> str:
-        return self.scope["path"]
+        return cast(str, self.scope["path"])
 
     @property
     def headers(self) -> dict[str, str]:
-        return {
-            k.decode(): v.decode()
-            for k, v in self.scope.get("headers", [])
-        }
+        return {k.decode(): v.decode() for k, v in self.scope.get("headers", [])}
 
     async def body(self) -> bytes:
         if self._body is None:
@@ -38,9 +33,7 @@ class Request:
             while True:
                 message = await self._receive()
 
-                chunks.append(
-                    message.get("body", b"")
-                )
+                chunks.append(message.get("body", b""))
 
                 if not message.get(
                     "more_body",

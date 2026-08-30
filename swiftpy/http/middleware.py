@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
+from swiftpy.core.container import Container
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response
 
-Handler = Callable[[Request], Awaitable[Response],]
+Handler = Callable[..., Awaitable[Response]]
 
 
 class Middleware:
@@ -27,12 +28,17 @@ class MiddlewarePipeline:
 
             async def wrapped_handler(
                 request: Request,
+                *args: Any,
                 middleware_cls: type[Middleware] = middleware_cls,
                 current: Handler = current,
+                **kwargs: Any,
             ) -> Response:
                 middleware = self.container.resolve(middleware_cls)
 
-                return await middleware.handle(request, current,)
+                async def next_handler(req: Request) -> Response:
+                    return await current(req, *args, **kwargs)
+
+                return await middleware.handle(request, next_handler)
 
             wrapped = wrapped_handler
 
