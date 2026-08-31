@@ -82,9 +82,8 @@ class Application:
         receive: Callable[[], Awaitable[dict[str, Any]]],
         send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        
-        try:
 
+        try:
             if scope["type"] != "http":
                 return
 
@@ -113,7 +112,7 @@ class Application:
                 request,
                 **params,
             )
-            
+
         except Exception:
             logger.exception("Unhandled exception during request processing")
 

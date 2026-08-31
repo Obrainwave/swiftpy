@@ -16,7 +16,9 @@ class Middleware:
 
 
 class MiddlewarePipeline:
-    def __init__(self, container: Container, middleware: list[type[Middleware]]) -> None:
+    def __init__(
+        self, container: Container, middleware: list[type[Middleware]]
+    ) -> None:
         self.container = container
         self.middleware = middleware
 

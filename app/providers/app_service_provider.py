@@ -7,7 +7,7 @@ class AppServiceProvider(ServiceProvider):
     """
     Core application service provider.
 
-    This is the first provider loaded by the framework.
+    This is the first provider loaded by the SwiftPY framework.
     Framework-level services will be registered here.
     """
 

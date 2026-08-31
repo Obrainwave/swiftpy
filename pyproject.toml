@@ -12,10 +12,15 @@ version = "1.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "uvicorn[standard]>=0.52.4",
+    "asyncpg>=0.30.0",
 ]
 
 [tool.mypy]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["asyncpg"]
+ignore_missing_imports = true
 
 [project.scripts]
 swiftpy = "swiftpy.console.cli:main"
