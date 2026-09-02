@@ -6,3 +6,4 @@ storage/logs/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+COMMANDS.md

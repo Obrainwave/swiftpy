@@ -1,0 +1,3 @@
+CONFIG = {
+    "name": "SwiftPY App",
+}

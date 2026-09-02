@@ -69,3 +69,29 @@ Transfer/sec:    482.06KB
 1. Accurate route parameter pattern matching and annotation-driven type coercion `(user_id: int)`.
 2. Isolated middleware pipeline execution with in-flight request mutation and JIT container resolution.
 3. Seamless route parameter tunneling `(*args, **kwargs)` through middleware adapter closures without arity mismatches.
+
+---
+
+## Week 6 - Connection Pool and Query Builder Foundation
+
+### Status: PASSED
+
+* **Test Suite:** `tests/db/load_test_database.py`
+* **Results:** 2,000 total asynchronous database tasks (1,000 reads, 1,000 writes) completed successfully with zero connection leaks (WSL2 / Python 3.12.14 / pytest-asyncio).
+* **Verified Guarantees:**
+1. **Nested Transaction Integrity:** Task-scoped context variables successfully map to native PostgreSQL savepoints. Inner transactions gracefully roll back on exceptions without aborting the parent transaction block.
+2. **Pool Saturation & Queue Management:** The asyncpg pool correctly bottlenecks at the configured saturation point (`max_size=20`) without deadlocking. Remaining tasks queue seamlessly in the connection wait-line across 1,000 concurrent requests.
+3. **Leak Prevention:** Context manager teardown guarantees strict connection release. Post-load testing confirms active pool size matches idle size (20/20) with no orphaned connections.
+4. **Throughput Performance:** System maintained stable execution under massive synthetic load, achieving ~657.25 Queries Per Second (QPS) for reads and ~833.07 writes per second.
+
+## Week 7 - Query Builder Completion and Transactions
+
+### Status: PASSED
+* **Test Suites:** `tests/db/test_sql_injections.py` & `tests/db/load_test_database2.py`  
+* **Results:** All 13 injection/feature tests passed; load test handled 1000 concurrent reads (1517 QPS) and 1000 concurrent writes (1826 writes/sec) with zero connection leaks (Environment: WSL2 / Python 3.12.14 / asyncpg).
+* **Verified Guarantees:**
+1. **SQL Injection Prevention** – All identifier inputs (table, column, order‑by, join, update keys, where columns, subqueries) are strictly validated via regex, blocking malicious payloads like `'; DROP TABLE` or `id; DROP`. Raw `where_raw()` binds values safely using parameterised queries, preventing injection even with malicious strings.
+2. **Query Builder Correctness** – Aggregates (`count()`), `JOIN` with qualified columns, and `IN` subqueries return accurate results; chained methods (`select`, `where`, `limit`, `first`, `get`) compose properly.
+3. **Transaction Semantics** – Nested transactions are implemented via savepoints; a rollback of the inner transaction does not affect the outer transaction, and an outer rollback cancels all nested work. Timeouts (e.g., `pg_sleep` inside a transaction) cancel and rollback the transaction correctly, leaving no orphaned data.
+4. **Concurrent Load & Pool Health** – 1000 concurrent read workers and 1000 concurrent write workers completed without errors. The connection pool (size 50) returned to full idle capacity after all tasks, confirming no connection leaks. Performance: read QPS ~1517, write throughput ~1826 writes/sec.
+5. **Data Consistency** – After all operations (including rollbacks and concurrent writes), the final row count (1101) matches expectations, and the nested transaction test correctly preserved the parent row while discarding the child row.

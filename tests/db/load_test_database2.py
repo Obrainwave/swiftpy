@@ -1,12 +1,12 @@
+# tests/db/load_test_database2.py
+
 from __future__ import annotations
 
 import asyncio
 import time
 
-from app.providers.database_service_provider import (
-    DatabaseServiceProvider,
-)
-
+from app.providers.app_service_provider import AppServiceProvider
+from app.providers.database_service_provider import DatabaseServiceProvider
 from swiftpy.core.bootstrap import create_app
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.query_builder import Query
@@ -30,8 +30,7 @@ async def create_table(db_pool: DatabasePool) -> None:
 
         await conn.execute(
             """
-            TRUNCATE TABLE test_users
-            RESTART IDENTITY
+            TRUNCATE TABLE test_users RESTART IDENTITY CASCADE
             """
         )
 
@@ -98,7 +97,7 @@ async def rollback_test() -> None:
 
 
 async def nested_transaction_test() -> None:
-    async with db.transaction(): # Outer transaction (Parent)
+    async with db.transaction():
         await Query.table("test_users").insert(
             {
                 "name": "parent_user",
@@ -107,7 +106,7 @@ async def nested_transaction_test() -> None:
         )
 
         try:
-            async with db.transaction(): # Inner transaction (Child / Savepoint)
+            async with db.transaction():
                 await Query.table("test_users").insert(
                     {
                         "name": "child_user",
@@ -116,9 +115,8 @@ async def nested_transaction_test() -> None:
                 )
 
                 raise RuntimeError("force nested rollback")
-                
+
         except RuntimeError:
-            # Catch the error here so it doesn't bubble up and abort the parent transaction
             pass
 
     parent = (
@@ -135,16 +133,20 @@ async def nested_transaction_test() -> None:
 
     print()
     print("==== NESTED TRANSACTION TEST ====")
-    print("Parent Exists:", parent is not None) # Should now be True
-    print("Child Exists :", child is not None)  # Should be False
+    print("Parent Exists:", parent is not None)
+    print("Child Exists :", child is not None)
+
 
 async def warm_pool(db_pool: DatabasePool) -> None:
     pool = db_pool.get_pool()
+
     async def touch():
         async with pool.acquire() as conn:
             await conn.execute("SELECT 1")
+
     await asyncio.gather(*(touch() for _ in range(pool.get_max_size())))
-    
+
+
 async def load_test_reads() -> None:
     concurrency = 1000
 
@@ -204,34 +206,32 @@ async def verify_row_count() -> None:
 
 
 async def main() -> None:
+    # 1. Bootstrap the application natively (injects config, container, router, and boots providers)
     app = create_app(
         providers=[
+            AppServiceProvider,
             DatabaseServiceProvider,
         ]
     )
 
+    # 2. Resolve the DatabasePool to control its async execution lifecycle
     db_pool = app.container.resolve(DatabasePool)
 
     await db_pool.init()
     
     await warm_pool(db_pool)
-    
     await create_table(db_pool)
-
     await seed_data()
-
+    
     await rollback_test()
-
     await nested_transaction_test()
-
+    
     await load_test_reads()
-
     await load_test_writes()
-
+    
     await verify_row_count()
-
     await verify_pool(db_pool)
-
+    
     await db_pool.close()
 
 

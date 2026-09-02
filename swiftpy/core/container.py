@@ -60,7 +60,6 @@ class Container:
     def __init__(self) -> None:
         self._bindings: dict[type[Any], Binding] = {}
         self._singletons: dict[type[Any], Any] = {}
-        self._resolving: list[type[Any]] = []
 
         self.instance(Container, self)
 

@@ -1,7 +1,7 @@
 from app.http.middleware.test_middleware import TestMiddleware
-from swiftpy.core.application import Application
-from swiftpy.http.request import Request
-from swiftpy.http.response import Response, json_response
+from swiftpy import Application
+from swiftpy import Request
+from swiftpy import Response, json_response
 
 app = Application()
 

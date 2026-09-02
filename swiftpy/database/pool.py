@@ -28,16 +28,10 @@ class DatabasePool:
                 password=str(self.config.get(f"{conn_path}.password", "")),
                 ssl=bool(self.config.get(f"{conn_path}.ssl", False)),
                 min_size=int(self.config.get("database.pool.min_size", 5)),
-                max_size=int(self.config.get("database.pool.max_size", 20)),
+                max_size=int(self.config.get("database.pool.max_size", 50)),
                 max_queries=int(self.config.get("database.pool.max_queries", 50000)),
-                max_inactive_connection_lifetime=float(
-                    self.config.get(
-                        "database.pool.max_inactive_connection_lifetime", 300.0
-                    )
-                ),
-                command_timeout=float(
-                    self.config.get("database.pool.command_timeout", 60.0)
-                ),
+                max_inactive_connection_lifetime=float(self.config.get("database.pool.max_inactive_connection_lifetime", 300.0)),
+                command_timeout=float(self.config.get("database.pool.command_timeout", 60.0)),
                 timeout=float(self.config.get("database.timeouts.connect", 10.0)),
             )
         return self._pool

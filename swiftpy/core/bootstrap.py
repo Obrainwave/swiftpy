@@ -36,7 +36,10 @@ def create_app(
     """
     app = Application()
 
-    app_config = Config(config or {})
+    if config is None:
+        app_config = Config.load("config")
+    else:
+        app_config = Config(config)
 
     app.container.instance(Application, app)
     app.container.instance(Container, app.container)
