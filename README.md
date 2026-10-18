@@ -1,90 +1,225 @@
 # SwiftPY
 
-**An ASGI native, Eloquent style, AI powered Python API framework.**
+**An ASGI-native, Eloquent-style Python web framework combining the developer experience of FastAPI with the elegance and structure of Laravel.**
 
-![CI](https://github.com/your-org/swiftpy/actions/workflows/ci.yml/badge.svg?branch=develop)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)
-![Status](https://img.shields.io/badge/status-pre--alpha-orange.svg)
+[![CI](https://github.com/your-org/swiftpy/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/your-org/swiftpy/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![Status: Alpha](https://img.shields.io/badge/status-alpha-blue.svg)](./DEVLOG.md)
+[![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![Types: Mypy Strict](https://img.shields.io/badge/types-mypy%20strict-blue.svg)](https://mypy-lang.org/)
 
-> **This is pre-alpha software.** SwiftPY is under active, early development and is not ready for production use, or for any use at all yet. Nothing here is published to PyPI. The API shown below is the target design, not something you can currently install and run. If you want to watch this repo grow from its first working request loop, you are in the right place. If you need a production API framework today, use FastAPI, Litestar, or Django.
+---
 
-## What is this
+## Overview
 
-SwiftPY combines three things that exist separately across the Python ecosystem today, but not together in one framework:
+SwiftPY brings the joy and productivity of Laravel to the modern asynchronous Python ecosystem. It eliminates boilerplate and fragmented third-party glue code by providing a unified, cohesive framework built natively on Python 3.12+ and high-performance [`asyncpg`](https://github.com/MagicStack/asyncpg).
 
-- **FastAPI grade developer experience**: type driven request validation, automatic OpenAPI generation, and async first routing.
-- **Eloquent caliber ORM**: an Active Record style ORM with a fluent query builder and expressive relationships, closing the gap left by SQLAlchemy's more verbose data mapper pattern.
-- **First class AI ecosystem**: LLM clients, streaming, embeddings, vector stores, RAG pipelines, tool calling, and agent loops as framework level citizens, not a LangChain layer bolted on top.
+- **FastAPI-Grade Simplicity**: Clean, intuitive entrypoint (`app = Application()`), async-first request/response cycle, automatic path parameter type coercion, and scoped route groups with middleware pipelines.
+- **Eloquent-Caliber Active Record ORM**: Typed models declaring class attributes via standard Python type hints, automatic irregular-aware table pluralization, dirty-tracking `save()`, expressive relationships (`HasMany`, `BelongsTo`, `HasOne`, `BelongsToMany`), and eager loading with strict N+1 query prevention.
+- **Database Engine & Native Transactions**: Connection pool management, automatic transaction propagation across context variables, nested transaction savepoints, and strict SQL injection prevention with full identifier quoting for reserved words.
+- **Fluent Migration DSL & Schema Builder**: Laravel-inspired `Blueprint` table definitions, safe statement ordering (drops executed before adds), column comments, unsigned checks, composite keys, and distributed PostgreSQL advisory locks.
+- **Zero-Config Provider Auto-Discovery**: Automatic service provider discovery in `app/providers/` that registers container dependencies behind the scenes without manual entrypoint registration.
+- **Developer CLI (`swiftpy`)**: Built-in CLI for running migrations, rolling back batches, inspecting migration status, scaffolding typed migrations, and starting the ASGI dev server.
 
-## Status
+---
 
-| Phase | Focus | Status |
+## Status & Roadmap
+
+| Milestone | Component Focus | Status |
 |---|---|---|
-| 1. Core Foundation | ASGI interface, routing, DI, task isolation, middleware | 🚧 In progress |
-| 2. Data and API Essentials | Query Builder, ORM, migrations, auth, validation, CLI | ⬜ Not started |
-| 3. Application Infrastructure | Queues, events, cache, WebSockets | ⬜ Not started |
-| 4. AI Native Module | LLM clients, RAG, tool calling, agents, admin panel | ⬜ Not started |
-| 5. Polish and Launch | Performance, security audit, docs, PyPI release | ⬜ Not started |
+| **Phase 1: Core Foundation** | ASGI HTTP kernel, async router, route groups, IoC container, task isolation, middleware pipeline, config repository | ✅ Completed |
+| **Phase 2: Data & ORM Essentials** | Connection pool, query builder, Active Record ORM, relationships, eager loading, migrations DSL, advisory locking, CLI | ✅ Completed |
+| **Phase 3: Application Infrastructure** | Queue workers, event dispatcher, cache drivers (Redis), WebSockets | 🚧 In Progress |
+| **Phase 4: AI Native Module** | LLM streaming clients, tool calling, embeddings, vector stores, RAG pipelines | ⬜ Planned |
+| **Phase 5: Polish & PyPI Release** | Performance benchmarks, security audit, comprehensive documentation | ⬜ Planned |
 
-## What it will look like
+*See [`DEVLOG.md`](./DEVLOG.md) for detailed test reports and verified architectural guarantees.*
 
-This is the target API. It is the design the PRD and Execution Plan are building toward, not something you can run yet.
+---
+
+## What It Looks Like
+
+### 1. Minimal Application Entrypoint
+
+No ugly provider lists or manual bootstrapping required—create your application in one line:
 
 ```python
-from swiftpy.core import Application
-from swiftpy.database.orm import Model, HasMany
+# main.py
+from app.http.middleware.test_middleware import TestMiddleware
+from swiftpy import Application, Request, Response, RouteGroup, json_response
 
-app = Application()
+app = Application(title="SwiftPY Store API", version="1.0.0")
+
+
+@app.get("/ping")
+async def ping(request: Request) -> Response:
+    return json_response({"message": "pong"})
+
+
+@app.group("/api/v1", middleware=[TestMiddleware])
+def v1_routes(group: RouteGroup) -> None:
+    @group.get("/users/{user_id}")
+    async def show_user(request: Request, user_id: int) -> Response:
+        return json_response({"user_id": user_id, "ok": True})
+```
+
+### 2. Active Record Models & Relationships
+
+Declare models using Python type hints. Unloaded relationships strictly raise `RelationNotLoadedError` to eliminate silent N+1 queries; use `.with_()` for explicit, high-performance eager loading:
+
+```python
+# app/models/user.py
+from datetime import datetime
+from swiftpy.database.orm import Model, HasMany, HasOne
 
 
 class User(Model):
+    __fillable__ = ["name", "email"]
+
+    id: int
     name: str
     email: str
-    posts = HasMany("Post")
+    created_at: datetime
+    updated_at: datetime
+
+    posts: HasMany = HasMany("Post")
+    profile: HasOne = HasOne("Profile")
 
 
-@app.get("/users/{user_id}")
-async def show_user(user_id: int) -> UserOut:
-    return await User.find(user_id)
+# Querying and eager loading:
+users = await User.with_("posts", "profile").where("name", "Alice").get()
+for user in users:
+    print(user.name, len(user.posts), user.profile.bio)
 
-
-@app.post("/chat/stream")
-async def chat_stream(body: ChatRequest):
-    async def tokens():
-        async for chunk in AI.chat("claude-sonnet-4-6").user(body.message).stream():
-            yield chunk
-
-    return stream(tokens())
+# Dirty-tracking save (updates only changed attributes and maintains updated_at):
+user = await User.find(1)
+user.name = "Alice Cooper"
+await user.save()
 ```
 
-## Installation
+### 3. Fluent Migrations & Schema Builder
 
-Not published yet. There is nothing to `pip install` or `uv add` until Phase 5. To run the project as it currently stands, see [Development Setup](#development-setup) below.
+Define and alter tables using the expressive `Blueprint` DSL:
+
+```python
+# database/migrations/2026_10_18_000001_create_posts_table.py
+from swiftpy.database.migrations import Blueprint, Migration, Schema
+
+
+class CreatePostsTable(Migration):
+    async def up(self) -> None:
+        def define(table: Blueprint) -> None:
+            table.id()
+            table.big_integer("user_id").unsigned()
+            table.string("title", 200)
+            table.text("body").nullable()
+            table.boolean("is_published").default(False)
+            table.timestamps()
+            table.foreign_key("user_id", references="id", on="users", on_delete="CASCADE")
+            table.index(["user_id", "is_published"], name="idx_posts_user_published")
+
+        await Schema.create("posts", define)
+
+    async def down(self) -> None:
+        await Schema.drop_if_exists("posts")
+```
+
+---
+
+## Command Line Interface (`swiftpy`)
+
+SwiftPY provides a unified CLI entrypoint for common development workflows:
+
+```bash
+# Create a new migration with smart table name inference
+swiftpy make:migration create_posts_table
+swiftpy make:migration add_status_to_orders
+
+# Run all outstanding migrations
+swiftpy migrate
+
+# Inspect migration status and batch history
+swiftpy migrate:status
+
+# Rollback the last migration batch
+swiftpy migrate:rollback
+
+# Start the ASGI development server with auto-reload
+swiftpy start
+```
+
+---
+
+## Project Structure
+
+SwiftPY follows a clean, intuitive layout inspired by Laravel:
+
+```text
+├── app/
+│   ├── exceptions/         # Application-level exceptions
+│   ├── http/               # Controllers, middleware, and request handlers
+│   ├── models/             # Active Record ORM models
+│   ├── providers/          # Service providers (auto-discovered on boot)
+│   │   ├── app_service_provider.py
+│   │   └── database_service_provider.py
+│   └── services/           # Domain business logic
+├── config/                 # Environment & framework configuration
+│   ├── app.py
+│   └── database.py
+├── database/
+│   └── migrations/         # Timestamped database migrations
+├── swiftpy/                # SwiftPY framework core
+│   ├── console/            # CLI commands, argument parsing, app loader
+│   ├── core/               # Application kernel, DI container, config repository
+│   ├── database/           # Pool, query builder, ORM, migrations, advisory lock
+│   ├── helpers/            # Inflection (pluralize/snake_case), global helpers
+│   └── http/               # Router, request/response, middleware pipeline
+├── tests/                  # Pytest test suites (unit, integration, stress, migrations)
+├── docker-compose.yml      # Local PostgreSQL & Redis environment
+├── main.py                 # Application entrypoint
+└── pyproject.toml          # Project configuration & dependencies
+```
+
+---
 
 ## Development Setup
 
+### Prerequisites
+- Python 3.12+
+- Docker and Docker Compose
+- [`uv`](https://github.com/astral-sh/uv) (recommended Python package manager)
+
+### 1. Clone & Start Containers
 ```bash
 git clone https://github.com/your-org/swiftpy.git
 cd swiftpy
-uv sync
-uv run pytest
+docker compose up -d
 ```
 
-Requires Python 3.12+, PostgreSQL 14+ with the pgvector extension, and Redis for the full dev environment. `docker-compose.yml` provisions both, see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the complete setup.
+### 2. Run Migrations
+```bash
+docker compose exec app swiftpy migrate
+```
 
-## Documentation
+### 3. Run Test Suites & Quality Checks
+```bash
+# Run full pytest test suite (56 tests)
+docker compose exec app uv run pytest
 
-Full documentation ships in Phase 5, alongside the first release. Until then, the three planning documents in `docs/` are the closest thing to a spec:
+# Run isolated migration system & CLI test suite
+docker compose exec app python tests/migrations/test_migrations.py
 
-- `SwiftPY_PRD_v1_0.docx`: what SwiftPY is and why
-- `SwiftPY_Structure_v1_0.docx`: where everything lives in the codebase
-- `SwiftPY_ExecutionPlan_v1_0.docx`: how it's being built, phase by phase
+# Static type checking with Mypy in strict mode
+docker compose exec app uv run mypy swiftpy main.py
 
-## Contributing
+# Linting and formatting with Ruff
+docker compose exec app uv run ruff check .
+docker compose exec app uv run ruff format --check .
+```
 
-Contribution guidelines live in [`CONTRIBUTING.md`](./CONTRIBUTING.md). Given the pre-alpha state, the most useful contribution right now is reading the PRD and Execution Plan and opening issues against the design itself, not pull requests against code that doesn't exist yet.
+---
 
 ## License
 
-MIT. See [`LICENSE`](./LICENSE).
+SwiftPY is open-source software licensed under the [MIT License](./LICENSE).
