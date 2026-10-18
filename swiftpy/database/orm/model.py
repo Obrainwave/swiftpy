@@ -1,0 +1,410 @@
+from __future__ import annotations
+
+import inspect
+from collections.abc import Generator
+from typing import (
+    Any,
+    ClassVar,
+    Self,
+    TypeVar,
+    get_origin,
+    get_type_hints,
+)
+
+from swiftpy.database.orm.relationships import (
+    BelongsTo,
+    BelongsToMany,
+    HasMany,
+    HasOne,
+    Relation,
+    RelationDescriptor,
+)
+from swiftpy.database.query_builder import Query
+from swiftpy.helpers.helper import snake_case
+
+T = TypeVar("T", bound="Model")
+_MODEL_REGISTRY: dict[str, type[Model]] = {}
+
+
+_MISSING = object()
+
+
+class ModelQueryBuilder[T: Model]:
+    """Hydrates database records into strongly typed Active Record Model instances."""
+
+    def __init__(self, model_cls: type[T]) -> None:
+        self.model_cls = model_cls
+        self.builder = Query.table(model_cls.__table__)
+        self._eager_loads: list[str] = []
+
+    def where(self, column: str, operator_or_value: Any, value: Any = _MISSING) -> Self:
+        if value is _MISSING:
+            self.builder.where(column, operator_or_value)
+        else:
+            self.builder.where(column, operator_or_value, value)
+        return self
+
+    def where_null(self, column: str) -> Self:
+        self.builder.where(column, "=", None)
+        return self
+
+    def where_not_null(self, column: str) -> Self:
+        self.builder.where(column, "!=", None)
+        return self
+
+    def where_raw(self, sql: str, bindings: list[Any] | None = None) -> Self:
+        self.builder.where_raw(sql, bindings)
+        return self
+
+    def with_(self, *relations: str) -> Self:
+        self._eager_loads.extend(relations)
+        return self
+
+    def limit(self, value: int) -> Self:
+        self.builder.limit(value)
+        return self
+
+    def order_by(self, column: str, direction: str = "ASC") -> Self:
+        self.builder.order_by(column, direction)
+        return self
+
+    def select(self, *columns: str) -> Self:
+        self.builder.select(*columns)
+        return self
+
+    async def count(self) -> int:
+        return await self.builder.count()
+
+    async def get(self) -> list[T]:
+        rows = await self.builder.get()
+        instances: list[T] = []
+
+        for row in rows:
+            inst = self.model_cls(**row)
+            inst._exists = True
+            instances.append(inst)
+
+        if self._eager_loads and instances:
+            await self._load_relations(instances)
+
+        return instances
+
+    async def first(self) -> T | None:
+        self.limit(1)
+        res = await self.get()
+        return res[0] if res else None
+
+    async def insert(self, data: dict[str, Any]) -> int:
+        return await self.builder.insert(data)
+
+    async def update(self, data: dict[str, Any]) -> str:
+        return await self.builder.update(data)
+
+    async def delete(self) -> str:
+        return await self.builder.delete()
+
+    def __await__(self) -> Generator[Any, None, list[T]]:
+        return self.get().__await__()
+
+    async def _load_relations(self, instances: list[T]) -> None:
+        for rel_name in self._eager_loads:
+            relation = self.model_cls.__relations_config__.get(rel_name)
+            if not relation:
+                raise ValueError(
+                    f"Relation '{rel_name}' not found on model {self.model_cls.__name__}"
+                )
+            await relation.eager_load(instances)
+
+
+class Model:
+    """Active Record base model with typed attributes and eager-loading relationships."""
+
+    __table__: ClassVar[str]
+    __primary_key__: ClassVar[str] = "id"
+
+    __fields__: ClassVar[dict[str, Any]]
+    __field_defaults__: ClassVar[dict[str, Any]]
+    __relations_config__: ClassVar[dict[str, Relation]]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+
+        # 1. Determine table name if not explicitly set
+        if "__table__" not in cls.__dict__:
+            cls.__table__ = f"{snake_case(cls.__name__)}s"
+
+        # 2. Inherit fields from parent Model classes
+        fields: dict[str, Any] = {}
+        defaults: dict[str, Any] = {}
+
+        for base in reversed(cls.__mro__[1:]):
+            fields.update(getattr(base, "__fields__", {}))
+            defaults.update(getattr(base, "__field_defaults__", {}))
+
+        # 3. Resolve typed class attributes using typing.get_type_hints
+        globalns = getattr(inspect.getmodule(cls), "__dict__", {})
+        localns = dict(_MODEL_REGISTRY)
+        localns[cls.__name__] = cls
+
+        try:
+            resolved_hints = get_type_hints(cls, globalns=globalns, localns=localns)
+        except (NameError, TypeError):
+            resolved_hints = inspect.get_annotations(cls, eval_str=False)
+
+        for name, hint in resolved_hints.items():
+            if name.startswith("__"):
+                continue
+            if get_origin(hint) is ClassVar:
+                continue
+
+            fields[name] = hint
+            if name in cls.__dict__:
+                defaults[name] = cls.__dict__[name]
+
+        # 4. Guarantee primary key field presence
+        if cls.__primary_key__ not in fields:
+            fields[cls.__primary_key__] = int
+
+        cls.__fields__ = fields
+        cls.__field_defaults__ = defaults
+
+        # 5. Discover declared relationships and install descriptors
+        relations: dict[str, Relation] = {}
+
+        for name, value in list(cls.__dict__.items()):
+            if isinstance(value, Relation):
+                value.name = name
+                value.owner_cls = cls
+                relations[name] = value
+                setattr(cls, name, RelationDescriptor(name, value))
+
+        cls.__relations_config__ = relations
+
+        # 6. Register model globally for forward string references
+        _MODEL_REGISTRY[cls.__name__] = cls
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._loaded_relations: dict[str, Any] = {}
+        self._exists: bool = False
+
+        for name in self.__fields__:
+            if name in kwargs:
+                setattr(self, name, kwargs[name])
+            elif name in self.__field_defaults__:
+                setattr(self, name, self.__field_defaults__[name])
+            else:
+                setattr(self, name, None)
+
+        for name, val in kwargs.items():
+            if name not in self.__fields__:
+                setattr(self, name, val)
+
+    @classmethod
+    def query(cls) -> ModelQueryBuilder[Self]:
+        """Return a new query builder for this model."""
+        return ModelQueryBuilder(cls)
+
+    @classmethod
+    async def find(cls, id: Any) -> Self | None:
+        """Find a model instance by its primary key."""
+        return await cls.where(cls.__primary_key__, id).first()
+
+    @classmethod
+    def where(
+        cls, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add a basic where clause to the query."""
+        return cls.query().where(column, operator_or_value, value)
+
+    @classmethod
+    def where_raw(
+        cls, sql: str, bindings: list[Any] | None = None
+    ) -> ModelQueryBuilder[Self]:
+        """Add a raw SQL where clause."""
+        return cls.query().where_raw(sql, bindings)
+
+    @classmethod
+    def with_(cls, *relations: str) -> ModelQueryBuilder[Self]:
+        """Eager-load specified relationships."""
+        return cls.query().with_(*relations)
+
+    @classmethod
+    async def all(cls) -> list[Self]:
+        """Retrieve all model instances."""
+        return await cls.query().get()
+
+    @classmethod
+    async def create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
+        """Create and persist a new model instance."""
+        data: dict[str, Any] = {}
+        if args:
+            data.update(args[0])
+        data.update(kwargs)
+
+        for key, val in list(data.items()):
+            if isinstance(val, Model):
+                data[key] = val.get_primary_key()
+
+        pk = await cls.query().insert(data)
+        instance = await cls.find(pk)
+
+        if instance is not None:
+            return instance
+
+        inst = cls(**data)
+        setattr(inst, cls.__primary_key__, pk)
+        inst._exists = True
+        return inst
+
+    async def save(self) -> None:
+        """Save the current model instance to the database."""
+        pk_name = self.__primary_key__
+        pk = getattr(self, pk_name, None)
+
+        data: dict[str, Any] = {}
+        for field in self.__fields__:
+            if field != pk_name and hasattr(self, field):
+                val = getattr(self, field)
+                if isinstance(val, Model):
+                    val = val.get_primary_key()
+                data[field] = val
+
+        if self._exists and pk is not None:
+            await self.__class__.query().where(pk_name, pk).update(data)
+        else:
+            pk = await self.__class__.query().insert(data)
+            setattr(self, pk_name, pk)
+            self._exists = True
+
+    async def delete(self) -> None:
+        """Delete this model instance from the database."""
+        pk_name = self.__primary_key__
+        pk = getattr(self, pk_name, None)
+
+        if not self._exists or pk is None:
+            raise RuntimeError(f"Cannot delete unsaved {self.__class__.__name__}.")
+
+        await self.__class__.query().where(pk_name, pk).delete()
+        self._exists = False
+
+    async def refresh(self) -> Self:
+        """Reload the model attributes from the database."""
+        pk = self.get_primary_key()
+        if not self._exists or pk is None:
+            raise RuntimeError(f"Cannot refresh unsaved {self.__class__.__name__}.")
+
+        refreshed = await self.__class__.find(pk)
+        if refreshed is None:
+            raise RuntimeError(
+                f"Record for {self.__class__.__name__} with "
+                f"{self.__primary_key__}={pk} no longer exists."
+            )
+
+        for k, v in refreshed.get_attributes().items():
+            setattr(self, k, v)
+
+        self._loaded_relations.clear()
+        return self
+
+    def get_primary_key(self) -> Any:
+        """Return the value of the primary key field."""
+        return getattr(self, self.__primary_key__, None)
+
+    def get_attributes(self) -> dict[str, Any]:
+        """Return a dictionary of model attributes."""
+        attrs: dict[str, Any] = {}
+        for f in self.__fields__:
+            if hasattr(self, f):
+                attrs[f] = getattr(self, f)
+        return attrs
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the model and its loaded relations to a dictionary."""
+        data = self.get_attributes()
+        for rel_name, rel_value in self._loaded_relations.items():
+            if isinstance(rel_value, list):
+                data[rel_name] = [
+                    item.to_dict() if isinstance(item, Model) else item
+                    for item in rel_value
+                ]
+            elif isinstance(rel_value, Model):
+                data[rel_name] = rel_value.to_dict()
+            else:
+                data[rel_name] = rel_value
+        return data
+
+    def has_many(
+        self,
+        related: str | type[Model],
+        foreign_key: str | None = None,
+        local_key: str = "id",
+    ) -> HasMany:
+        """Construct a HasMany relationship instance."""
+        rel = HasMany(related, foreign_key, local_key)
+        rel.owner_cls = self.__class__
+        return rel
+
+    def belongs_to(
+        self,
+        related: str | type[Model],
+        foreign_key: str | None = None,
+        local_key: str = "id",
+    ) -> BelongsTo:
+        """Construct a BelongsTo relationship instance."""
+        rel = BelongsTo(related, foreign_key, local_key)
+        rel.owner_cls = self.__class__
+        return rel
+
+    def has_one(
+        self,
+        related: str | type[Model],
+        foreign_key: str | None = None,
+        local_key: str = "id",
+    ) -> HasOne:
+        """Construct a HasOne relationship instance."""
+        rel = HasOne(related, foreign_key, local_key)
+        rel.owner_cls = self.__class__
+        return rel
+
+    def belongs_to_many(
+        self,
+        related: str | type[Model],
+        pivot_table: str | None = None,
+        foreign_pivot_key: str | None = None,
+        related_pivot_key: str | None = None,
+        parent_key: str = "id",
+        related_key: str = "id",
+    ) -> BelongsToMany:
+        """Construct a BelongsToMany relationship instance."""
+        rel = BelongsToMany(
+            related,
+            pivot_table,
+            foreign_pivot_key,
+            related_pivot_key,
+            parent_key,
+            related_key,
+        )
+        rel.owner_cls = self.__class__
+        return rel
+
+    def __repr__(self) -> str:
+        attrs = ", ".join(f"{k}={v!r}" for k, v in self.get_attributes().items())
+        return f"{self.__class__.__name__}({attrs})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, self.__class__):
+            return False
+        pk = self.get_primary_key()
+        other_pk = other.get_primary_key()
+        if pk is not None and other_pk is not None:
+            return pk == other_pk  # type: ignore[no-any-return]
+        return self.get_attributes() == other.get_attributes()
+
+    def __hash__(self) -> int:
+        pk = self.get_primary_key()
+        if pk is not None:
+            return hash((self.__class__, pk))
+        return hash(id(self))
+
+
+__all__ = ["Model", "ModelQueryBuilder"]

@@ -14,4 +14,6 @@ COPY . .
 
 RUN uv sync
 
+ENV PATH="/app/.venv/bin:$PATH"
+
 CMD ["tail", "-f", "/dev/null"]

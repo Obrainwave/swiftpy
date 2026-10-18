@@ -84,6 +84,8 @@ Transfer/sec:    482.06KB
 3. **Leak Prevention:** Context manager teardown guarantees strict connection release. Post-load testing confirms active pool size matches idle size (20/20) with no orphaned connections.
 4. **Throughput Performance:** System maintained stable execution under massive synthetic load, achieving ~657.25 Queries Per Second (QPS) for reads and ~833.07 writes per second.
 
+---
+
 ## Week 7 - Query Builder Completion and Transactions
 
 ### Status: PASSED
@@ -95,3 +97,19 @@ Transfer/sec:    482.06KB
 3. **Transaction Semantics** – Nested transactions are implemented via savepoints; a rollback of the inner transaction does not affect the outer transaction, and an outer rollback cancels all nested work. Timeouts (e.g., `pg_sleep` inside a transaction) cancel and rollback the transaction correctly, leaving no orphaned data.
 4. **Concurrent Load & Pool Health** – 1000 concurrent read workers and 1000 concurrent write workers completed without errors. The connection pool (size 50) returned to full idle capacity after all tasks, confirming no connection leaks. Performance: read QPS ~1517, write throughput ~1826 writes/sec.
 5. **Data Consistency** – After all operations (including rollbacks and concurrent writes), the final row count (1101) matches expectations, and the nested transaction test correctly preserved the parent row while discarding the child row.
+
+---
+
+## Week 8 - The Active Record ORM
+
+### Status: PASSED
+* **Test Suite:** `tests/orm/test_eager_loading.py`
+* **Results:** All 7 ORM test suites passed (100% test pass rate across 32 total tests in the repository; strict mypy typing verified across 37 source files; ruff compliant).
+* **Verified Guarantees:**
+1. **Typed Model Base Class & Annotation Resolution:** `Model` uses `typing.get_type_hints` at class definition time to inspect typed class attributes, supporting modern Python 3.12 syntax, field defaults, and automatic table name snake_case resolution.
+2. **Active Record CRUD Methods:** Implemented `Model.find(id)`, `Model.where(...)`, `Model.create(...)`, `instance.save()`, `instance.delete()`, and `instance.refresh()` with primary key resolution.
+3. **Relationships with Scoped Query Builders:** Implemented `HasMany`, `BelongsTo`, `HasOne`, and `BelongsToMany`. Each returns a lazily awaitable query builder scoped to the relationship (e.g., `await user.posts` or `await user.posts.where("published", True).get()`).
+4. **Explicit Eager Loading via `.with_()`:** Resolves related models across arbitrary collection sizes in batched `WHERE IN (...)` queries, loading dual relationship types (`HasMany` + `HasOne`) on 10 users in exactly 3 database queries instead of 21.
+5. **Strict N+1 Query Antipattern Prevention:** Synchronous access on un-eager-loaded relationships (`iter`, `len`, `bool`, subscripting, and direct model attribute access) strictly raises `RelationNotLoadedError` with actionable error messages, eliminating silent N+1 queries.
+
+---

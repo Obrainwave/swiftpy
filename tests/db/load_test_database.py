@@ -6,7 +6,6 @@ import time
 from app.providers.database_service_provider import (
     DatabaseServiceProvider,
 )
-
 from swiftpy.core.bootstrap import create_app
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.query_builder import Query
@@ -56,12 +55,7 @@ async def read_worker() -> None:
     )
 
     async with db.transaction():
-        await (
-            Query.table("test_users")
-            .where("active", True)
-            .limit(1)
-            .first()
-        )
+        await Query.table("test_users").where("active", True).limit(1).first()
 
 
 async def write_worker(worker_id: int) -> None:
@@ -88,17 +82,13 @@ async def rollback_test() -> None:
     except RuntimeError:
         pass
 
-    user = (
-        await Query.table("test_users")
-        .where("name", "rollback_user")
-        .first()
-    )
+    user = await Query.table("test_users").where("name", "rollback_user").first()
 
     assert user is None, "Rollback failed"
 
 
 async def nested_transaction_test() -> None:
-    async with db.transaction(): # Outer transaction (Parent)
+    async with db.transaction():  # Outer transaction (Parent)
         await Query.table("test_users").insert(
             {
                 "name": "parent_user",
@@ -107,7 +97,7 @@ async def nested_transaction_test() -> None:
         )
 
         try:
-            async with db.transaction(): # Inner transaction (Child / Savepoint)
+            async with db.transaction():  # Inner transaction (Child / Savepoint)
                 await Query.table("test_users").insert(
                     {
                         "name": "child_user",
@@ -116,43 +106,37 @@ async def nested_transaction_test() -> None:
                 )
 
                 raise RuntimeError("force nested rollback")
-                
+
         except RuntimeError:
             # Catch the error here so it doesn't bubble up and abort the parent transaction
             pass
 
-    parent = (
-        await Query.table("test_users")
-        .where("name", "parent_user")
-        .first()
-    )
+    parent = await Query.table("test_users").where("name", "parent_user").first()
 
-    child = (
-        await Query.table("test_users")
-        .where("name", "child_user")
-        .first()
-    )
+    child = await Query.table("test_users").where("name", "child_user").first()
 
     print()
     print("==== NESTED TRANSACTION TEST ====")
-    print("Parent Exists:", parent is not None) # Should now be True
+    print("Parent Exists:", parent is not None)  # Should now be True
     print("Child Exists :", child is not None)  # Should be False
+
 
 async def warm_pool(db_pool: DatabasePool) -> None:
     pool = db_pool.get_pool()
+
     async def touch():
         async with pool.acquire() as conn:
             await conn.execute("SELECT 1")
+
     await asyncio.gather(*(touch() for _ in range(pool.get_max_size())))
-    
+
+
 async def load_test_reads() -> None:
     concurrency = 1000
 
     started = time.perf_counter()
 
-    await asyncio.gather(
-        *(read_worker() for _ in range(concurrency))
-    )
+    await asyncio.gather(*(read_worker() for _ in range(concurrency)))
 
     elapsed = time.perf_counter() - started
 
@@ -168,9 +152,7 @@ async def load_test_writes() -> None:
 
     started = time.perf_counter()
 
-    await asyncio.gather(
-        *(write_worker(i) for i in range(concurrency))
-    )
+    await asyncio.gather(*(write_worker(i) for i in range(concurrency)))
 
     elapsed = time.perf_counter() - started
 
@@ -213,9 +195,9 @@ async def main() -> None:
     db_pool = app.container.resolve(DatabasePool)
 
     await db_pool.init()
-    
+
     await warm_pool(db_pool)
-    
+
     await create_table(db_pool)
 
     await seed_data()

@@ -13,9 +13,9 @@ class Config:
 
     def __init__(self, data: dict[str, Any] | None = None) -> None:
         self._data = data or {}
-        
+
     @classmethod
-    def load(cls, config_dir: str = "config") -> "Config":
+    def load(cls, config_dir: str = "config") -> Config:
         data: dict[str, Any] = {}
 
         for file in Path(config_dir).glob("*.py"):

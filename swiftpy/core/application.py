@@ -4,14 +4,13 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from swiftpy.core.container import Container
-from swiftpy.core.providers.base import ServiceProvider
-from swiftpy.http.middleware import (
-    MiddlewarePipeline,
-)
+from swiftpy.http.middleware import MiddlewarePipeline
 from swiftpy.http.request import Request
-from swiftpy.http.response import json_response, not_found
-from swiftpy.http.router import RouteGroup, Router
+from swiftpy.http.response import json_response, not_found, unprocessable
+from swiftpy.http.router import PathParamCoercionError, RouteGroup, Router
+
+from .container import Container
+from .providers.base import ServiceProvider
 
 logger = logging.getLogger("swiftpy")
 
@@ -24,16 +23,17 @@ class Application:
     def __init__(self) -> None:
         self.container = Container()
         self.router = Router()
-
         self._providers: list[ServiceProvider] = []
+        self._booted = False
 
     def register(self, provider_class: type[ServiceProvider]) -> ServiceProvider:
         """Instantiate and register a service provider."""
         provider = provider_class(self.container)
-
         provider.register()
-
         self._providers.append(provider)
+
+        if self._booted:
+            provider.boot()
 
         return provider
 
@@ -41,8 +41,19 @@ class Application:
         """
         Boot all registered service providers once all bindings are configured.
         """
+        if self._booted:
+            return
+
         for provider in self._providers:
             provider.boot()
+
+        self._booted = True
+        self._compile_routes()
+
+    def _compile_routes(self) -> None:
+        for route in self.router.routes:
+            pipeline = MiddlewarePipeline(self.container, route.middleware)
+            route.compiled_handler = pipeline.wrap(route.handler)
 
     def get(
         self, path: str
@@ -87,31 +98,32 @@ class Application:
             if scope["type"] != "http":
                 return
 
-            request = Request(
-                scope,
-                receive,
-            )
-
-            route, params = self.router.match(
-                request.method,
-                request.path,
-            )
+            request = Request(scope, receive)
+            try:
+                route, params = self.router.match(request.method, request.path)
+            except PathParamCoercionError as exc:
+                response = unprocessable({exc.param: str(exc)})
+                await response.send(send)
+                return
 
             if route is None:
                 response = not_found()
-
                 await response.send(send)
 
                 return
 
-            pipeline = MiddlewarePipeline(self.container, route.middleware)
+            MiddlewarePipeline(self.container, route.middleware)
 
-            handler = pipeline.wrap(route.handler)
+            handler = route.compiled_handler
 
-            response = await handler(
-                request,
-                **params,
-            )
+            if handler is None:
+                # Route matched before boot() ran, e.g. ad hoc testing.
+                # Not the production hot path, so rebuilding here is acceptable.
+                handler = MiddlewarePipeline(self.container, route.middleware).wrap(
+                    route.handler
+                )
+
+            response = await handler(request, **params)
 
         except Exception:
             logger.exception("Unhandled exception during request processing")

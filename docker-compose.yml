@@ -13,6 +13,7 @@ services:
         condition: service_started
     environment:
       APP_ENV: local
+      PATH: "/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 
       DATABASE_DEFAULT: postgresql
 

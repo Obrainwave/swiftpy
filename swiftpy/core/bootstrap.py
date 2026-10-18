@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextvars import ContextVar
 from typing import Any
 
 from swiftpy.core.application import Application
@@ -9,18 +10,30 @@ from swiftpy.core.container import Container
 from swiftpy.core.providers.base import ServiceProvider
 from swiftpy.http.router import Router
 
-_container: Container | None = None
+_container_var: ContextVar[Container | None] = ContextVar(
+    "swiftpy_container", default=None
+)
+# _container: Container | None = None
 
 
+# def set_container(container: Container) -> None:
+#     global _container
+#     _container = container
+
+
+# def get_container() -> Container:
+#     if _container is None:
+#         raise RuntimeError("Application container not bootstrapped")
+#     return _container
 def set_container(container: Container) -> None:
-    global _container
-    _container = container
+    _container_var.set(container)
 
 
 def get_container() -> Container:
-    if _container is None:
+    container = _container_var.get()
+    if container is None:
         raise RuntimeError("Application container not bootstrapped")
-    return _container
+    return container
 
 
 def create_app(

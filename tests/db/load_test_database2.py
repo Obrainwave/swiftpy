@@ -55,12 +55,7 @@ async def read_worker() -> None:
     )
 
     async with db.transaction():
-        await (
-            Query.table("test_users")
-            .where("active", True)
-            .limit(1)
-            .first()
-        )
+        await Query.table("test_users").where("active", True).limit(1).first()
 
 
 async def write_worker(worker_id: int) -> None:
@@ -87,11 +82,7 @@ async def rollback_test() -> None:
     except RuntimeError:
         pass
 
-    user = (
-        await Query.table("test_users")
-        .where("name", "rollback_user")
-        .first()
-    )
+    user = await Query.table("test_users").where("name", "rollback_user").first()
 
     assert user is None, "Rollback failed"
 
@@ -119,17 +110,9 @@ async def nested_transaction_test() -> None:
         except RuntimeError:
             pass
 
-    parent = (
-        await Query.table("test_users")
-        .where("name", "parent_user")
-        .first()
-    )
+    parent = await Query.table("test_users").where("name", "parent_user").first()
 
-    child = (
-        await Query.table("test_users")
-        .where("name", "child_user")
-        .first()
-    )
+    child = await Query.table("test_users").where("name", "child_user").first()
 
     print()
     print("==== NESTED TRANSACTION TEST ====")
@@ -152,9 +135,7 @@ async def load_test_reads() -> None:
 
     started = time.perf_counter()
 
-    await asyncio.gather(
-        *(read_worker() for _ in range(concurrency))
-    )
+    await asyncio.gather(*(read_worker() for _ in range(concurrency)))
 
     elapsed = time.perf_counter() - started
 
@@ -170,9 +151,7 @@ async def load_test_writes() -> None:
 
     started = time.perf_counter()
 
-    await asyncio.gather(
-        *(write_worker(i) for i in range(concurrency))
-    )
+    await asyncio.gather(*(write_worker(i) for i in range(concurrency)))
 
     elapsed = time.perf_counter() - started
 
@@ -218,20 +197,20 @@ async def main() -> None:
     db_pool = app.container.resolve(DatabasePool)
 
     await db_pool.init()
-    
+
     await warm_pool(db_pool)
     await create_table(db_pool)
     await seed_data()
-    
+
     await rollback_test()
     await nested_transaction_test()
-    
+
     await load_test_reads()
     await load_test_writes()
-    
+
     await verify_row_count()
     await verify_pool(db_pool)
-    
+
     await db_pool.close()
 
 

@@ -9,14 +9,25 @@ from typing import Any
 RouteHandler = Any
 
 
+class PathParamCoercionError(Exception):
+    def __init__(self, param: str, value: str, expected_type: type) -> None:
+        self.param = param
+        self.value = value
+        self.expected_type = expected_type
+        super().__init__(
+            f"Path parameter '{param}' with value '{value}' could not be "
+            f"converted to {expected_type.__name__}"
+        )
+
+
 @dataclass(slots=True)
 class Route:
     method: str
     path: str
     handler: RouteHandler
     middleware: list[type]
-
     pattern: re.Pattern[str] = field(init=False)
+    compiled_handler: RouteHandler | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         regex = re.sub(
@@ -183,7 +194,9 @@ class Router:
                         try:
                             params[name] = annotation(value)
                         except (ValueError, TypeError):
-                            return None, {}
+                            raise PathParamCoercionError(
+                                name, value, annotation
+                            ) from None
 
             return route, params
 
