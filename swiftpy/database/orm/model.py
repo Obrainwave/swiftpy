@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Generator, Iterable
+from datetime import UTC, datetime
 from typing import (
     Any,
     ClassVar,
@@ -11,6 +12,7 @@ from typing import (
     get_type_hints,
 )
 
+from swiftpy.database.orm.registry import _MODEL_REGISTRY
 from swiftpy.database.orm.relationships import (
     BelongsTo,
     BelongsToMany,
@@ -23,7 +25,6 @@ from swiftpy.database.query_builder import Query
 from swiftpy.helpers.helper import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
-_MODEL_REGISTRY: dict[str, dict[str, type[Model]]] = {}
 _MISSING = object()
 
 
@@ -302,6 +303,11 @@ class Model:
                 if name != pk_name and getattr(self, name, None) != original
             }
             if changed:
+                if "updated_at" in self.__fields__:
+                    now = datetime.now(UTC)
+                    changed["updated_at"] = now
+                    self.updated_at = now
+
                 await self.__class__.query().where(pk_name, pk).update(changed)
                 for name in changed:
                     self._original[name] = getattr(self, name)

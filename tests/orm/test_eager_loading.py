@@ -22,6 +22,7 @@ from swiftpy.database.orm.relationships import (
 )
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.query_builder import Query
+from swiftpy.helpers.helper import pluralize
 
 
 class QueryCounter:
@@ -486,7 +487,6 @@ async def test_fillable_mass_assignment_protection() -> None:
 
 async def test_pluralize_and_table_name_resolution() -> None:
     print("\n==== PLURALIZATION & TABLE NAME RESOLUTION ====")
-    from swiftpy.helpers.helper import pluralize
 
     test_words = [
         ("user", "users"),

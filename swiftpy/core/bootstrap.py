@@ -1,70 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextvars import ContextVar
 from typing import Any
 
 from swiftpy.core.application import Application
-from swiftpy.core.config import Config
-from swiftpy.core.container import Container
+from swiftpy.core.container import Container, get_container, set_container
 from swiftpy.core.providers.base import ServiceProvider
-from swiftpy.http.router import Router
 
-_container_var: ContextVar[Container | None] = ContextVar(
-    "swiftpy_container", default=None
-)
-# _container: Container | None = None
-
-
-# def set_container(container: Container) -> None:
-#     global _container
-#     _container = container
-
-
-# def get_container() -> Container:
-#     if _container is None:
-#         raise RuntimeError("Application container not bootstrapped")
-#     return _container
-def set_container(container: Container) -> None:
-    _container_var.set(container)
-
-
-def get_container() -> Container:
-    container = _container_var.get()
-    if container is None:
-        raise RuntimeError("Application container not bootstrapped")
-    return container
+__all__ = [
+    "Container",
+    "create_app",
+    "get_container",
+    "set_container",
+]
 
 
 def create_app(
     providers: Sequence[type[ServiceProvider]] | None = None,
     config: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> Application:
     """
     Bootstrap and initialize the SwiftPY application instance.
 
-    Registers application singletons into the container, registers provided
-    service providers, loads optional runtime configuration, and triggers the
-    boot phase across all registered services.
+    Convenience factory function wrapping Application instantiation and boot.
     """
-    app = Application()
-
-    if config is None:
-        app_config = Config.load("config")
-    else:
-        app_config = Config(config)
-
-    app.container.instance(Application, app)
-    app.container.instance(Container, app.container)
-    app.container.instance(Router, app.router)
-    app.container.instance(Config, app_config)
-
-    set_container(app.container)
-
-    if providers:
-        for provider_cls in providers:
-            app.register(provider_cls)
-
+    app = Application(providers=providers, config=config, **kwargs)
     app.boot()
-
     return app

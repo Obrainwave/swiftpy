@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Generator, Sequence
 from typing import TYPE_CHECKING, Any, Self
 
+from swiftpy.database.orm.registry import _MODEL_REGISTRY
+from swiftpy.database.query_builder import Column
 from swiftpy.helpers.helper import snake_case
 
 if TYPE_CHECKING:
@@ -51,8 +53,6 @@ class Relation:
         """Resolve the related Model class, preferring direct class references and module scope."""
         if self._related_cls is not None:
             return self._related_cls
-
-        from swiftpy.database.orm.model import _MODEL_REGISTRY
 
         candidates = _MODEL_REGISTRY.get(self.related_model_name, {})
         if not candidates:
@@ -249,8 +249,6 @@ class BelongsToMany(Relation):
     async def eager_load(self, instances: Sequence[Model]) -> None:
         if not instances:
             return
-
-        from swiftpy.database.query_builder import Column
 
         target = self.get_target_model()
         parent_cls = (

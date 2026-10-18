@@ -118,3 +118,24 @@ Transfer/sec:    482.06KB
 10. **Strict N+1 Query Antipattern Prevention:** Synchronous access on un-eager-loaded relationships (`iter`, `len`, `bool`, subscripting, and direct model attribute access) strictly raises `RelationNotLoadedError` with actionable error messages, eliminating silent N+1 queries.
 
 ---
+
+## Week 9 - Migration System, Schema Builder, and CLI Foundation
+
+### Status: PASSED
+* **Test Suite:** `tests/migrations/test_migrations.py`
+* **Results:** All 14 migration, schema builder, concurrency lock, and CLI test suites passed (100% test pass rate across 53 total tests in repository; strict mypy typing verified across 41 source files; ruff compliant).
+* **Verified Guarantees:**
+1. **Framework-Application Decoupling:** CLI loader (`swiftpy/console/loader.py`) dynamically imports the project's application target (`load_application("main:app")`), ensuring `swiftpy` commands do not hardcode or leak imports from the consumer application.
+2. **Deterministic Schema DDL Ordering:** `SchemaGrammar.compile_table` enforces a safe ordering: drops first (foreign keys, unique constraints, indexes, columns), renames second, and additions third. This guarantees that one blueprint can drop and replace an index, constraint, or column without collisions.
+3. **Dedicated `drop_unique` Constraint Handling:** Dropping unique constraints routes to `ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{name}";` instead of dropping indexes, respecting PostgreSQL constraint-backed index semantics.
+4. **Identifier Quoting & Reserved Words Support:** Comprehensive `quote_identifier` helper validates and quotes all table and column names across DDL and Query builder (select, where, join, order by, insert, update), allowing reserved words (`from`, `to`, `order`, `group`) and mixed-case identifiers.
+5. **Enforced Column Comments and Unsigned Checks:** Column `.unsigned()` generates `CHECK ("{col}" >= 0)` constraints in PostgreSQL, and `.comment(...)` emits `COMMENT ON COLUMN "{table}"."{col}" IS '...'`.
+6. **Schema DDL Transaction Atomicity:** `Schema._execute_statements` wraps all generated DDL statements inside an atomic `async with conn.transaction():` savepoint/transaction block, guaranteeing that partial failures in direct schema executions do not leave half-built tables.
+7. **Clean Non-Destructive Defaults:** Removed dangerous `IF NOT EXISTS` from `CREATE TABLE` and `CREATE INDEX` (relying on the migration tracking table for idempotency), removed silent `CASCADE` drops, aligned `foreign_key` default to `NO ACTION`, and properly escaped structured JSON/list/datetime defaults.
+8. **Automated `updated_at` Maintenance:** `Model.save()` automatically updates `updated_at = datetime.now(UTC)` when existing models are modified.
+9. **Composite Primary Keys:** `Blueprint.primary(["post_id", "tag_id"], name=...)` generates table-level composite primary keys for pivot tables, and `Query.insert()` uses `RETURNING *` to support tables without standalone `id` columns.
+10. **PostgreSQL Advisory Lock Concurrency & Timeouts:** `MigrationLock` prevents concurrent runner execution with configurable `lock_timeout` (default 300.0s). Concurrent migrations run through `asyncio.gather` verify that exactly one runner executes pending migrations (`[0, 0, 1]`).
+11. **Strict Up-Front Missing File Validation:** `rollback()` and `reset()` validate all recorded migration files exist on disk before executing rollback transactions.
+12. **Per-Migration Performance Timing & Scaffolding:** `Migrator.run()` and `rollback()` provide timing callbacks (`on_applied`, `on_rolled_back`) with terminal color formatting (`_paint()` respecting `sys.stdout.isatty()` and `NO_COLOR`). `make:migration` uses regex table guessing and generates typed `def define(table: Blueprint) -> None:` stubs.
+
+---

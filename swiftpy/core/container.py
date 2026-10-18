@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast, get_type_hints
@@ -32,6 +33,28 @@ PRIMITIVE_TYPES: tuple[type[Any], ...] = (
 )
 
 _DI_RESOLVING_KEY = "__swiftpy_di_resolving__"
+
+_container_var: ContextVar[Container | None] = ContextVar(
+    "swiftpy_container", default=None
+)
+_container_fallback: Container | None = None
+
+
+def set_container(container: Container) -> None:
+    """Set the active application container context-wide and globally."""
+    global _container_fallback
+    _container_var.set(container)
+    _container_fallback = container
+
+
+def get_container() -> Container:
+    """Retrieve the currently active application container."""
+    container = _container_var.get()
+    if container is None:
+        container = _container_fallback
+    if container is None:
+        raise RuntimeError("Application container not bootstrapped")
+    return container
 
 
 class Scope(StrEnum):
@@ -135,6 +158,10 @@ class Container:
         )
 
         self._singletons[interface] = instance_obj
+
+    def has(self, interface: type[Any]) -> bool:
+        """Determine whether an interface or service has been registered in the container."""
+        return interface in self._bindings or interface in self._singletons
 
     def resolve(self, target: type[T]) -> T:
         """

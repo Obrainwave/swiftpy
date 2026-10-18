@@ -1,5 +1,5 @@
 from app.http.middleware.test_middleware import TestMiddleware
-from swiftpy import Application, Request, Response, json_response
+from swiftpy import Application, Request, Response, RouteGroup, json_response
 
 app = Application()
 
@@ -16,7 +16,7 @@ async def show_user(request: Request) -> Response:
 
 
 @app.group("/api/v1", middleware=[TestMiddleware])
-def v1_routes(group):
+def v1_routes(group: RouteGroup) -> None:
 
     @group.get("/users/{user_id}")
     async def show_users(request: Request, user_id: int) -> Response:

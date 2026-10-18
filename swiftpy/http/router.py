@@ -4,9 +4,10 @@ import inspect
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 RouteHandler = Any
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 class PathParamCoercionError(Exception):
@@ -65,36 +66,36 @@ class RouteGroup:
             middleware=list(self.middleware),
         )
 
-    def get(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(func: RouteHandler) -> RouteHandler:
+    def get(self, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
             self._add_route("GET", path, func)
             return func
 
         return decorator
 
-    def post(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(func: RouteHandler) -> RouteHandler:
+    def post(self, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
             self._add_route("POST", path, func)
             return func
 
         return decorator
 
-    def put(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(func: RouteHandler) -> RouteHandler:
+    def put(self, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
             self._add_route("PUT", path, func)
             return func
 
         return decorator
 
-    def patch(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(func: RouteHandler) -> RouteHandler:
+    def patch(self, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
             self._add_route("PATCH", path, func)
             return func
 
         return decorator
 
-    def delete(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(func: RouteHandler) -> RouteHandler:
+    def delete(self, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
             self._add_route("DELETE", path, func)
             return func
 
@@ -121,10 +122,8 @@ class Router:
             )
         )
 
-    def route(
-        self, method: str, path: str
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(func: RouteHandler) -> RouteHandler:
+    def route(self, method: str, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
             self.add_route(
                 method,
                 path,
@@ -135,31 +134,31 @@ class Router:
 
         return decorator
 
-    def get(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def get(self, path: str) -> Callable[[F], F]:
         return self.route(
             "GET",
             path,
         )
 
-    def post(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def post(self, path: str) -> Callable[[F], F]:
         return self.route(
             "POST",
             path,
         )
 
-    def put(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def put(self, path: str) -> Callable[[F], F]:
         return self.route(
             "PUT",
             path,
         )
 
-    def patch(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def patch(self, path: str) -> Callable[[F], F]:
         return self.route(
             "PATCH",
             path,
         )
 
-    def delete(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def delete(self, path: str) -> Callable[[F], F]:
         return self.route(
             "DELETE",
             path,

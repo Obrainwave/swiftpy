@@ -37,6 +37,16 @@ def validate_column_identifier(column: str) -> str:
     return column
 
 
+def quote_identifier(identifier: str) -> str:
+    """Validate, then quote each dotted segment: t.col becomes "t"."col"."""
+    if identifier == "*":
+        return "*"
+    validate_column_identifier(identifier)
+    return ".".join(
+        "*" if part == "*" else f'"{part}"' for part in identifier.split(".")
+    )
+
+
 class Column:
     def __init__(self, name: str, *, alias: str | None = None) -> None:
         self.name = validate_column_identifier(name)
@@ -44,10 +54,11 @@ class Column:
         self.alias = validate_identifier(alias) if alias is not None else None
 
     def to_sql(self) -> str:
+        quoted = quote_identifier(self.name)
         if self.alias is None:
-            return self.name
+            return quoted
 
-        return f"{self.name} AS {self.alias}"
+        return f'{quoted} AS "{self.alias}"'
 
 
 class Raw:
@@ -140,12 +151,12 @@ class QueryBuilder:
 
     def where_null(self, column: str) -> QueryBuilder:
         """Add an 'IS NULL' clause for the specified column."""
-        self._raw_wheres.append(Raw(f"{validate_identifier(column)} IS NULL"))
+        self._raw_wheres.append(Raw(f"{quote_identifier(column)} IS NULL"))
         return self
 
     def where_not_null(self, column: str) -> QueryBuilder:
         """Add an 'IS NOT NULL' clause for the specified column."""
-        self._raw_wheres.append(Raw(f"{validate_identifier(column)} IS NOT NULL"))
+        self._raw_wheres.append(Raw(f"{quote_identifier(column)} IS NOT NULL"))
         return self
 
     def join(
@@ -159,10 +170,10 @@ class QueryBuilder:
         self._joins.append(
             (
                 type_.upper(),
-                validate_identifier(table),
-                validate_identifier(first),
+                quote_identifier(table),
+                quote_identifier(first),
                 operator,
-                validate_identifier(second),
+                quote_identifier(second),
             )
         )
         return self
@@ -184,7 +195,7 @@ class QueryBuilder:
         if direction not in {"ASC", "DESC"}:
             raise ValueError("Direction must be ASC or DESC")
 
-        self._order_column = validate_identifier(column)
+        self._order_column = quote_identifier(column)
         self._order_direction = direction
 
         return self
@@ -246,7 +257,7 @@ class QueryBuilder:
                 select_parts.append(sql)
                 continue
 
-            select_parts.append(column)
+            select_parts.append(quote_identifier(column))
 
         return (", ".join(select_parts), bindings, idx)
 
@@ -265,10 +276,11 @@ class QueryBuilder:
         idx = start_idx
 
         for column, operator, value in self._wheres:
+            col_quoted = quote_identifier(column)
             if isinstance(value, QueryBuilder):
                 sub_sql, sub_bindings = value.to_sql(idx)
 
-                clauses.append(f"{column} {operator} ({sub_sql})")
+                clauses.append(f"{col_quoted} {operator} ({sub_sql})")
 
                 bindings.extend(sub_bindings)
 
@@ -284,15 +296,15 @@ class QueryBuilder:
                     bindings.append(item)
                     idx += 1
 
-                clauses.append(f"{column} IN ({', '.join(placeholders)})")
+                clauses.append(f"{col_quoted} IN ({', '.join(placeholders)})")
 
                 continue
 
             if value is None and operator in {"IS", "IS NOT"}:
-                clauses.append(f"{column} {operator} NULL")
+                clauses.append(f"{col_quoted} {operator} NULL")
                 continue
 
-            clauses.append(f"{column} {operator} ${idx}")
+            clauses.append(f"{col_quoted} {operator} ${idx}")
 
             bindings.append(value)
 
@@ -334,7 +346,7 @@ class QueryBuilder:
         where_sql, where_bindings, idx = self._compile_where(idx)
 
         bindings = select_bindings + where_bindings
-        sql = f"SELECT {select_sql} FROM {self._table}{join_sql}{where_sql}"
+        sql = f"SELECT {select_sql} FROM {quote_identifier(self._table)}{join_sql}{where_sql}"
 
         if self._order_column:
             sql += f" ORDER BY {self._order_column} {self._order_direction}"
@@ -361,11 +373,7 @@ class QueryBuilder:
         return rows[0] if rows else None
 
     async def _aggregate(self, function: str, column: str) -> Any:
-        col_safe = validate_identifier(column)
-        if column == "*":
-            col_safe = "*"
-        else:
-            col_safe = validate_identifier(column)
+        col_safe = quote_identifier(column) if column != "*" else "*"
 
         # Store original columns to restore later
         original = self._columns
@@ -394,17 +402,17 @@ class QueryBuilder:
         return await self._aggregate("AVG", column)
 
     async def insert(self, data: dict[str, Any]) -> int:
-        columns = [validate_identifier(column) for column in data]
+        columns = [quote_identifier(column) for column in data]
 
         values = list(data.values())
 
         placeholders = [f"${i}" for i in range(1, len(values) + 1)]
 
         sql = (
-            f"INSERT INTO {self._table} "
+            f"INSERT INTO {quote_identifier(self._table)} "
             f"({', '.join(columns)}) "
             f"VALUES ({', '.join(placeholders)}) "
-            f"RETURNING id"
+            f"RETURNING *"
         )
 
         conn = await self._connection()
@@ -415,7 +423,13 @@ class QueryBuilder:
             if row is None:
                 raise RuntimeError("Insert failed")
 
-            return int(row["id"])
+            if "id" in row and row["id"] is not None:
+                try:
+                    return int(row["id"])
+                except (ValueError, TypeError):
+                    return 0
+
+            return 0
 
         finally:
             await self._release(conn)
@@ -428,7 +442,7 @@ class QueryBuilder:
         idx = 1
 
         for column, value in data.items():
-            safe_column = validate_identifier(column)
+            safe_column = quote_identifier(column)
             sets.append(f"{safe_column} = ${idx}")
             bindings.append(value)
             idx += 1
@@ -437,7 +451,7 @@ class QueryBuilder:
 
         bindings.extend(where_bindings)
 
-        sql = f"UPDATE {self._table} SET {', '.join(sets)}{where_sql}"
+        sql = f"UPDATE {quote_identifier(self._table)} SET {', '.join(sets)}{where_sql}"
 
         conn = await self._connection()
 
@@ -451,7 +465,7 @@ class QueryBuilder:
     async def delete(self) -> str:
         where_sql, bindings, _ = self._compile_where()
 
-        sql = f"DELETE FROM {self._table}{where_sql}"
+        sql = f"DELETE FROM {quote_identifier(self._table)}{where_sql}"
 
         conn = await self._connection()
 

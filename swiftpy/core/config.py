@@ -49,3 +49,7 @@ class Config:
     def all(self) -> dict[str, Any]:
         """Return a copy of the complete configuration dictionary."""
         return self._data.copy()
+
+    def set(self, key: str, value: Any) -> None:
+        """Set a configuration value."""
+        self._data[key] = value

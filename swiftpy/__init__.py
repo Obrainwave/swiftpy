@@ -14,6 +14,7 @@ from swiftpy.database.orm import (
 from swiftpy.helpers.helper import app, config, container, env, resolve, snake_case
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
+from swiftpy.http.router import RouteGroup
 
 __all__ = [
     "Application",
@@ -28,6 +29,7 @@ __all__ = [
     "RelationNotLoadedError",
     "Request",
     "Response",
+    "RouteGroup",
     "ServiceProvider",
     "app",
     "config",

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
+from swiftpy.console.commands.make import MakeCommand
+from swiftpy.console.commands.migrate import MigrateCommand
 from swiftpy.console.commands.start import StartCommand
-
-# from swiftpy.console.commands.migrate import MigrateCommand
-# from swiftpy.console.commands.make import MakeCommand
-# from swiftpy.console.commands.ai import AICommand
-# from swiftpy.console.commands.cache import CacheCommand
 
 
 class CLI:
@@ -34,34 +32,26 @@ class CLI:
         self._register_commands()
 
     def _register_commands(self) -> None:
-        """
-        Register all framework commands.
-        """
-
+        """Register all framework commands."""
         StartCommand.register(self.subparsers)
-        # MigrateCommand.register(self.subparsers)
-        # MakeCommand.register(self.subparsers)
-        # AICommand.register(self.subparsers)
-        # CacheCommand.register(self.subparsers)
+        MigrateCommand.register(self.subparsers)
+        MakeCommand.register(self.subparsers)
 
-    def run(self) -> None:
-        """
-        Parse arguments and dispatch.
-        """
+    def run(self, args: list[str] | None = None) -> None:
+        """Parse arguments and dispatch."""
+        parsed_args = self.parser.parse_args(args)
 
-        args = self.parser.parse_args()
-
-        handler = getattr(args, "_handler", None)
+        handler = getattr(parsed_args, "_handler", None)
 
         if handler is None:
             self.parser.print_help()
             return
 
-        handler(args)
+        handler(parsed_args)
 
 
 def main() -> None:
-    CLI().run()
+    CLI().run(sys.argv[1:])
 
 
 if __name__ == "__main__":
