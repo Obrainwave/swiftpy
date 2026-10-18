@@ -138,6 +138,16 @@ class QueryBuilder:
         self._raw_wheres.append(Raw(sql, bindings))
         return self
 
+    def where_null(self, column: str) -> QueryBuilder:
+        """Add an 'IS NULL' clause for the specified column."""
+        self._raw_wheres.append(Raw(f"{validate_identifier(column)} IS NULL"))
+        return self
+
+    def where_not_null(self, column: str) -> QueryBuilder:
+        """Add an 'IS NOT NULL' clause for the specified column."""
+        self._raw_wheres.append(Raw(f"{validate_identifier(column)} IS NOT NULL"))
+        return self
+
     def join(
         self, table: str, first: str, operator: str, second: str, type_: str = "INNER"
     ) -> QueryBuilder:

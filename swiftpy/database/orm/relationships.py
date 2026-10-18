@@ -16,6 +16,16 @@ class RelationNotLoadedError(RuntimeError):
     """Raised when attempting to synchronously access an un-eager-loaded relationship."""
 
 
+class LoadedList(list[Any]):
+    """A list of eager-loaded models that can also be directly awaited."""
+
+    def __await__(self) -> Generator[Any, None, Self]:
+        async def _resolved() -> Self:
+            return self
+
+        return _resolved().__await__()
+
+
 class Relation:
     """Base relation definition for Active Record Models."""
 
@@ -25,10 +35,12 @@ class Relation:
         foreign_key: str | None = None,
         local_key: str = "id",
     ) -> None:
+        self._related_cls: type[Model] | None = None
         if isinstance(related_model, str):
             self.related_model_name = related_model
         else:
             self.related_model_name = related_model.__name__
+            self._related_cls = related_model
 
         self.foreign_key = foreign_key
         self.local_key = local_key
@@ -36,14 +48,30 @@ class Relation:
         self.owner_cls: type[Model] | None = None
 
     def get_target_model(self) -> type[Model]:
-        """Resolve the related Model class from the registry."""
+        """Resolve the related Model class, preferring direct class references and module scope."""
+        if self._related_cls is not None:
+            return self._related_cls
+
         from swiftpy.database.orm.model import _MODEL_REGISTRY
 
-        if self.related_model_name not in _MODEL_REGISTRY:
+        candidates = _MODEL_REGISTRY.get(self.related_model_name, {})
+        if not candidates:
             raise RuntimeError(
                 f"Model '{self.related_model_name}' has not been registered."
             )
-        return _MODEL_REGISTRY[self.related_model_name]
+
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+
+        owner_module = self.owner_cls.__module__ if self.owner_cls else None
+        same_module = [c for c in candidates.values() if c.__module__ == owner_module]
+        if len(same_module) == 1:
+            return same_module[0]
+
+        raise RuntimeError(
+            f"Model name '{self.related_model_name}' is ambiguous: {sorted(candidates)}. "
+            "Pass the class itself instead of a string."
+        )
 
     async def eager_load(self, instances: Sequence[Model]) -> None:
         """Batch load related models for instances in a single query."""
@@ -78,7 +106,7 @@ class HasMany(Relation):
 
         if not unique_keys:
             for inst in instances:
-                inst._loaded_relations[self.name] = []
+                inst._loaded_relations[self.name] = LoadedList()
             return
 
         related_instances = await target_model.where(fk, "IN", unique_keys).get()
@@ -90,7 +118,7 @@ class HasMany(Relation):
 
         for inst in instances:
             key = getattr(inst, self.local_key, None)
-            inst._loaded_relations[self.name] = grouped.get(key, [])
+            inst._loaded_relations[self.name] = LoadedList(grouped.get(key, []))
 
     def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
         target_model = self.get_target_model()
@@ -241,7 +269,7 @@ class BelongsToMany(Relation):
 
         if not unique_keys:
             for inst in instances:
-                inst._loaded_relations[self.name] = []
+                inst._loaded_relations[self.name] = LoadedList()
             return
 
         builder = target.query().builder
@@ -263,12 +291,12 @@ class BelongsToMany(Relation):
         for row in rows:
             pivot_parent_key = row.pop("_pivot_parent_key")
             item = target(**row)
-            item._exists = True
+            item._mark_persisted(row.keys())
             grouped.setdefault(pivot_parent_key, []).append(item)
 
         for inst in instances:
             key = getattr(inst, self.parent_key, None)
-            inst._loaded_relations[self.name] = grouped.get(key, [])
+            inst._loaded_relations[self.name] = LoadedList(grouped.get(key, []))
 
     def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
         target = self.get_target_model()
@@ -280,6 +308,8 @@ class BelongsToMany(Relation):
         rpk = self.related_pivot_key or f"{snake_case(target.__name__)}_id"
 
         builder = target.query()
+        # Explicitly scope select to target table so pivot table columns do not overwrite target attributes
+        builder.select(f"{target.__table__}.*")
         builder.builder.join(
             pivot_table,
             f"{target.__table__}.{self.related_key}",
@@ -378,6 +408,11 @@ class RelationshipQueryBuilder[T: Model]:
 
     async def create(self, *args: dict[str, Any], **kwargs: Any) -> T:
         """Create a new model instance pre-bound to this relationship."""
+        if isinstance(self._relation, BelongsToMany):
+            raise NotImplementedError(
+                "create() would leave the new row unlinked; use attach()."
+            )
+
         target_model = self._relation.get_target_model()
         data: dict[str, Any] = {}
         if args:
@@ -446,6 +481,7 @@ __all__ = [
     "BelongsToMany",
     "HasMany",
     "HasOne",
+    "LoadedList",
     "Relation",
     "RelationDescriptor",
     "RelationNotLoadedError",

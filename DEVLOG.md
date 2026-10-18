@@ -104,12 +104,17 @@ Transfer/sec:    482.06KB
 
 ### Status: PASSED
 * **Test Suite:** `tests/orm/test_eager_loading.py`
-* **Results:** All 7 ORM test suites passed (100% test pass rate across 32 total tests in the repository; strict mypy typing verified across 37 source files; ruff compliant).
+* **Results:** All 14 ORM test suites passed (100% test pass rate across 39 total tests in repository; strict mypy typing verified across 37 source files; ruff compliant).
 * **Verified Guarantees:**
-1. **Typed Model Base Class & Annotation Resolution:** `Model` uses `typing.get_type_hints` at class definition time to inspect typed class attributes, supporting modern Python 3.12 syntax, field defaults, and automatic table name snake_case resolution.
-2. **Active Record CRUD Methods:** Implemented `Model.find(id)`, `Model.where(...)`, `Model.create(...)`, `instance.save()`, `instance.delete()`, and `instance.refresh()` with primary key resolution.
-3. **Relationships with Scoped Query Builders:** Implemented `HasMany`, `BelongsTo`, `HasOne`, and `BelongsToMany`. Each returns a lazily awaitable query builder scoped to the relationship (e.g., `await user.posts` or `await user.posts.where("published", True).get()`).
-4. **Explicit Eager Loading via `.with_()`:** Resolves related models across arbitrary collection sizes in batched `WHERE IN (...)` queries, loading dual relationship types (`HasMany` + `HasOne`) on 10 users in exactly 3 database queries instead of 21.
-5. **Strict N+1 Query Antipattern Prevention:** Synchronous access on un-eager-loaded relationships (`iter`, `len`, `bool`, subscripting, and direct model attribute access) strictly raises `RelationNotLoadedError` with actionable error messages, eliminating silent N+1 queries.
+1. **Typed Model Base Class & Predictable Table Naming:** `Model` uses `typing.get_type_hints` at class definition time to dynamically inspect typed class attributes, supporting modern Python 3.12 syntax and field defaults. Automatic table naming uses a comprehensive zero-dependency inflection engine (`pluralize(snake_case(cls.__name__))`) supporting uncountables (`sheep`), irregulars (`person` $\to$ `people`, `mouse` $\to$ `mice`), suffix rules (`analysis` $\to$ `analyses`, `axis` $\to$ `axes`, `quiz` $\to$ `quizzes`, `bus` $\to$ `buses`), and case preservation, with explicit `__table__` overrides given first-class priority.
+2. **Dirty-Tracking `save()` & Partial Select Protection:** `_mark_persisted()` tracks loaded column values. Updates only emit SQL for changed fields, preventing partial selects (`select("id", "name")`) from clobbering unselected columns, and inserts preserve database defaults (e.g., `NOW()`).
+3. **Multi-Candidate Model Registry:** `_MODEL_REGISTRY` tracks models by qualified names and disambiguates candidates across modules, allowing test and application models to coexist without collision.
+4. **LoadedList Dual-State Awaitability:** Eager-loaded collections use `LoadedList`, allowing `await user.posts` to resolve cleanly without `TypeError` in both eager and lazy states while functioning as standard lists.
+5. **Relationships with Scoped Query Builders:** Implemented `HasMany`, `BelongsTo`, `HasOne`, and `BelongsToMany`. Each returns a lazily awaitable query builder scoped to the relationship (e.g., `await user.posts` or `await user.posts.where("published", True).get()`). Subclasses cleanly inherit relationships from ancestors.
+6. **Explicit Eager Loading via `.with_()`:** Resolves related models across arbitrary collection sizes in batched `WHERE IN (...)` queries, loading dual relationship types (`HasMany` + `HasOne`) on 10 users in exactly 3 database queries instead of 21.
+7. **BelongsToMany Integrity & Attach Enforcement:** `build_lazy_query` explicitly scopes columns to `target.*` to avoid pivot ID collisions, and `create()` on a `BelongsToMany` raises `NotImplementedError` to enforce explicit linking via `attach()`.
+8. **Null Checking (`where_null` & `where_not_null`):** Raw `IS NULL` and `IS NOT NULL` expressions properly validated and compiled without operator mismatches.
+9. **Mass Assignment Protection (`__fillable__`):** `Model.create(...)` enforces `__fillable__` whitelisting when declared, safely discarding unauthorized fields like `is_admin`.
+10. **Strict N+1 Query Antipattern Prevention:** Synchronous access on un-eager-loaded relationships (`iter`, `len`, `bool`, subscripting, and direct model attribute access) strictly raises `RelationNotLoadedError` with actionable error messages, eliminating silent N+1 queries.
 
 ---

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from typing import (
     Any,
     ClassVar,
@@ -20,12 +20,10 @@ from swiftpy.database.orm.relationships import (
     RelationDescriptor,
 )
 from swiftpy.database.query_builder import Query
-from swiftpy.helpers.helper import snake_case
+from swiftpy.helpers.helper import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
-_MODEL_REGISTRY: dict[str, type[Model]] = {}
-
-
+_MODEL_REGISTRY: dict[str, dict[str, type[Model]]] = {}
 _MISSING = object()
 
 
@@ -45,11 +43,11 @@ class ModelQueryBuilder[T: Model]:
         return self
 
     def where_null(self, column: str) -> Self:
-        self.builder.where(column, "=", None)
+        self.builder.where_null(column)
         return self
 
     def where_not_null(self, column: str) -> Self:
-        self.builder.where(column, "!=", None)
+        self.builder.where_not_null(column)
         return self
 
     def where_raw(self, sql: str, bindings: list[Any] | None = None) -> Self:
@@ -81,7 +79,7 @@ class ModelQueryBuilder[T: Model]:
 
         for row in rows:
             inst = self.model_cls(**row)
-            inst._exists = True
+            inst._mark_persisted(row.keys())
             instances.append(inst)
 
         if self._eager_loads and instances:
@@ -117,10 +115,11 @@ class ModelQueryBuilder[T: Model]:
 
 
 class Model:
-    """Active Record base model with typed attributes and eager-loading relationships."""
+    """Active Record base model with typed attributes, dirty tracking, and relationship support."""
 
     __table__: ClassVar[str]
     __primary_key__: ClassVar[str] = "id"
+    __fillable__: ClassVar[set[str] | list[str] | tuple[str, ...] | None] = None
 
     __fields__: ClassVar[dict[str, Any]]
     __field_defaults__: ClassVar[dict[str, Any]]
@@ -129,9 +128,9 @@ class Model:
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
-        # 1. Determine table name if not explicitly set
+        # 1. Determine table name if not explicitly set (overridable via __table__)
         if "__table__" not in cls.__dict__:
-            cls.__table__ = f"{snake_case(cls.__name__)}s"
+            cls.__table__ = pluralize(snake_case(cls.__name__))
 
         # 2. Inherit fields from parent Model classes
         fields: dict[str, Any] = {}
@@ -143,7 +142,10 @@ class Model:
 
         # 3. Resolve typed class attributes using typing.get_type_hints
         globalns = getattr(inspect.getmodule(cls), "__dict__", {})
-        localns = dict(_MODEL_REGISTRY)
+        localns: dict[str, Any] = {
+            name: next(reversed(variants.values()))
+            for name, variants in _MODEL_REGISTRY.items()
+        }
         localns[cls.__name__] = cls
 
         try:
@@ -168,8 +170,10 @@ class Model:
         cls.__fields__ = fields
         cls.__field_defaults__ = defaults
 
-        # 5. Discover declared relationships and install descriptors
+        # 5. Inherit relations from ancestors and discover newly declared relations
         relations: dict[str, Relation] = {}
+        for base in reversed(cls.__mro__[1:]):
+            relations.update(getattr(base, "__relations_config__", {}))
 
         for name, value in list(cls.__dict__.items()):
             if isinstance(value, Relation):
@@ -180,12 +184,15 @@ class Model:
 
         cls.__relations_config__ = relations
 
-        # 6. Register model globally for forward string references
-        _MODEL_REGISTRY[cls.__name__] = cls
+        # 6. Register model globally under bare name and fully qualified name
+        qualname = f"{cls.__module__}.{cls.__qualname__}"
+        _MODEL_REGISTRY.setdefault(cls.__name__, {})[qualname] = cls
 
     def __init__(self, **kwargs: Any) -> None:
         self._loaded_relations: dict[str, Any] = {}
         self._exists: bool = False
+        self._original: dict[str, Any] = {}
+        self._init_keys: set[str] = set(kwargs)
 
         for name in self.__fields__:
             if name in kwargs:
@@ -198,6 +205,19 @@ class Model:
         for name, val in kwargs.items():
             if name not in self.__fields__:
                 setattr(self, name, val)
+
+    def _mark_persisted(self, keys: Iterable[str]) -> None:
+        """Mark the instance as persisted and record original attribute values for dirty checking."""
+        self._exists = True
+        self._original = {
+            k: getattr(self, k)
+            for k in keys
+            if k in self.__fields__ and hasattr(self, k)
+        }
+
+    @staticmethod
+    def _persistable(value: Any) -> Any:
+        return value.get_primary_key() if isinstance(value, Model) else value
 
     @classmethod
     def query(cls) -> ModelQueryBuilder[Self]:
@@ -215,6 +235,16 @@ class Model:
     ) -> ModelQueryBuilder[Self]:
         """Add a basic where clause to the query."""
         return cls.query().where(column, operator_or_value, value)
+
+    @classmethod
+    def where_null(cls, column: str) -> ModelQueryBuilder[Self]:
+        """Add a where null clause to the query."""
+        return cls.query().where_null(column)
+
+    @classmethod
+    def where_not_null(cls, column: str) -> ModelQueryBuilder[Self]:
+        """Add a where not null clause to the query."""
+        return cls.query().where_not_null(column)
 
     @classmethod
     def where_raw(
@@ -235,11 +265,15 @@ class Model:
 
     @classmethod
     async def create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
-        """Create and persist a new model instance."""
+        """Create and persist a new model instance, honoring __fillable__ if defined."""
         data: dict[str, Any] = {}
         if args:
             data.update(args[0])
         data.update(kwargs)
+
+        if cls.__fillable__ is not None:
+            allowed = set(cls.__fillable__) | {cls.__primary_key__}
+            data = {k: v for k, v in data.items() if k in allowed}
 
         for key, val in list(data.items()):
             if isinstance(val, Model):
@@ -253,28 +287,35 @@ class Model:
 
         inst = cls(**data)
         setattr(inst, cls.__primary_key__, pk)
-        inst._exists = True
+        inst._mark_persisted([*data, cls.__primary_key__])
         return inst
 
     async def save(self) -> None:
-        """Save the current model instance to the database."""
+        """Save the current model instance, writing only changed attributes on update."""
         pk_name = self.__primary_key__
         pk = getattr(self, pk_name, None)
 
-        data: dict[str, Any] = {}
-        for field in self.__fields__:
-            if field != pk_name and hasattr(self, field):
-                val = getattr(self, field)
-                if isinstance(val, Model):
-                    val = val.get_primary_key()
-                data[field] = val
-
         if self._exists and pk is not None:
-            await self.__class__.query().where(pk_name, pk).update(data)
-        else:
-            pk = await self.__class__.query().insert(data)
-            setattr(self, pk_name, pk)
-            self._exists = True
+            changed = {
+                name: self._persistable(getattr(self, name))
+                for name, original in self._original.items()
+                if name != pk_name and getattr(self, name, None) != original
+            }
+            if changed:
+                await self.__class__.query().where(pk_name, pk).update(changed)
+                for name in changed:
+                    self._original[name] = getattr(self, name)
+            return
+
+        data = {
+            name: self._persistable(getattr(self, name))
+            for name in self.__fields__
+            if name != pk_name
+            and (name in self._init_keys or getattr(self, name, None) is not None)
+        }
+        pk = await self.__class__.query().insert(data)
+        setattr(self, pk_name, pk)
+        self._mark_persisted([*data, pk_name])
 
     async def delete(self) -> None:
         """Delete this model instance from the database."""
@@ -303,6 +344,8 @@ class Model:
         for k, v in refreshed.get_attributes().items():
             setattr(self, k, v)
 
+        self._original = dict(refreshed._original)
+        self._init_keys = set(refreshed._init_keys)
         self._loaded_relations.clear()
         return self
 
@@ -398,7 +441,7 @@ class Model:
         other_pk = other.get_primary_key()
         if pk is not None and other_pk is not None:
             return pk == other_pk  # type: ignore[no-any-return]
-        return self.get_attributes() == other.get_attributes()
+        return self is other
 
     def __hash__(self) -> int:
         pk = self.get_primary_key()
