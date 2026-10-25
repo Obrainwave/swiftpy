@@ -172,13 +172,16 @@ class Router:
         Route | None,
         dict[str, Any],
     ]:
-        for route in self.routes:
-            if route.method != method:
-                continue
+        allowed_methods: list[str] = []
 
+        for route in self.routes:
             match = route.pattern.match(path)
 
             if not match:
+                continue
+
+            if route.method != method:
+                allowed_methods.append(route.method)
                 continue
 
             params = match.groupdict()
@@ -187,6 +190,20 @@ class Router:
             for name, value in params.items():
                 if name in sig.parameters:
                     annotation = sig.parameters[name].annotation
+                    if isinstance(annotation, str):
+                        builtins_map = {
+                            "int": int,
+                            "str": str,
+                            "float": float,
+                            "bool": bool,
+                        }
+                        annotation = builtins_map.get(
+                            annotation,
+                            getattr(route.handler, "__globals__", {}).get(
+                                annotation, annotation
+                            ),
+                        )
+
                     if annotation is not inspect.Parameter.empty and callable(
                         annotation
                     ):
@@ -198,6 +215,15 @@ class Router:
                             ) from None
 
             return route, params
+
+        if allowed_methods:
+            from swiftpy.core.exceptions import MethodNotAllowedError
+
+            unique_methods = sorted(set(allowed_methods))
+            raise MethodNotAllowedError(
+                f"Method '{method}' not allowed for path '{path}'. Allowed: {', '.join(unique_methods)}",
+                headers={"Allow": ", ".join(unique_methods)},
+            )
 
         return None, {}
 

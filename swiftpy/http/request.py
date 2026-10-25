@@ -26,6 +26,27 @@ class Request:
     def headers(self) -> dict[str, str]:
         return {k.decode(): v.decode() for k, v in self.scope.get("headers", [])}
 
+    @property
+    def query_params(self) -> dict[str, str]:
+        """Parsed dictionary of URL query string parameters (first value for each key)."""
+        raw_qs = self.scope.get("query_string", b"")
+        if not raw_qs:
+            return {}
+        from urllib.parse import parse_qs
+
+        parsed = parse_qs(raw_qs.decode("latin-1"), keep_blank_values=True)
+        return {k: v[0] for k, v in parsed.items()}
+
+    @property
+    def query_param_list(self) -> dict[str, list[str]]:
+        """Parsed dictionary of URL query string parameters with all values as lists."""
+        raw_qs = self.scope.get("query_string", b"")
+        if not raw_qs:
+            return {}
+        from urllib.parse import parse_qs
+
+        return parse_qs(raw_qs.decode("latin-1"), keep_blank_values=True)
+
     async def body(self) -> bytes:
         if self._body is None:
             chunks: list[bytes] = []

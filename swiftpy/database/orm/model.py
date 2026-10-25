@@ -22,6 +22,7 @@ from swiftpy.database.orm.relationships import (
     RelationDescriptor,
 )
 from swiftpy.database.query_builder import Query
+from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.helpers.helper import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
@@ -283,13 +284,16 @@ class Model:
         pk = await cls.query().insert(data)
         instance = await cls.find(pk)
 
-        if instance is not None:
-            return instance
+        if instance is None:
+            inst = cls(**data)
+            setattr(inst, cls.__primary_key__, pk)
+            inst._mark_persisted([*data, cls.__primary_key__])
+            instance = inst
 
-        inst = cls(**data)
-        setattr(inst, cls.__primary_key__, pk)
-        inst._mark_persisted([*data, cls.__primary_key__])
-        return inst
+        await EventDispatcher.get_instance().dispatch(
+            f"{snake_case(cls.__name__)}.created", instance
+        )
+        return instance
 
     async def save(self) -> None:
         """Save the current model instance, writing only changed attributes on update."""
@@ -311,6 +315,9 @@ class Model:
                 await self.__class__.query().where(pk_name, pk).update(changed)
                 for name in changed:
                     self._original[name] = getattr(self, name)
+            await EventDispatcher.get_instance().dispatch(
+                f"{snake_case(self.__class__.__name__)}.updated", self
+            )
             return
 
         data = {
@@ -322,6 +329,9 @@ class Model:
         pk = await self.__class__.query().insert(data)
         setattr(self, pk_name, pk)
         self._mark_persisted([*data, pk_name])
+        await EventDispatcher.get_instance().dispatch(
+            f"{snake_case(self.__class__.__name__)}.created", self
+        )
 
     async def delete(self) -> None:
         """Delete this model instance from the database."""
@@ -333,6 +343,9 @@ class Model:
 
         await self.__class__.query().where(pk_name, pk).delete()
         self._exists = False
+        await EventDispatcher.get_instance().dispatch(
+            f"{snake_case(self.__class__.__name__)}.deleted", self
+        )
 
     async def refresh(self) -> Self:
         """Reload the model attributes from the database."""

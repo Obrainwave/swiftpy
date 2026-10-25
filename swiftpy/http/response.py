@@ -90,13 +90,17 @@ class StreamingResponse(Response):
 def json_response(
     data: Any,
     status_code: int = 200,
+    headers: dict[str, str] | None = None,
 ) -> Response:
+    resp_headers = {
+        "content-type": "application/json",
+    }
+    if headers:
+        resp_headers.update(headers)
     return Response(
         content=json.dumps(data).encode(),
         status_code=status_code,
-        headers={
-            "content-type": "application/json",
-        },
+        headers=resp_headers,
     )
 
 
@@ -120,6 +124,27 @@ def unprocessable(
     return json_response(
         {"errors": errors},
         status_code=422,
+    )
+
+
+def unauthorized(
+    message: str = "Unauthorized",
+    headers: dict[str, str] | None = None,
+) -> Response:
+    resp_headers = {"content-type": "application/json", "WWW-Authenticate": "Bearer"}
+    if headers:
+        resp_headers.update(headers)
+    return Response(
+        content=json.dumps({"detail": message}).encode(),
+        status_code=401,
+        headers=resp_headers,
+    )
+
+
+def forbidden(message: str = "Forbidden") -> Response:
+    return json_response(
+        {"detail": message},
+        status_code=403,
     )
 
 

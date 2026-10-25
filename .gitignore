@@ -8,3 +8,6 @@ storage/logs/
 .ruff_cache/
 COMMANDS.md
 PROMPTS.md
+docs/
+AGENTS.md
+DEVLOG.md

@@ -116,7 +116,9 @@ class CreatePostsTable(Migration):
             table.text("body").nullable()
             table.boolean("is_published").default(False)
             table.timestamps()
-            table.foreign_key("user_id", references="id", on="users", on_delete="CASCADE")
+            table.foreign_key(
+                "user_id", references="id", on="users", on_delete="CASCADE"
+            )
             table.index(["user_id", "is_published"], name="idx_posts_user_published")
 
         await Schema.create("posts", define)

@@ -4,8 +4,10 @@ import os
 import re
 from typing import Any
 
+from swiftpy.cache.cache import Cache
 from swiftpy.core.bootstrap import get_container
 from swiftpy.core.config import Config
+from swiftpy.events.dispatcher import EventDispatcher
 
 _UNCOUNTABLES = {
     "aircraft",
@@ -59,9 +61,25 @@ def app() -> Any:
     return get_container()
 
 
+def cache(driver_name: str | None = None) -> Any:
+    """Retrieve the application Cache manager or a specific driver."""
+
+    try:
+        c = get_container().resolve(Cache)
+    except RuntimeError:
+        c = Cache()
+
+    if driver_name is not None:
+        return c.driver(driver_name)
+    return c
+
+
 def config(key: str | None = None, default: Any = None) -> Any:
     """Retrieve configuration values."""
-    cfg = get_container().resolve(Config)
+    try:
+        cfg = get_container().resolve(Config)
+    except RuntimeError:
+        cfg = Config.get_instance()
 
     if key is None:
         return cfg
@@ -131,4 +149,30 @@ def pluralize(word: str) -> str:
     return "_".join(parts)
 
 
-__all__ = ["app", "config", "container", "env", "pluralize", "resolve", "snake_case"]
+def dispatcher() -> EventDispatcher:
+    """Retrieve the application EventDispatcher."""
+    try:
+        disp: EventDispatcher = get_container().resolve(EventDispatcher)
+        return disp
+    except RuntimeError:
+        return EventDispatcher.get_instance()
+
+
+async def event(event_name: str, payload: Any = None) -> list[Any]:
+    """Dispatch an event through the event dispatcher."""
+    d = dispatcher()
+    return await d.dispatch(event_name, payload)
+
+
+__all__ = [
+    "app",
+    "cache",
+    "config",
+    "container",
+    "dispatcher",
+    "env",
+    "event",
+    "pluralize",
+    "resolve",
+    "snake_case",
+]
