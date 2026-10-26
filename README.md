@@ -127,6 +127,40 @@ class CreatePostsTable(Migration):
         await Schema.drop_if_exists("posts")
 ```
 
+### 4. Asynchronous Queues & Background Jobs
+
+Define background jobs with automatic JSON serialization, retry with backoff, and dead letter queue routing:
+
+```python
+# app/jobs/send_welcome_email.py
+from swiftpy.queue import Job
+
+
+class SendWelcomeEmail(Job):
+    tries = 3
+    backoff = [1.0, 5.0, 15.0]
+
+    def __init__(self, user_id: int, email: str) -> None:
+        super().__init__(user_id, email)
+        self.user_id = user_id
+        self.email = email
+
+    async def handle(self) -> None:
+        # Business logic executed by the queue worker
+        print(f"Sending welcome email to {self.email} for user {self.user_id}")
+
+    async def failed(self, exception: BaseException) -> None:
+        # Hook called when retries are exhausted and job moves to Dead Letter Queue
+        print(f"Failed permanently for user {self.user_id}: {exception}")
+
+
+# Dispatching jobs:
+await SendWelcomeEmail(user_id=42, email="alice@example.com").dispatch()
+
+# Or dispatch with delay:
+await SendWelcomeEmail(user_id=42, email="alice@example.com").dispatch(delay=60.0)
+```
+
 ---
 
 ## Command Line Interface (`swiftpy`)
@@ -146,6 +180,9 @@ swiftpy migrate:status
 
 # Rollback the last migration batch
 swiftpy migrate:rollback
+
+# Start the queue worker process
+swiftpy queue:work --queue default --sleep 1.0
 
 # Start the ASGI development server with auto-reload
 swiftpy start

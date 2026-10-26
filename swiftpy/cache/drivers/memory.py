@@ -80,9 +80,7 @@ class MemoryDriver(CacheDriver):
             if not self.prefix:
                 self._storage.clear()
             else:
-                keys_to_delete = [
-                    k for k in self._storage if k.startswith(self.prefix)
-                ]
+                keys_to_delete = [k for k in self._storage if k.startswith(self.prefix)]
                 for k in keys_to_delete:
                     del self._storage[k]
             return True

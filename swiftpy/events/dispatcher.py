@@ -129,9 +129,7 @@ class EventDispatcher:
 
         return results
 
-    def _invoke_handler(
-        self, handler: EventHandler, event: str, payload: Any
-    ) -> Any:
+    def _invoke_handler(self, handler: EventHandler, event: str, payload: Any) -> Any:
         """Invoke a handler with appropriate arguments based on its signature."""
         try:
             sig = inspect.signature(handler)
@@ -177,9 +175,7 @@ class EventDispatcher:
                 return handler(payload, **kwargs)
             return handler(event, payload, **kwargs)
 
-        required_params = [
-            p for p in params if p.default is inspect.Parameter.empty
-        ]
+        required_params = [p for p in params if p.default is inspect.Parameter.empty]
 
         if len(required_params) == 0:
             if len(params) >= 1:
@@ -208,6 +204,4 @@ class EventDispatcher:
         if event is None:
             self._registry.clear()
         else:
-            self._registry = [
-                reg for reg in self._registry if reg.pattern != event
-            ]
+            self._registry = [reg for reg in self._registry if reg.pattern != event]

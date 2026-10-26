@@ -162,7 +162,9 @@ class RedisEventBus:
         finally:
             seen.remove(obj_id)
 
-        raise TypeError(f"Unsupported payload type for serialization: {type(val).__name__}")
+        raise TypeError(
+            f"Unsupported payload type for serialization: {type(val).__name__}"
+        )
 
     async def publish(
         self, event: str, payload: Any = None, *, local: bool = False

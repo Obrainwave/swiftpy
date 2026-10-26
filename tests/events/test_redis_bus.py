@@ -57,9 +57,7 @@ async def test_redis_bus_dual_instance_delivery(
         assert received_b[0] == payload
 
 
-async def test_redis_bus_ignore_self(
-    redis_host: str, redis_port: int
-) -> None:
+async def test_redis_bus_ignore_self(redis_host: str, redis_port: int) -> None:
     """
     Test: RedisEventBus ignores messages published by itself when ignore_self=True,
     preventing duplicate execution in the publisher worker.
@@ -157,7 +155,9 @@ async def test_redis_bus_payload_serialization(
     prefix = f"test_serial_{uuid.uuid4().hex[:8]}:"
 
     bus_sender = RedisEventBus(host=redis_host, port=redis_port, channel_prefix=prefix)
-    bus_receiver = RedisEventBus(host=redis_host, port=redis_port, channel_prefix=prefix)
+    bus_receiver = RedisEventBus(
+        host=redis_host, port=redis_port, channel_prefix=prefix
+    )
 
     received_data: list[Any] = []
     received_event = asyncio.Event()
@@ -192,9 +192,7 @@ async def test_redis_bus_payload_serialization(
         assert rx["metadata"] == {"active": True, "ratio": 3.14}
 
 
-async def test_redis_bus_idempotent_close(
-    redis_host: str, redis_port: int
-) -> None:
+async def test_redis_bus_idempotent_close(redis_host: str, redis_port: int) -> None:
     """Test: Calling close() repeatedly is safe and idempotent."""
     bus = RedisEventBus(host=redis_host, port=redis_port)
     await bus.start_listening()
@@ -228,9 +226,7 @@ async def test_redis_bus_caller_client_ownership(
         await client.aclose()
 
 
-async def test_redis_bus_prefix_isolation(
-    redis_host: str, redis_port: int
-) -> None:
+async def test_redis_bus_prefix_isolation(redis_host: str, redis_port: int) -> None:
     """Test: Two buses with different channel prefixes are isolated from each other."""
     prefix_1 = f"prefix_a_{uuid.uuid4().hex[:8]}:"
     prefix_2 = f"prefix_b_{uuid.uuid4().hex[:8]}:"
@@ -330,7 +326,9 @@ async def test_redis_bus_resilience_to_malformed_messages_and_handler_errors(
 
             # 2. Publish invalid envelope (non-dict or missing event)
             await raw_client.publish(channel_failing, json.dumps("string_envelope"))
-            await raw_client.publish(channel_failing, json.dumps({"only_sender": "123"}))
+            await raw_client.publish(
+                channel_failing, json.dumps({"only_sender": "123"})
+            )
 
             # 3. Publish to failing handler (handler raises exception)
             await sender_bus.publish("failing.action", {"step": 1})

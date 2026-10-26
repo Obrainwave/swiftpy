@@ -5,6 +5,7 @@ import sys
 
 from swiftpy.console.commands.make import MakeCommand
 from swiftpy.console.commands.migrate import MigrateCommand
+from swiftpy.console.commands.queue import QueueCommand
 from swiftpy.console.commands.start import StartCommand
 
 
@@ -36,6 +37,7 @@ class CLI:
         StartCommand.register(self.subparsers)
         MigrateCommand.register(self.subparsers)
         MakeCommand.register(self.subparsers)
+        QueueCommand.register(self.subparsers)
 
     def run(self, args: list[str] | None = None) -> None:
         """Parse arguments and dispatch."""

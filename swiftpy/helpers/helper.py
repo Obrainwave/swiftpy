@@ -8,6 +8,8 @@ from swiftpy.cache.cache import Cache
 from swiftpy.core.bootstrap import get_container
 from swiftpy.core.config import Config
 from swiftpy.events.dispatcher import EventDispatcher
+from swiftpy.queue.dispatcher import QueueDispatcher
+from swiftpy.queue.job import Job
 
 _UNCOUNTABLES = {
     "aircraft",
@@ -164,15 +166,36 @@ async def event(event_name: str, payload: Any = None) -> list[Any]:
     return await d.dispatch(event_name, payload)
 
 
+def queue() -> QueueDispatcher:
+    """Retrieve the application QueueDispatcher."""
+    try:
+        q: QueueDispatcher = get_container().resolve(QueueDispatcher)
+        return q
+    except RuntimeError:
+        return QueueDispatcher.get_instance()
+
+
+async def dispatch(
+    job: Job,
+    queue_name: str | None = None,
+    delay: float = 0,
+) -> str:
+    """Dispatch a job onto the application queue."""
+    q = queue()
+    return await q.push(job, queue=queue_name, delay=delay)
+
+
 __all__ = [
     "app",
     "cache",
     "config",
     "container",
+    "dispatch",
     "dispatcher",
     "env",
     "event",
     "pluralize",
+    "queue",
     "resolve",
     "snake_case",
 ]

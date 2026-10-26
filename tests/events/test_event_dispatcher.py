@@ -317,4 +317,3 @@ async def test_dispatcher_complex_callable_signatures() -> None:
     assert results_map["class_callable"] == "sample_payload"
     assert results_map["default_arg"] == ("sample_payload", True)
     assert results_map["keyword_only"] == "sample_payload"
-

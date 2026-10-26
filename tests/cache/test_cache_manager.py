@@ -73,9 +73,7 @@ async def test_cache_manager_custom_driver_extension() -> None:
         async def get(self, key: str, default: object = None) -> object:
             return self.data.get(key, default)
 
-        async def set(
-            self, key: str, value: object, ttl: float | None = None
-        ) -> bool:
+        async def set(self, key: str, value: object, ttl: float | None = None) -> bool:
             self.data[key] = str(value)
             return True
 

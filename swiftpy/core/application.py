@@ -380,9 +380,7 @@ class Application:
                 request = Request(scope, receive)
                 Context.set("request", request)
                 try:
-                    route, params = self.router.match(
-                        request.method, request.path
-                    )
+                    route, params = self.router.match(request.method, request.path)
                 except PathParamCoercionError as exc:
                     response = unprocessable({exc.param: str(exc)})
                     await response.send(send)
@@ -399,16 +397,14 @@ class Application:
                     # Route matched before boot() ran, e.g. ad hoc testing.
                     # Not the production hot path, so rebuilding here is acceptable.
                     wrapped = self._wrap_handler(route.handler)
-                    handler = MiddlewarePipeline(
-                        self.container, route.middleware
-                    ).wrap(wrapped)
+                    handler = MiddlewarePipeline(self.container, route.middleware).wrap(
+                        wrapped
+                    )
 
                 response = await handler(request, **params)
 
             except Exception as exc:  # noqa: BLE001
-                response = await self.exception_handler.handle(
-                    exc, request=request
-                )
+                response = await self.exception_handler.handle(exc, request=request)
 
             finally:
                 if scope.get("type") == "http":

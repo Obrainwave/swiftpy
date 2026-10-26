@@ -55,10 +55,12 @@ from swiftpy.helpers.helper import (
     cache,
     config,
     container,
+    dispatch,
     dispatcher,
     env,
     event,
     pluralize,
+    queue,
     resolve,
     snake_case,
 )
@@ -70,6 +72,13 @@ from swiftpy.http.response import (
     unauthorized,
 )
 from swiftpy.http.router import RouteGroup
+from swiftpy.queue import (
+    Job,
+    JobSerializationError,
+    QueueDispatcher,
+    QueueWorker,
+    push,
+)
 from swiftpy.testing import (
     TestCase,
     TestClient,
@@ -151,6 +160,8 @@ __all__ = [
     "InternalServerError",
     "JWTGuard",
     "JWTIssuer",
+    "Job",
+    "JobSerializationError",
     "MaxRule",
     "MemoryDriver",
     "MethodNotAllowedError",
@@ -159,6 +170,8 @@ __all__ = [
     "NotFoundError",
     "NotInRule",
     "NullableRule",
+    "QueueDispatcher",
+    "QueueWorker",
     "RedisDriver",
     "RedisEventBus",
     "RegexRule",
@@ -189,6 +202,7 @@ __all__ = [
     "container",
     "current_user",
     "db_transaction",
+    "dispatch",
     "dispatcher",
     "email",
     "env",
@@ -205,6 +219,8 @@ __all__ = [
     "not_in",
     "nullable",
     "pluralize",
+    "push",
+    "queue",
     "regex",
     "require_api_key",
     "require_jwt",

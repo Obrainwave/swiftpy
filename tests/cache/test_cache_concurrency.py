@@ -109,10 +109,7 @@ async def test_concurrent_add_only_one_wins_memory() -> None:
 
     try:
         results = await asyncio.gather(
-            *(
-                driver.add("shared_add", f"value_{i}")
-                for i in range(concurrency_count)
-            )
+            *(driver.add("shared_add", f"value_{i}") for i in range(concurrency_count))
         )
         assert sum(results) == 1
         assert await driver.has("shared_add") is True

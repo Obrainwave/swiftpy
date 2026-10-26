@@ -125,15 +125,9 @@ async def test_multiword_model_name_lifecycle_events() -> None:
     dispatcher = EventDispatcher.get_instance()
     events_log: list[str] = []
 
-    dispatcher.listen(
-        "audit_log_entry.created", lambda p: events_log.append("created")
-    )
-    dispatcher.listen(
-        "audit_log_entry.updated", lambda p: events_log.append("updated")
-    )
-    dispatcher.listen(
-        "audit_log_entry.deleted", lambda p: events_log.append("deleted")
-    )
+    dispatcher.listen("audit_log_entry.created", lambda p: events_log.append("created"))
+    dispatcher.listen("audit_log_entry.updated", lambda p: events_log.append("updated"))
+    dispatcher.listen("audit_log_entry.deleted", lambda p: events_log.append("deleted"))
 
     entry = await AuditLogEntry.create(action="login", metadata="IP:127.0.0.1")
     assert events_log == ["created"]
@@ -201,12 +195,8 @@ async def test_model_save_repeatedly_transitions_created_to_updated() -> None:
     dispatcher = EventDispatcher.get_instance()
     lifecycle_log: list[str] = []
 
-    dispatcher.listen(
-        "event_user.created", lambda p: lifecycle_log.append("created")
-    )
-    dispatcher.listen(
-        "event_user.updated", lambda p: lifecycle_log.append("updated")
-    )
+    dispatcher.listen("event_user.created", lambda p: lifecycle_log.append("created"))
+    dispatcher.listen("event_user.updated", lambda p: lifecycle_log.append("updated"))
 
     user = EventUser(name="First", email="first@example.com")
 
@@ -248,4 +238,3 @@ async def test_model_lifecycle_listener_failure_propagates() -> None:
 
     with pytest.raises(PermissionError, match="Listener rejected model creation"):
         await EventUser.create(name="RejectMe", email="reject@example.com")
-

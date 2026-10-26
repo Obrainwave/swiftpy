@@ -320,3 +320,51 @@ Transfer/sec:    482.06KB
    - **Service Provider:** Implemented `EventServiceProvider` registering `EventDispatcher` and `RedisEventBus` singletons in the application DI container.
 5. **Cross-Process Verification:**
    - Verified that an event published by Worker Process A (`RedisEventBus.publish("order.cross_process.shipped", payload)`) is received and processed by a listener registered in a completely separate OS Worker Process B running in an independent Python interpreter, with the exact payload confirmed via Redis key storage within SLA.
+
+---
+
+## Week 15 - Queues Subsystem
+
+### Status: PASSED
+* **Test Module:** `tests/queue/test_queue.py`
+* **Results:** All **18 queue tests passed** (100% test pass rate across **269 total tests** in repository; strict mypy typing verified across 132 source files; ruff compliant).
+* **Verified Guarantees & Architectural Principles:**
+1. **Base Job Class (`swiftpy/queue/job.py`):**
+   - **Async `handle()` Contract:** Subclasses inherit `Job` and implement the coroutine `async def handle(self) -> None`, called directly by worker processes upon dequeuing.
+   - **Configurable Retry & Backoff Metadata:** Configurable `tries` (default 3), `attempts` counter, `timeout` execution limit, and `backoff` delay strategies supporting scalar constants (e.g. `backoff = 2.0`), progressive delay schedules (e.g. `backoff = [1.0, 5.0, 15.0]`), and immediate retry with `backoff = 0` (or `[0, 0]`).
+   - **Permanent Failure Hook:** Supports `async def failed(self, exception: BaseException) -> None` hook invoked when all retries are exhausted. If the hook itself raises an exception, the worker catches the error, logs it, and still guarantees that the failed job record is safely routed to the Dead Letter Queue.
+   - **Trusted Namespace Deserialization Security:** Mitigates arbitrary code execution before module import. Enforces a trusted namespace allowlist (`Job.set_trusted_namespaces(["app.", "tests."])`) that validates the target module path before invoking `importlib.import_module()`. Avoids `pickle` entirely, serializing jobs into structured JSON envelopes containing `job_class` (module:qualname), `job_id`, `queue`, `tries`, `attempts`, `backoff`, `timeout`, `args`, `kwargs`, and `data`. Deserialization dynamically verifies the target is a valid `Job` subclass and restores all instance parameters and persisted metadata.
+   - **Instance Dispatch Convenience:** Provides `await job.dispatch(queue=..., delay=...)` instance method delegating to the application's queue dispatcher.
+2. **Redis-Backed Queue Dispatcher (`swiftpy/queue/dispatcher.py`):**
+   - **Dual Data Structure Architecture:**
+     - **Active FIFO Queue:** Immediate jobs pushed via `RPUSH` onto Redis lists (`{prefix}{queue}`).
+     - **Delayed & Scheduled ZSET:** Jobs with `delay > 0` stored in Redis sorted sets (`{prefix}{queue}:delayed`) with score set to `time.time() + delay`.
+     - **Dead Letter Queue (DLQ):** Failed jobs routed to Redis lists (`{prefix}{queue}:failed`) capturing full diagnostic context (exception type, error message, formatted traceback, attempt counts, and failure timestamp).
+   - **Connection Management:** Backed by `aioredis.BlockingConnectionPool` with lazy async client initialization, configurable concurrency limits, and clean lifecycle teardown (`close()` / `aclose()`).
+   - **Queue Observability & Management:** Provides `size()`, `delayed_size()`, `failed_size()`, `get_failed_jobs()`, and `clear()` methods for active queue inspection and administration.
+   - **Global Dispatcher & Helper:** Accessible as a singleton via `QueueDispatcher.get_instance()`, container resolution, or the global `push()` / `dispatch()` helpers.
+3. **Standalone Worker Process (`swiftpy/queue/worker.py`):**
+   - **Atomic Lua Delayed Job Promotion:** Atomically migrates scheduled jobs whose `score <= now` from the delayed ZSET to the active FIFO list using a Lua script (`zrangebyscore`, `zrem`, `rpush`). Guaranteed zero race conditions across concurrent workers (verified under 10 concurrent promotion tasks racing for 50 scheduled jobs).
+   - **Delivery Contracts & Atomic FIFO Job Consumption:** Consumes jobs using atomic Redis `LPOP`, ensuring every queued job is delivered to exactly one worker process.
+     - *Graceful Shutdown / In-Flight Cancellation Recovery:* In-flight tasks interrupted via `SIGINT`/`SIGTERM` or `asyncio.CancelledError` automatically catch cancellation, serialize the in-flight job payload, and re-enqueue it onto the active Redis queue via `LPUSH` before exiting, ensuring zero lost jobs.
+     - *Ungraceful Kill Caveat:* If a worker process is terminated abruptly via hard `SIGKILL` mid-execution, atomic `LPOP` yields at-most-once delivery.
+   - **Retry with Backoff Orchestration:** If a job fails and `attempts < tries`, the worker computes the backoff delay: if `delay > 0`, it pushes the job to the delayed sorted set; if `delay <= 0`, it immediately pushes it back to the active FIFO queue for immediate re-execution.
+   - **Dead Letter Queue Routing:** If a job exhausts its maximum attempts, the worker invokes the job's `failed(exc)` hook and pushes the complete error record to the Dead Letter Queue.
+   - **Malformed Envelope Resilience:** Corrupt JSON payloads and unresolvable or untrusted job classes are safely quarantined into the DLQ without crashing or terminating the worker process.
+   - **Graceful Termination & POSIX Signal Handling:** Registers handlers for `SIGINT` (Ctrl+C) and `SIGTERM`, allowing in-flight jobs to complete or safely re-enqueue before closing Redis connections and shutting down.
+   - **Batch & Testing Execution:** Supports `--stop-when-empty` mode to terminate when all monitored active queues and delayed queues are drained, as well as `--max-jobs N` to stop after processing `N` jobs.
+4. **CLI Integration (`swiftpy queue:work`):**
+   - Implemented `QueueCommand` in `swiftpy/console/commands/queue.py` registered in `swiftpy/console/cli.py`.
+   - Supports CLI options: `--queue`, `--sleep`, `--max-jobs`, `--stop-when-empty`, `--timeout`, `--prefix`, and `--app` (application bootstrapping).
+5. **High-Concurrency Multi-Process Stress Verification:**
+   - Dispatched **500 distinct jobs** onto a single Redis queue.
+   - Spawned **3 concurrent, independent OS worker processes** executing `swiftpy queue:work --stop-when-empty`.
+   - Drained worker stdout/stderr asynchronously via `communicate()` inside `wait_for` to guarantee no OS 64KB pipe buffer deadlocks.
+   - **Guarantees verified:**
+     - Worker concurrency confirmed via OS PIDs: All 3 distinct worker OS processes actively participated and recorded their distinct PIDs in Redis (`unique_pids == 3`).
+     - Total executed jobs = **500** (`assert total_executed == 500`).
+     - Unique executed jobs = **500** (`assert unique_executed == 500`).
+     - Exactly-once execution with **zero duplicates** and **zero dropped jobs**.
+     - Active queue and delayed queue completely drained to 0.
+     - Dead letter queue size = 0.
+     - All 3 worker processes exited cleanly with exit code 0.
