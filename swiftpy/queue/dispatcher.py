@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Self
 import redis.asyncio as aioredis
 
 from swiftpy.queue.job import Job, set_dispatch_handler
+from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.queue")
 
@@ -74,28 +75,19 @@ class QueueDispatcher:
                 )
             else:
                 if self._pool is None:
-                    host = self.host or os.getenv("REDIS_HOST", "127.0.0.1")
-                    port = (
-                        self.port
-                        if self.port is not None
-                        else int(os.getenv("REDIS_PORT", "6379"))
-                    )
-                    password = (
-                        self.password
-                        if self.password is not None
-                        else os.getenv("REDIS_PASSWORD", None)
-                    )
-                    db = (
-                        self.database
-                        if self.database != 0
-                        else int(os.getenv("REDIS_QUEUE_DB", "0"))
+                    params = resolve_redis_params(
+                        section="queue",
+                        host=self.host,
+                        port=self.port,
+                        password=self.password,
+                        database=self.database if self.database != 0 else None,
                     )
 
                     self._pool = aioredis.BlockingConnectionPool(
-                        host=host,
-                        port=port,
-                        db=db,
-                        password=password or None,
+                        host=params["host"],
+                        port=params["port"],
+                        db=params["database"],
+                        password=params["password"] or None,
                         decode_responses=True,
                         max_connections=self.max_connections,
                         timeout=self.timeout,

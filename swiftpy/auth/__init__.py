@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from swiftpy.auth.api_key_guard import (
     ApiKeyGuard,
+    generate_api_key,
+    get_server_pepper,
     hash_api_key,
     require_api_key,
     verify_api_key_hash,
@@ -39,6 +41,8 @@ __all__ = [
     "TokenExpiredError",
     "TokenRevokedError",
     "current_user",
+    "generate_api_key",
+    "get_server_pepper",
     "hash_api_key",
     "require_api_key",
     "require_jwt",

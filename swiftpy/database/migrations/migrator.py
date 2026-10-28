@@ -13,7 +13,7 @@ from typing import Any
 import asyncpg
 
 from swiftpy.core.bootstrap import get_container
-from swiftpy.database.migrations.blueprint import validate_identifier
+from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.migrations.lock import MigrationLock
 from swiftpy.database.migrations.migration import Migration, MigrationProtocol
 from swiftpy.database.pool import DatabasePool

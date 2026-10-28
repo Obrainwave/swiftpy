@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from swiftpy.auth import AuthManager, CurrentUser, JWTIssuer, TokenBlacklist
+from swiftpy.core.config import Config
 from swiftpy.core.context import Context
 from swiftpy.core.providers.base import ServiceProvider
 
@@ -11,7 +12,12 @@ class AuthServiceProvider(ServiceProvider):
     """
 
     def register(self) -> None:
-        self.container.singleton(JWTIssuer)
+        self.container.singleton(
+            JWTIssuer,
+            lambda c: JWTIssuer.from_config(
+                c.resolve(Config) if c.has(Config) else None
+            ),
+        )
         self.container.singleton(TokenBlacklist)
         self.container.singleton(AuthManager)
         self.container.scoped(

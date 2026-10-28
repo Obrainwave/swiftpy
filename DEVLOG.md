@@ -471,3 +471,100 @@ Transfer/sec:    482.06KB
   - Relocated standalone scripts `asgi_app.py` and `test_asyncio.py` to `examples/` and added `exclude = ["examples/"]` in `pyproject.toml`.
   - Added attribute and return type annotations to test modules across `tests/app`, `tests/auth`, `tests/db`, `tests/http`, `tests/concurrency`, `tests/stress`, `tests/validation`, `tests/test_placeholder.py`, and `tests/orm`.
 
+---
+
+## Phase 1 - Foundation & Cross-Cutting Fixes
+
+### P1-F1: Unified SQL Identifier Validation
+* **Status:** PASSED
+* **Date:** 2026-10-28
+* **Changes:**
+  - Created centralized `swiftpy/database/identifiers.py` module with `MAX_IDENTIFIER_LENGTH = 63`, `validate_identifier()`, `validate_column_identifier()`, and `quote_identifier()`.
+  - Enforced strict regex matching (`re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*")`) rejecting trailing newlines (`\n`), spaces, special characters, and identifiers > 63 bytes (Postgres NAMEDATALEN limit).
+  - Updated `QueryBuilder` (`from_table`, `join`, `where`, `order_by`, `select`, etc.) to use centralized identifier validation and rejected `*` in `.where()` conditions.
+  - Replaced duplicate / permissive identifier regexes in `Blueprint`, `Schema`, `Migrator`, `UniqueRule`, `ExistsRule`, and `ApiKeyGuard`.
+  - Added unit test suite `tests/db/test_identifiers.py` and extended `tests/db/test_sql_injections.py`.
+* **Quality Gate Results:**
+  - `ruff check .`: All checks passed!
+  - `mypy swiftpy tests/db/`: Success: no issues found in 119 source files.
+  - `pytest`: 322 passed in 122.23s.
+
+---
+
+### P1-F2: String Helpers Relocation & Acronym Handling
+* **Status:** PASSED
+* **Date:** 2026-10-28
+* **Changes:**
+  - Extracted string utilities (`snake_case`, `pluralize`, inflection rules, irregulars, and uncountables) out of `swiftpy/helpers/helper.py` into newly created `swiftpy/support/strings.py`.
+  - Re-exported `snake_case` and `pluralize` in `swiftpy/helpers/helper.py` and `swiftpy/support/__init__.py` for backward compatibility.
+  - Fixed acronym handling in `snake_case`: acronym runs followed by lowercase are separated correctly so that `snake_case("APIKey") == "api_key"` (resolving table name mismatch with `ApiKeyGuard`), `snake_case("HTTPRequest") == "http_request"`, and `snake_case("UserAPIKey") == "user_api_key"`.
+  - Updated ORM (`swiftpy/database/orm/model.py`, `swiftpy/database/orm/relationships.py`) and CLI scaffolding (`swiftpy/console/commands/make.py`) to import directly from `swiftpy.support.strings`, eliminating circular import coupling from `helpers.py`.
+  - Added test suite `tests/support/test_strings.py` (31 tests covering acronyms, casing preservation, irregulars, and re-export parity).
+* **Quality Gate Results:**
+  - `ruff check .`: All checks passed!
+  - `mypy swiftpy tests/support/`: Success: no issues found in 118 source files.
+  - `pytest tests/support/test_strings.py`: 31 passed in 8.09s.
+  - `pytest tests/orm/ tests/console/`: 21 passed in 16.83s.
+
+---
+
+### P1-F3: Centralized Redis Connection Configuration Resolver
+* **Status:** PASSED
+* **Date:** 2026-10-28
+* **Changes:**
+  - Created `swiftpy/support/redis_config.py` offering `build_redis_url()` and `resolve_redis_params()`.
+  - Enforced single-source-of-truth configuration resolution through `Config` exclusively (eliminating scattered raw `os.getenv` calls).
+  - Sanitized credentials with RFC-compliant percent-encoding (`urllib.parse.quote(..., safe="")`) for passwords containing special characters (`@`, `:`, `/`, `#`, `?`, etc.) and usernames.
+  - Provided automatic fallback to subsystem-specific configs (`cache.stores.redis`, `queue.connections.redis`, `events.redis`) and per-subsystem databases (`REDIS_CACHE_DB`, `REDIS_QUEUE_DB`, `REDIS_EVENTS_DB`).
+  - Updated `swiftpy/cache/drivers/redis.py` and `swiftpy/queue/dispatcher.py` to use `resolve_redis_params`.
+  - Added unit test suite `tests/support/test_redis_config.py` (11 tests covering URL generation, credential escaping, SSL schemes, keyword overrides, and subsystem resolution).
+* **Quality Gate Results:**
+  - `ruff check .`: All checks passed!
+  - `mypy swiftpy tests/support/ tests/cache/ tests/queue/`: Success: no issues found in 125 source files.
+  - `pytest tests/support/ tests/cache/ tests/queue/`: 112 passed in 36.48s.
+  - Full test suite: **364 passed in 129.57s** (0:02:09) with 0 regressions.
+
+---
+
+## Phase 2 - Security Blockers
+
+### P2-A1: JWT Secret Enforcement & Config Wiring (Decision D-1)
+* **Status:** PASSED
+* **Date:** 2026-10-28
+* **Changes:**
+  - Enforced strict minimum 32-byte secret validation for symmetric algorithms (`HS256`) in `JWTIssuer.__init__`, raising `ConfigurationError` on empty, `None`, or short secrets (< 32 bytes).
+  - Enforced key requirement for asymmetric algorithms (`RS256`), raising `ConfigurationError` when both `private_key` and `public_key` are absent.
+  - Added `JWTIssuer.from_config(config: Config | None = None)` factory reading secrets, algorithms, and TTLs from `Config` (`auth.guards.jwt.*` or `auth.jwt.*`).
+  - In production (`debug=False`), boot immediately fails fast with `ConfigurationError` if `JWT_SECRET` is missing.
+  - In debug/development mode, if `JWT_SECRET` is absent, generates an ephemeral per-process random secret (`secrets.token_urlsafe(48)`) and logs a high-visibility security warning.
+  - Removed hard-coded default secret from `config/auth.py`.
+  - Updated `AuthServiceProvider` to register `JWTIssuer` via `JWTIssuer.from_config`.
+  - Updated `jwt_guard.py` fallback to resolve `JWTIssuer` via `from_config`.
+  - Documented `JWT_SECRET=` generation guidance in `.env.example`.
+  - Added unit test suite `tests/auth/test_jwt_issuer.py` (9 tests) and updated secret fixtures in `tests/auth/test_auth_security.py`.
+* **Quality Gate Results:**
+  - `ruff check .`: All checks passed!
+  - `mypy swiftpy tests/auth/`: Success: no issues found in 120 source files.
+  - `pytest tests/auth/`: 41 passed in 15.39s.
+
+---
+
+### P2-A2: API Key Guard Overhaul (Decision D-2)
+* **Status:** PASSED
+* **Date:** 2026-10-28
+* **Changes:**
+  - Redesigned API key format into `<prefix>.<secret>` (e.g., `sk_live_abc123.secretxyz...`) with unique indexed column `key_prefix` (Decision D-2).
+  - Replaced catastrophic O(N) full-table scan and synchronous bcrypt hashing with O(1) single-row prefix lookup: `SELECT * FROM "{table}" WHERE "{key_prefix}" = $1 LIMIT 1`.
+  - Implemented high-entropy random key generation (`generate_api_key`) and constant-time peppered HMAC-SHA256 verification (`hash_api_key`, `verify_api_key_hash`) with server pepper resolution (`get_server_pepper`).
+  - Added dummy constant-time HMAC comparison when key prefix does not match any row, preventing prefix-enumeration timing side-channels.
+  - Added strict validation for `is_active`, `revoked`, and timezone-aware `expires_at`.
+  - Added stripping of `key_hash`, `secret`, and password fields from `request.state["user"]` and `Context` before returning.
+  - Sanitized dynamic table, column, and prefix SQL identifiers via `validate_identifier` from P1-F1.
+  - Added test suite `tests/auth/test_api_key_guard.py` (4 tests covering prefix generation, peppered HMAC verification, production pepper enforcement, and database prefix-indexed lookup with revocation/expiration/state stripping).
+* **Quality Gate Results:**
+  - `ruff check swiftpy/auth tests/auth`: All checks passed!
+  - `mypy swiftpy/auth tests/auth`: Success: no issues found in 10 source files.
+  - `pytest tests/auth/`: 45 passed in 15.50s.
+
+
+

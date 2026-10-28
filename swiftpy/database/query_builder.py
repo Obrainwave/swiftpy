@@ -1,50 +1,19 @@
 from __future__ import annotations
 
-import re
 from typing import Any, cast
 
 import asyncpg
 
 from swiftpy.core.bootstrap import get_container
+from swiftpy.database.identifiers import (
+    quote_identifier,
+    validate_column_identifier,
+    validate_identifier,
+)
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection
 
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
-_COLUMN_RE = re.compile(
-    r"^(?:"
-    r"\*"
-    r"|"
-    r"[a-zA-Z_][a-zA-Z0-9_]*"
-    r"(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|\*))?"
-    r")$"
-)
-
 _MISSING = object()
-
-
-def validate_identifier(identifier: str) -> str:
-    if identifier == "*":
-        return identifier
-    if not _IDENTIFIER_RE.match(identifier):
-        raise ValueError(f"Invalid SQL identifier detected: {identifier}")
-    return identifier
-
-
-def validate_column_identifier(column: str) -> str:
-    if not _COLUMN_RE.fullmatch(column):
-        raise ValueError(f"Invalid SQL column identifier detected: {column}")
-
-    return column
-
-
-def quote_identifier(identifier: str) -> str:
-    """Validate, then quote each dotted segment: t.col becomes "t"."col"."""
-    if identifier == "*":
-        return "*"
-    validate_column_identifier(identifier)
-    return ".".join(
-        "*" if part == "*" else f'"{part}"' for part in identifier.split(".")
-    )
 
 
 class Column:
@@ -81,7 +50,7 @@ SelectExpression = str | Column | Raw
 
 class QueryBuilder:
     def __init__(self, table_name: str) -> None:
-        self._table = validate_identifier(table_name)
+        self._table = validate_identifier(table_name, allow_dotted=True)
         self._columns: list[SelectExpression] = ["*"]
         self._wheres: list[tuple[str, str, Any]] = []
         self._joins: list[tuple[str, str, str, str, str]] = []
@@ -112,7 +81,7 @@ class QueryBuilder:
     def where(
         self, column: str, operator_or_value: Any, value: Any = _MISSING
     ) -> QueryBuilder:
-        column = validate_identifier(column)
+        column = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
 
         if value is _MISSING:
             operator = "="

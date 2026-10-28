@@ -213,8 +213,8 @@ async def test_jwt_issuer_rs256_lifecycle() -> None:
 @pytest.mark.asyncio
 async def test_jwt_wrong_signing_key_rejected() -> None:
     """Verify that tokens signed with Secret A are rejected by Verifier using Secret B."""
-    issuer_a = JWTIssuer(secret="secret-key-a-32-bytes-minimum!!")
-    issuer_b = JWTIssuer(secret="secret-key-b-32-bytes-minimum!!")
+    issuer_a = JWTIssuer(secret="secret-key-a-32-bytes-minimum----!")
+    issuer_b = JWTIssuer(secret="secret-key-b-32-bytes-minimum----!")
 
     token_a = issuer_a.issue_access_token(subject=1)
     with pytest.raises(InvalidSignatureError, match="Signature verification failed"):
@@ -224,7 +224,7 @@ async def test_jwt_wrong_signing_key_rejected() -> None:
 @pytest.mark.asyncio
 async def test_jwt_malformed_token_segments_rejected() -> None:
     """Verify that structurally malformed tokens are rejected with InvalidTokenError."""
-    issuer = JWTIssuer(secret="secret-key-32-bytes-minimum!!")
+    issuer = JWTIssuer(secret="secret-key-32-bytes-minimum------!")
 
     with pytest.raises(InvalidTokenError, match="expected 3 segments"):
         issuer.decode_token("not.enough.parts.here.extra")
@@ -240,7 +240,7 @@ async def test_jwt_malformed_token_segments_rejected() -> None:
 async def test_jwt_issuer_and_audience_validation() -> None:
     """Verify that mismatching issuer or audience claims raise InvalidTokenError."""
     issuer = JWTIssuer(
-        secret="secret-key-32-bytes-minimum!!",
+        secret="secret-key-32-bytes-minimum------!",
         issuer="expected-issuer",
         audience="expected-audience",
     )
@@ -251,7 +251,7 @@ async def test_jwt_issuer_and_audience_validation() -> None:
 
     # Verifier with different expected issuer
     verifier_wrong_iss = JWTIssuer(
-        secret="secret-key-32-bytes-minimum!!",
+        secret="secret-key-32-bytes-minimum------!",
         issuer="wrong-issuer",
     )
     with pytest.raises(InvalidTokenError, match="Invalid issuer"):
@@ -259,7 +259,7 @@ async def test_jwt_issuer_and_audience_validation() -> None:
 
     # Verifier with different expected audience
     verifier_wrong_aud = JWTIssuer(
-        secret="secret-key-32-bytes-minimum!!",
+        secret="secret-key-32-bytes-minimum------!",
         audience="wrong-audience",
     )
     with pytest.raises(InvalidTokenError, match="Invalid audience"):
@@ -500,7 +500,10 @@ async def test_jwt_guard_missing_credentials_returns_challenge() -> None:
 async def test_jwt_guard_malformed_bearer_headers_rejected() -> None:
     """Verify that malformed Authorization header formats return 401."""
     app = Application()
-    app.container.instance(JWTIssuer, JWTIssuer(secret="test-secret-32-bytes-minimum!"))
+    app.container.instance(
+        JWTIssuer,
+        JWTIssuer(secret="test-secret-32-bytes-minimum-----!"),
+    )
 
     @app.get("/protected")
     async def protected(request: Request) -> Response:
@@ -966,7 +969,7 @@ async def test_current_user_di_injection_and_task_isolation() -> None:
 async def test_di_context_cleared_after_failed_request() -> None:
     """Verify that a failed/rejected authentication does not leave lingering user context."""
     app = Application()
-    issuer = JWTIssuer(secret="test-secret-32-bytes-minimum!")
+    issuer = JWTIssuer(secret="test-secret-32-bytes-minimum-----!")
     app.container.instance(JWTIssuer, issuer)
 
     auth = app.container.resolve(AuthManager)
@@ -1004,8 +1007,8 @@ async def test_di_context_cleared_after_failed_request() -> None:
 @pytest.mark.asyncio
 async def test_cross_application_isolation() -> None:
     """Verify that two independent Application instances maintain strict container and token isolation."""
-    issuer_1 = JWTIssuer(secret="app1-secret-at-least-32-bytes!!")
-    issuer_2 = JWTIssuer(secret="app2-secret-at-least-32-bytes!!")
+    issuer_1 = JWTIssuer(secret="app1-secret-at-least-32-bytes----!")
+    issuer_2 = JWTIssuer(secret="app2-secret-at-least-32-bytes----!")
 
     app1 = Application(title="App 1")
     app1.container.instance(JWTIssuer, issuer_1)
@@ -1090,7 +1093,7 @@ async def test_jwt_wrong_signing_key_rejected_http() -> None:
 async def test_jwt_none_algorithm_case_variations() -> None:
     """Security verification: The 'none' algorithm is rejected across all case variations ('none', 'NONE', 'None', 'nOnE')."""
     issuer = JWTIssuer(
-        secret="test-secret-32-bytes-minimum!",
+        secret="test-secret-32-bytes-minimum-----!",
         algorithm="HS256",
     )
     payload = {

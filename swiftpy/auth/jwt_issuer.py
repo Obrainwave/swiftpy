@@ -4,6 +4,8 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import secrets
 import time
 import uuid
 from datetime import timedelta
@@ -16,6 +18,10 @@ from cryptography.hazmat.primitives.asymmetric.rsa import (
     RSAPrivateKey,
     RSAPublicKey,
 )
+
+from swiftpy.core.config import Config, ConfigurationError
+
+logger = logging.getLogger("swiftpy.auth.jwt")
 
 
 class JWTError(Exception):
@@ -67,11 +73,13 @@ class JWTIssuer:
         "jti",
         "type",
         "token_type",
+        "typ",
         "sub",
         "iss",
         "aud",
         "nbf",
     }
+
 
     def __init__(
         self,
@@ -97,7 +105,18 @@ class JWTIssuer:
 
         # Symmetric key setup
         self._secret: bytes | None = None
-        if secret is not None:
+        if self.algorithm == "HS256":
+            if secret is None:
+                raise ConfigurationError(
+                    "JWT secret must be provided for symmetric algorithm HS256."
+                )
+            raw_secret = secret.encode("utf-8") if isinstance(secret, str) else secret
+            if len(raw_secret) < 32:
+                raise ConfigurationError(
+                    f"JWT secret must be at least 32 bytes (got {len(raw_secret)} bytes) for HS256."
+                )
+            self._secret = raw_secret
+        elif secret is not None:
             self._secret = secret.encode("utf-8") if isinstance(secret, str) else secret
 
         # Asymmetric key setup
@@ -137,6 +156,83 @@ class JWTIssuer:
                 if not isinstance(loaded_pub, RSAPublicKey):
                     raise TypeError("Loaded public key is not an RSAPublicKey")
                 self._public_key = loaded_pub
+
+        if self.algorithm == "RS256" and self._private_key is None and self._public_key is None:
+            raise ConfigurationError(
+                "RS256 algorithm requires a private_key (for signing) or public_key (for verification)."
+            )
+
+    @classmethod
+    def from_config(cls, config: Config | None = None) -> JWTIssuer:
+        """
+        Build and configure a JWTIssuer from application Config.
+
+        Reads settings from 'auth.guards.jwt.*' or 'auth.jwt.*'.
+        In production (debug=False), fails fast if JWT_SECRET is missing or <32 bytes.
+        In debug mode (debug=True), if JWT_SECRET is absent, generates a per-process
+        random secret and logs a loud warning.
+        """
+        if config is None:
+            try:
+                cfg = Config.get_instance()
+            except (RuntimeError, ValueError):
+                cfg = Config()
+        else:
+            cfg = config
+
+        # Look up jwt guard config dict
+        jwt_cfg: dict[str, Any] = {}
+        guards = cfg.get("auth.guards")
+        if isinstance(guards, dict) and isinstance(guards.get("jwt"), dict):
+            jwt_cfg = guards["jwt"]
+        elif isinstance(cfg.get("auth.jwt"), dict):
+            jwt_cfg = cfg.get("auth.jwt")
+
+        algorithm = str(jwt_cfg.get("algorithm") or cfg.get("auth.jwt.algorithm") or "HS256").upper()
+        raw_secret = jwt_cfg.get("secret") if "secret" in jwt_cfg else cfg.get("auth.jwt.secret")
+        if raw_secret is None:
+            raw_secret = cfg.get("jwt_secret")
+
+        app_env = str(cfg.get("app.env") or cfg.get("env") or "development").lower()
+        debug_val = cfg.get("app.debug") if cfg.get("app.debug") is not None else cfg.get("debug")
+        if debug_val is not None:
+            is_debug = bool(debug_val)
+        else:
+            is_debug = app_env not in ("production", "prod")
+
+        secret: str | bytes | None = None
+        if algorithm == "HS256":
+            if raw_secret is not None and str(raw_secret).strip():
+                secret = str(raw_secret)
+            elif is_debug:
+                secret = secrets.token_urlsafe(48)
+                logger.warning(
+                    "SECURITY WARNING: No JWT_SECRET configured. Generated a random ephemeral "
+                    "secret for debug mode. All tokens will be invalidated on server restart. "
+                    "Set JWT_SECRET in your environment for persistence."
+                )
+            else:
+                raise ConfigurationError(
+                    "JWT_SECRET is not configured. A secret of at least 32 bytes is required in production."
+                )
+
+        access_ttl = int(jwt_cfg.get("access_token_ttl") or cfg.get("auth.jwt.access_token_ttl") or 900)
+        refresh_ttl = int(jwt_cfg.get("refresh_token_ttl") or cfg.get("auth.jwt.refresh_token_ttl") or 604800)
+        issuer = jwt_cfg.get("issuer") or cfg.get("auth.jwt.issuer")
+        audience = jwt_cfg.get("audience") or cfg.get("auth.jwt.audience")
+        private_key = jwt_cfg.get("private_key") or cfg.get("auth.jwt.private_key")
+        public_key = jwt_cfg.get("public_key") or cfg.get("auth.jwt.public_key")
+
+        return cls(
+            secret=secret,
+            private_key=private_key,
+            public_key=public_key,
+            algorithm=algorithm,
+            access_token_ttl=access_ttl,
+            refresh_token_ttl=refresh_ttl,
+            issuer=str(issuer) if issuer else None,
+            audience=str(audience) if audience else None,
+        )
 
     @classmethod
     def generate_rsa_key_pair(cls, key_size: int = 2048) -> tuple[str, str]:
@@ -198,6 +294,7 @@ class JWTIssuer:
             "sub": str(subject),
             "type": token_type,
             "token_type": token_type,
+            "typ": token_type,
             "iat": now,
             "exp": now + ttl_seconds,
             "jti": str(uuid.uuid4()),
@@ -222,7 +319,7 @@ class JWTIssuer:
 
         header = {
             "alg": alg,
-            "typ": "JWT",
+            "typ": token_type if token_type in {"access", "refresh"} else "JWT",
         }
 
         header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
@@ -271,9 +368,12 @@ class JWTIssuer:
         claims: dict[str, Any] | None = None,
         access_expires_in: int | timedelta | None = None,
         refresh_expires_in: int | timedelta | None = None,
+        refresh_claims: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Issue both an access token and a refresh token.
+        Access token carries caller claims; refresh token does not inherit
+        access claims unless explicitly provided in refresh_claims.
         """
         access_token = self.issue_access_token(
             subject=subject,
@@ -282,7 +382,7 @@ class JWTIssuer:
         )
         refresh_token = self.issue_refresh_token(
             subject=subject,
-            claims=claims,
+            claims=refresh_claims,
             expires_in=refresh_expires_in,
         )
         ttl = access_expires_in or self.access_token_ttl
@@ -294,6 +394,7 @@ class JWTIssuer:
             "token_type": "Bearer",
             "expires_in": ttl_seconds,
         }
+
 
     def decode_token(
         self,
@@ -415,13 +516,23 @@ class JWTIssuer:
 
         # Token type check
         if expected_type is not None:
-            token_type = payload.get("type") or payload.get("token_type")
+            token_type = (
+                payload.get("type")
+                or payload.get("token_type")
+                or payload.get("typ")
+            )
             if token_type != expected_type:
                 raise InvalidTokenError(
                     f"Invalid token type: expected '{expected_type}', got '{token_type}'"
                 )
+            header_typ = str(header.get("typ") or "").lower()
+            if header_typ and header_typ not in {"jwt", expected_type.lower()}:
+                raise InvalidTokenError(
+                    f"Invalid token type in header: expected '{expected_type}', got '{header.get('typ')}'"
+                )
 
         return payload
+
 
     @classmethod
     def decode_unverified(cls, token: str) -> dict[str, Any]:

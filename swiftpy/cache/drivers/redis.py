@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -14,6 +13,7 @@ import redis.asyncio as aioredis
 from redis.exceptions import RedisError, ResponseError
 
 from swiftpy.cache.driver import _SENTINEL, CacheDriver
+from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.cache")
 
@@ -61,24 +61,20 @@ class RedisDriver(CacheDriver):
                 )
             else:
                 if self._pool is None:
-                    host = self.host or os.getenv("REDIS_HOST", "127.0.0.1")
-                    port = (
-                        self.port
-                        if self.port is not None
-                        else int(os.getenv("REDIS_PORT", "6379"))
-                    )
-                    password = (
-                        self.password
-                        if self.password is not None
-                        else os.getenv("REDIS_PASSWORD", None)
+                    params = resolve_redis_params(
+                        section="cache",
+                        host=self.host,
+                        port=self.port,
+                        password=self.password,
+                        database=self.database,
                     )
                     max_conns = self.max_connections or 50
 
                     self._pool = aioredis.BlockingConnectionPool(
-                        host=host,
-                        port=port,
-                        db=self.database,
-                        password=password or None,
+                        host=params["host"],
+                        port=params["port"],
+                        db=params["database"],
+                        password=params["password"] or None,
                         decode_responses=True,
                         max_connections=max_conns,
                         timeout=self.timeout,

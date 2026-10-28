@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from swiftpy.core.container import get_container
+from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.pool import DatabasePool
-
-_IDENTIFIER_REGEX = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class UniqueRule:
@@ -23,15 +21,9 @@ class UniqueRule:
         id_column: str = "id",
         pool: DatabasePool | None = None,
     ) -> None:
-        if not _IDENTIFIER_REGEX.match(table):
-            raise ValueError(f"Invalid table identifier '{table}'")
-        if not _IDENTIFIER_REGEX.match(column):
-            raise ValueError(f"Invalid column identifier '{column}'")
-        if not _IDENTIFIER_REGEX.match(id_column):
-            raise ValueError(f"Invalid column identifier '{id_column}'")
-
-        self.table = table
-        self.column = column
+        self.table = validate_identifier(table, param_name="table")
+        self.column = validate_identifier(column, param_name="column")
+        self.id_column = validate_identifier(id_column, param_name="column")
         self.ignore_id = ignore_id
         self.id_column = id_column
         self.pool = pool

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from swiftpy.database.orm.registry import _MODEL_REGISTRY
 from swiftpy.database.query_builder import Column
-from swiftpy.helpers.helper import snake_case
+from swiftpy.support.strings import snake_case
 
 if TYPE_CHECKING:
     from swiftpy.database.orm.model import Model, ModelQueryBuilder

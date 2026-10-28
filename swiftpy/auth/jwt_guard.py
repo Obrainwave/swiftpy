@@ -13,6 +13,7 @@ from swiftpy.auth.exceptions import (
 )
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist
+from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
 from swiftpy.core.context import Context
 from swiftpy.http.middleware import Handler, Middleware
@@ -76,11 +77,13 @@ async def require_jwt(
             container = get_container()
             if container.has(JWTIssuer):
                 active_issuer = container.resolve(JWTIssuer)
+            elif container.has(Config):
+                active_issuer = JWTIssuer.from_config(container.resolve(Config))
         except RuntimeError:
             pass
 
     if active_issuer is None:
-        active_issuer = JWTIssuer()
+        active_issuer = JWTIssuer.from_config()
 
     # 4. Resolve TokenBlacklist from parameters, container, or default
     active_blacklist = blacklist
@@ -108,11 +111,21 @@ async def require_jwt(
     except InvalidTokenError as exc:
         raise AuthenticationError(f"Invalid token: {exc}") from exc
 
-    # 6. Check Redis revocation blacklist if jti is present
+    # 6. Check Redis revocation blacklist if jti or subject is present
     jti = payload.get("jti")
-    if jti and active_blacklist is not None:
+    if active_blacklist is not None:
+        sub = payload.get("sub")
+        raw_iat = payload.get("iat")
+        iat = int(raw_iat) if isinstance(raw_iat, (int, float)) else None
         try:
-            if await active_blacklist.is_revoked(jti):
+            try:
+                is_rev = await active_blacklist.is_revoked(
+                    jti or "", subject=sub, issued_at=iat
+                )
+            except TypeError:
+                is_rev = bool(jti and await active_blacklist.is_revoked(jti))
+
+            if is_rev:
                 raise TokenRevokedError("Token has been revoked")
         except TokenRevokedError:
             raise
@@ -121,6 +134,7 @@ async def require_jwt(
             raise AuthenticationServiceUnavailableError(
                 f"Authentication service temporarily unavailable: Redis error ({exc})"
             ) from exc
+
 
     # 7. Attach authenticated user payload to request state and task context
     req.state["user"] = payload

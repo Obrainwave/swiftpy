@@ -8,11 +8,11 @@ from typing import Any
 import asyncpg
 
 from swiftpy.core.bootstrap import get_container
+from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.migrations.blueprint import (
     _UNSET,
     Blueprint,
     ColumnDefinition,
-    validate_identifier,
 )
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection

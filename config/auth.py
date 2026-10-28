@@ -8,9 +8,7 @@ CONFIG: dict[str, object] = {
         "jwt": {
             "driver": "jwt",
             "algorithm": env("JWT_ALGORITHM", "HS256"),
-            "secret": env(
-                "JWT_SECRET", "super-secret-key-change-in-production-32-chars!"
-            ),
+            "secret": env("JWT_SECRET", None),
             "access_token_ttl": int(env("JWT_ACCESS_TTL", "900")),
             "refresh_token_ttl": int(env("JWT_REFRESH_TTL", "604800")),
             "private_key": env("JWT_PRIVATE_KEY", None),

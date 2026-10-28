@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from swiftpy.console.stubs import get_stub
-from swiftpy.helpers.helper import pluralize, snake_case
+from swiftpy.support.strings import pluralize, snake_case
 
 
 def _pascal_case(snake_str: str) -> str:

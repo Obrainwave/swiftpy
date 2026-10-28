@@ -268,6 +268,21 @@ async def load_test_reads() -> None:
     pass
 
 
+async def test_trailing_newline_injection() -> None:
+    print("\n==== TRAILING NEWLINE Injection ====")
+    for invalid_table in ("test_users\n", "test_users\r\n", "test_users "):
+        with pytest.raises(ValueError, match="Invalid SQL identifier detected"):
+            Query.table(invalid_table)
+
+    for invalid_col in ("name\n", "name ", "name\r\n", "*"):
+        with pytest.raises(ValueError, match="Invalid SQL identifier detected"):
+            Query.table("test_users").where(invalid_col, "John")
+
+    for invalid_order in ("name\n", "name ", "name\r\n"):
+        with pytest.raises(ValueError, match="Invalid SQL column identifier detected"):
+            Query.table("test_users").order_by(invalid_order)
+
+
 async def main() -> None:
     app = create_app(providers=[AppServiceProvider, DatabaseServiceProvider])
     db_pool = app.container.resolve(DatabasePool)
@@ -288,6 +303,7 @@ async def main() -> None:
     await test_update_column_injection()
     await test_subquery_injection()
     await test_raw_where_binding_injection()
+    await test_trailing_newline_injection()
 
     await db_pool.close()
 

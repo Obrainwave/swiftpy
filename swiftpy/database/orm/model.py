@@ -23,7 +23,7 @@ from swiftpy.database.orm.relationships import (
 )
 from swiftpy.database.query_builder import Query
 from swiftpy.events.dispatcher import EventDispatcher
-from swiftpy.helpers.helper import pluralize, snake_case
+from swiftpy.support.strings import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
 _MISSING = object()

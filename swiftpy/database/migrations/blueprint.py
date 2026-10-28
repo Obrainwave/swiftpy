@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Self
 
+from swiftpy.database.identifiers import validate_identifier
+
+__all__ = [
+    "Blueprint",
+    "ColumnDefinition",
+    "ForeignKeyDefinition",
+    "IndexDefinition",
+    "validate_identifier",
+]
+
 _UNSET = object()
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
-
-
-def validate_identifier(name: str) -> str:
-    """Validate that an SQL identifier contains only alphanumeric characters and underscores."""
-    if not _IDENTIFIER_RE.match(name):
-        raise ValueError(f"Invalid SQL identifier detected: {name!r}")
-    return name
 
 
 class ColumnDefinition:
