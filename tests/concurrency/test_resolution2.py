@@ -21,10 +21,7 @@ async def test_concurrent_scoped_resolution_isolation() -> None:
 
     container = Container()
 
-    container.scoped(
-        ScopedDatabaseConnection,
-        ScopedDatabaseConnection,
-    )
+    container.scoped(ScopedDatabaseConnection)
 
     async def worker(
         index: int,
@@ -61,10 +58,7 @@ async def test_concurrent_scoped_resolution_isolation() -> None:
 async def test_scoped_resolution_reuses_instance_in_same_task() -> None:
     container = Container()
 
-    container.scoped(
-        ScopedDatabaseConnection,
-        ScopedDatabaseConnection,
-    )
+    container.scoped(ScopedDatabaseConnection)
 
     first = container.resolve(
         ScopedDatabaseConnection,
@@ -80,10 +74,7 @@ async def test_scoped_resolution_reuses_instance_in_same_task() -> None:
 def test_singleton_resolution_returns_same_instance() -> None:
     container = Container()
 
-    container.singleton(
-        ScopedDatabaseConnection,
-        ScopedDatabaseConnection,
-    )
+    container.singleton(ScopedDatabaseConnection)
 
     first = container.resolve(
         ScopedDatabaseConnection,

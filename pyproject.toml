@@ -21,6 +21,7 @@ dependencies = [
 
 [tool.mypy]
 strict = true
+exclude = ["examples/"]
 
 [[tool.mypy.overrides]]
 module = ["asyncpg"]

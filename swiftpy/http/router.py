@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
+from swiftpy.core.exceptions import MethodNotAllowedError
+
 RouteHandler = Any
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -101,6 +103,13 @@ class RouteGroup:
 
         return decorator
 
+    def websocket(self, path: str) -> Callable[[F], F]:
+        def decorator(func: F) -> F:
+            self._add_route("WEBSOCKET", path, func)
+            return func
+
+        return decorator
+
 
 class Router:
     def __init__(self) -> None:
@@ -164,6 +173,12 @@ class Router:
             path,
         )
 
+    def websocket(self, path: str) -> Callable[[F], F]:
+        return self.route(
+            "WEBSOCKET",
+            path,
+        )
+
     def match(
         self,
         method: str,
@@ -181,7 +196,8 @@ class Router:
                 continue
 
             if route.method != method:
-                allowed_methods.append(route.method)
+                if method != "WEBSOCKET" and route.method != "WEBSOCKET":
+                    allowed_methods.append(route.method)
                 continue
 
             params = match.groupdict()
@@ -217,8 +233,6 @@ class Router:
             return route, params
 
         if allowed_methods:
-            from swiftpy.core.exceptions import MethodNotAllowedError
-
             unique_methods = sorted(set(allowed_methods))
             raise MethodNotAllowedError(
                 f"Method '{method}' not allowed for path '{path}'. Allowed: {', '.join(unique_methods)}",

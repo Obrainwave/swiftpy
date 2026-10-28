@@ -1,0 +1,21 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+class {class_name}:
+    """{class_name} API resource transformer."""
+
+    def __init__(self, resource: Any) -> None:
+        self.resource = resource
+
+    def to_dict(self) -> dict[str, Any]:
+        """Transform the resource into an array/dict."""
+        return {
+            "id": getattr(self.resource, "id", None),
+        }
+
+    @classmethod
+    def collection(cls, items: list[Any]) -> list[dict[str, Any]]:
+        """Transform a collection of resources."""
+        return [cls(item).to_dict() for item in items]

@@ -1231,10 +1231,13 @@ async def test_duplicate_authorization_and_api_key_headers_rejected() -> None:
 
     @app.get("/apikey-guarded")
     async def guarded_key(request: Request) -> Response:
+        async def _val(k: str) -> dict[str, str] | None:
+            return {"user": k} if k == "valid_key" else None
+
         await require_api_key(
             request,
             header_name="x-api-key",
-            key_validator=lambda k: {"user": k} if k == "valid_key" else None,
+            key_validator=_val,
         )
         return json_response({"ok": True})
 

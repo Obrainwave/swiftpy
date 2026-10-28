@@ -368,3 +368,106 @@ Transfer/sec:    482.06KB
      - Active queue and delayed queue completely drained to 0.
      - Dead letter queue size = 0.
      - All 3 worker processes exited cleanly with exit code 0.
+---
+
+## Week 16 - WebSockets and Phase 3 Verification
+
+### Status: PASSED
+* **Test Modules:** `tests/websockets/test_websocket_connection.py`, `tests/websockets/test_websocket_manager.py`, `tests/websockets/test_websocket_concurrency.py`, `tests/websockets/test_websocket_routing_and_lifecycle.py`, & `tests/integration/test_queue_event_websocket.py`
+* **Results:** All **35 WebSocket and Integration tests passed** (100% test pass rate across **304 total tests** in repository; strict mypy typing verified across 118 source files; ruff compliant).
+* **Verified Guarantees & Architectural Principles:**
+1. **ASGI WebSocket Connection Wrapper (`swiftpy/websockets/connection.py`):**
+   - **Full ASGI 3.0 Lifecycle Support:** Implemented `WebSocketConnection` (aliased as `WebSocket`) wrapping ASGI scope, `receive`, and `send` callables. Supports `accept()`, `receive()`, `send()`, and `close()`.
+   - **Handshake Protocol Invariants:** Accurately reads `websocket.connect` and sends `websocket.accept` with negotiated subprotocols and custom headers. Calling `accept()` repeatedly raises `WebSocketException`, and calling `close()` before accept cleanly transmits a closing handshake (e.g. 1008 rejection). Repeated `close()` calls are idempotent.
+   - **Type-Strict Message Handling:** Enforces frame type integrity: `receive_text()` strictly accepts text frames (raising `WebSocketException` on binary frames), `receive_bytes()` strictly accepts binary frames (raising `WebSocketException` on text frames), and `receive_json()` safely catches malformed JSON and raises `WebSocketException`. Polymorphic `send()` automatically encodes strings, binary bytes, and JSON serializable dictionaries/lists.
+   - **Connection State Machine:** Explicit `WebSocketState` (`CONNECTING`, `CONNECTED`, `DISCONNECTED`) with clean tracking of `close_code` and `close_reason`. Transmitting messages after client disconnect raises `WebSocketException` or `WebSocketDisconnect`.
+   - **Parameter Extraction & Coercion:** Exposes `path`, `headers` (decoded Latin-1 and normalized), `query_params` (scalar), `query_param_list` (multi-value list), and per-connection `state`. Route parameters are matched and typed using handler type annotations.
+2. **WebSocket Connection Manager (`swiftpy/websockets/manager.py`):**
+   - **Active Connection & Room Tracking:** Implemented `WebSocketManager` managing active connections and room subscriptions with `asyncio.Lock` concurrency safety.
+   - **Concurrent Broadcast Distribution:** Non-blocking `broadcast()` sends messages concurrently across all target connections using `asyncio.gather(..., return_exceptions=True)`.
+   - **Pruning & Room Isolation:** Supports targeting specific rooms (`broadcast(msg, room="...")`) or custom predicate filters (`filter_fn=...`). Dead connections or connections that fail during `send()` are automatically pruned from active connections and room membership without interrupting delivery to other recipients.
+   - **Fault-Isolated Filtering:** Custom `filter_fn` predicates that raise exceptions are caught and isolated, preventing an erroneous filter callback from aborting broadcasts to other valid connections.
+   - **Invariants & Idempotency:** Connections can belong to multiple rooms simultaneously, leave individual rooms via `leave_room()`, or be completely removed via `disconnect()`. Repeated `connect()` and `disconnect()` calls are idempotent.
+   - **IoC Container Integration:** Registered as singleton in the application container, accessible via `app.websocket_manager`, `container.resolve(WebSocketManager)`, or `websocket_manager()` / `ws_manager()` helper functions.
+3. **Phase 1 Router & ASGI Application Wiring:**
+   - **Unified Router Decorator:** Added `@app.websocket("/ws/chat/{room_id}")` and `@router.websocket(...)` / `@group.websocket(...)` into the Phase 1 router.
+   - **Routing Isolation:** HTTP 405 Method Not Allowed responses strictly exclude `WEBSOCKET` from HTTP `Allow` headers, preventing HTTP/WS method confusion.
+   - **Dispatched Handler Wrapping:** `_wrap_websocket_handler` dynamically binds `WebSocketConnection` and coerced path parameters based on handler signatures.
+   - **Lifespan & Context Isolation:** `Application.__call__` routes `scope["type"] == "websocket"` and `scope["type"] == "lifespan"`. Manages task-scoped `Context.set("websocket", ws)`, handles `WebSocketDisconnect`, logs unhandled exceptions, and guarantees `Context.clear()` in `finally` across all exit paths (including 404 route not found and 1002 path parameter coercion errors). Lifespan startup failure emits standard `lifespan.startup.failed`.
+4. **In-Process Testing Driver (`WebSocketTestSession`):**
+   - Extended `TestClient` with `websocket_connect(path)` returning a non-blocking in-process `WebSocketTestSession` executing ASGI coroutines without network overhead or socket port exhaustion. Stores accepted subprotocols and headers, and normalizes response headers for case-insensitive access.
+5. **High-Concurrency Stress Verification:**
+   - Verified **50 concurrent in-process WebSocket sessions** received the expected broadcast with zero dropped messages.
+   - Verified concurrent room isolation with **40 in-process sessions** across distinct rooms.
+   - Verified concurrent request/acknowledgment exchanges across **30 simultaneous sessions**.
+   - Verified concurrent full-duplex messaging with **15 concurrent sessions** executing independent sender and receiver tasks simultaneously on the same connection.
+   - All concurrency tests utilize structured `try ... finally` blocks guaranteeing task cancellation and `asyncio.gather(..., return_exceptions=True)` teardown on assertion failures or timeouts.
+6. **Queue-to-Event-to-WebSocket Integration:**
+   - Verified the queue → event dispatcher → WebSocket manager path using an in-process `QueueWorker`, including delivery to clients in the target room and isolation from another room.
+   - Test teardown executes in a guaranteed `try ... finally` block, ensuring Redis key cleanup and singleton resets (`WebSocketManager`, `EventDispatcher`, `QueueDispatcher`, trusted namespaces) even if test assertions fail.
+
+---
+
+## Phase 3 Verification Checklist
+
+- [x] **Cache operations are correct under concurrent access, verified by a stress test.**
+  - Verified in `tests/cache/test_cache_concurrency.py` (200 concurrent tasks across `MemoryDriver` and `RedisDriver` verifying atomic `add()`, `increment()`, distributed stampede-protected `remember()`, and same-key writes).
+- [x] **Events fire and are received both within a single process and across worker processes via Redis.**
+  - Verified in `tests/events/test_event_dispatcher.py` and `tests/events/test_redis_bus.py` (cross-process Redis Pub/Sub delivery between independent OS processes).
+- [x] **Queued jobs are processed exactly once under concurrent workers, with retry and dead lettering both verified.**
+  - Verified in `tests/queue/test_queue.py` (500 distinct jobs processed exactly once across 3 independent OS worker processes with zero duplicates and zero dropped jobs, plus retry with backoff and Dead Letter Queue routing).
+- [x] **WebSocket connections accept, send, receive, and broadcast correctly, verified with multiple simultaneous connections.**
+  - Verified in `tests/websockets/test_websocket_connection.py`, `tests/websockets/test_websocket_manager.py`, `tests/websockets/test_websocket_concurrency.py`, and `tests/websockets/test_websocket_routing_and_lifecycle.py` (50 simultaneous connections receiving broadcasts, room isolation, send failure pruning, concurrent disconnect/broadcast races, and full-duplex sender/receiver tasks).
+- [x] **The queue-to-event-to-WebSocket integration test passes end to end.**
+  - Verified in `tests/integration/test_queue_event_websocket.py` (queued job processed by in-process worker -> fires event -> broadcasts via WebSocket manager to clients in targeted room with guaranteed teardown).
+
+---
+
+## Week 17 - Developer Experience: CLI Scaffolding & Code Generation Stubs
+
+### Status: PASSED
+* **Test Modules:** `tests/console/test_stubs_and_make.py`
+* **Results:** All **7 scaffolding and make tests passed** (100% test pass rate across **311 total tests** in repository; strict mypy typing verified across 120 source files; ruff compliant).
+* **Verified Features & Architectural Design:**
+1. **Dedicated Stubs Engine (`swiftpy/console/stubs/`):**
+   - Implemented `get_stub(name: str) -> str` supporting dotted paths (`migration.create`), snake_case names (`migration_create`), and explicit extensions (`migration.create.stub`).
+   - Reusable template stubs:
+     - `migration.create.stub`, `migration.alter.stub`, `migration.update.stub`, `migration.blank.stub`, `migration.stub`.
+     - `model.stub`: Active Record model template with `__table__`, `__fillable__`, and standard timestamps.
+     - `service.stub`: Business logic service class template.
+     - `request.stub`: FormRequest validation class template with typed `rules()` method.
+     - `resource.stub`: API resource transformer class template with `to_dict()` and `collection()`.
+     - `repository.stub`: Data access repository class template.
+     - `schema.stub`: Data schema template with `schema = {}`.
+2. **Laravel-Style Generators (`swiftpy/console/commands/make.py`):**
+   - **`make:model <name> [-m] [--table] [--path] [--force]`:**
+     - Scaffolds Active Record models in `app/models/` (creates directory automatically if absent).
+     - Infers snake_cased pluralized table name from model name (or honors explicit `--table`).
+     - Supports `-m` / `--migration` flag: automatically generates the corresponding `create_<table_name>_table` migration in `database/migrations/`.
+   - **`make:service <name> [--path] [--force]`:** Scaffolds business services into `app/services/`.
+   - **`make:request <name> [--path] [--force]`:** Scaffolds form requests into `app/http/requests/`.
+   - **`make:resource <name> [--path] [--force]`:** Scaffolds API resources into `app/http/resources/`.
+   - **`make:repository <name> [--path] [--force]`:** Scaffolds repositories into `app/repositories/`.
+   - **`make:schema <name> [--path] [--force]`:** Scaffolds schemas into `app/schemas/`.
+3. **Robust Scaffolding Invariants:**
+   - **Nested Namespaces & Subdirectories:** E.g., `make:request Auth/LoginRequest` scaffolds into `app/http/requests/Auth/login_request.py` with `class LoginRequest(FormRequest)`.
+   - **Collision Protection:** Prevents unintentional file clobbering by raising an error if target exists, unless `--force` is specified.
+   - **Literal Braces Compatibility:** Uses direct placeholder substitution instead of `str.format()` to avoid syntax collisions with Python dictionary braces `{}` in stubs.
+
+---
+
+## Phase 0 - Green Tooling Baseline Verification
+
+### Status: PASSED
+* **Tasks Executed:** P0-T1 to P0-T4 (Environment, stray root scripts, test typing declarations, baseline capture)
+* **Date:** 2026-10-28
+* **Quality Gate Results:**
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy swiftpy`: **Success: no issues found in 114 source files** (100% clean under strict mypy)
+  - `mypy .`: Down from 82 errors in 14 files to 25 errors in 1 file (`tests/orm/test_eager_loading.py`). All 25 remaining errors are the documented public typing gap for Active Record relationships (`HasMany`, `BelongsToMany`, `HasOne`, `BelongsTo` descriptor typing), scheduled for structural resolution in Phase 7 (P7-M6).
+  - `pytest`: **311 passed in 132.78s** (0:02:12) with full test suite green.
+* **Environment & Source Changes:**
+  - Cleaned root-owned cache artifacts (`.venv`, `.ruff_cache`, `.mypy_cache`, `.pytest_cache`) via Docker and initialized clean host venv using `uv sync --frozen` (Decision D-0).
+  - Relocated standalone scripts `asgi_app.py` and `test_asyncio.py` to `examples/` and added `exclude = ["examples/"]` in `pyproject.toml`.
+  - Added attribute and return type annotations to test modules across `tests/app`, `tests/auth`, `tests/db`, `tests/http`, `tests/concurrency`, `tests/stress`, `tests/validation`, `tests/test_placeholder.py`, and `tests/orm`.
+

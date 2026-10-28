@@ -124,7 +124,7 @@ async def nested_transaction_test() -> None:
 async def warm_pool(db_pool: DatabasePool) -> None:
     pool = db_pool.get_pool()
 
-    async def touch():
+    async def touch() -> None:
         async with pool.acquire() as conn:
             await conn.execute("SELECT 1")
 

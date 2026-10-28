@@ -125,4 +125,4 @@ class CustomServiceProvider(ServiceProvider):
     provider_inst = next(
         p for p in app._providers if type(p).__name__ == "CustomServiceProvider"
     )
-    assert type(provider_inst).booted is True
+    assert getattr(type(provider_inst), "booted", False) is True

@@ -10,6 +10,7 @@ from swiftpy.core.config import Config
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
+from swiftpy.websockets.manager import WebSocketManager
 
 _UNCOUNTABLES = {
     "aircraft",
@@ -185,6 +186,20 @@ async def dispatch(
     return await q.push(job, queue=queue_name, delay=delay)
 
 
+def websocket_manager() -> WebSocketManager:
+    """Retrieve the application WebSocketManager."""
+    try:
+        wm: WebSocketManager = get_container().resolve(WebSocketManager)
+        return wm
+    except RuntimeError:
+        return WebSocketManager.get_instance()
+
+
+def ws_manager() -> WebSocketManager:
+    """Alias for websocket_manager()."""
+    return websocket_manager()
+
+
 __all__ = [
     "app",
     "cache",
@@ -198,4 +213,6 @@ __all__ = [
     "queue",
     "resolve",
     "snake_case",
+    "websocket_manager",
+    "ws_manager",
 ]

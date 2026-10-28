@@ -38,12 +38,14 @@ class QueryCounter:
 # Models demonstrating multiple relationship types and inheritance
 class Role(Model):
     __table__ = "orm_roles"
+    id: int
     name: str
     users = BelongsToMany("User", pivot_table="orm_user_roles")
 
 
 class Profile(Model):
     __table__ = "orm_profiles"
+    id: int
     user_id: int
     bio: str
     user = BelongsTo("User", foreign_key="user_id")
@@ -51,6 +53,7 @@ class Profile(Model):
 
 class Post(Model):
     __table__ = "orm_posts"
+    id: int
     user_id: int
     title: str
     published: bool = True
@@ -60,6 +63,7 @@ class Post(Model):
 
 class User(Model):
     __table__ = "orm_users"
+    id: int
     name: str
     email: str = ""
     is_admin: bool = False
@@ -74,6 +78,7 @@ class AdminUser(User):
 
 class SecureUser(Model):
     __table__ = "orm_users"
+    id: int
     name: str
     email: str = ""
     is_admin: bool = False

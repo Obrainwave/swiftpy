@@ -7,16 +7,16 @@ from swiftpy.core.context import Context
 
 
 @pytest.mark.asyncio
-async def test_request_task_isolation():
+async def test_request_task_isolation() -> None:
     Context.clear()
 
-    async def task_a():
+    async def task_a() -> None:
         Context.set("req_id", "A")
         await asyncio.sleep(0.01)
         assert Context.get("req_id") == "A"
         assert not Context.has("req_id_b")
 
-    async def task_b():
+    async def task_b() -> None:
         Context.set("req_id_b", "B")
         await asyncio.sleep(0.01)
         assert Context.get("req_id_b") == "B"
@@ -27,11 +27,11 @@ async def test_request_task_isolation():
 
 
 @pytest.mark.asyncio
-async def test_child_task_inheritance_and_isolation():
+async def test_child_task_inheritance_and_isolation() -> None:
     Context.clear()
     Context.set("tenant", "acme")
 
-    async def child_task():
+    async def child_task() -> None:
         # Child inherits parent's context value
         assert Context.get("tenant") == "acme"
         # Child mutates its copy
@@ -46,7 +46,7 @@ async def test_child_task_inheritance_and_isolation():
 
 
 @pytest.mark.asyncio
-async def test_isolation_under_load():
+async def test_isolation_under_load() -> None:
     """The actual Phase 1 gate: 500 concurrent tasks, zero leaks."""
     Context.clear()
 
@@ -54,7 +54,7 @@ async def test_isolation_under_load():
         unique_val = f"user_{i}_{uuid.uuid4()}"
         Context.set("user_id", unique_val)
         await asyncio.sleep(0.001 * (i % 10))
-        return Context.get("user_id") == unique_val
+        return bool(Context.get("user_id") == unique_val)
 
     results = await asyncio.gather(*(worker(i) for i in range(500)))
     failures = results.count(False)
@@ -64,7 +64,7 @@ async def test_isolation_under_load():
 
 
 @pytest.mark.asyncio
-async def test_get_default_fallback():
+async def test_get_default_fallback() -> None:
     """Covers DEVLOG guarantee #3, currently unverified."""
     Context.clear()
     assert Context.get("never_set") is None

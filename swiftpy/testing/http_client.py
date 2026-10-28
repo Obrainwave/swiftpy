@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+from types import TracebackType
 from typing import Any
 from urllib.parse import urlencode
+
+from swiftpy.websockets.connection import WebSocketDisconnect
+
+logger = logging.getLogger("swiftpy.testing")
 
 
 class TestResponse:
@@ -249,7 +256,10 @@ class TestClient:
             if message["type"] == "http.response.start":
                 status_code = message["status"]
                 for k, v in message.get("headers", []):
-                    resp_headers[k.decode("latin-1")] = v.decode("latin-1")
+                    h_key = k.decode("latin-1")
+                    h_val = v.decode("latin-1")
+                    resp_headers[h_key] = h_val
+                    resp_headers[h_key.lower()] = h_val
             elif message["type"] == "http.response.body":
                 resp_body.extend(message.get("body", b""))
 
@@ -328,5 +338,226 @@ class TestClient:
     ) -> TestResponse:
         return await self.request("DELETE", path, headers=headers, query=query)
 
+    def websocket_connect(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        subprotocols: list[str] | None = None,
+    ) -> WebSocketConnectCM:
+        """Establish an in-process WebSocket connection."""
+        return WebSocketConnectCM(
+            self, path, headers=headers, subprotocols=subprotocols
+        )
 
-__all__ = ["TestClient", "TestResponse"]
+
+class WebSocketTestSession:
+    """
+    In-process WebSocket test session for testing ASGI WebSocket endpoints.
+    """
+
+    __test__ = False
+
+    def __init__(
+        self,
+        app: Any,
+        default_headers: dict[str, str] | None = None,
+    ) -> None:
+        self.app = app
+        self.default_headers = default_headers or {}
+        self._to_app_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._from_app_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._app_task: asyncio.Task[None] | None = None
+        self.is_closed = False
+        self.accepted_subprotocol: str | None = None
+        self.accepted_headers: list[tuple[bytes, bytes]] = []
+
+    async def connect(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        subprotocols: list[str] | None = None,
+    ) -> None:
+        parsed_path = path
+        query_string = b""
+        if "?" in path:
+            parsed_path, raw_qs = path.split("?", 1)
+            query_string = raw_qs.encode("ascii")
+
+        req_headers = dict(self.default_headers)
+        if headers:
+            req_headers.update(headers)
+
+        raw_headers = [
+            (k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in req_headers.items()
+        ]
+
+        scope: dict[str, Any] = {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "scheme": "ws",
+            "path": parsed_path,
+            "raw_path": parsed_path.encode("ascii"),
+            "query_string": query_string,
+            "headers": raw_headers,
+            "subprotocols": subprotocols or [],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 80),
+        }
+
+        await self._to_app_queue.put({"type": "websocket.connect"})
+
+        async def receive() -> dict[str, Any]:
+            return await self._to_app_queue.get()
+
+        async def send(message: dict[str, Any]) -> None:
+            await self._from_app_queue.put(message)
+
+        self._app_task = asyncio.create_task(self.app(scope, receive, send))
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                logger.debug("WebSocket app task ended with exception", exc_info=t.exception())
+
+        self._app_task.add_done_callback(_on_done)
+
+        try:
+            msg = await asyncio.wait_for(self._from_app_queue.get(), timeout=5.0)
+        except TimeoutError:
+            self.is_closed = True
+            if self._app_task and not self._app_task.done():
+                self._app_task.cancel()
+            raise TimeoutError("Timed out waiting for WebSocket handshake response") from None
+
+        if msg["type"] == "websocket.close":
+            self.is_closed = True
+            code = msg.get("code", 1000)
+            reason = msg.get("reason", "")
+            raise WebSocketDisconnect(code=code, reason=reason)
+
+        if msg["type"] == "websocket.accept":
+            self.accepted_subprotocol = msg.get("subprotocol")
+            self.accepted_headers = msg.get("headers", [])
+
+    async def send_text(self, text: str) -> None:
+        if self.is_closed:
+            raise WebSocketDisconnect(1000, "Connection already closed")
+        await self._to_app_queue.put({"type": "websocket.receive", "text": text})
+
+    async def send_bytes(self, data: bytes) -> None:
+        if self.is_closed:
+            raise WebSocketDisconnect(1000, "Connection already closed")
+        await self._to_app_queue.put({"type": "websocket.receive", "bytes": data})
+
+    async def send_json(self, data: Any) -> None:
+        await self.send_text(json.dumps(data))
+
+    async def receive_raw(self, timeout: float = 5.0) -> dict[str, Any]:
+        if self.is_closed:
+            raise WebSocketDisconnect(1000, "Connection already closed")
+        try:
+            msg = await asyncio.wait_for(self._from_app_queue.get(), timeout=timeout)
+        except TimeoutError:
+            raise TimeoutError("Timed out waiting for message from WebSocket") from None
+
+        if msg["type"] == "websocket.close":
+            self.is_closed = True
+            code = msg.get("code", 1000)
+            reason = msg.get("reason", "")
+            raise WebSocketDisconnect(code=code, reason=reason)
+
+        return msg
+
+    async def receive_text(self, timeout: float = 5.0) -> str:
+        msg = await self.receive_raw(timeout=timeout)
+        if "text" in msg and msg["text"] is not None:
+            return str(msg["text"])
+        if "bytes" in msg and msg["bytes"] is not None:
+            return bytes(msg["bytes"]).decode("utf-8")
+        return ""
+
+    async def receive_bytes(self, timeout: float = 5.0) -> bytes:
+        msg = await self.receive_raw(timeout=timeout)
+        if "bytes" in msg and msg["bytes"] is not None:
+            return bytes(msg["bytes"])
+        if "text" in msg and msg["text"] is not None:
+            return str(msg["text"]).encode("utf-8")
+        return b""
+
+    async def receive_json(self, timeout: float = 5.0) -> Any:
+        text = await self.receive_text(timeout=timeout)
+        return json.loads(text)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        if self.is_closed:
+            return
+        self.is_closed = True
+        await self._to_app_queue.put(
+            {"type": "websocket.disconnect", "code": code, "reason": reason}
+        )
+        if self._app_task and not self._app_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._app_task), timeout=2.0)
+            except (TimeoutError, asyncio.CancelledError):
+                self._app_task.cancel()
+
+
+class WebSocketConnectCM:
+    """Async context manager and awaitable for connecting to an ASGI WebSocket endpoint."""
+
+    __test__ = False
+
+    def __init__(
+        self,
+        client: TestClient,
+        path: str,
+        headers: dict[str, str] | None = None,
+        subprotocols: list[str] | None = None,
+    ) -> None:
+        self.client = client
+        self.path = path
+        self.headers = headers
+        self.subprotocols = subprotocols
+        self.session: WebSocketTestSession | None = None
+
+    async def __aenter__(self) -> WebSocketTestSession:
+        session = WebSocketTestSession(
+            self.client.app, default_headers=self.client._default_headers
+        )
+        await session.connect(
+            self.path, headers=self.headers, subprotocols=self.subprotocols
+        )
+        self.session = session
+        return session
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        if self.session is not None:
+            await self.session.close()
+
+    def __await__(self) -> Any:
+        async def _connect() -> WebSocketTestSession:
+            session = WebSocketTestSession(
+                self.client.app, default_headers=self.client._default_headers
+            )
+            await session.connect(
+                self.path, headers=self.headers, subprotocols=self.subprotocols
+            )
+            return session
+
+        return _connect().__await__()
+
+
+__all__ = [
+    "TestClient",
+    "TestResponse",
+    "WebSocketConnectCM",
+    "WebSocketTestSession",
+]

@@ -11,9 +11,9 @@ class ScopedDatabaseConnection:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_scoped_resolution_isolation():
+async def test_concurrent_scoped_resolution_isolation() -> None:
     container = Container()
-    container.scoped(ScopedDatabaseConnection, ScopedDatabaseConnection)
+    container.scoped(ScopedDatabaseConnection)
 
     async def worker(
         index: int,

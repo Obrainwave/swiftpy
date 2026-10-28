@@ -26,7 +26,7 @@ class SynchronizedSlowRule(ValidatorRule):
     async def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
         self.slow_started.set()
         await asyncio.wait_for(self.fast_finished.wait(), timeout=5.0)
-        return value == "valid_payload"
+        return bool(value == "valid_payload")
 
     def message(self, field: str) -> str:
         return f"The {field} verification failed."

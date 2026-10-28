@@ -240,7 +240,7 @@ async def test_validator_rule_protocol_and_custom_rules() -> None:
     class AsyncExternalCheckRule:
         async def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
             await asyncio.sleep(0.01)
-            return value == "valid_token"
+            return bool(value == "valid_token")
 
         def message(self, field: str) -> str:
             return f"The {field} verification failed."
@@ -506,7 +506,8 @@ async def test_bool_rule_complete_tokens() -> None:
         assert type(res.validated_data["flag"]) is bool
 
     # Rejected tokens
-    for bad in ("yes", "no", 2, -1, 3.14, None, "maybe", [], {}):
+    rejected_tokens: list[Any] = ["yes", "no", 2, -1, 3.14, None, "maybe", [], {}]
+    for bad in rejected_tokens:
         res = await validate({"flag": bad}, schema)
         assert res.is_valid is False, f"Unexpectedly accepted {bad!r}"
 
@@ -533,7 +534,7 @@ async def test_custom_rule_duck_typing_and_fallbacks() -> None:
     # 1. Custom rule with passes() only (no validate method)
     class PassesOnlyRule:
         def passes(self, field: str, value: Any, data: dict[str, Any]) -> bool:
-            return value == "secret"
+            return bool(value == "secret")
 
         def message(self, field: str) -> str:
             return "Passes-only rule rejected value."
@@ -543,7 +544,8 @@ async def test_custom_rule_duck_typing_and_fallbacks() -> None:
 
     res_fail = await validate({"code": "wrong"}, {"code": [PassesOnlyRule()]})
     assert res_fail.is_valid is False
-    assert "Passes-only" in res_fail.first_error("code")
+    first_err = res_fail.first_error("code")
+    assert first_err is not None and "Passes-only" in first_err
 
     # 2. Custom rule with string message attribute instead of callable
     class StringMessageRule:

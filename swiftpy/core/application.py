@@ -25,6 +25,12 @@ from swiftpy.http.router import PathParamCoercionError, RouteGroup, Router
 from swiftpy.validation.exceptions import ValidationException
 from swiftpy.validation.form_request import FormRequest
 from swiftpy.validation.validator import validate
+from swiftpy.websockets.connection import (
+    WebSocket,
+    WebSocketConnection,
+    WebSocketDisconnect,
+)
+from swiftpy.websockets.manager import WebSocketManager
 
 logger = logging.getLogger("swiftpy")
 
@@ -144,11 +150,13 @@ class Application:
         self.exception_handler = ExceptionHandler(debug=self.debug)
 
         # 3. Register core singletons into container
+        self.websocket_manager = WebSocketManager.get_instance()
         self.container.instance(Application, self)
         self.container.instance(Container, self.container)
         self.container.instance(Router, self.router)
         self.container.instance(Config, self.config)
         self.container.instance(ExceptionHandler, self.exception_handler)
+        self.container.instance(WebSocketManager, self.websocket_manager)
 
         # 4. Bind active container globally
         set_container(self.container)
@@ -312,11 +320,64 @@ class Application:
 
         return dispatched_handler
 
+    def _wrap_websocket_handler(self, handler: Any) -> Any:
+        sig = inspect.signature(handler)
+        try:
+            type_hints = get_type_hints(handler)
+        except (NameError, TypeError, ValueError):
+            type_hints = {}
+
+        async def dispatched_ws_handler(
+            websocket: WebSocketConnection, *args: Any, **params: Any
+        ) -> Any:
+            call_kwargs: dict[str, Any] = {}
+            for name, param in sig.parameters.items():
+                param_ann = type_hints.get(name, param.annotation)
+                if (
+                    name in ("websocket", "ws", "conn", "connection")
+                    or param_ann is WebSocketConnection
+                    or param_ann is WebSocket
+                    or param.annotation is WebSocketConnection
+                    or param.annotation is WebSocket
+                ):
+                    call_kwargs[name] = websocket
+                elif name in params:
+                    call_kwargs[name] = params[name]
+
+            if websocket not in call_kwargs.values() and sig.parameters:
+                for name, param in sig.parameters.items():
+                    if name not in call_kwargs and name not in params:
+                        call_kwargs[name] = websocket
+                        break
+
+            has_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if has_var_keyword:
+                for k, v in params.items():
+                    if k not in call_kwargs:
+                        call_kwargs[k] = v
+
+            if inspect.iscoroutinefunction(handler):
+                return await handler(**call_kwargs)
+            res = handler(**call_kwargs)
+            if inspect.isawaitable(res):
+                return await res
+            return res
+
+        return dispatched_ws_handler
+
     def _compile_routes(self) -> None:
         for route in self.router.routes:
-            wrapped = self._wrap_handler(route.handler)
-            pipeline = MiddlewarePipeline(self.container, route.middleware)
-            route.compiled_handler = pipeline.wrap(wrapped)
+            if route.method == "WEBSOCKET":
+                route.compiled_handler = self._wrap_websocket_handler(route.handler)
+            else:
+                wrapped = self._wrap_handler(route.handler)
+                pipeline = MiddlewarePipeline(self.container, route.middleware)
+                route.compiled_handler = pipeline.wrap(wrapped)
+
+    def websocket(self, path: str) -> Callable[[F], F]:
+        return self.router.websocket(path)
 
     def get(self, path: str) -> Callable[[F], F]:
         return self.router.get(path)
@@ -362,11 +423,52 @@ class Application:
                 while True:
                     message = await receive()
                     if message["type"] == "lifespan.startup":
-                        self.boot()
-                        await send({"type": "lifespan.startup.complete"})
+                        try:
+                            self.boot()
+                            await send({"type": "lifespan.startup.complete"})
+                        except Exception as exc:
+                            logger.exception("Lifespan startup failed")
+                            await send({"type": "lifespan.startup.failed", "message": str(exc)})
+                            return
                     elif message["type"] == "lifespan.shutdown":
                         await send({"type": "lifespan.shutdown.complete"})
                         return
+
+            if scope["type"] == "websocket":
+                if not self._booted:
+                    self.boot()
+
+                set_container(self.container)
+                connection = WebSocketConnection(scope, receive, send)
+                Context.set("websocket", connection)
+                try:
+                    try:
+                        route, params = self.router.match("WEBSOCKET", connection.path)
+                    except PathParamCoercionError:
+                        await connection.close(code=1002, reason="Invalid path parameter")
+                        return
+
+                    if route is None:
+                        await connection.close(code=1000, reason="Not Found")
+                        return
+
+                    handler = route.compiled_handler
+                    if handler is None:
+                        handler = self._wrap_websocket_handler(route.handler)
+
+                    try:
+                        await handler(connection, **params)
+                        if connection.is_connected:
+                            await connection.close(code=1000)
+                    except WebSocketDisconnect:
+                        pass
+                    except Exception:
+                        logger.exception("Unhandled exception in WebSocket handler")
+                        if connection.is_connected:
+                            await connection.close(code=1011, reason="Internal Server Error")
+                finally:
+                    Context.clear()
+                return
 
             if scope["type"] != "http":
                 return
