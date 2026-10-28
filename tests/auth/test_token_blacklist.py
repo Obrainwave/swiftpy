@@ -1,23 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import timedelta
-
 
 import pytest
 
 from swiftpy.auth.jwt_issuer import InvalidSignatureError, JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist
+from swiftpy.core.container import Container, set_container
+
+
+def test_decode_unverified_removed_p2a3() -> None:
+    """Verifies that JWTIssuer.decode_unverified is removed so unverified decoding is impossible."""
+    assert not hasattr(JWTIssuer, "decode_unverified")
 
 
 @pytest.mark.asyncio
-async def test_revoke_token_requires_signature() -> None:
-    """Verifies that unsigned or tampered tokens cannot revoke arbitrary JTIs."""
+async def test_revoke_token_requires_issuer_and_signature() -> None:
+    """Verifies that unsigned or tampered tokens cannot revoke arbitrary JTIs and issuer is required."""
+    set_container(Container())
     issuer1 = JWTIssuer(secret="test-secret-revocation-valid-32-bytes!!")
     issuer_bad = JWTIssuer(secret="test-secret-revocation-wrong-32-bytes!")
 
     prefix = f"test_jwt_bl_{uuid.uuid4().hex[:8]}:"
+    blacklist_no_issuer = TokenBlacklist(prefix=prefix)
+    token_valid = issuer1.issue_access_token(subject=123)
+
+    with pytest.raises(ValueError, match="JWTIssuer is required"):
+        await blacklist_no_issuer.revoke_token(token_valid)
+    await blacklist_no_issuer.close()
+
     blacklist = TokenBlacklist(prefix=prefix, issuer=issuer1)
     await blacklist.clear()
 
@@ -77,7 +91,9 @@ async def test_concurrent_get_client_creates_one_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_revoke_all_for_subject_invalidates_older_tokens() -> None:
+async def test_revoke_all_for_subject_invalidates_older_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verifies that revoke_all_for_subject sets a per-subject cutoff that invalidates older tokens."""
     issuer = JWTIssuer(secret="test-secret-revocation-valid-32-bytes!!")
     prefix = f"test_jwt_bl_{uuid.uuid4().hex[:8]}:"
@@ -85,23 +101,23 @@ async def test_revoke_all_for_subject_invalidates_older_tokens() -> None:
     await blacklist.clear()
 
     user_id = 456
+    base_time = int(time.time())
 
-    # 1. Issue token 1 (past/current timestamp)
+    # 1. Issue token 1 at base_time - 10
+    monkeypatch.setattr(time, "time", lambda: float(base_time - 10))
     token1 = issuer.issue_access_token(subject=user_id)
     payload1 = issuer.decode_token(token1)
 
-    # 2. Revoke all for subject
-    # Ensure monotonic timestamp boundary
-    await asyncio.sleep(1.05)
+    # 2. Revoke all for subject at base_time - 5
+    monkeypatch.setattr(time, "time", lambda: float(base_time - 5))
     await blacklist.revoke_all_for_subject(user_id)
 
-    # 3. Issue token 2 after revoke_all
-    await asyncio.sleep(1.05)
+    # 3. Issue token 2 at base_time (after revoke_all)
+    monkeypatch.setattr(time, "time", lambda: float(base_time))
     token2 = issuer.issue_access_token(subject=user_id)
-
     payload2 = issuer.decode_token(token2)
 
-    # Token 1 was issued before or at cutoff -> revoked
+    # Token 1 was issued before cutoff -> revoked
     assert (
         await blacklist.is_revoked(
             payload1["jti"],
@@ -143,4 +159,5 @@ def test_issue_token_pair_does_not_leak_access_claims_to_refresh() -> None:
     assert "permissions" not in refresh_payload
     assert refresh_payload["type"] == "refresh"
     assert refresh_payload["typ"] == "refresh"
+
 

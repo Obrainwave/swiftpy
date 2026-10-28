@@ -56,9 +56,10 @@ def snake_case(name: str) -> str:
     Examples:
         snake_case("UserProfile") -> "user_profile"
         snake_case("APIKey") -> "api_key"
+        snake_case("HTTPServer") -> "http_server"
         snake_case("HTTPRequest") -> "http_request"
         snake_case("UserAPIKey") -> "user_api_key"
-        snake_case("OAuth2Client") -> "oauth2_client"
+        snake_case("Oauth2Client") -> "oauth2_client"
     """
     if not name:
         return name

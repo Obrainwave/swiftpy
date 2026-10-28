@@ -13,6 +13,14 @@ from urllib.parse import quote
 from swiftpy.core.config import Config
 
 
+def _first_not_none(*values: Any) -> Any:
+    """Return the first value that is not None."""
+    for val in values:
+        if val is not None:
+            return val
+    return None
+
+
 def _resolve_section_dict(cfg: Config, section: str) -> dict[str, Any]:
     """Retrieve dictionary for the given section or known subsystem fallback."""
     # Subsystem-specific structures
@@ -48,11 +56,6 @@ def _resolve_section_dict(cfg: Config, section: str) -> dict[str, Any]:
             return {str(k): v for k, v in val_redis.items()}
         return {str(k): v for k, v in val.items()}
 
-    # Global redis fallback
-    global_redis = cfg.get("redis")
-    if isinstance(global_redis, dict):
-        return {str(k): v for k, v in global_redis.items()}
-
     return {}
 
 
@@ -83,57 +86,66 @@ def resolve_redis_params(
 
     # Check for direct URL in section or sub-path
     section_dict = _resolve_section_dict(cfg, section)
-    explicit_url = (
-        section_dict.get("url")
-        or cfg.get(f"{section}.url")
-        or cfg.get(f"{section}.redis_url")
-        or cfg.get("redis.url")
-        or cfg.get("redis_url")
+    explicit_url = _first_not_none(
+        section_dict.get("url"),
+        cfg.get(f"{section}.url"),
+        cfg.get(f"{section}.redis_url"),
+        cfg.get("redis.url"),
+        cfg.get("redis_url"),
     )
 
     # Resolve individual components
-    cfg_host = (
-        section_dict.get("host")
-        or cfg.get(f"{section}.host")
-        or cfg.get("redis.host")
-        or cfg.get("redis_host")
+    cfg_host = _first_not_none(
+        section_dict.get("host"),
+        cfg.get(f"{section}.host"),
+        cfg.get("redis.host"),
+        cfg.get("redis_host"),
     )
-    cfg_port = (
-        section_dict.get("port")
-        or cfg.get(f"{section}.port")
-        or cfg.get("redis.port")
-        or cfg.get("redis_port")
+    cfg_port = _first_not_none(
+        section_dict.get("port"),
+        cfg.get(f"{section}.port"),
+        cfg.get("redis.port"),
+        cfg.get("redis_port"),
     )
     cfg_password = (
         section_dict.get("password")
         if "password" in section_dict
-        else (cfg.get(f"{section}.password") or cfg.get("redis.password") or cfg.get("redis_password"))
+        else _first_not_none(
+            cfg.get(f"{section}.password"),
+            cfg.get("redis.password"),
+            cfg.get("redis_password"),
+        )
     )
 
     # Per-subsystem database fallback
     subsystem_db = None
     if section in ("queue", "queue.redis", "queue.connections.redis"):
-        subsystem_db = cfg.get("redis_queue_db") or cfg.get("redis.queue_db")
+        subsystem_db = _first_not_none(cfg.get("redis_queue_db"), cfg.get("redis.queue_db"))
     elif section in ("cache", "cache.redis", "cache.stores.redis"):
-        subsystem_db = cfg.get("redis_cache_db") or cfg.get("redis.cache_db")
+        subsystem_db = _first_not_none(cfg.get("redis_cache_db"), cfg.get("redis.cache_db"))
     elif section in ("events", "events.redis"):
-        subsystem_db = cfg.get("redis_events_db") or cfg.get("redis.events_db")
+        subsystem_db = _first_not_none(cfg.get("redis_events_db"), cfg.get("redis.events_db"))
 
     cfg_database = (
         section_dict.get("database")
         if "database" in section_dict
-        else (subsystem_db or cfg.get(f"{section}.database") or cfg.get("redis.database") or cfg.get("redis_db"))
+        else _first_not_none(
+            subsystem_db,
+            cfg.get(f"{section}.database"),
+            cfg.get("redis.database"),
+            cfg.get("redis_db"),
+        )
     )
 
-    cfg_username = (
-        section_dict.get("username")
-        or cfg.get(f"{section}.username")
-        or cfg.get("redis.username")
+    cfg_username = _first_not_none(
+        section_dict.get("username"),
+        cfg.get(f"{section}.username"),
+        cfg.get("redis.username"),
     )
     cfg_ssl = (
         section_dict.get("ssl")
         if "ssl" in section_dict
-        else (cfg.get(f"{section}.ssl") or cfg.get("redis.ssl"))
+        else _first_not_none(cfg.get(f"{section}.ssl"), cfg.get("redis.ssl"))
     )
 
     # Apply overrides over config

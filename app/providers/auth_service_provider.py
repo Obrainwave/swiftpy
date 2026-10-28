@@ -18,7 +18,13 @@ class AuthServiceProvider(ServiceProvider):
                 c.resolve(Config) if c.has(Config) else None
             ),
         )
-        self.container.singleton(TokenBlacklist)
+        self.container.singleton(
+            TokenBlacklist,
+            lambda c: TokenBlacklist(
+                issuer=c.resolve(JWTIssuer) if c.has(JWTIssuer) else None,
+                config=c.resolve(Config) if c.has(Config) else None,
+            ),
+        )
         self.container.singleton(AuthManager)
         self.container.scoped(
             CurrentUser,
@@ -26,4 +32,21 @@ class AuthServiceProvider(ServiceProvider):
         )
 
     def boot(self) -> None:
-        pass
+        if self.container.has(Config):
+            cfg = self.container.resolve(Config)
+            app_env = str(cfg.get("app.env") or cfg.get("env") or "development").lower()
+            debug_val = (
+                cfg.get("app.debug")
+                if cfg.get("app.debug") is not None
+                else cfg.get("debug")
+            )
+            is_debug = (
+                bool(debug_val)
+                if debug_val is not None
+                else app_env not in ("production", "prod")
+            )
+            default_guard = str(
+                cfg.get("auth.defaults.guard") or cfg.get("auth.default") or "jwt"
+            ).lower()
+            if not is_debug and default_guard == "jwt" and self.container.has(JWTIssuer):
+                self.container.resolve(JWTIssuer)

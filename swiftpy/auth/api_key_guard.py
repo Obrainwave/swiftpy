@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -20,6 +21,7 @@ from swiftpy.core.container import get_container
 from swiftpy.core.context import Context
 from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.pool import DatabasePool
+from swiftpy.database.transaction import get_active_connection
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response, unauthorized
@@ -142,6 +144,23 @@ def verify_api_key_hash(
     return False
 
 
+async def _verify_api_key_hash_async(
+    raw_key_or_secret: str,
+    hashed: str,
+    pepper: str | bytes | None = None,
+) -> bool:
+    """
+    Non-blocking wrapper for API key hash verification.
+    Offloads CPU-heavy bcrypt verification to the default executor so the event loop is never blocked.
+    """
+    if hashed.startswith("$2"):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, verify_api_key_hash, raw_key_or_secret, hashed, pepper
+        )
+    return verify_api_key_hash(raw_key_or_secret, hashed, pepper=pepper)
+
+
 async def require_api_key(
     request: Request | None = None,
     *,
@@ -156,11 +175,13 @@ async def require_api_key(
     """
     Parse an API key from request headers and validate it against the database (Decision D-2).
 
-    Supports:
-      1. Prefix-indexed O(1) single-row lookup for 'prefix.secret' format with HMAC-SHA256 + pepper
-      2. Constant-time comparison to prevent timing side channels
-      3. Backward-compatible fallback for legacy unsegmented keys
-      4. Validation of active, revoked, and expires_at constraints
+    Enforces:
+      1. Strict '<prefix>.<secret>' key format (legacy unsegmented keys are rejected upfront)
+      2. Prefix-indexed O(1) single-row lookup ('SELECT * FROM table WHERE key_prefix = $1 LIMIT 1')
+      3. Constant-time HMAC-SHA256 verification with server pepper (or executor-offloaded bcrypt)
+      4. Active transaction connection reuse via get_active_connection()
+      5. Validation of active, revoked, and timezone-aware expires_at constraints
+      6. Stripping of sensitive hash/secret fields before attaching to request.state and Context
     """
     # 1. Resolve request from argument or task Context
     req = request or Context.get("request")
@@ -210,6 +231,11 @@ async def require_api_key(
             if isinstance(user_or_record, dict)
             else {"user": user_or_record}
         )
+        record_dict.pop(hash_column, None)
+        record_dict.pop("key_hash", None)
+        record_dict.pop("secret", None)
+        record_dict.pop("password", None)
+        record_dict.pop("password_hash", None)
         req.state["user"] = record_dict
         req.state["auth_guard"] = "api_key"
         Context.set("__swiftpy_current_user__", record_dict)
@@ -217,11 +243,25 @@ async def require_api_key(
 
     # 4. Validate table and column identifiers to prevent SQL injection
     table = validate_identifier(table, param_name="table")
+    valid_prefix_col = validate_identifier(prefix_column, param_name="prefix_column")
     hash_column = validate_identifier(hash_column, param_name="column")
 
-    # 5. Resolve DatabasePool
+    # 5. Enforce '<prefix>.<secret>' format (Decision D-2); reject legacy unsegmented keys upfront
+    if "." not in raw_key:
+        raise InvalidApiKeyError(
+            "Invalid API key format. Expected '<prefix>.<secret>'."
+        )
+
+    prefix, secret = raw_key.split(".", 1)
+    if not prefix or not secret:
+        raise InvalidApiKeyError(
+            "Invalid API key format. Expected '<prefix>.<secret>'."
+        )
+
+    # 6. Resolve active transaction connection or DatabasePool
+    active_conn = get_active_connection()
     active_pool = pool
-    if active_pool is None:
+    if active_conn is None and active_pool is None:
         try:
             container = get_container()
             if container.has(DatabasePool):
@@ -229,117 +269,89 @@ async def require_api_key(
         except RuntimeError:
             pass
 
-    if active_pool is None:
+    if active_conn is None and active_pool is None:
         raise RuntimeError(
             "DatabasePool is required to validate API keys against the database."
         )
 
-    # 6. Check for prefix.secret format (Decision D-2 O(1) indexed lookup)
-    now = datetime.now(UTC)
-    matched_record: dict[str, Any]
+    active_pepper = (
+        pepper.encode("utf-8")
+        if isinstance(pepper, str)
+        else (pepper if pepper is not None else get_server_pepper())
+    )
 
-    if "." in raw_key:
-        prefix, secret = raw_key.split(".", 1)
-        valid_prefix_col = validate_identifier(prefix_column, param_name="prefix_column")
-
-        active_pepper = (
-            pepper.encode("utf-8")
-            if isinstance(pepper, str)
-            else (pepper if pepper is not None else get_server_pepper())
-        )
-
-        try:
+    # 7. Single-row O(1) indexed lookup by key_prefix
+    query = f'SELECT * FROM "{table}" WHERE "{valid_prefix_col}" = $1 LIMIT 1'
+    try:
+        if active_conn is not None:
+            row = await active_conn.fetchrow(query, prefix)
+        else:
+            assert active_pool is not None
             db = active_pool.get_pool()
             async with db.acquire() as conn:
-                query = f'SELECT * FROM "{table}" WHERE "{valid_prefix_col}" = $1 LIMIT 1'
                 row = await conn.fetchrow(query, prefix)
-        except Exception as exc:
-            raise AuthenticationServiceUnavailableError(
-                f"Authentication service temporarily unavailable: database error ({exc})"
-            ) from exc
+    except Exception as exc:
+        logger.exception(
+            "Authentication service unavailable: database error during API key check"
+        )
+        raise AuthenticationServiceUnavailableError(
+            "Authentication service unavailable"
+        ) from exc
 
-        if row is None:
-            # Constant-time dummy comparison to prevent prefix-timing side channels
-            dummy_computed = hmac.new(
-                active_pepper, b"dummy_constant_time_comparison", hashlib.sha256
-            ).hexdigest()
-            hmac.compare_digest(dummy_computed, _DUMMY_HASH)
+    if row is None:
+        # Constant-time dummy comparison to prevent prefix-timing side channels
+        dummy_computed = hmac.new(
+            active_pepper, b"dummy_constant_time_comparison", hashlib.sha256
+        ).hexdigest()
+        hmac.compare_digest(dummy_computed, _DUMMY_HASH)
+        raise InvalidApiKeyError("Invalid API key")
+
+    row_dict = dict(row)
+    stored_hash: str = str(row_dict.get(hash_column) or "")
+
+    if not stored_hash or not await _verify_api_key_hash_async(
+        secret, stored_hash, pepper=active_pepper
+    ):
+        raise InvalidApiKeyError("Invalid API key")
+
+    # Check active status
+    if row_dict.get("is_active") is False or row_dict.get("active") is False:
+        raise InvalidApiKeyError("API key is inactive")
+
+    # Check revocation
+    if row_dict.get("revoked") is True:
+        raise InvalidApiKeyError("API key has been revoked")
+
+    # Check expiration with strict type validation (P2-A5)
+    now = datetime.now(UTC)
+    expires_at = row_dict.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at)
+            except ValueError as exc:
+                raise InvalidApiKeyError("Invalid API key") from exc
+        elif not isinstance(expires_at, datetime):
             raise InvalidApiKeyError("Invalid API key")
 
-        row_dict = dict(row)
-        stored_hash: str = str(row_dict.get(hash_column) or "")
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if now >= expires_at:
+            raise InvalidApiKeyError("API key has expired")
 
-        if not verify_api_key_hash(secret, stored_hash, pepper=active_pepper):
-            raise InvalidApiKeyError("Invalid API key")
-
-        # Check active status
-        if row_dict.get("is_active") is False or row_dict.get("active") is False:
-            raise InvalidApiKeyError("API key is inactive")
-
-        # Check revocation
-        if row_dict.get("revoked") is True:
-            raise InvalidApiKeyError("API key has been revoked")
-
-        # Check expiration
-        expires_at = row_dict.get("expires_at")
-        if expires_at is not None:
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-            if now >= expires_at:
-                raise InvalidApiKeyError("API key has expired")
-
-        matched_record = row_dict
-    else:
-        # Legacy unsegmented key fallback
-        try:
-            db = active_pool.get_pool()
-            async with db.acquire() as conn:
-                query = f'SELECT * FROM "{table}"'
-                rows = await conn.fetch(query)
-        except Exception as exc:
-            raise AuthenticationServiceUnavailableError(
-                f"Authentication service temporarily unavailable: database error ({exc})"
-            ) from exc
-
-        found_record: dict[str, Any] | None = None
-        for row in rows:
-            row_dict = dict(row)
-            stored_hash = str(row_dict.get(hash_column) or "")
-            if not stored_hash:
-                continue
-
-            if verify_api_key_hash(raw_key, stored_hash, pepper=pepper):
-                if row_dict.get("is_active") is False or row_dict.get("active") is False:
-                    raise InvalidApiKeyError("API key is inactive")
-                if row_dict.get("revoked") is True:
-                    raise InvalidApiKeyError("API key has been revoked")
-                expires_at = row_dict.get("expires_at")
-                if expires_at is not None:
-                    if expires_at.tzinfo is None:
-                        expires_at = expires_at.replace(tzinfo=UTC)
-                    if now >= expires_at:
-                        raise InvalidApiKeyError("API key has expired")
-                found_record = row_dict
-                break
-
-        if found_record is None:
-            raise InvalidApiKeyError("Invalid API key")
-        matched_record = found_record
-
-    # 7. Strip sensitive credentials before storing in request state / Context (P2-A2 requirement 4)
-    safe_record = dict(matched_record)
+    # 8. Strip sensitive credentials before storing in request state / Context (P2-A2 requirement 4)
+    safe_record = dict(row_dict)
     safe_record.pop(hash_column, None)
     safe_record.pop("key_hash", None)
     safe_record.pop("secret", None)
     safe_record.pop("password", None)
+    safe_record.pop("password_hash", None)
 
     req.state["user"] = safe_record
     req.state["auth_guard"] = "api_key"
     Context.set("__swiftpy_current_user__", safe_record)
 
     return safe_record
-
-
 
 
 class ApiKeyGuard(Middleware):
@@ -364,6 +376,60 @@ class ApiKeyGuard(Middleware):
         self.header_name = header_name
         self.pepper = pepper
         self.pool = pool
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Config | None = None,
+        pool: DatabasePool | None = None,
+    ) -> ApiKeyGuard:
+        """Construct an ApiKeyGuard reading settings from Config ('auth.guards.api_key.*')."""
+        if config is None:
+            try:
+                cfg = Config.get_instance()
+            except (RuntimeError, ValueError):
+                cfg = Config()
+        else:
+            cfg = config
+
+        guard_cfg: dict[str, Any] = {}
+        guards = cfg.get("auth.guards")
+        if isinstance(guards, dict) and isinstance(guards.get("api_key"), dict):
+            guard_cfg = guards["api_key"]
+        elif isinstance(cfg.get("auth.api_key"), dict):
+            guard_cfg = cfg.get("auth.api_key")
+
+        table = str(
+            guard_cfg.get("table")
+            or cfg.get("auth.guards.api_key.table")
+            or "api_keys"
+        )
+        prefix_column = str(
+            guard_cfg.get("prefix_column")
+            or cfg.get("auth.guards.api_key.prefix_column")
+            or "key_prefix"
+        )
+        hash_column = str(
+            guard_cfg.get("hash_column")
+            or cfg.get("auth.guards.api_key.hash_column")
+            or "key_hash"
+        )
+        header_name = str(
+            guard_cfg.get("header")
+            or guard_cfg.get("header_name")
+            or cfg.get("auth.guards.api_key.header")
+            or "x-api-key"
+        )
+        pepper = guard_cfg.get("pepper") or cfg.get("auth.guards.api_key.pepper")
+
+        return cls(
+            table=table,
+            prefix_column=prefix_column,
+            hash_column=hash_column,
+            header_name=header_name,
+            pepper=str(pepper) if pepper is not None else None,
+            pool=pool,
+        )
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
         try:

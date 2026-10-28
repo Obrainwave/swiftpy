@@ -101,7 +101,15 @@ def test_quote_identifier() -> None:
     assert quote_identifier("*") == "*"
     assert quote_identifier("users") == '"users"'
     assert quote_identifier("users.id") == '"users"."id"'
+    assert quote_identifier("public.users.id") == '"public"."users"."id"'
     assert quote_identifier("users.*") == '"users".*'
 
-    with pytest.raises(ValueError, match="Invalid SQL column identifier detected"):
+    with pytest.raises(ValueError, match="Invalid SQL"):
         quote_identifier("users\n.id")
+
+    with pytest.raises(ValueError, match="Invalid SQL"):
+        quote_identifier("*", allow_wildcard=False)
+
+    with pytest.raises(ValueError, match="Invalid SQL"):
+        quote_identifier("users.*", allow_wildcard=False)
+

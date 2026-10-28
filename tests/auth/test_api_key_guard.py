@@ -1,8 +1,14 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
 from swiftpy.auth.api_key_guard import (
+    ApiKeyGuard,
     generate_api_key,
     get_server_pepper,
     hash_api_key,
@@ -11,7 +17,9 @@ from swiftpy.auth.api_key_guard import (
 )
 from swiftpy.auth.exceptions import InvalidApiKeyError
 from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.container import Container, set_container
 from swiftpy.database.pool import DatabasePool
+from swiftpy.database.transaction import db
 from swiftpy.http.request import Request
 
 
@@ -59,10 +67,41 @@ def test_missing_pepper_in_production_fails(monkeypatch: pytest.MonkeyPatch) -> 
     })
     monkeypatch.delenv("AUTH_KEY_PEPPER", raising=False)
     monkeypatch.delenv("API_KEY_PEPPER", raising=False)
-    # In production without pepper, get_server_pepper must raise ConfigurationError
     with pytest.raises(ConfigurationError, match=r"(?i)pepper"):
         get_server_pepper(cfg)
 
+
+def test_api_key_guard_from_config() -> None:
+    cfg = Config({
+        "auth": {
+            "guards": {
+                "api_key": {
+                    "table": "custom_keys",
+                    "prefix_column": "prefix_id",
+                    "hash_column": "secret_digest",
+                    "header": "x-custom-key",
+                    "pepper": "custom-pepper-32-bytes-minimum!!",
+                }
+            }
+        }
+    })
+    guard = ApiKeyGuard.from_config(cfg)
+    assert guard.table == "custom_keys"
+    assert guard.prefix_column == "prefix_id"
+    assert guard.hash_column == "secret_digest"
+    assert guard.header_name == "x-custom-key"
+    assert guard.pepper == "custom-pepper-32-bytes-minimum!!"
+
+
+@pytest.mark.asyncio
+async def test_legacy_unsegmented_key_rejected_with_clear_message() -> None:
+    for legacy_key in (b"sk_live_legacy_unsegmented_key", b"prefix_only.", b".secret_only"):
+        req = _make_request([(b"x-api-key", legacy_key)])
+        with pytest.raises(
+            InvalidApiKeyError,
+            match=r"Invalid API key format\. Expected '<prefix>\.<secret>'\.",
+        ):
+            await require_api_key(req, pepper="test-pepper-32-bytes-minimum----!")
 
 
 @pytest.mark.asyncio
@@ -91,15 +130,12 @@ async def test_api_key_indexed_prefix_lookup(ensure_db_pool: DatabasePool) -> No
         full_key, prefix, secret = generate_api_key(prefix="sk_test")
         key_hash = hash_api_key(secret, pepper=pepper)
 
-        # Inactive key
         inactive_full, inactive_prefix, inactive_secret = generate_api_key(prefix="sk_inact")
         inactive_hash = hash_api_key(inactive_secret, pepper=pepper)
 
-        # Revoked key
         revoked_full, revoked_prefix, revoked_secret = generate_api_key(prefix="sk_rev")
         revoked_hash = hash_api_key(revoked_secret, pepper=pepper)
 
-        # Expired key
         expired_full, expired_prefix, expired_secret = generate_api_key(prefix="sk_exp")
         expired_hash = hash_api_key(expired_secret, pepper=pepper)
 
@@ -117,7 +153,7 @@ async def test_api_key_indexed_prefix_lookup(ensure_db_pool: DatabasePool) -> No
             expired_prefix, expired_hash,
         )
 
-    # 1. Valid key succeeds and returns user row
+    # 1. Valid key succeeds and returns user row with key_hash stripped
     req_valid = _make_request([(b"x-api-key", full_key.encode("latin1"))])
     user = await require_api_key(
         req_valid,
@@ -129,7 +165,6 @@ async def test_api_key_indexed_prefix_lookup(ensure_db_pool: DatabasePool) -> No
     assert user["key_prefix"] == prefix
     assert "key_hash" not in user
     assert "key_hash" not in req_valid.state["user"]
-
 
     # 2. Invalid prefix returns 401
     req_bad_prefix = _make_request([(b"x-api-key", b"sk_nonexistent_prefix.randomsecret1234567890")])
@@ -180,4 +215,162 @@ async def test_api_key_indexed_prefix_lookup(ensure_db_pool: DatabasePool) -> No
             pepper=pepper,
             pool=ensure_db_pool,
         )
+
+
+@pytest.mark.asyncio
+async def test_api_key_one_query_regardless_of_table_size_and_non_blocking_loop(
+    ensure_db_pool: DatabasePool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    P2-A2: Asserts that:
+    1. Exactly one DB query is executed regardless of how many rows exist in the table.
+    2. A table of N rows does not block the asyncio event loop (concurrent ticker task max gap < threshold).
+    3. Active transaction connection (get_active_connection) is reused inside db.transaction().
+    """
+    container = Container()
+    container.instance(DatabasePool, ensure_db_pool)
+    set_container(container)
+
+    pool = ensure_db_pool.get_pool()
+    table_name = "test_auth_api_keys_scale"
+    pepper = "scale-server-pepper-32-bytes-long!"
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            DROP TABLE IF EXISTS "{table_name}" CASCADE;
+            CREATE TABLE "{table_name}" (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_prefix VARCHAR(64) NOT NULL UNIQUE,
+                key_hash VARCHAR(128) NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                revoked BOOLEAN DEFAULT FALSE,
+                expires_at TIMESTAMPTZ DEFAULT NULL
+            );
+            CREATE INDEX "idx_{table_name}_prefix" ON "{table_name}" (key_prefix);
+            """
+        )
+
+        rows_to_insert: list[tuple[str, str, str]] = []
+        for i in range(39):
+            _fk, pfx, sec = generate_api_key(prefix=f"sk_row{i}_")
+            kh = hash_api_key(sec, pepper=pepper)
+            rows_to_insert.append((f"Client {i}", pfx, kh))
+
+        await conn.executemany(
+            f'INSERT INTO "{table_name}" (name, key_prefix, key_hash) VALUES ($1, $2, $3)',
+            rows_to_insert,
+        )
+
+    target_full_key, target_pfx, target_sec = generate_api_key(prefix="sk_row39_")
+    target_hash = hash_api_key(target_sec, pepper=pepper)
+
+    # Spy on query count via active transaction connection
+    query_count = 0
+    max_gap = 0.0
+    stop_ticker = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal max_gap
+        last = time.perf_counter()
+        while not stop_ticker.is_set():
+            await asyncio.sleep(0.002)
+            now = time.perf_counter()
+            gap = now - last
+            max_gap = max(max_gap, gap)
+            last = now
+
+    class _CountingConnProxy:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        async def fetchrow(self, query: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal query_count
+            query_count += 1
+            return await self._inner.fetchrow(query, *args, **kwargs)
+
+        async def fetch(self, query: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal query_count
+            query_count += 1
+            return await self._inner.fetch(query, *args, **kwargs)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        async with db.transaction() as tx_conn:
+            # Insert row 39 uncommitted inside the active transaction so it is only visible via tx_conn
+            await tx_conn.execute(
+                f'INSERT INTO "{table_name}" (name, key_prefix, key_hash) VALUES ($1, $2, $3)',
+                "Client 39",
+                target_pfx,
+                target_hash,
+            )
+            monkeypatch.setattr(
+                "swiftpy.auth.api_key_guard.get_active_connection",
+                lambda: _CountingConnProxy(tx_conn),
+            )
+            req = _make_request([(b"x-api-key", target_full_key.encode("latin1"))])
+            user = await require_api_key(req, table=table_name, pepper=pepper)
+            assert user["name"] == "Client 39"
+            assert query_count == 1
+    finally:
+        stop_ticker.set()
+        await ticker_task
+
+    assert max_gap < 0.25
+
+
+@pytest.mark.asyncio
+async def test_api_key_expires_at_type_validation_p2a5(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-A5: Non-datetime expires_at in row raises InvalidApiKeyError (401), never 500 AttributeError."""
+    pepper = "type-check-pepper-at-least-32-bytes!"
+    full_key, _prefix, secret = generate_api_key(prefix="sk_type")
+    key_hash = hash_api_key(secret, pepper=pepper)
+
+    class FakeConn:
+        def __init__(self, expires_val: Any) -> None:
+            self.expires_val = expires_val
+
+        async def fetchrow(self, query: str, pfx: str) -> dict[str, Any]:
+            return {
+                "id": 1,
+                "name": "Typed Key",
+                "key_prefix": pfx,
+                "key_hash": key_hash,
+                "is_active": True,
+                "revoked": False,
+                "expires_at": self.expires_val,
+            }
+
+    # 1. Invalid integer expires_at -> InvalidApiKeyError (not AttributeError)
+    monkeypatch.setattr(
+        "swiftpy.auth.api_key_guard.get_active_connection",
+        lambda: FakeConn(12345),
+    )
+    req1 = _make_request([(b"x-api-key", full_key.encode("latin1"))])
+    with pytest.raises(InvalidApiKeyError, match="Invalid API key"):
+        await require_api_key(req1, pepper=pepper)
+
+    # 2. Invalid string expires_at -> InvalidApiKeyError
+    monkeypatch.setattr(
+        "swiftpy.auth.api_key_guard.get_active_connection",
+        lambda: FakeConn("not-a-timestamp"),
+    )
+    req2 = _make_request([(b"x-api-key", full_key.encode("latin1"))])
+    with pytest.raises(InvalidApiKeyError, match="Invalid API key"):
+        await require_api_key(req2, pepper=pepper)
+
+    # 3. Valid future ISO-8601 string expires_at -> succeeds
+    future_iso = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(
+        "swiftpy.auth.api_key_guard.get_active_connection",
+        lambda: FakeConn(future_iso),
+    )
+    req3 = _make_request([(b"x-api-key", full_key.encode("latin1"))])
+    res = await require_api_key(req3, pepper=pepper)
+    assert res["name"] == "Typed Key"
+
 

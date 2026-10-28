@@ -136,3 +136,32 @@ class TestRedisConfig:
         assert params["password"] == "pass"
         assert params["database"] == 3
         assert params["url"] == "redis://:pass@127.0.0.1:6379/3"
+
+    def test_per_section_db_keys_override_global_redis_db(self) -> None:
+        cfg = Config({
+            "redis": {
+                "host": "127.0.0.1",
+                "port": 6379,
+                "database": 0,
+            },
+            "redis_queue_db": 5,
+            "redis_cache_db": 2,
+            "redis_events_db": 7,
+        })
+        assert build_redis_url(cfg, section="queue") == "redis://127.0.0.1:6379/5"
+        assert build_redis_url(cfg, section="cache") == "redis://127.0.0.1:6379/2"
+        assert build_redis_url(cfg, section="events") == "redis://127.0.0.1:6379/7"
+
+    def test_section_database_zero_overrides_nonzero_global_db(self) -> None:
+        cfg = Config({
+            "redis": {
+                "host": "127.0.0.1",
+                "port": 6379,
+                "database": 4,
+            },
+            "queue": {
+                "database": 0,
+            },
+        })
+        assert build_redis_url(cfg, section="queue") == "redis://127.0.0.1:6379/0"
+

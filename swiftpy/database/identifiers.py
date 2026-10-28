@@ -84,11 +84,20 @@ def validate_column_identifier(column: str) -> str:
     return column
 
 
-def quote_identifier(identifier: str) -> str:
+def quote_identifier(
+    identifier: str,
+    *,
+    allow_dotted: bool = True,
+    allow_wildcard: bool = True,
+) -> str:
     """Validate, then quote each dotted segment: t.col becomes "t"."col"."""
+    validate_identifier(
+        identifier,
+        allow_dotted=allow_dotted,
+        allow_wildcard=allow_wildcard,
+    )
     if identifier == "*":
         return "*"
-    validate_column_identifier(identifier)
     return ".".join(
         f'"{part}"' if part != "*" else "*" for part in identifier.split(".")
     )

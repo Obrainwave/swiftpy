@@ -7,14 +7,79 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from swiftpy.auth.api_key_guard import (
+    generate_api_key,
+    get_server_pepper,
+    hash_api_key,
+)
 from swiftpy.console.stubs import get_stub
+from swiftpy.core.config import ConfigurationError
+from swiftpy.database.identifiers import validate_identifier
 from swiftpy.support.strings import pluralize, snake_case
+
+_SEGMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _pascal_case(snake_str: str) -> str:
     """Convert snake_case string to PascalCase class name."""
     components = re.split(r"[^a-zA-Z0-9]+", snake_str)
     return "".join(x.capitalize() for x in components if x)
+
+
+def _validate_and_split_name(
+    raw_name: str,
+    item_type: str = "File",
+    *,
+    allow_nested: bool = True,
+) -> tuple[list[str], str, str]:
+    """
+    Validate a generator name (optionally with nested '/' path segments) and return
+    (dir_segments, snake_name, class_name).
+    """
+    trimmed = raw_name.strip()
+    if not trimmed:
+        raise SystemExit(f"Invalid {item_type.lower()} name: {raw_name!r}")
+
+    if (
+        "\\" in trimmed
+        or trimmed.startswith("/")
+        or trimmed.endswith("/")
+        or "//" in trimmed
+        or Path(trimmed).is_absolute()
+    ):
+        raise SystemExit(
+            f"Invalid {item_type.lower()} path {raw_name!r}: absolute or malformed paths are not allowed."
+        )
+
+    segments = trimmed.split("/")
+    if not allow_nested and len(segments) > 1:
+        raise SystemExit(
+            f"Invalid {item_type.lower()} name {raw_name!r}: nested paths are not allowed."
+        )
+
+    for seg in segments:
+        if seg in ("", ".", ".."):
+            raise SystemExit(
+                f"Invalid {item_type.lower()} path {raw_name!r}: path traversal is not allowed."
+            )
+        seg_snake = snake_case(seg)
+        if not _SEGMENT_PATTERN.fullmatch(seg) or not _SEGMENT_PATTERN.fullmatch(
+            seg_snake
+        ):
+            raise SystemExit(
+                f"Invalid {item_type.lower()} name segment {seg!r} in {raw_name!r}. "
+                "Each segment must be a valid Python identifier starting with a letter or underscore."
+            )
+
+    base_name = segments[-1]
+    snake_name = snake_case(base_name)
+    class_name = _pascal_case(snake_name)
+    if not class_name or not _SEGMENT_PATTERN.fullmatch(class_name):
+        raise SystemExit(
+            f"Invalid {item_type.lower()} class name {class_name!r} derived from {raw_name!r}."
+        )
+
+    return segments[:-1], snake_name, class_name
 
 
 _CREATE_PATTERNS = (
@@ -54,25 +119,37 @@ def _scaffold_file(
 ) -> Path:
     """
     Generic scaffolding engine for SwiftPY generators.
-    Resolves class names, filenames, creates target directories, and writes stub templates.
+    Resolves class names, filenames, validates path containment, creates target directories,
+    and writes stub templates.
     """
-    trimmed = raw_name.strip()
-    if not trimmed:
-        raise SystemExit(f"Invalid {item_type.lower()} name: {raw_name!r}")
-
-    raw_path = Path(trimmed)
-    subpath = raw_path.parent if str(raw_path.parent) != "." else None
-    base_name = raw_path.name
-
-    snake_name = snake_case(base_name)
-    class_name = _pascal_case(snake_name)
+    dir_segments, snake_name, class_name = _validate_and_split_name(
+        raw_name,
+        item_type=item_type,
+        allow_nested=True,
+    )
 
     base_dir = Path(override_path) if override_path else Path.cwd() / default_dir_rel
-    target_dir = base_dir / subpath if subpath else base_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-
+    resolved_base = base_dir.resolve()
+    target_dir = base_dir.joinpath(*dir_segments) if dir_segments else base_dir
     filename = f"{snake_name}.py"
     filepath = target_dir / filename
+
+    resolved_target_dir = target_dir.resolve()
+    resolved_filepath = filepath.resolve()
+    if not resolved_target_dir.is_relative_to(
+        resolved_base
+    ) or not resolved_filepath.is_relative_to(resolved_base):
+        raise SystemExit(
+            f"Invalid {item_type.lower()} path {raw_name!r}: target escapes base directory '{resolved_base}'."
+        )
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-verify containment after directory creation
+    if not filepath.resolve().is_relative_to(resolved_base) or filepath.is_symlink():
+        raise SystemExit(
+            f"Invalid {item_type.lower()} path {raw_name!r}: target escapes base directory '{resolved_base}'."
+        )
 
     if filepath.exists() and not force:
         raise SystemExit(f"{item_type} already exists: {filepath}. Use --force to overwrite.")
@@ -288,32 +365,114 @@ class MakeCommand:
             _handler=MakeCommand.handle_schema,
         )
 
+        # 8. make:api-key
+        parser_api_key = subparsers.add_parser(
+            "make:api-key",
+            help="Generate a new prefix.secret API key and its peppered HMAC-SHA256 hash",
+        )
+        parser_api_key.add_argument(
+            "--prefix",
+            dest="prefix",
+            default="sk_live_",
+            help="Prefix for the API key (default: sk_live_)",
+        )
+        parser_api_key.add_argument(
+            "--pepper",
+            dest="pepper",
+            default=None,
+            help="Server pepper for HMAC-SHA256 hashing (defaults to AUTH_KEY_PEPPER config)",
+        )
+        parser_api_key.add_argument(
+            "-m",
+            "--migration",
+            action="store_true",
+            help="Also create the api_keys table migration file",
+        )
+        parser_api_key.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="Migration target directory when --migration is specified",
+        )
+        parser_api_key.set_defaults(
+            _handler=MakeCommand.handle_api_key,
+        )
+
     @staticmethod
     def handle_migration(args: argparse.Namespace) -> None:
         """Handle make:migration command execution."""
         raw_name: str = args.name.strip()
+        if not raw_name or "/" in raw_name or "\\" in raw_name or ".." in raw_name:
+            raise SystemExit(f"Invalid migration name: {raw_name!r}")
+
         snake_name = re.sub(r"[^a-zA-Z0-9_]+", "_", raw_name.lower()).strip("_")
-        if not snake_name or snake_name[0].isdigit():
+        if not snake_name or not _SEGMENT_PATTERN.fullmatch(snake_name):
             raise SystemExit(f"Invalid migration name: {raw_name!r}")
 
         class_name = _pascal_case(snake_name)
+        if not class_name or not _SEGMENT_PATTERN.fullmatch(class_name):
+            raise SystemExit(f"Invalid migration class name: {class_name!r}")
+
+        raw_table = getattr(args, "create", None) or getattr(args, "table", None)
+        is_create = bool(getattr(args, "create", None))
+        if raw_table is not None:
+            try:
+                table_name: str | None = validate_identifier(
+                    str(raw_table), param_name="table"
+                )
+            except ValueError as exc:
+                raise SystemExit(f"Invalid table identifier: {exc}") from exc
+        else:
+            guessed_table, is_create = _guess_table(snake_name)
+            if guessed_table is not None:
+                try:
+                    table_name = validate_identifier(
+                        guessed_table, param_name="table"
+                    )
+                except ValueError as exc:
+                    raise SystemExit(f"Invalid table identifier: {exc}") from exc
+            else:
+                table_name = None
 
         target_dir = (
             Path(args.path) if args.path else Path.cwd() / "database" / "migrations"
         )
-        target_dir.mkdir(parents=True, exist_ok=True)
-
+        resolved_base = target_dir.resolve()
         timestamp = datetime.now(tz=UTC).strftime("%Y_%m_%d_%H%M%S")
         filename = f"{timestamp}_{snake_name}.py"
         filepath = target_dir / filename
 
-        table_name = args.create or args.table
-        is_create = bool(args.create)
-        if not table_name:
-            table_name, is_create = _guess_table(snake_name)
+        if not filepath.resolve().is_relative_to(resolved_base):
+            raise SystemExit(
+                f"Invalid migration path {raw_name!r}: target escapes base directory '{resolved_base}'."
+            )
 
-        if table_name is None:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if not filepath.resolve().is_relative_to(resolved_base) or filepath.is_symlink():
+            raise SystemExit(
+                f"Invalid migration path {raw_name!r}: target escapes base directory '{resolved_base}'."
+            )
+
+        if filepath.exists() and not getattr(args, "force", False):
+            raise SystemExit(
+                f"Migration already exists: {filepath}. Use --force to overwrite."
+            )
+
+        stub_override = getattr(args, "stub", None)
+        if stub_override:
+            content = (
+                get_stub(stub_override)
+                .replace("{class_name}", class_name)
+                .replace("{table_name}", table_name or "api_keys")
+            )
+        elif table_name is None:
             content = get_stub("migration.blank").replace("{class_name}", class_name)
+        elif is_create and table_name == "api_keys":
+            content = (
+                get_stub("migration.api_keys")
+                .replace("{class_name}", class_name)
+                .replace("{table_name}", table_name)
+            )
         elif is_create:
             content = (
                 get_stub("migration.create")
@@ -337,11 +496,25 @@ class MakeCommand:
     def handle_model(args: argparse.Namespace) -> None:
         """Handle make:model command execution."""
         raw_name: str = args.name.strip()
-        raw_path = Path(raw_name)
-        base_name = raw_path.name
-        snake_name = snake_case(base_name)
+        _, snake_name, _ = _validate_and_split_name(
+            raw_name,
+            item_type="Model",
+            allow_nested=True,
+        )
 
-        table_name = getattr(args, "table", None) or pluralize(snake_name)
+        raw_table = getattr(args, "table", None)
+        if raw_table is not None:
+            try:
+                table_name = validate_identifier(str(raw_table), param_name="table")
+            except ValueError as exc:
+                raise SystemExit(f"Invalid table identifier: {exc}") from exc
+        else:
+            try:
+                table_name = validate_identifier(
+                    pluralize(snake_name), param_name="table"
+                )
+            except ValueError as exc:
+                raise SystemExit(f"Invalid table identifier: {exc}") from exc
 
         _scaffold_file(
             raw_name=raw_name,
@@ -361,6 +534,37 @@ class MakeCommand:
                 path=None,
                 create=table_name,
                 table=None,
+            )
+            MakeCommand.handle_migration(mig_args)
+
+    @staticmethod
+    def handle_api_key(args: argparse.Namespace) -> None:
+        """Handle make:api-key command execution (P2-A2 requirement 5)."""
+        prefix_arg: str = getattr(args, "prefix", "sk_live_") or "sk_live_"
+        pepper_arg: str | None = getattr(args, "pepper", None)
+
+        try:
+            active_pepper: str | bytes = (
+                pepper_arg if pepper_arg is not None else get_server_pepper()
+            )
+        except ConfigurationError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        full_key, key_prefix, secret = generate_api_key(prefix=prefix_arg)
+        key_hash = hash_api_key(secret, pepper=active_pepper)
+
+        print("Generated API Key (save this secret now; it will not be shown again):")
+        print(f"  API Key:    {full_key}")
+        print(f"  key_prefix: {key_prefix}")
+        print(f"  key_hash:   {key_hash}")
+
+        if getattr(args, "migration", False):
+            mig_args = argparse.Namespace(
+                name="create_api_keys_table",
+                path=getattr(args, "path", None),
+                create="api_keys",
+                table=None,
+                stub="migration.api_keys",
             )
             MakeCommand.handle_migration(mig_args)
 

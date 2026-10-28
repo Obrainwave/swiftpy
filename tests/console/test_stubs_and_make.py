@@ -13,6 +13,7 @@ def test_stubs_directory_and_files_exist() -> None:
 
     expected_stubs = [
         "migration.create.stub",
+        "migration.api_keys.stub",
         "migration.alter.stub",
         "migration.update.stub",
         "migration.blank.stub",
@@ -199,3 +200,98 @@ def test_make_collision_protection_and_force_flag(tmp_path: Path, monkeypatch: p
     svc_path.write_text("# modified content", encoding="utf-8")
     cli.run(["make:service", "NotificationService", "--force"])
     assert "class NotificationService:" in svc_path.read_text(encoding="utf-8")
+
+
+def test_make_path_containment_and_validation_p2_cli1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    P2-CLI1: Verifies that path traversal, absolute paths, symlink escapes,
+    invalid identifier characters, leading digits, and SQL injection in --table
+    are strictly rejected with SystemExit.
+    """
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(project_dir)
+
+    cli = CLI()
+
+    # 1. Path traversal attempts
+    for traversal_name in ("../../x", "/tmp/x/Foo", "a/../../b", "../Escape", "Admin/../../Evil"):
+        with pytest.raises(SystemExit):
+            cli.run(["make:model", traversal_name])
+        with pytest.raises(SystemExit):
+            cli.run(["make:service", traversal_name])
+        with pytest.raises(SystemExit):
+            cli.run(["make:migration", traversal_name])
+
+    assert list(outside_dir.glob("*")) == []
+
+    # 2. Symlinked directory pointing outside base_dir
+    models_dir = project_dir / "app" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    symlink_dir = models_dir / "SymlinkEscape"
+    symlink_dir.symlink_to(outside_dir, target_is_directory=True)
+
+    with pytest.raises(SystemExit, match="escapes base directory"):
+        cli.run(["make:model", "SymlinkEscape/User"])
+    assert not (outside_dir / "user.py").exists()
+
+    # 3. Invalid characters (spaces, hyphens) and leading digits
+    for bad_name in ("Foo Bar", "1Foo", "Admin/1User", "Foo-Bar", "User;Drop"):
+        with pytest.raises(SystemExit):
+            cli.run(["make:model", bad_name])
+        with pytest.raises(SystemExit):
+            cli.run(["make:request", bad_name])
+
+    # 4. --table and --create validation via P1-F1 identifier validator
+    for bad_table in ('x; DROP TABLE', 'users\n', '123table', 'a' * 64, 'users --'):
+        with pytest.raises(SystemExit, match="Invalid table identifier"):
+            cli.run(["make:model", "ValidModel", "--table", bad_table])
+        with pytest.raises(SystemExit, match="Invalid table identifier"):
+            cli.run(["make:migration", "add_col_migration", "--table", bad_table])
+        with pytest.raises(SystemExit, match="Invalid table identifier"):
+            cli.run(["make:migration", "create_tbl_migration", "--create", bad_table])
+
+    # 5. Valid nested path still works
+    cli.run(["make:model", "Admin/User"])
+    nested_model = project_dir / "app" / "models" / "Admin" / "user.py"
+    assert nested_model.is_file()
+    assert "class User(Model):" in nested_model.read_text(encoding="utf-8")
+
+
+def test_make_api_key_command_and_migration_stub_p2a2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P2-A2: Verifies make:api-key outputs prefix.secret key once and scaffolds api_keys migration."""
+    monkeypatch.chdir(tmp_path)
+    cli = CLI()
+
+    cli.run(
+        [
+            "make:api-key",
+            "--prefix",
+            "sk_live_",
+            "--pepper",
+            "cli-pepper-secret-at-least-32-bytes!",
+            "-m",
+            "--path",
+            str(tmp_path),
+        ]
+    )
+    captured = capsys.readouterr().out
+    assert "API Key:" in captured
+    assert "sk_live_" in captured
+    assert "key_prefix:" in captured
+    assert "key_hash:" in captured
+
+    mig_files = list(tmp_path.glob("*_create_api_keys_table.py"))
+    assert len(mig_files) == 1
+    mig_content = mig_files[0].read_text(encoding="utf-8")
+    assert 'table.string("key_prefix", length=64).unique().index()' in mig_content
+    assert 'table.string("key_hash", length=128)' in mig_content
+

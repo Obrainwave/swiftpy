@@ -25,7 +25,6 @@ class UniqueRule:
         self.column = validate_identifier(column, param_name="column")
         self.id_column = validate_identifier(id_column, param_name="column")
         self.ignore_id = ignore_id
-        self.id_column = id_column
         self.pool = pool
 
     async def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:

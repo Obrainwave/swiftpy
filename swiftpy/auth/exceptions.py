@@ -27,7 +27,7 @@ class AuthenticationError(HttpException):
 class TokenRevokedError(AuthenticationError):
     """Raised when a valid token has been revoked in the blacklist."""
 
-    def __init__(self, message: str = "Token has been revoked") -> None:
+    def __init__(self, message: str = "Invalid or expired token") -> None:
         super().__init__(message=message, status_code=401)
 
 
@@ -47,7 +47,7 @@ class AuthenticationServiceUnavailableError(HttpException):
 
     def __init__(
         self,
-        message: str = "Authentication service temporarily unavailable",
+        message: str = "Authentication service unavailable",
         status_code: int = 503,
         headers: dict[str, str] | None = None,
     ) -> None:

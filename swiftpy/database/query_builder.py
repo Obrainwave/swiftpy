@@ -120,12 +120,16 @@ class QueryBuilder:
 
     def where_null(self, column: str) -> QueryBuilder:
         """Add an 'IS NULL' clause for the specified column."""
-        self._raw_wheres.append(Raw(f"{quote_identifier(column)} IS NULL"))
+        self._raw_wheres.append(
+            Raw(f"{quote_identifier(column, allow_wildcard=False)} IS NULL")
+        )
         return self
 
     def where_not_null(self, column: str) -> QueryBuilder:
         """Add an 'IS NOT NULL' clause for the specified column."""
-        self._raw_wheres.append(Raw(f"{quote_identifier(column)} IS NOT NULL"))
+        self._raw_wheres.append(
+            Raw(f"{quote_identifier(column, allow_wildcard=False)} IS NOT NULL")
+        )
         return self
 
     def join(
@@ -139,10 +143,10 @@ class QueryBuilder:
         self._joins.append(
             (
                 type_.upper(),
-                quote_identifier(table),
-                quote_identifier(first),
+                quote_identifier(table, allow_wildcard=False),
+                quote_identifier(first, allow_wildcard=False),
                 operator,
-                quote_identifier(second),
+                quote_identifier(second, allow_wildcard=False),
             )
         )
         return self
@@ -164,7 +168,7 @@ class QueryBuilder:
         if direction not in {"ASC", "DESC"}:
             raise ValueError("Direction must be ASC or DESC")
 
-        self._order_column = quote_identifier(column)
+        self._order_column = quote_identifier(column, allow_wildcard=False)
         self._order_direction = direction
 
         return self
@@ -371,7 +375,10 @@ class QueryBuilder:
         return await self._aggregate("AVG", column)
 
     async def insert(self, data: dict[str, Any]) -> int:
-        columns = [quote_identifier(column) for column in data]
+        columns = [
+            quote_identifier(column, allow_dotted=False, allow_wildcard=False)
+            for column in data
+        ]
 
         values = list(data.values())
 
@@ -411,7 +418,9 @@ class QueryBuilder:
         idx = 1
 
         for column, value in data.items():
-            safe_column = quote_identifier(column)
+            safe_column = quote_identifier(
+                column, allow_dotted=False, allow_wildcard=False
+            )
             sets.append(f"{safe_column} = ${idx}")
             bindings.append(value)
             idx += 1

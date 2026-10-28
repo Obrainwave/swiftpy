@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from swiftpy.auth.exceptions import (
@@ -8,6 +9,7 @@ from swiftpy.auth.exceptions import (
     InvalidAlgorithmError,
     InvalidSignatureError,
     InvalidTokenError,
+    JWTError,
     TokenExpiredError,
     TokenRevokedError,
 )
@@ -18,7 +20,9 @@ from swiftpy.core.container import get_container
 from swiftpy.core.context import Context
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
-from swiftpy.http.response import Response, unauthorized
+from swiftpy.http.response import Response, json_response, unauthorized
+
+logger = logging.getLogger("swiftpy.auth.jwt")
 
 
 async def require_jwt(
@@ -95,21 +99,22 @@ async def require_jwt(
         except RuntimeError:
             pass
 
-    # 5. Decode and cryptographically verify token
+    # 5. Decode and cryptographically verify token (P2-A4: log detail server-side, return generic 401 message)
     try:
         payload = active_issuer.decode_token(
             token,
             verify_exp=True,
             expected_type=token_type,
         )
-    except TokenExpiredError as exc:
-        raise AuthenticationError("Token has expired") from exc
-    except InvalidSignatureError as exc:
-        raise AuthenticationError("Invalid token signature") from exc
-    except InvalidAlgorithmError as exc:
-        raise AuthenticationError("Invalid token algorithm") from exc
-    except InvalidTokenError as exc:
-        raise AuthenticationError(f"Invalid token: {exc}") from exc
+    except (
+        TokenExpiredError,
+        InvalidSignatureError,
+        InvalidAlgorithmError,
+        InvalidTokenError,
+        JWTError,
+    ) as exc:
+        logger.warning("JWT authentication failed: %s", exc)
+        raise AuthenticationError("Invalid or expired token") from exc
 
     # 6. Check Redis revocation blacklist if jti or subject is present
     jti = payload.get("jti")
@@ -126,15 +131,22 @@ async def require_jwt(
                 is_rev = bool(jti and await active_blacklist.is_revoked(jti))
 
             if is_rev:
-                raise TokenRevokedError("Token has been revoked")
+                logger.warning(
+                    "JWT authentication failed: Token has been revoked (jti=%s, sub=%s)",
+                    jti,
+                    sub,
+                )
+                raise TokenRevokedError("Invalid or expired token")
         except TokenRevokedError:
             raise
         except Exception as exc:
-            # If Redis connection fails unexpectedly, fail closed with 503 Service Unavailable
+            # If Redis connection fails unexpectedly, log server-side and fail closed with generic 503 (P2-A4)
+            logger.exception(
+                "Authentication service unavailable: Redis blacklist check failed"
+            )
             raise AuthenticationServiceUnavailableError(
-                f"Authentication service temporarily unavailable: Redis error ({exc})"
+                "Authentication service unavailable"
             ) from exc
-
 
     # 7. Attach authenticated user payload to request state and task context
     req.state["user"] = payload
@@ -172,8 +184,6 @@ class JWTGuard(Middleware):
         except AuthenticationError as exc:
             return unauthorized(exc.message, headers=exc.headers)
         except AuthenticationServiceUnavailableError as exc:
-            from swiftpy.http.response import json_response
-
             return json_response(
                 {"detail": exc.message},
                 status_code=exc.status_code,

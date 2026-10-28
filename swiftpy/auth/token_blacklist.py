@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 
 import redis.asyncio as aioredis
 
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.core.config import Config
+from swiftpy.core.container import get_container
 from swiftpy.support.redis_config import build_redis_url
 
 
@@ -86,11 +88,16 @@ class TokenBlacklist:
         active_issuer = issuer or self._issuer
         if active_issuer is None:
             try:
-                active_issuer = JWTIssuer.from_config(self._config)
-            except Exception as exc:
-                raise ValueError(
-                    "JWTIssuer is required to cryptographically verify token signature before revocation."
-                ) from exc
+                container = get_container()
+                if container.has(JWTIssuer):
+                    active_issuer = container.resolve(JWTIssuer)
+            except RuntimeError:
+                pass
+
+        if active_issuer is None:
+            raise ValueError(
+                "JWTIssuer is required to cryptographically verify token signature before revocation."
+            )
 
         # Cryptographically verify signature (exp expiration is checked manually for TTL calculation)
         payload = active_issuer.decode_token(token, verify_exp=False)
@@ -101,7 +108,12 @@ class TokenBlacklist:
 
         exp = payload.get("exp")
         ttl: int
-        if exp is not None and isinstance(exp, (int, float)):
+        if (
+            exp is not None
+            and not isinstance(exp, bool)
+            and isinstance(exp, (int, float))
+            and math.isfinite(exp)
+        ):
             remaining = int(exp - time.time())
             if remaining <= 0:
                 # Token has already expired; naturally rejected by exp check, skip Redis allocation
@@ -121,7 +133,7 @@ class TokenBlacklist:
         Revoke all tokens issued for a given subject (user_id) at or before the current timestamp.
         Used for logout-all, password reset, or account compromise (P2-A3).
         """
-        if not subject:
+        if subject is None or str(subject) == "":
             raise ValueError("Subject cannot be empty")
 
         client = await self.get_client()

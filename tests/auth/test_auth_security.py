@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
+import logging
 import time
 import uuid
 from typing import Any
@@ -21,6 +24,7 @@ from swiftpy.auth import (
     TokenBlacklist,
     TokenExpiredError,
     current_user,
+    generate_api_key,
     hash_api_key,
     require_api_key,
     require_jwt,
@@ -152,29 +156,32 @@ async def test_jwt_token_pair_claims_and_lifetimes() -> None:
 
 @pytest.mark.asyncio
 async def test_jwt_reserved_claims_cannot_be_overridden() -> None:
-    """Verify that user-supplied claims cannot overwrite security metadata."""
+    """Verify that user-supplied claims cannot overwrite security metadata (raises ValueError per P2-A5)."""
     issuer = JWTIssuer(
         secret="test-secret-key-at-least-32-chars-long!",
         algorithm="HS256",
         access_token_ttl=300,
     )
 
-    # Attacker tries to escalate privileges or extend expiration via claims
+    with pytest.raises(ValueError, match="Cannot override reserved JWT claim"):
+        issuer.issue_access_token(
+            subject=10,
+            claims={
+                "sub": "admin",
+                "exp": 9999999999,
+                "type": "refresh",
+                "custom_data": "allowed",
+            },
+        )
+
     token = issuer.issue_access_token(
         subject=10,
-        claims={
-            "sub": "admin",
-            "exp": 9999999999,
-            "type": "refresh",
-            "custom_data": "allowed",
-        },
+        claims={"custom_data": "allowed"},
     )
-
     payload = issuer.decode_token(token, expected_type="access")
-    assert payload["sub"] == "10"  # Original subject preserved
-    assert payload["type"] == "access"  # Original type preserved
-    assert payload["exp"] < 9999999999  # Forced expiration ignored
-    assert payload["custom_data"] == "allowed"  # Safe custom claims preserved
+    assert payload["sub"] == "10"
+    assert payload["type"] == "access"
+    assert payload["custom_data"] == "allowed"
 
 
 @pytest.mark.asyncio
@@ -277,9 +284,6 @@ async def test_rs256_rejects_hs256_algorithm_confusion() -> None:
     Security verification: An RS256 verifier strictly rejects an HS256 token
     signed using the RSA public key as an HMAC secret (CVE-2015-9235 defense).
     """
-    import hashlib
-    import hmac
-
     _, public_pem = JWTIssuer.generate_rsa_key_pair(key_size=2048)
     verifier = JWTIssuer(
         public_key=public_pem,
@@ -558,7 +562,7 @@ async def test_jwt_guard_rejects_refresh_token() -> None:
     )
     assert status == 401
     assert "ok" not in body
-    assert "invalid token type" in body.get("detail", "").lower()
+    assert body.get("detail") == "Invalid or expired token"
 
 
 # ==============================================================================
@@ -614,7 +618,7 @@ async def test_security_revoked_tokens_rejected() -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
     assert status_revoked == 401
-    assert "revoked" in body_revoked.get("detail", "").lower()
+    assert body_revoked.get("detail") == "Invalid or expired token"
 
     # 4. Issue a new fresh token for the same user; it must succeed
     fresh_token = issuer.issue_access_token(subject=77)
@@ -657,7 +661,7 @@ async def test_token_blacklist_ttl_and_expired_behavior() -> None:
 
     # Test already-expired token: should not be added to Redis
     expired_token = issuer.issue_token(subject=88, expires_in=-50)
-    expired_payload = JWTIssuer.decode_unverified(expired_token)
+    expired_payload = issuer.decode_token(expired_token, verify_exp=False)
     expired_jti = expired_payload["jti"]
 
     await blacklist.revoke_token(expired_token, issuer=issuer)
@@ -667,14 +671,16 @@ async def test_token_blacklist_ttl_and_expired_behavior() -> None:
 
 
 @pytest.mark.asyncio
-async def test_token_blacklist_redis_failure_fails_closed() -> None:
-    """Verify that if Redis fails during revocation check, authentication fails closed with 503."""
+async def test_token_blacklist_redis_failure_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify that if Redis fails during revocation check, authentication fails closed with generic 503 and logs detail."""
     issuer = JWTIssuer(secret="test-fail-closed-secret-32-bytes!")
     token = issuer.issue_access_token(subject=99)
 
     class BrokenBlacklist:
-        async def is_revoked(self, jti: str) -> bool:
-            raise ConnectionError("Redis cluster unreachable")
+        async def is_revoked(self, jti: str, **kwargs: Any) -> bool:
+            raise ConnectionError("Redis cluster unreachable at 10.0.0.42:6379")
 
     app = Application()
     app.container.instance(JWTIssuer, issuer)
@@ -685,18 +691,19 @@ async def test_token_blacklist_redis_failure_fails_closed() -> None:
         await require_jwt(request)
         return json_response({"ok": True})
 
-    status, headers, body = await _simulate_request(
-        app,
-        "GET",
-        "/data",
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    with caplog.at_level(logging.ERROR):
+        status, headers, body = await _simulate_request(
+            app,
+            "GET",
+            "/data",
+            headers={"Authorization": f"Bearer {token}"},
+        )
     assert status == 503
     assert any(name.lower() == "retry-after" for name, _ in headers)
-    assert (
-        "unavailable" in body.get("detail", "").lower()
-        or "redis" in body.get("detail", "").lower()
-    )
+    assert body.get("detail") == "Authentication service unavailable"
+    assert "redis" not in body.get("detail", "").lower()
+    assert "10.0.0.42" not in json.dumps(body)
+    assert any("10.0.0.42" in str(r.exc_info) or "Redis" in r.message for r in caplog.records)
 
 
 # ==============================================================================
@@ -709,8 +716,9 @@ async def test_security_api_keys_bcrypt_validation(
     ensure_db_pool: DatabasePool,
 ) -> None:
     """
-    Security verification: Validates API keys against bcrypt hashes in the database
-    including active, inactive, revoked, and expired states.
+    Security verification: Validates prefix.secret API keys against bcrypt hashes
+    in the database (offloaded to executor) including active, inactive, revoked,
+    and expired states, and rejects legacy unsegmented keys.
     """
     pool = ensure_db_pool.get_pool()
     table_name = "test_auth_api_keys_comprehensive"
@@ -722,6 +730,7 @@ async def test_security_api_keys_bcrypt_validation(
             CREATE TABLE "{table_name}" (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
+                key_prefix VARCHAR(64) NOT NULL UNIQUE,
                 key_hash TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT TRUE,
                 revoked BOOLEAN DEFAULT FALSE,
@@ -730,30 +739,34 @@ async def test_security_api_keys_bcrypt_validation(
             """
         )
 
-        valid_raw_key = "sk_live_valid_secret_key_123"
-        valid_hash = hash_api_key(valid_raw_key, rounds=4)
+        valid_raw_key, valid_pfx, valid_sec = generate_api_key(prefix="sk_live_val")
+        valid_hash = hash_api_key(valid_sec, rounds=4)
 
-        inactive_raw_key = "sk_live_inactive_key_333"
-        inactive_hash = hash_api_key(inactive_raw_key, rounds=4)
+        inactive_raw_key, inactive_pfx, inactive_sec = generate_api_key(prefix="sk_live_inact")
+        inactive_hash = hash_api_key(inactive_sec, rounds=4)
 
-        revoked_raw_key = "sk_live_revoked_key_456"
-        revoked_hash = hash_api_key(revoked_raw_key, rounds=4)
+        revoked_raw_key, revoked_pfx, revoked_sec = generate_api_key(prefix="sk_live_rev")
+        revoked_hash = hash_api_key(revoked_sec, rounds=4)
 
-        expired_raw_key = "sk_live_expired_key_789"
-        expired_hash = hash_api_key(expired_raw_key, rounds=4)
+        expired_raw_key, expired_pfx, expired_sec = generate_api_key(prefix="sk_live_exp")
+        expired_hash = hash_api_key(expired_sec, rounds=4)
 
         await conn.execute(
             f"""
-            INSERT INTO "{table_name}" (name, key_hash, is_active, revoked, expires_at) VALUES
-            ('Production Key', $1, TRUE, FALSE, NULL),
-            ('Inactive Key', $2, FALSE, FALSE, NULL),
-            ('Old Staging Key', $3, TRUE, TRUE, NULL),
-            ('Expired Key', $4, TRUE, FALSE, NOW() - INTERVAL '1 day'),
-            ('Malformed Hash Row', 'not_a_bcrypt_hash', TRUE, FALSE, NULL);
+            INSERT INTO "{table_name}" (name, key_prefix, key_hash, is_active, revoked, expires_at) VALUES
+            ('Production Key', $1, $2, TRUE, FALSE, NULL),
+            ('Inactive Key', $3, $4, FALSE, FALSE, NULL),
+            ('Old Staging Key', $5, $6, TRUE, TRUE, NULL),
+            ('Expired Key', $7, $8, TRUE, FALSE, NOW() - INTERVAL '1 day'),
+            ('Malformed Hash Row', 'sk_live_malformed', 'not_a_bcrypt_hash', TRUE, FALSE, NULL);
             """,
+            valid_pfx,
             valid_hash,
+            inactive_pfx,
             inactive_hash,
+            revoked_pfx,
             revoked_hash,
+            expired_pfx,
             expired_hash,
         )
 
@@ -820,12 +833,22 @@ async def test_security_api_keys_bcrypt_validation(
         app,
         "GET",
         "/api/v1/metrics",
-        headers={"x-api-key": "sk_live_completely_wrong_key"},
+        headers={"x-api-key": "sk_live_malformed.wrong_secret"},
     )
     assert status_bad == 401
     assert "invalid" in body_bad.get("detail", "").lower()
 
-    # Negative test 5: Missing header
+    # Negative test 5: Legacy unsegmented key rejected with format error
+    status_legacy, _, body_legacy = await _simulate_request(
+        app,
+        "GET",
+        "/api/v1/metrics",
+        headers={"x-api-key": "sk_live_legacy_unsegmented_key"},
+    )
+    assert status_legacy == 401
+    assert "format" in body_legacy.get("detail", "").lower()
+
+    # Negative test 6: Missing header
     status_none, _, body_none = await _simulate_request(
         app,
         "GET",
@@ -849,7 +872,7 @@ async def test_api_key_guard_invalid_table_identifier_blocked() -> None:
         ApiKeyGuard(hash_column="key_hash; DROP TABLE users;")
 
     # 2. Direct call to require_api_key also validates table identifier upfront
-    req = Request(_make_http_scope(headers=[(b"x-api-key", b"some-key")]), None)
+    req = Request(_make_http_scope(headers=[(b"x-api-key", b"sk_pfx.secret")]), None)
     with pytest.raises(ValueError, match="Invalid table identifier"):
         await require_api_key(req, table="api_keys; DROP TABLE users;")
 
@@ -860,28 +883,37 @@ async def test_api_key_guard_invalid_table_identifier_blocked() -> None:
 @pytest.mark.asyncio
 async def test_api_key_guard_database_failure_fails_closed(
     ensure_db_pool: DatabasePool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Verify that database query errors during API key verification fail closed with 503."""
+    """Verify that database query errors during API key verification fail closed with generic 503 and log detail."""
     app = Application()
     app.container.instance(DatabasePool, ensure_db_pool)
 
     @app.get("/data")
     async def handler(request: Request) -> Response:
         # Table does not exist in database
-        await require_api_key(request, table="non_existent_table_xyz")
+        await require_api_key(
+            request,
+            table="non_existent_table_xyz",
+            pepper="pepper-at-least-32-bytes-long---!",
+        )
         return json_response({"ok": True})
 
-    status, headers, body = await _simulate_request(
-        app,
-        "GET",
-        "/data",
-        headers={"x-api-key": "sk_some_key"},
-    )
+    with caplog.at_level(logging.ERROR):
+        status, headers, body = await _simulate_request(
+            app,
+            "GET",
+            "/data",
+            headers={"x-api-key": "sk_some_prefix.some_secret_value"},
+        )
     assert status == 503
     assert any(name.lower() == "retry-after" for name, _ in headers)
-    assert (
-        "unavailable" in body.get("detail", "").lower()
-        or "database" in body.get("detail", "").lower()
+    assert body.get("detail") == "Authentication service unavailable"
+    assert "database" not in body.get("detail", "").lower()
+    assert "non_existent_table_xyz" not in json.dumps(body)
+    assert any(
+        "non_existent_table_xyz" in str(r.exc_info) or "database error" in r.message
+        for r in caplog.records
     )
 
 
@@ -1081,7 +1113,7 @@ async def test_jwt_wrong_signing_key_rejected_http() -> None:
         name.lower() == "www-authenticate" and value.lower().startswith("bearer")
         for name, value in headers
     )
-    assert body.get("detail") == "Invalid token signature"
+    assert body.get("detail") == "Invalid or expired token"
     # Ensure no secrets or sensitive internal stack details are leaked
     body_str = json.dumps(body)
     assert "key-a" not in body_str
@@ -1214,7 +1246,7 @@ async def test_rs256_wrong_public_key_rejected_and_http() -> None:
         name.lower() == "www-authenticate" and value.lower().startswith("bearer")
         for name, value in headers
     )
-    assert body.get("detail") == "Invalid token signature"
+    assert body.get("detail") == "Invalid or expired token"
 
 
 @pytest.mark.asyncio
@@ -1335,16 +1367,17 @@ async def test_api_key_guard_malformed_hashes_in_database_only(
             CREATE TABLE "{table_name}" (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
+                key_prefix VARCHAR(64) NOT NULL UNIQUE,
                 key_hash TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT TRUE,
                 revoked BOOLEAN DEFAULT FALSE,
                 expires_at TIMESTAMPTZ DEFAULT NULL
             );
-            INSERT INTO "{table_name}" (name, key_hash, is_active, revoked) VALUES
-            ('Plain text hash', 'not_a_bcrypt_hash_at_all', TRUE, FALSE),
-            ('Bad prefix', '$2a$bad_salt_too_short', TRUE, FALSE),
-            ('Empty hash', '', TRUE, FALSE),
-            ('Truncated', '$2b$12$', TRUE, FALSE);
+            INSERT INTO "{table_name}" (name, key_prefix, key_hash, is_active, revoked) VALUES
+            ('Plain text hash', 'sk_m1', 'not_a_bcrypt_hash_at_all', TRUE, FALSE),
+            ('Bad prefix', 'sk_m2', '$2a$bad_salt_too_short', TRUE, FALSE),
+            ('Empty hash', 'sk_m3', '', TRUE, FALSE),
+            ('Truncated', 'sk_m4', '$2b$12$', TRUE, FALSE);
             """
         )
 
@@ -1353,18 +1386,69 @@ async def test_api_key_guard_malformed_hashes_in_database_only(
 
     @app.get("/api/data")
     async def get_data(request: Request) -> Response:
-        await require_api_key(request, table=table_name)
+        await require_api_key(
+            request,
+            table=table_name,
+            pepper="malformed-test-pepper-32-bytes!!",
+        )
         return json_response({"ok": True})
 
-    # Any presented key must cleanly fail with 401 Unauthorized
-    status, _, body = await _simulate_request(
-        app,
-        "GET",
-        "/api/data",
-        headers={"x-api-key": "sk_live_attempt_key_123"},
+    for pfx in ("sk_m1", "sk_m2", "sk_m3", "sk_m4", "sk_nonexistent"):
+        status, _, body = await _simulate_request(
+            app,
+            "GET",
+            "/api/data",
+            headers={"x-api-key": f"{pfx}.attempt_secret_123"},
+        )
+        assert status == 401
+        assert "invalid" in body.get("detail", "").lower()
+
+
+@pytest.mark.asyncio
+async def test_auth_errors_never_leak_issuer_audience_or_token_p2a4(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    P2-A4: Verifies that 401 response bodies never leak expected issuer or audience,
+    while logging the cause server-side without logging the raw JWT token.
+    """
+    secret = "p2a4-no-leak-secret-at-least-32-bytes!"
+    issuer_token = JWTIssuer(
+        secret=secret,
+        issuer="wrong-issuer",
+        audience="wrong-audience",
     )
+    issuer_server = JWTIssuer(
+        secret=secret,
+        issuer="secret-internal-issuer-name",
+        audience="secret-internal-audience-name",
+    )
+    token = issuer_token.issue_access_token(subject="user_p2a4")
+
+    app = Application()
+    app.container.instance(JWTIssuer, issuer_server)
+
+    @app.get("/protected")
+    async def protected(request: Request) -> Response:
+        await require_jwt(request)
+        return json_response({"ok": True})
+
+    with caplog.at_level(logging.WARNING):
+        status, _, body = await _simulate_request(
+            app,
+            "GET",
+            "/protected",
+            headers={"Authorization": f"Bearer {token}"},
+        )
     assert status == 401
-    assert "invalid" in body.get("detail", "").lower()
+    assert body.get("detail") == "Invalid or expired token"
+    body_text = json.dumps(body)
+    assert "secret-internal-issuer-name" not in body_text
+    assert "secret-internal-audience-name" not in body_text
+    # Log record contains the cause, but NEVER the raw token
+    log_messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "Invalid issuer" in log_messages
+    assert token not in log_messages
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 
 import asyncpg
+import pytest
 
 from app.providers.app_service_provider import AppServiceProvider
 from app.providers.database_service_provider import DatabaseServiceProvider
@@ -31,8 +32,6 @@ async def setup_schema(db_pool: DatabasePool) -> None:
             TRUNCATE TABLE test_profiles, test_users RESTART IDENTITY;
         """)
 
-
-import pytest
 
 _setup_done = False
 
@@ -275,11 +274,15 @@ async def test_trailing_newline_injection() -> None:
             Query.table(invalid_table)
 
     for invalid_col in ("name\n", "name ", "name\r\n", "*"):
-        with pytest.raises(ValueError, match="Invalid SQL identifier detected"):
+        with pytest.raises(ValueError, match="Invalid SQL"):
             Query.table("test_users").where(invalid_col, "John")
+        with pytest.raises(ValueError, match="Invalid SQL"):
+            Query.table("test_users").where_null(invalid_col)
+        with pytest.raises(ValueError, match="Invalid SQL"):
+            Query.table("test_users").where_not_null(invalid_col)
 
-    for invalid_order in ("name\n", "name ", "name\r\n"):
-        with pytest.raises(ValueError, match="Invalid SQL column identifier detected"):
+    for invalid_order in ("name\n", "name ", "name\r\n", "*"):
+        with pytest.raises(ValueError, match="Invalid SQL"):
             Query.table("test_users").order_by(invalid_order)
 
 

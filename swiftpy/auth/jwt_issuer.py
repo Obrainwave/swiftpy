@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import secrets
 import time
 import uuid
@@ -60,6 +61,15 @@ def _base64url_decode(data: str) -> bytes:
         raise InvalidTokenError(f"Base64 decoding failed: {exc}") from exc
 
 
+def _is_valid_timestamp(value: Any) -> bool:
+    """Return True if value is a finite int or float (excluding bool)."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 class JWTIssuer:
     """
     High-performance, secure JWT engine supporting RS256 and HS256 algorithms
@@ -80,7 +90,6 @@ class JWTIssuer:
         "nbf",
     }
 
-
     def __init__(
         self,
         secret: str | bytes | None = None,
@@ -90,18 +99,23 @@ class JWTIssuer:
         access_token_ttl: int = 900,  # 15 minutes
         refresh_token_ttl: int = 604800,  # 7 days
         issuer: str | None = None,
-        audience: str | None = None,
+        audience: str | list[str] | set[str] | tuple[str, ...] | None = None,
+        leeway: int = 0,
     ) -> None:
-        self.algorithm = algorithm.upper()
-        if self.algorithm not in self.SUPPORTED_ALGORITHMS:
+        if not isinstance(algorithm, str) or algorithm not in self.SUPPORTED_ALGORITHMS:
             raise InvalidAlgorithmError(
                 f"Unsupported algorithm '{algorithm}'. Must be one of {self.SUPPORTED_ALGORITHMS}."
             )
+        self.algorithm = algorithm
+
+        if isinstance(leeway, bool) or not isinstance(leeway, (int, float)) or not math.isfinite(leeway) or leeway < 0:
+            raise ConfigurationError("JWT leeway must be a non-negative number.")
 
         self.access_token_ttl = access_token_ttl
         self.refresh_token_ttl = refresh_token_ttl
         self.issuer = issuer
         self.audience = audience
+        self.leeway = int(leeway)
 
         # Symmetric key setup
         self._secret: bytes | None = None
@@ -188,7 +202,7 @@ class JWTIssuer:
         elif isinstance(cfg.get("auth.jwt"), dict):
             jwt_cfg = cfg.get("auth.jwt")
 
-        algorithm = str(jwt_cfg.get("algorithm") or cfg.get("auth.jwt.algorithm") or "HS256").upper()
+        algorithm = str(jwt_cfg.get("algorithm") or cfg.get("auth.jwt.algorithm") or "HS256")
         raw_secret = jwt_cfg.get("secret") if "secret" in jwt_cfg else cfg.get("auth.jwt.secret")
         if raw_secret is None:
             raw_secret = cfg.get("jwt_secret")
@@ -218,8 +232,18 @@ class JWTIssuer:
 
         access_ttl = int(jwt_cfg.get("access_token_ttl") or cfg.get("auth.jwt.access_token_ttl") or 900)
         refresh_ttl = int(jwt_cfg.get("refresh_token_ttl") or cfg.get("auth.jwt.refresh_token_ttl") or 604800)
+        raw_leeway = jwt_cfg.get("leeway") if "leeway" in jwt_cfg else cfg.get("auth.jwt.leeway")
+        leeway = int(raw_leeway) if raw_leeway is not None else 0
         issuer = jwt_cfg.get("issuer") or cfg.get("auth.jwt.issuer")
-        audience = jwt_cfg.get("audience") or cfg.get("auth.jwt.audience")
+        raw_audience = jwt_cfg.get("audience") or cfg.get("auth.jwt.audience")
+        audience: str | list[str] | None
+        if isinstance(raw_audience, (list, tuple, set)):
+            audience = [str(a) for a in raw_audience]
+        elif raw_audience:
+            audience = str(raw_audience)
+        else:
+            audience = None
+
         private_key = jwt_cfg.get("private_key") or cfg.get("auth.jwt.private_key")
         public_key = jwt_cfg.get("public_key") or cfg.get("auth.jwt.public_key")
 
@@ -231,7 +255,8 @@ class JWTIssuer:
             access_token_ttl=access_ttl,
             refresh_token_ttl=refresh_ttl,
             issuer=str(issuer) if issuer else None,
-            audience=str(audience) if audience else None,
+            audience=audience,
+            leeway=leeway,
         )
 
     @classmethod
@@ -272,17 +297,29 @@ class JWTIssuer:
         """
         Issue a signed JSON Web Token with standard and custom claims.
         """
-        alg = (algorithm or self.algorithm).upper()
-        if alg not in self.SUPPORTED_ALGORITHMS:
+        alg = self.algorithm if algorithm is None else algorithm
+        if not isinstance(alg, str) or alg not in self.SUPPORTED_ALGORITHMS:
             raise InvalidAlgorithmError(f"Unsupported algorithm '{alg}'.")
+
+        if claims:
+            conflicting = set(claims.keys()) & self.RESERVED_CLAIMS
+            if conflicting:
+                raise ValueError(
+                    f"Cannot override reserved JWT claim(s): {', '.join(sorted(conflicting))}"
+                )
 
         now = int(time.time())
         ttl_seconds: int
         if expires_in is not None:
             if isinstance(expires_in, timedelta):
-                ttl_seconds = int(expires_in.total_seconds())
-            else:
+                total_sec = expires_in.total_seconds()
+                if not math.isfinite(total_sec):
+                    raise ValueError("expires_in must be a finite duration")
+                ttl_seconds = int(total_sec)
+            elif _is_valid_timestamp(expires_in):
                 ttl_seconds = int(expires_in)
+            else:
+                raise ValueError("expires_in must be a finite integer or timedelta")
         else:
             ttl_seconds = (
                 self.access_token_ttl
@@ -303,27 +340,34 @@ class JWTIssuer:
         if not_before is not None:
             if isinstance(not_before, timedelta):
                 payload["nbf"] = now + int(not_before.total_seconds())
-            else:
+            elif _is_valid_timestamp(not_before):
                 payload["nbf"] = int(not_before)
+            else:
+                raise ValueError("not_before must be a finite integer or timedelta")
 
         if self.issuer:
             payload["iss"] = self.issuer
         if self.audience:
-            payload["aud"] = self.audience
+            if isinstance(self.audience, (set, tuple)):
+                payload["aud"] = list(self.audience)
+            else:
+                payload["aud"] = self.audience
 
         if claims:
-            # Prevent overwriting core security metadata
             for key, val in claims.items():
-                if key not in self.RESERVED_CLAIMS:
-                    payload[key] = val
+                payload[key] = val
 
         header = {
             "alg": alg,
             "typ": token_type if token_type in {"access", "refresh"} else "JWT",
         }
 
-        header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-        payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        header_bytes = json.dumps(
+            header, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        payload_bytes = json.dumps(
+            payload, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
 
         header_b64 = _base64url_encode(header_bytes)
         payload_b64 = _base64url_encode(payload_bytes)
@@ -345,7 +389,7 @@ class JWTIssuer:
             subject=subject,
             token_type="access",
             claims=claims,
-            expires_in=expires_in or self.access_token_ttl,
+            expires_in=self.access_token_ttl if expires_in is None else expires_in,
         )
 
     def issue_refresh_token(
@@ -359,7 +403,7 @@ class JWTIssuer:
             subject=subject,
             token_type="refresh",
             claims=claims,
-            expires_in=expires_in or self.refresh_token_ttl,
+            expires_in=self.refresh_token_ttl if expires_in is None else expires_in,
         )
 
     def issue_token_pair(
@@ -385,7 +429,7 @@ class JWTIssuer:
             claims=refresh_claims,
             expires_in=refresh_expires_in,
         )
-        ttl = access_expires_in or self.access_token_ttl
+        ttl = self.access_token_ttl if access_expires_in is None else access_expires_in
         ttl_seconds = int(ttl.total_seconds() if isinstance(ttl, timedelta) else ttl)
 
         return {
@@ -395,7 +439,6 @@ class JWTIssuer:
             "expires_in": ttl_seconds,
         }
 
-
     def decode_token(
         self,
         token: str,
@@ -403,12 +446,17 @@ class JWTIssuer:
         verify_exp: bool = True,
         expected_type: str | None = None,
         allowed_algorithms: list[str] | set[str] | None = None,
+        leeway: int | None = None,
     ) -> dict[str, Any]:
         """
         Decode and cryptographically verify a JWT.
         """
         if not isinstance(token, str) or not token:
             raise InvalidTokenError("Token must be a non-empty string")
+
+        active_leeway = self.leeway if leeway is None else leeway
+        if not _is_valid_timestamp(active_leeway) or active_leeway < 0:
+            raise ValueError("leeway must be a non-negative finite number")
 
         parts = token.strip().split(".")
         if len(parts) != 3:
@@ -431,24 +479,23 @@ class JWTIssuer:
         if not alg or not isinstance(alg, str):
             raise InvalidAlgorithmError("Missing or invalid 'alg' in token header")
 
-        alg_upper = alg.upper()
-
-        # Strict security protection: reject "none" algorithm attacks
-        if alg_upper == "NONE":
+        # Strict security protection: reject "none" algorithm attacks across all case variations
+        if alg.upper() == "NONE":
             raise InvalidAlgorithmError("The 'none' algorithm is strictly disallowed.")
 
+        # Exact-case matching for allowed and supported algorithms (P2-A5)
         allowed = (
-            {a.upper() for a in allowed_algorithms}
+            set(allowed_algorithms)
             if allowed_algorithms is not None
             else {self.algorithm}
         )
 
-        if alg_upper not in allowed:
+        if alg not in allowed:
             raise InvalidAlgorithmError(
                 f"Algorithm '{alg}' is not allowed for this issuer. Allowed: {allowed}"
             )
 
-        if alg_upper not in self.SUPPORTED_ALGORITHMS:
+        if alg not in self.SUPPORTED_ALGORITHMS:
             raise InvalidAlgorithmError(
                 f"Algorithm '{alg}' is not supported. Supported: {self.SUPPORTED_ALGORITHMS}"
             )
@@ -457,7 +504,7 @@ class JWTIssuer:
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
         signature_bytes = _base64url_decode(signature_b64)
 
-        self._verify_signature(signing_input, signature_bytes, alg_upper)
+        self._verify_signature(signing_input, signature_bytes, alg)
 
         # Parse payload
         try:
@@ -475,27 +522,30 @@ class JWTIssuer:
         if "sub" not in payload or not payload["sub"]:
             raise InvalidTokenError("Missing or empty 'sub' claim in token")
 
-        # Issued At (iat) check
+        # Issued At (iat) check (including future check with leeway)
         iat = payload.get("iat")
-        if iat is not None and not isinstance(iat, (int, float)):
-            raise InvalidTokenError("Claim 'iat' must be a numeric timestamp")
+        if iat is not None:
+            if not _is_valid_timestamp(iat):
+                raise InvalidTokenError("Claim 'iat' must be a numeric timestamp")
+            if iat > now + active_leeway:
+                raise InvalidTokenError("Token 'iat' claim is in the future")
 
-        # Expiration check
+        # Expiration check (always validate finiteness if present; check expiry when verify_exp=True)
+        exp = payload.get("exp")
+        if exp is not None and not _is_valid_timestamp(exp):
+            raise InvalidTokenError("Claim 'exp' must be a numeric timestamp")
         if verify_exp:
-            exp = payload.get("exp")
             if exp is None:
                 raise InvalidTokenError("Missing 'exp' claim in token")
-            if not isinstance(exp, (int, float)):
-                raise InvalidTokenError("Claim 'exp' must be a numeric timestamp")
-            if now >= exp:
+            if now - active_leeway >= exp:
                 raise TokenExpiredError("Token has expired")
 
-        # Not Before (nbf) check
+        # Not Before (nbf) check with leeway
         nbf = payload.get("nbf")
         if nbf is not None:
-            if not isinstance(nbf, (int, float)):
+            if not _is_valid_timestamp(nbf):
                 raise InvalidTokenError("Claim 'nbf' must be a numeric timestamp")
-            if now < nbf:
+            if now + active_leeway < nbf:
                 raise InvalidTokenError("Token is not active yet (nbf constraint)")
 
         # Issuer check
@@ -506,10 +556,28 @@ class JWTIssuer:
                     f"Invalid issuer: expected '{self.issuer}', got '{token_iss}'"
                 )
 
-        # Audience check
+        # Audience check (supports str or list[str] on both token and issuer, P2-A5)
         if self.audience is not None:
             token_aud = payload.get("aud")
-            if token_aud != self.audience:
+            if isinstance(token_aud, str) and token_aud:
+                token_aud_set = {token_aud}
+            elif (
+                isinstance(token_aud, list)
+                and token_aud
+                and all(isinstance(item, str) and bool(item) for item in token_aud)
+            ):
+                token_aud_set = set(token_aud)
+            else:
+                raise InvalidTokenError(
+                    f"Invalid audience: expected '{self.audience}', got '{token_aud}'"
+                )
+
+            expected_aud_set = (
+                {self.audience}
+                if isinstance(self.audience, str)
+                else set(self.audience)
+            )
+            if expected_aud_set.isdisjoint(token_aud_set):
                 raise InvalidTokenError(
                     f"Invalid audience: expected '{self.audience}', got '{token_aud}'"
                 )
@@ -532,24 +600,6 @@ class JWTIssuer:
                 )
 
         return payload
-
-
-    @classmethod
-    def decode_unverified(cls, token: str) -> dict[str, Any]:
-        """
-        Extract token payload without verifying signature (useful for reading jti/exp before revocation).
-        """
-        parts = token.strip().split(".")
-        if len(parts) != 3:
-            raise InvalidTokenError("Malformed token structure")
-        try:
-            payload_json = _base64url_decode(parts[1]).decode("utf-8")
-            payload = json.loads(payload_json)
-            if not isinstance(payload, dict):
-                raise InvalidTokenError("Token payload must be a dictionary")
-            return payload
-        except Exception as exc:
-            raise InvalidTokenError(f"Failed to read payload: {exc}") from exc
 
     def _sign(self, data: bytes, algorithm: str) -> bytes:
         if algorithm == "HS256":

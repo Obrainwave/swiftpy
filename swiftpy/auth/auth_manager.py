@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from swiftpy.auth.api_key_guard import ApiKeyGuard
-from swiftpy.auth.jwt_guard import JWTGuard
+from swiftpy.auth.api_key_guard import ApiKeyGuard, require_api_key
+from swiftpy.auth.jwt_guard import JWTGuard, require_jwt
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist
 from swiftpy.core.config import Config
 from swiftpy.core.container import Container, get_container
 from swiftpy.core.context import Context
+from swiftpy.database.pool import DatabasePool
 from swiftpy.http.request import Request
 
 
@@ -115,7 +116,17 @@ class AuthManager:
             return JWTGuard(issuer=issuer, blacklist=blacklist)
 
         if name == "api_key":
-            return ApiKeyGuard()
+            cfg = (
+                self.container.resolve(Config)
+                if self.container.has(Config)
+                else None
+            )
+            pool = (
+                self.container.resolve(DatabasePool)
+                if self.container.has(DatabasePool)
+                else None
+            )
+            return ApiKeyGuard.from_config(config=cfg, pool=pool)
 
         raise ValueError(f"Auth guard [{name}] is not defined.")
 
@@ -135,15 +146,11 @@ class AuthManager:
         if guard_name == "jwt" or (
             guard_name is None and self.default_guard_name() == "jwt"
         ):
-            from swiftpy.auth.jwt_guard import require_jwt
-
             return await require_jwt(request)
 
         if guard_name == "api_key" or (
             guard_name is None and self.default_guard_name() == "api_key"
         ):
-            from swiftpy.auth.api_key_guard import require_api_key
-
             return await require_api_key(request)
 
         raise TypeError(f"Guard [{guard_name}] does not support authenticate()")
