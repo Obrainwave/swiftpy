@@ -7,6 +7,7 @@ import asyncio
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import ClassVar
 
 import asyncpg
 import pytest
@@ -677,6 +678,7 @@ async def test_updated_at_maintained_on_save(
         name: str
         created_at: datetime
         updated_at: datetime
+        __guarded__: ClassVar[list[str]] = []
 
     try:
         user = await TimestampUser.create({"name": "Alice"})

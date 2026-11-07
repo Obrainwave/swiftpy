@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -14,6 +14,7 @@ class EventUser(Model):
     id: int
     name: str
     email: str = ""
+    __guarded__: ClassVar[list[str]] = []
 
 
 class AuditLogEntry(Model):
@@ -21,6 +22,7 @@ class AuditLogEntry(Model):
     id: int
     action: str
     metadata: str = ""
+    __guarded__: ClassVar[list[str]] = []
 
 
 @pytest.fixture(autouse=True)
@@ -154,10 +156,15 @@ async def test_wildcard_listener_captures_all_model_lifecycle_events() -> None:
     await user.save()
     await user.delete()
 
-    assert len(captured) == 3
-    assert captured[0][0] == "event_user.created"
-    assert captured[1][0] == "event_user.updated"
-    assert captured[2][0] == "event_user.deleted"
+    assert len(captured) == 6
+    assert [name for name, _ in captured] == [
+        "event_user.creating",
+        "event_user.created",
+        "event_user.updating",
+        "event_user.updated",
+        "event_user.deleting",
+        "event_user.deleted",
+    ]
 
 
 async def test_model_crud_without_listeners() -> None:
@@ -234,7 +241,7 @@ async def test_model_lifecycle_listener_failure_propagates() -> None:
     def bad_listener(p: Any) -> None:
         raise PermissionError("Listener rejected model creation")
 
-    dispatcher.listen("event_user.created", bad_listener)
+    dispatcher.listen("event_user.creating", bad_listener)
 
     with pytest.raises(PermissionError, match="Listener rejected model creation"):
         await EventUser.create(name="RejectMe", email="reject@example.com")

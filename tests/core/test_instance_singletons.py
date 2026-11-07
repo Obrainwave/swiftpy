@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -26,6 +26,7 @@ class SingletonEventWidget(Model):
     __table__ = "singleton_event_widgets"
     id: int
     label: str
+    __guarded__: ClassVar[list[str]] = []
 
 
 def test_two_applications_do_not_share_singletons() -> None:
@@ -135,8 +136,11 @@ async def test_model_events_route_to_active_application_dispatcher_only(
         await w1.delete()
 
         assert events_app1 == [
+            "singleton_event_widget.creating:from_app1",
             "singleton_event_widget.created:from_app1",
+            "singleton_event_widget.updating:from_app1_updated",
             "singleton_event_widget.updated:from_app1_updated",
+            "singleton_event_widget.deleting:from_app1_updated",
             "singleton_event_widget.deleted:from_app1_updated",
         ]
         assert events_app2 == []
@@ -144,8 +148,11 @@ async def test_model_events_route_to_active_application_dispatcher_only(
         # Execute model lifecycle under app2
         set_container(app2.container)
         await SingletonEventWidget.create(label="from_app2")
-        assert events_app2 == ["singleton_event_widget.created:from_app2"]
-        assert len(events_app1) == 3
+        assert events_app2 == [
+            "singleton_event_widget.creating:from_app2",
+            "singleton_event_widget.created:from_app2",
+        ]
+        assert len(events_app1) == 6
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS singleton_event_widgets CASCADE;")

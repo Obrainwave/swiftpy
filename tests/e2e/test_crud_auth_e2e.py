@@ -28,6 +28,7 @@ class E2EUser(Model):
     name: str
     email: str
     password_hash: str
+    __guarded__: ClassVar[list[str]] = []
 
 
 class E2EArticle(Model):
@@ -36,6 +37,7 @@ class E2EArticle(Model):
     title: str
     content: str
     author_id: int
+    __guarded__: ClassVar[list[str]] = []
 
 
 class RegisterForm(FormRequest):

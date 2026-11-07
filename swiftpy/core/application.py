@@ -455,17 +455,25 @@ class Application:
                             ) from None
                         raise
 
-                    rules = ann.get_rules()
+                    rules = ann.get_parsed_rules(container=self.container)
                     result = await validate(data, rules)
                     if result.fails():
                         raise ValidationException(result.errors)
 
-                    instance = ann(
-                        data=result.validated_data,
-                        raw_data=data,
-                        request=request,
-                        validation_result=result,
-                    )
+                    try:
+                        instance = ann(
+                            data=result.validated_data,
+                            raw_data=data,
+                            request=request,
+                            validation_result=result,
+                        )
+                    except TypeError:
+                        instance = self.container.resolve(ann)
+                        instance.data = result.validated_data
+                        instance.raw_data = data
+                        instance.request = request
+                        instance.validation_result = result
+
                     call_kwargs[spec.name] = instance
                 elif spec.kind == "di":
                     call_kwargs[spec.name] = self.container.resolve(spec.annotation)

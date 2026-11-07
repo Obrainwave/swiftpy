@@ -151,6 +151,61 @@ All notable changes to SwiftPY will be documented in this file.
   - Added `max_items` LRU eviction and lazy expiry sweeping to `MemoryDriver`, performing `copy.deepcopy` outside the lock to minimize lock contention.
   - Updated `Cache._resolve_driver` to honor `redis_url`, `max_connections`, and `timeout`, sharing connection pools across stores with identical connection configurations.
 
+### Phase 7 – ORM Safety and Typing
+- **P7-M1 (ORM – Hidden Attributes & Safe Serialization):**
+  - **Breaking:** `Model.__repr__` now outputs `<ClassName pk_name=pk_val!r>` only, preventing accidental credential/token leakage in logs, interactive shells, and exception traces (Decision `D-5`).
+  - Added `__hidden__: ClassVar[tuple[str, ...]] = ()` support on `Model`. Fields declared in `__hidden__` are omitted from `to_dict()`, `encode_json()`, and event payloads published on the bus, while remaining accessible as Python attributes on the instance.
+  - Added `model.make_visible(*fields)` and `model.make_hidden(*fields)` instance methods to temporarily expose or hide fields in `to_dict()` outputs.
+  - Updated `to_dict(include_hidden=False)` to recursively respect `__hidden__` declarations across loaded relationships.
+- **P7-M2 (ORM – Mass Assignment Protection):**
+  - **Breaking:** Mass assignment via `Model(...)`, `Model.create(...)`, `Model.fill(...)`, and `ModelQueryBuilder.create(...)` now denies all fields by default unless declared in `__fillable__` or allowed via `__guarded__` (Decision `D-4`). To opt out of mass assignment protection, models must explicitly declare `__guarded__: ClassVar[list[str]] = []`.
+  - Added `MassAssignmentError(ValueError)`. Attributes starting with `_` (e.g. `_exists`, `_original`) and undeclared attribute keys passed to `__init__`, `create()`, or `fill()` raise `MassAssignmentError`.
+  - Added `Model.force_fill(attributes)` and `Model.force_create(**attributes)` to explicitly bypass mass assignment checks for trusted internal code.
+  - Added `Model._hydrate(row)` to instantiate models directly from trusted database rows without mass-assignment validation overhead.
+- **P7-M3 (ORM – Defaults and Dirty Tracking):**
+  - Implemented `Field(default=..., default_factory=..., primary_key=..., nullable=...)` returning `FieldInfo` metadata.
+  - Added per-instance deep-copying (`copy.deepcopy`) of mutable class defaults, callables, and `default_factory` callbacks evaluated at instance creation time.
+  - Implemented deep-copy snapshotting of `_original` so in-place mutations of mutable types (`dict`, `list`, JSON/JSONB) are detected as dirty.
+  - Added `model.is_dirty(*fields)` and `model.get_dirty()`. Partial select models track explicit modifications via `_modified_keys` to ensure unselected columns are never clobbered on update.
+  - `model.save()` skips database `UPDATE` and suppresses `.updated` lifecycle events when dirty tracking detects no changes (no-op save).
+  - Added `_coerce_db_value` to automatically deserialize PostgreSQL JSON/JSONB string columns into typed Python dictionaries and lists.
+- **P7-M4 (ORM – Events and Transaction Ordering):**
+  - Refactored model lifecycle dispatch (`_dispatch_lifecycle_event`): `*ing` (before) events (`creating`, `updating`, `deleting`) execute inline and abort database operations if an exception is raised or a listener returns `False`.
+  - Deferred `*ed` (after) events (`created`, `updated`, `deleted`) to execute post-commit via `on_commit` when inside an active database transaction.
+  - Added `Model.strict_events: ClassVar[bool] = False`. When `strict_events` is False (default), listener exceptions on `*ed` events are logged without turning committed database writes into apparent failures; when True, listener exceptions propagate to the caller.
+- **P7-M5 (ORM – Relationships Hardening):**
+  - Chunked `IN` queries during eager loading in batches of 1,000 keys (`_chunk_list`) across `HasMany`, `HasOne`, `BelongsTo`, and `BelongsToMany` to prevent hitting database parameter limits.
+  - Implemented multi-level nested eager loading (e.g. `with_("books.reviews")`, `with_("author.books.tags")`) issuing exactly 1 query per relation level via recursive relation dependency grouping.
+  - Guarded `RelationshipQueryBuilder.__getattr__` against private/dunder attribute lookups to prevent recursion during `copy.copy` or inspection.
+  - Added pivot manipulation methods on `BelongsToMany` (`attach(model_or_id, **pivot_extra)`, `detach(model_or_id=None)`, `sync(ids_or_models)`).
+  - Added `Model.prevent_lazy_loading: ClassVar[bool] = False`. When enabled, accessing un-eager-loaded relationships raises `LazyLoadingDisabledError`.
+  - Enforced symmetric `__eq__` and `__hash__` semantics (`type(self) is type(other)` and identical primary key).
+- **P7-M6 (ORM – Public Typing for Models & Relations):**
+  - Added descriptor protocol (`@overload def __get__(...)`) to `Relation` and `RelationDescriptor` in `swiftpy/database/orm/relationships.py`, allowing Mypy to recognize relationship properties on model classes.
+  - Added `tests/typing/test_orm_typing.py` validating static and runtime contracts for attributes, relationships, dirty tracking, hidden fields, and BelongsToMany operations.
+  - Completely resolved the 25 legacy Mypy errors in `tests/orm/test_eager_loading.py`. Mypy now passes with **0 errors across 208 source files** in strict mode.
+
+### Phase 8 – Validation Hardening
+- **P8-V1 (Validation – Rule Correctness & Coercion):**
+  - Hardened `IntRule` with ASCII-only regex `^[+-]?[0-9]+$` rejecting unicode superscript digits (e.g. `"²"`, `"³"`) and booleans, coercing valid numeric strings into integers.
+  - Hardened `FloatRule` to reject `NaN`, `Infinity`, and `-Infinity`, coercing finite numeric strings into floats.
+  - Hardened `EmailRule` with tighter RFC-compliant checks (local <= 64, total <= 254, rejecting consecutive dots `..` and leading/trailing dots in local part). Normalizes domain to lowercase and strips whitespace on validation and storage, preserving local part case (or full lowercase when `email:lowercase` is configured).
+  - Hardened `UrlRule` enforcing a 2048-character maximum length limit and valid HTTP/HTTPS schemes.
+  - Added support for escaping `\|` and `\:` in rule strings (e.g. `regex:^(a\|b)+$`) and list-based rule declarations `["required", "regex:^(a|b)+$"]`. Caught `re.error` so invalid regex patterns return validation errors rather than 500 errors.
+  - `BetweenRule` parsing (`between:1`) now raises `ConfigurationError` at parse time when missing the required range boundaries.
+  - Hardened `InRule` and `NotInRule` with strict type matching, ensuring boolean values (`True`/`False`) do not match integer `1`/`0` or string `"True"`.
+  - Added case-insensitive support for database rules (`unique:table,column,ci` and `UniqueRule(..., case_insensitive=True)`) using `LOWER("{column}") = LOWER($1)`.
+  - Database data errors (`asyncpg.DataError`) during `unique` or `exists` evaluation now fail validation gracefully with field errors rather than crashing the request with HTTP 500.
+- **P8-V2 (Validation – Engine Optimization & Order Independence):**
+  - Precomputed and cached rule invocation metadata and signatures (`(param_count, is_async)`), eliminating per-field `inspect.signature` overhead on every request.
+  - Removed `except TypeError` retry fallback in `_run_rule`, ensuring rule implementation bugs propagate cleanly as framework errors instead of being re-executed.
+  - Enforced structured 422 `Unprocessable Entity` response with `{"body": ["The request body must be a JSON object."]}` when non-dict payloads (`[]`, `"x"`, `null`, `123`) are sent.
+  - Achieved rule order independence for coercion: sorted rule execution so type coercion rules (`IntRule`, `FloatRule`, `BoolRule`, `EmailRule`) run before magnitude and length constraint rules (`MinRule`, `MaxRule`, `BetweenRule`).
+- **P8-V3 (Validation – Fail-Closed Validation & DI Resolution):**
+  - **Breaking (Security):** `FormRequest.get_rules()` now fails closed with `ConfigurationError` (HTTP 500) if rule instantiation or definition raises `TypeError` or any exception, removing the unsafe fallback that previously returned `{}` and allowed unvalidated requests to execute route handlers (Decision `D-9`).
+  - Added parse-once caching (`_cached_parsed_rules`) per `FormRequest` class so static rule definitions are parsed once and reused across requests.
+  - Integrated container dependency injection for `FormRequest`: constructors requiring registered services or dependencies are automatically resolved via `container.resolve(ann)`.
+
 
 
 

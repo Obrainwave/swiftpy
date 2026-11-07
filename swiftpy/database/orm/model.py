@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
 import inspect
+import json
+import logging
 from collections.abc import Generator, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import (
@@ -14,6 +17,7 @@ from typing import (
 )
 
 from swiftpy.database.identifiers import validate_identifier
+from swiftpy.database.orm.fields import Field, FieldInfo
 from swiftpy.database.orm.registry import (
     _MODEL_REGISTRY,
     restore_model_registry,
@@ -28,15 +32,21 @@ from swiftpy.database.orm.relationships import (
     RelationDescriptor,
 )
 from swiftpy.database.query_builder import Query
+from swiftpy.database.transaction import get_active_connection
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.support.strings import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
 _MISSING = object()
+logger = logging.getLogger(__name__)
 
 
 class PrimaryKeyError(RuntimeError, ValueError):
     """Raised when a primary key is invalid, composite, or missing on a persisted model."""
+
+
+class MassAssignmentError(ValueError):
+    """Raised when an attribute cannot be mass-assigned."""
 
 
 class ModelQueryBuilder[T: Model]:
@@ -148,8 +158,7 @@ class ModelQueryBuilder[T: Model]:
         instances: list[T] = []
 
         for row in rows:
-            inst = self.model_cls(**row)
-            inst._mark_persisted(row.keys())
+            inst = self.model_cls._hydrate(row)
             instances.append(inst)
 
         if self._eager_loads and instances:
@@ -195,13 +204,43 @@ class ModelQueryBuilder[T: Model]:
         return self.get().__await__()
 
     async def _load_relations(self, instances: list[T]) -> None:
-        for rel_name in self._eager_loads:
-            relation = self.model_cls.__relations_config__.get(rel_name)
+        if not instances or not self._eager_loads:
+            return
+
+        # Group eager loads by top-level relation name
+        tree: dict[str, list[str]] = {}
+        for path in self._eager_loads:
+            parts = path.split(".", 1)
+            top = parts[0]
+            sub = parts[1] if len(parts) > 1 else None
+            tree.setdefault(top, [])
+            if sub:
+                tree[top].append(sub)
+
+        for top_name, sub_paths in tree.items():
+            relation = self.model_cls.__relations_config__.get(top_name)
             if not relation:
                 raise ValueError(
-                    f"Relation '{rel_name}' not found on model {self.model_cls.__name__}"
+                    f"Relation '{top_name}' not found on model {self.model_cls.__name__}"
                 )
             await relation.eager_load(instances)
+
+            if sub_paths:
+                related_items: list[Model] = []
+                for inst in instances:
+                    val = inst._loaded_relations.get(top_name)
+                    if isinstance(val, list):
+                        related_items.extend(
+                            item for item in val if isinstance(item, Model)
+                        )
+                    elif isinstance(val, Model):
+                        related_items.append(val)
+
+                if related_items:
+                    target_model = relation.get_target_model()
+                    sub_builder = target_model.query()
+                    sub_builder._eager_loads = sub_paths
+                    await sub_builder._load_relations(related_items)
 
 
 class Model:
@@ -210,10 +249,14 @@ class Model:
     __table__: ClassVar[str]
     __primary_key__: ClassVar[str] = "id"
     __fillable__: ClassVar[set[str] | list[str] | tuple[str, ...] | None] = None
+    __guarded__: ClassVar[set[str] | list[str] | tuple[str, ...] | None] = None
     __hidden__: ClassVar[set[str] | list[str] | tuple[str, ...]] = ()
+    strict_events: ClassVar[bool] = False
+    prevent_lazy_loading: ClassVar[bool] = False
 
     __fields__: ClassVar[dict[str, Any]]
     __field_defaults__: ClassVar[dict[str, Any]]
+    __field_factories__: ClassVar[dict[str, Any]]
     __relations_config__: ClassVar[dict[str, Relation]]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -235,10 +278,12 @@ class Model:
         # 2. Inherit fields from parent Model classes
         fields: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
+        factories: dict[str, Any] = {}
 
         for base in reversed(cls.__mro__[1:]):
             fields.update(getattr(base, "__fields__", {}))
             defaults.update(getattr(base, "__field_defaults__", {}))
+            factories.update(getattr(base, "__field_factories__", {}))
 
         # 3. Resolve typed class attributes using typing.get_type_hints
         globalns = getattr(inspect.getmodule(cls), "__dict__", {})
@@ -261,7 +306,30 @@ class Model:
 
             fields[name] = hint
             if name in cls.__dict__:
-                defaults[name] = cls.__dict__[name]
+                val = cls.__dict__[name]
+                if isinstance(val, FieldInfo):
+                    if val.primary_key:
+                        cls.__primary_key__ = name
+                    if val.default_factory is not None:
+                        factories[name] = val.default_factory
+                    elif val.default is not _MISSING:
+                        defaults[name] = val.default
+                elif callable(val) and not isinstance(val, (classmethod, staticmethod, property)):
+                    factories[name] = val
+                else:
+                    defaults[name] = val
+
+        for name, val in cls.__dict__.items():
+            if name.startswith("__") or name in fields:
+                continue
+            if isinstance(val, FieldInfo):
+                fields[name] = Any
+                if val.primary_key:
+                    cls.__primary_key__ = name
+                if val.default_factory is not None:
+                    factories[name] = val.default_factory
+                elif val.default is not _MISSING:
+                    defaults[name] = val.default
 
         # 4. Guarantee primary key field presence
         if cls.__primary_key__ not in fields:
@@ -269,6 +337,7 @@ class Model:
 
         cls.__fields__ = fields
         cls.__field_defaults__ = defaults
+        cls.__field_factories__ = factories
 
         # 5. Inherit relations from ancestors and discover newly declared relations
         relations: dict[str, Relation] = {}
@@ -288,36 +357,193 @@ class Model:
         qualname = f"{cls.__module__}.{cls.__qualname__}"
         _MODEL_REGISTRY.setdefault(cls.__name__, {})[qualname] = cls
 
+    def fill(self, **attributes: Any) -> Self:
+        """Mass-assign attributes to the model instance after validating mass assignment rules."""
+        guarded = getattr(self, "__guarded__", None)
+        fillable = getattr(self, "__fillable__", None)
+
+        if guarded is None and fillable is None:
+            raise MassAssignmentError(
+                f"Model '{self.__class__.__name__}' has no __fillable__ or __guarded__ declared; "
+                "mass assignment is denied by default (Decision D-4). "
+                "Declare __fillable__ or set __guarded__ = []."
+            )
+
+        for key, val in attributes.items():
+            if key.startswith("_"):
+                raise MassAssignmentError(
+                    f"Cannot mass-assign private attribute '{key}'."
+                )
+            if key not in self.__fields__ and key not in getattr(self, "__relations_config__", {}):
+                raise MassAssignmentError(
+                    f"Unknown attribute '{key}' for model '{self.__class__.__name__}'."
+                )
+
+            if guarded is not None:
+                if key in guarded:
+                    raise MassAssignmentError(
+                        f"Attribute '{key}' is guarded on model '{self.__class__.__name__}'."
+                    )
+                setattr(self, key, val)
+                self._init_keys.add(key)
+            elif fillable is not None:
+                if key in fillable or key == self.__primary_key__:
+                    setattr(self, key, val)
+                    self._init_keys.add(key)
+                # Unlisted fields in fillable are omitted/ignored
+        return self
+
+    def force_fill(self, **attributes: Any) -> Self:
+        """Mass-assign attributes bypassing fillable/guarded rules (still checks private/unknown)."""
+        for key, val in attributes.items():
+            if key.startswith("_"):
+                raise MassAssignmentError(
+                    f"Cannot mass-assign private attribute '{key}'."
+                )
+            if key not in self.__fields__ and key not in getattr(self, "__relations_config__", {}):
+                raise MassAssignmentError(
+                    f"Unknown attribute '{key}' for model '{self.__class__.__name__}'."
+                )
+            setattr(self, key, val)
+            self._init_keys.add(key)
+        return self
+
+    @classmethod
+    def _hydrate(cls, row: dict[str, Any]) -> Self:
+        """Hydrate a model instance from raw database columns without mass-assignment checks."""
+        inst = cls.__new__(cls)
+        inst._loaded_relations = {}
+        inst._exists = True
+        inst._original = {}
+        inst._init_keys = set(row.keys())
+        inst._modified_keys = set()
+        inst._temp_visible = set()
+        inst._temp_hidden = set()
+
+        for name in cls.__fields__:
+            if name in row:
+                setattr(inst, name, cls._coerce_db_value(name, row[name]))
+            elif name in cls.__field_factories__:
+                setattr(inst, name, cls.__field_factories__[name]())
+            elif name in cls.__field_defaults__:
+                setattr(inst, name, copy.deepcopy(cls.__field_defaults__[name]))
+            else:
+                setattr(inst, name, None)
+
+        for name, val in row.items():
+            if name not in cls.__fields__:
+                setattr(inst, name, val)
+
+        inst._mark_persisted(row.keys())
+        return inst
+
     def __init__(self, **kwargs: Any) -> None:
         self._loaded_relations: dict[str, Any] = {}
         self._exists: bool = False
         self._original: dict[str, Any] = {}
-        self._init_keys: set[str] = set(kwargs)
+        self._init_keys: set[str] = set()
+        self._modified_keys: set[str] = set()
+        self._temp_visible: set[str] = set()
+        self._temp_hidden: set[str] = set()
 
         for name in self.__fields__:
-            if name in kwargs:
-                setattr(self, name, kwargs[name])
+            if name in self.__field_factories__:
+                setattr(self, name, self.__field_factories__[name]())
             elif name in self.__field_defaults__:
-                setattr(self, name, self.__field_defaults__[name])
+                setattr(self, name, copy.deepcopy(self.__field_defaults__[name]))
             else:
                 setattr(self, name, None)
 
-        for name, val in kwargs.items():
-            if name not in self.__fields__:
-                setattr(self, name, val)
+        if kwargs:
+            self.fill(**kwargs)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (
+            hasattr(self, "_exists")
+            and self._exists
+            and name in getattr(self, "__fields__", {})
+        ):
+            orig = getattr(self, "_original", None)
+            if orig is not None and name not in orig:
+                if not hasattr(self, "_modified_keys"):
+                    self._modified_keys = set()
+                self._modified_keys.add(name)
+        super().__setattr__(name, value)
 
     def _mark_persisted(self, keys: Iterable[str]) -> None:
-        """Mark the instance as persisted and record original attribute values for dirty checking."""
+        """Mark the instance as persisted and record deep-copied original attribute values for dirty checking."""
         self._exists = True
         self._original = {
-            k: getattr(self, k)
+            k: copy.deepcopy(getattr(self, k))
             for k in keys
             if k in self.__fields__ and hasattr(self, k)
         }
+        if hasattr(self, "_modified_keys"):
+            self._modified_keys.clear()
+
+    def is_dirty(self, *attributes: str) -> bool:
+        """Check if the model or specified attributes have changed since being persisted."""
+        if not self._exists:
+            return bool(self._init_keys or attributes)
+        dirty = self.get_dirty()
+        if not attributes:
+            return bool(dirty)
+        return any(attr in dirty for attr in attributes)
+
+    def get_dirty(self) -> dict[str, Any]:
+        """Return a mapping of attributes that have changed since being persisted to their current values."""
+        if not self._exists:
+            return {
+                k: getattr(self, k)
+                for k in self.__fields__
+                if hasattr(self, k) and getattr(self, k) is not None
+            }
+
+        dirty: dict[str, Any] = {}
+        for name, original in self._original.items():
+            if name == self.__primary_key__:
+                continue
+            if not hasattr(self, name):
+                continue
+            current_val = getattr(self, name)
+            if current_val != original:
+                dirty[name] = current_val
+
+        for name in getattr(self, "_modified_keys", ()):
+            if name == self.__primary_key__:
+                continue
+            if hasattr(self, name):
+                dirty[name] = getattr(self, name)
+
+        return dirty
+
+    @classmethod
+    def _coerce_db_value(cls, field_name: str, value: Any) -> Any:
+        """Coerce database values such as JSON strings back to typed Python structures if needed."""
+        if isinstance(value, str) and field_name in cls.__fields__:
+            hint = cls.__fields__[field_name]
+            origin = get_origin(hint) or hint
+            is_json_type = (
+                origin in (dict, list)
+                or (
+                    isinstance(hint, str)
+                    and hint.startswith(("dict", "list"))
+                )
+            )
+            if is_json_type:
+                try:
+                    return json.loads(value)
+                except (ValueError, TypeError):
+                    return value
+        return value
 
     @staticmethod
     def _persistable(value: Any) -> Any:
-        return value.get_primary_key() if isinstance(value, Model) else value
+        if isinstance(value, Model):
+            return value.get_primary_key()
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return value
 
     @classmethod
     def query(cls) -> ModelQueryBuilder[Self]:
@@ -364,29 +590,100 @@ class Model:
         return await cls.query().get()
 
     @classmethod
+    async def _dispatch_lifecycle_event(
+        cls,
+        event_suffix: str,
+        instance: Model,
+        *,
+        is_after_event: bool = False,
+    ) -> None:
+        """
+        Dispatch a model lifecycle event.
+
+        - Before events (is_after_event=False) execute inline immediately. If any listener raises,
+          the operation is aborted and the exception propagates.
+        - After events (is_after_event=True) are deferred to transaction commit via on_commit if
+          inside an active transaction. By default (strict_events=False), listener exceptions do
+          not fail an already committed database write.
+        """
+        event_name = f"{snake_case(cls.__name__)}.{event_suffix}"
+
+        async def _do_dispatch() -> None:
+            try:
+                await EventDispatcher.get_instance().dispatch(event_name, instance)
+            except Exception:
+                if is_after_event and not getattr(cls, "strict_events", False):
+                    logger.exception(
+                        "Error executing lifecycle event listener for %s",
+                        event_name,
+                    )
+                else:
+                    raise
+
+        if is_after_event:
+            active_conn = get_active_connection()
+            if active_conn is not None and hasattr(active_conn, "on_commit"):
+                active_conn.on_commit(_do_dispatch)
+                return
+
+        await _do_dispatch()
+
+    @classmethod
     async def create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
-        """Create and persist a new model instance, honoring __fillable__ if defined."""
+        """Create and persist a new model instance, validating mass assignment rules."""
         data: dict[str, Any] = {}
         if args:
             data.update(args[0])
         data.update(kwargs)
 
-        if cls.__fillable__ is not None:
-            allowed = set(cls.__fillable__) | {cls.__primary_key__}
-            data = {k: v for k, v in data.items() if k in allowed}
+        instance = cls()
+        instance.fill(**data)
 
-        for key, val in list(data.items()):
-            if isinstance(val, Model):
-                data[key] = val.get_primary_key()
+        await cls._dispatch_lifecycle_event("creating", instance, is_after_event=False)
 
-        row = await cls.query().insert_returning(data)
-        merged = {**data, **row}
-        instance = cls(**merged)
-        instance._mark_persisted(merged.keys())
+        insert_data = {
+            k: instance._persistable(getattr(instance, k))
+            for k in instance._init_keys
+            if k in cls.__fields__
+        }
+        row = await cls.query().insert_returning(insert_data)
+        for col, val in row.items():
+            if col in cls.__fields__:
+                setattr(instance, col, cls._coerce_db_value(col, val))
+            elif col == cls.__primary_key__:
+                setattr(instance, col, val)
+        instance._mark_persisted([*insert_data.keys(), *row.keys()])
 
-        await EventDispatcher.get_instance().dispatch(
-            f"{snake_case(cls.__name__)}.created", instance
-        )
+        await cls._dispatch_lifecycle_event("created", instance, is_after_event=True)
+        return instance
+
+    @classmethod
+    async def force_create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
+        """Create and persist a new model instance, bypassing fillable/guarded checks for trusted code."""
+        data: dict[str, Any] = {}
+        if args:
+            data.update(args[0])
+        data.update(kwargs)
+
+        instance = cls()
+        instance.force_fill(**data)
+
+        await cls._dispatch_lifecycle_event("creating", instance, is_after_event=False)
+
+        insert_data = {
+            k: instance._persistable(getattr(instance, k))
+            for k in instance._init_keys
+            if k in cls.__fields__
+        }
+        row = await cls.query().insert_returning(insert_data)
+        for col, val in row.items():
+            if col in cls.__fields__:
+                setattr(instance, col, cls._coerce_db_value(col, val))
+            elif col == cls.__primary_key__:
+                setattr(instance, col, val)
+        instance._mark_persisted([*insert_data.keys(), *row.keys()])
+
+        await cls._dispatch_lifecycle_event("created", instance, is_after_event=True)
         return instance
 
     async def save(self) -> None:
@@ -401,23 +698,35 @@ class Model:
                 )
 
             changed = {
-                name: self._persistable(getattr(self, name))
-                for name, original in self._original.items()
-                if name != pk_name and getattr(self, name, None) != original
+                name: self._persistable(val)
+                for name, val in self.get_dirty().items()
+                if name != pk_name
             }
-            if changed:
-                if "updated_at" in self.__fields__:
-                    now = datetime.now(UTC)
-                    changed["updated_at"] = now
-                    self.updated_at = now
+            if not changed:
+                return
 
-                await self.__class__.query().where(pk_name, pk).update(changed)
-                for name in changed:
-                    self._original[name] = getattr(self, name)
-            await EventDispatcher.get_instance().dispatch(
-                f"{snake_case(self.__class__.__name__)}.updated", self
+            await self.__class__._dispatch_lifecycle_event(
+                "updating", self, is_after_event=False
+            )
+
+            if "updated_at" in self.__fields__:
+                now = datetime.now(UTC)
+                changed["updated_at"] = now
+                self.updated_at = now
+
+            await self.__class__.query().where(pk_name, pk).update(changed)
+            for name in changed:
+                self._original[name] = copy.deepcopy(getattr(self, name))
+            if hasattr(self, "_modified_keys"):
+                self._modified_keys.clear()
+            await self.__class__._dispatch_lifecycle_event(
+                "updated", self, is_after_event=True
             )
             return
+
+        await self.__class__._dispatch_lifecycle_event(
+            "creating", self, is_after_event=False
+        )
 
         data = {
             name: self._persistable(getattr(self, name))
@@ -437,8 +746,8 @@ class Model:
             if col in self.__fields__ or col == pk_name:
                 setattr(self, col, val)
         self._mark_persisted([*data, *row])
-        await EventDispatcher.get_instance().dispatch(
-            f"{snake_case(self.__class__.__name__)}.created", self
+        await self.__class__._dispatch_lifecycle_event(
+            "created", self, is_after_event=True
         )
 
     async def delete(self) -> None:
@@ -449,10 +758,13 @@ class Model:
         if not self._exists or pk is None:
             raise RuntimeError(f"Cannot delete unsaved {self.__class__.__name__}.")
 
+        await self.__class__._dispatch_lifecycle_event(
+            "deleting", self, is_after_event=False
+        )
         await self.__class__.query().where(pk_name, pk).delete()
         self._exists = False
-        await EventDispatcher.get_instance().dispatch(
-            f"{snake_case(self.__class__.__name__)}.deleted", self
+        await self.__class__._dispatch_lifecycle_event(
+            "deleted", self, is_after_event=True
         )
 
     async def refresh(self) -> Self:
@@ -488,9 +800,26 @@ class Model:
                 attrs[f] = getattr(self, f)
         return attrs
 
-    def to_dict(self) -> dict[str, Any]:
+    def make_visible(self, *fields: str) -> Self:
+        """Temporarily make specified fields visible in to_dict() serialization."""
+        self._temp_visible.update(fields)
+        self._temp_hidden.difference_update(fields)
+        return self
+
+    def make_hidden(self, *fields: str) -> Self:
+        """Temporarily hide specified fields from to_dict() serialization."""
+        self._temp_hidden.update(fields)
+        self._temp_visible.difference_update(fields)
+        return self
+
+    def to_dict(self, include_hidden: bool = False) -> dict[str, Any]:
         """Convert the model and its loaded relations to a raw dictionary, omitting __hidden__ fields."""
-        hidden = set(getattr(self, "__hidden__", ()) or ())
+        if include_hidden:
+            hidden: set[str] = set()
+        else:
+            base_hidden = set(getattr(self, "__hidden__", ()) or ())
+            hidden = (base_hidden | self._temp_hidden) - self._temp_visible
+
         data = {
             k: v for k, v in self.get_attributes().items() if k not in hidden
         }
@@ -499,11 +828,15 @@ class Model:
                 continue
             if isinstance(rel_value, list):
                 data[rel_name] = [
-                    item.to_dict() if isinstance(item, Model) else item
+                    (
+                        item.to_dict(include_hidden=include_hidden)
+                        if isinstance(item, Model)
+                        else item
+                    )
                     for item in rel_value
                 ]
             elif isinstance(rel_value, Model):
-                data[rel_name] = rel_value.to_dict()
+                data[rel_name] = rel_value.to_dict(include_hidden=include_hidden)
             else:
                 data[rel_name] = rel_value
         return data
@@ -563,16 +896,16 @@ class Model:
         return rel
 
     def __repr__(self) -> str:
-        attrs = ", ".join(f"{k}={v!r}" for k, v in self.get_attributes().items())
-        return f"{self.__class__.__name__}({attrs})"
+        pk = self.get_primary_key()
+        return f"<{self.__class__.__name__} {self.__primary_key__}={pk!r}>"
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, self.__class__):
+        if type(self) is not type(other):
             return False
         pk = self.get_primary_key()
         other_pk = other.get_primary_key()
         if pk is not None and other_pk is not None:
-            return pk == other_pk  # type: ignore[no-any-return]
+            return bool(pk == other_pk)
         return self is other
 
     def __hash__(self) -> int:
@@ -584,6 +917,9 @@ class Model:
 
 __all__ = [
     "_MODEL_REGISTRY",
+    "Field",
+    "FieldInfo",
+    "MassAssignmentError",
     "Model",
     "ModelQueryBuilder",
     "PrimaryKeyError",

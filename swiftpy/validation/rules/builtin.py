@@ -6,8 +6,17 @@ import urllib.parse
 from collections.abc import Sequence
 from typing import Any
 
-# Standard RFC-compliant email regex pattern
-_EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+# Strict RFC-compliant email regex patterns
+_LOCAL_PART_REGEX = re.compile(
+    r"^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*$"
+)
+_DOMAIN_LABEL_REGEX = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+
+# ASCII-only integer and finite float regexes
+_INT_REGEX = re.compile(r"^[+-]?[0-9]+$")
+_FLOAT_REGEX = re.compile(
+    r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+)
 
 
 class StrRule:
@@ -30,9 +39,7 @@ class IntRule:
             return True
         if isinstance(value, str):
             clean = value.strip()
-            if clean.startswith(("-", "+")):
-                return clean[1:].isdigit()
-            return clean.isdigit()
+            return bool(_INT_REGEX.fullmatch(clean))
         return False
 
     def message(self, field: str) -> str:
@@ -48,8 +55,11 @@ class FloatRule:
         if isinstance(value, (int, float)):
             return math.isfinite(value)
         if isinstance(value, str):
+            clean = value.strip()
+            if not _FLOAT_REGEX.fullmatch(clean):
+                return False
             try:
-                val = float(value)
+                val = float(clean)
                 return math.isfinite(val)
             except (ValueError, TypeError):
                 return False
@@ -81,13 +91,38 @@ class BoolRule:
 class EmailRule:
     """Validates that a field is a well-formed email address."""
 
+    def __init__(self, lowercase: bool = False) -> None:
+        self.lowercase = lowercase
+
+    def normalize(self, value: str) -> str:
+        val = value.strip()
+        if "@" in val:
+            local, domain = val.rsplit("@", 1)
+            if self.lowercase:
+                return f"{local.lower()}@{domain.lower()}"
+            return f"{local}@{domain.lower()}"
+        return val
+
     def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
         if not isinstance(value, str) or isinstance(value, bool):
             return False
         val = value.strip()
         if len(val) > 254 or ".." in val:
             return False
-        return bool(_EMAIL_REGEX.match(val))
+        if val.count("@") != 1:
+            return False
+        local, domain = val.split("@")
+        if not local or len(local) > 64 or not _LOCAL_PART_REGEX.fullmatch(local):
+            return False
+        if not domain or len(domain) > 253:
+            return False
+        labels = domain.split(".")
+        if len(labels) < 2:
+            return False
+        for label in labels:
+            if not _DOMAIN_LABEL_REGEX.fullmatch(label):
+                return False
+        return True
 
     def message(self, field: str) -> str:
         return f"The {field} field must be a valid email address."
@@ -99,8 +134,11 @@ class UrlRule:
     def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
         if not isinstance(value, str) or isinstance(value, bool):
             return False
+        val = value.strip()
+        if len(val) > 2048:
+            return False
         try:
-            parsed = urllib.parse.urlparse(value.strip())
+            parsed = urllib.parse.urlparse(val)
             return bool(parsed.scheme in ("http", "https") and parsed.netloc)
         except (ValueError, TypeError):
             return False
@@ -176,12 +214,18 @@ class InRule:
 
     def __init__(self, values: Sequence[Any] | set[Any]) -> None:
         self.values = list(values)
-        self._str_values = {str(v) for v in self.values}
+        self._str_values = {str(v) for v in self.values if not isinstance(v, bool)}
+        self._bool_values = {v for v in self.values if isinstance(v, bool)}
 
     def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
-        if value in self.values:
-            return True
-        return str(value) in self._str_values
+        if isinstance(value, bool):
+            return value in self._bool_values
+        for v in self.values:
+            if not isinstance(v, bool) and value == v:
+                return True
+        if isinstance(value, (str, int)):
+            return str(value) in self._str_values
+        return False
 
     def message(self, field: str) -> str:
         return f"The selected {field} is invalid."
@@ -192,10 +236,18 @@ class NotInRule:
 
     def __init__(self, values: Sequence[Any] | set[Any]) -> None:
         self.values = list(values)
-        self._str_values = {str(v) for v in self.values}
+        self._str_values = {str(v) for v in self.values if not isinstance(v, bool)}
+        self._bool_values = {v for v in self.values if isinstance(v, bool)}
 
     def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
-        return value not in self.values and str(value) not in self._str_values
+        if isinstance(value, bool):
+            return value not in self._bool_values
+        for v in self.values:
+            if not isinstance(v, bool) and value == v:
+                return False
+        if isinstance(value, (str, int)):
+            return str(value) not in self._str_values
+        return True
 
     def message(self, field: str) -> str:
         return f"The selected {field} is invalid."
@@ -205,14 +257,25 @@ class RegexRule:
     """Validates that a field value matches a specific regular expression."""
 
     def __init__(self, pattern: str | re.Pattern[str]) -> None:
-        self.pattern = (
-            pattern if isinstance(pattern, re.Pattern) else re.compile(pattern)
-        )
+        self._compile_error = False
+        if isinstance(pattern, re.Pattern):
+            self.pattern: re.Pattern[str] | None = pattern
+        else:
+            try:
+                self.pattern = re.compile(pattern)
+            except re.error:
+                self._compile_error = True
+                self.pattern = None
 
     def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
+        if self._compile_error or self.pattern is None:
+            return False
         if not isinstance(value, (str, int, float)) or isinstance(value, bool):
             return False
-        return bool(self.pattern.search(str(value)))
+        try:
+            return bool(self.pattern.search(str(value)))
+        except re.error:
+            return False
 
     def message(self, field: str) -> str:
         return f"The {field} field format is invalid."
@@ -247,8 +310,8 @@ def boolean() -> BoolRule:
     return BoolRule()
 
 
-def email() -> EmailRule:
-    return EmailRule()
+def email(lowercase: bool = False) -> EmailRule:
+    return EmailRule(lowercase=lowercase)
 
 
 def url() -> UrlRule:

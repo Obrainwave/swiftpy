@@ -977,6 +977,139 @@ Transfer/sec:    482.06KB
   - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 6 tests.
   - Full suite: `pytest -q -p no:cacheprovider`: **537 passed in 304.83s** (498 post-Phase-5 + 39 new Phase 6 tests).
 
+---
+
+## Phase 7 – ORM Safety and Typing
+
+### P7-M1: Hidden Attributes and Safe Serialization (`D-7`, `D-5`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `__hidden__: ClassVar[tuple[str, ...]] = ()` support on `Model` in `swiftpy/database/orm/model.py`.
+  - Added `_temp_visible` and `_temp_hidden` sets per instance, along with `make_visible(*fields)` and `make_hidden(*fields)`.
+  - Updated `to_dict(include_hidden=False)` to recursively filter hidden fields and loaded relations while preserving raw Python types.
+  - Changed `Model.__repr__` to output `<ClassName pk_name=pk_val!r>` only, preventing accidental credential/token leakage in logs, interactive shells, and exception traces (`D-5`).
+  - Added `tests/orm/test_hidden.py` (6 tests).
+
+---
+
+### P7-M2: Mass Assignment Protection (`D-7`, `D-4`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Enforced deny-all default for mass assignment on `Model` unless `__fillable__` or `__guarded__` is explicitly declared (`D-4`).
+  - Added `MassAssignmentError(ValueError)`.
+  - Rejects attributes starting with `_` and undeclared attribute keys in `__init__`, `create()`, and `fill()`.
+  - Added `force_fill(attributes)` and `force_create(**attributes)` to explicitly bypass mass assignment checks for trusted internal code.
+  - Added `_hydrate(row)` on `Model` and wired `ModelQueryBuilder.get()` to hydrate models from trusted DB rows without mass-assignment validation overhead.
+  - Updated test suite models with explicit `__guarded__: ClassVar[list[str]] = []` where mass assignment is expected.
+  - Added `tests/orm/test_mass_assignment.py` (9 tests).
+
+---
+
+### P7-M3: Defaults and Dirty Tracking (`D-7`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `Field(default=..., default_factory=..., primary_key=..., nullable=...)` returning `FieldInfo` metadata in `swiftpy/database/orm/fields.py`.
+  - Deep-copies mutable class defaults (`copy.deepcopy`), evaluates callable defaults, and resolves `default_factory` callbacks per instance.
+  - Implemented deep-copy snapshotting of `_original` in `_hydrate()` and `save()`, allowing in-place mutations of lists and dicts to be detected as dirty.
+  - Added `is_dirty(*fields)` and `get_dirty()` on `Model`.
+  - Added `_modified_keys` tracking in `Model.__setattr__` so partial-select models never clobber unselected columns during `save()`.
+  - In `Model.save()`, skips `UPDATE` queries and suppresses `.updated` events when dirty tracking detects no changes (no-op save).
+  - Added `_coerce_db_value` to automatically coerce JSON/JSONB string columns back to typed Python lists/dicts.
+  - Added `tests/orm/test_defaults_dirty.py` (5 tests).
+
+---
+
+### P7-M4: Events and Transaction Ordering (`D-7`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Refactored model lifecycle dispatch (`_dispatch_lifecycle_event`): `*ing` (before) events (`creating`, `updating`, `deleting`) execute inline and abort database operations if an exception is raised or a listener returns `False`.
+  - Deferred `*ed` (after) events (`created`, `updated`, `deleted`) to execute post-commit via `on_commit` when inside an active database transaction.
+  - Added `Model.strict_events: ClassVar[bool] = False`. When False (default), listener exceptions on `*ed` events are logged without turning committed database writes into apparent failures; when True, listener exceptions propagate to the caller.
+  - Added `tests/orm/test_model_events_transaction.py` (5 tests).
+
+---
+
+### P7-M5: Relationships Hardening (`D-8`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Chunked `IN` queries during eager loading in batches of 1,000 keys (`_chunk_list`) across `HasMany`, `HasOne`, `BelongsTo`, and `BelongsToMany` to prevent hitting database parameter limits.
+  - Implemented multi-level nested eager loading (e.g. `with_("books.reviews")`, `with_("author.books.tags")`) issuing exactly 1 query per relation level via recursive relation dependency grouping.
+  - Guarded `RelationshipQueryBuilder.__getattr__` against private/dunder attribute lookups to prevent recursion during `copy.copy` or inspection.
+  - Added pivot manipulation methods on `BelongsToMany` (`attach(model_or_id, **pivot_extra)`, `detach(model_or_id=None)`, `sync(ids_or_models)`).
+  - Added `Model.prevent_lazy_loading: ClassVar[bool] = False`. When enabled, accessing un-eager-loaded relationships raises `LazyLoadingDisabledError`.
+  - Enforced symmetric `__eq__` and `__hash__` semantics (`type(self) is type(other)` and identical primary key).
+  - Added `tests/orm/test_relationships_hardening.py` (5 tests).
+
+---
+
+### P7-M6: Public Typing for Models & Relations (`D-7`, `P0-T3`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added descriptor protocol (`@overload def __get__(...)`) to `Relation` and `RelationDescriptor` in `swiftpy/database/orm/relationships.py`, allowing Mypy to recognize relationship properties on model classes.
+  - Added `tests/typing/test_orm_typing.py` validating static and runtime contracts for attributes, relationships, dirty tracking, hidden fields, and BelongsToMany operations.
+  - Completely resolved the 25 legacy Mypy errors in `tests/orm/test_eager_loading.py`. Mypy now passes with **0 errors across 208 source files** in strict mode.
+
+---
+
+### Phase 7 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy .`: **Success: no issues found in 208 source files** (all 25 previous Mypy relation-typing errors resolved!).
+  - Full suite: `pytest -q -p no:cacheprovider`: **568 passed in 359s** (537 post-Phase-6 + 31 new Phase 7 tests).
+
+---
+
+## Phase 8 – Validation
+
+### P8-V1: Rule Correctness (`V-1`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Hardened `IntRule` with ASCII-only regex `^[+-]?[0-9]+$` in `swiftpy/validation/rules/builtin.py`, rejecting unicode superscript digits (`"²"`, `"³"`, `"¹"`) and booleans, coercing valid numeric strings into integers.
+  - Hardened `FloatRule` to reject `NaN`, `Infinity`, and `-Infinity`, coercing finite numeric strings into floats.
+  - Hardened `EmailRule` with tighter RFC-compliant checks (local <= 64, total <= 254, rejecting consecutive dots `..` and leading/trailing dots in local part). Normalizes domain to lowercase and strips whitespace on validation and storage, preserving local part case (or full lowercase when `email:lowercase` is configured).
+  - Hardened `UrlRule` enforcing a 2048-character maximum length limit and valid HTTP/HTTPS schemes.
+  - Added support in `swiftpy/validation/rules/registry.py` for escaping `\|` and `\:` in rule strings (e.g. `regex:^(a\|b)+$`) and list-based rule declarations `["required", "regex:^(a|b)+$"]`. Caught `re.error` so invalid regex patterns return validation errors rather than 500 errors.
+  - `BetweenRule` parsing (`between:1`) now raises `ConfigurationError` at parse time when missing the required range boundaries.
+  - Hardened `InRule` and `NotInRule` with strict type matching, ensuring boolean values (`True`/`False`) do not match integer `1`/`0` or string `"True"`.
+  - Added case-insensitive support for database rules (`unique:table,column,ci` and `UniqueRule(..., case_insensitive=True)`) using `LOWER("{column}") = LOWER($1)`.
+  - Database data errors (`asyncpg.DataError`) during `unique` or `exists` evaluation now fail validation gracefully with field errors rather than crashing the request with HTTP 500.
+  - Added `tests/validation/test_rules_hardening.py` (10 tests).
+
+---
+
+### P8-V2: Validator Engine Optimization & Order Independence (`V-2`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Precomputed and cached rule invocation metadata and signatures (`(param_count, is_async)`) in `swiftpy/validation/validator.py`, eliminating per-field `inspect.signature` overhead on every request.
+  - Removed `except TypeError` retry fallback in `_run_rule`, ensuring rule implementation bugs propagate cleanly as framework errors instead of being re-executed.
+  - Enforced structured 422 `Unprocessable Entity` response with `{"body": ["The request body must be a JSON object."]}` when non-dict payloads (`[]`, `"x"`, `null`, `123`) are sent.
+  - Achieved rule order independence for coercion: sorted rule execution so type coercion rules (`IntRule`, `FloatRule`, `BoolRule`, `EmailRule`) run before magnitude and length constraint rules (`MinRule`, `MaxRule`, `BetweenRule`).
+
+---
+
+### P8-V3: Fail-Closed Validation & DI Resolution (`V-3`, `D-9`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Hardened `FormRequest.get_rules()` in `swiftpy/validation/form_request.py` to fail closed with `ConfigurationError` (HTTP 500) if rule instantiation or definition raises `TypeError` or any exception, removing the unsafe fallback that previously returned `{}` and allowed unvalidated requests to execute route handlers (`D-9`).
+  - Added parse-once caching (`_cached_parsed_rules`) per `FormRequest` class so static rule definitions are parsed once and reused across requests.
+  - Integrated container dependency injection for `FormRequest`: constructors requiring registered services or dependencies are automatically resolved via `container.resolve(ann)`.
+  - Added `tests/validation/test_form_request_fail_closed.py` (7 tests).
+
+---
+
+### Phase 8 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy .`: **Success: no issues found in 210 source files** (0 errors).
+  - Full suite: `pytest -q -p no:cacheprovider`: **585 passed in 381.01s** (568 post-Phase-7 + 17 new Phase 8 tests).
+
 
 
 

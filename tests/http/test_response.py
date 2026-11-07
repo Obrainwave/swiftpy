@@ -123,6 +123,7 @@ class OrderStatus(Enum):
 class InvoiceModel(Model):
     __table__ = "p4h2_invoices"
     __hidden__: ClassVar[tuple[str, ...]] = ("secret_token",)
+    __guarded__: ClassVar[list[str]] = []
 
     id: int
     code: uuid.UUID

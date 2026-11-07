@@ -8,11 +8,44 @@ from typing import Any
 from swiftpy.database.transaction import get_active_connection
 from swiftpy.validation.rules.builtin import (
     BoolRule,
+    EmailRule,
     FloatRule,
     IntRule,
+    StrRule,
 )
 from swiftpy.validation.rules.registry import RuleRegistry, default_registry
 from swiftpy.validation.rules.required import NullableRule, RequiredRule
+
+_RULE_INVOKER_CACHE: dict[type, tuple[int, bool]] = {}
+
+
+def _get_rule_invoker_info(rule: Any) -> tuple[int, bool]:
+    """Precompute and cache rule method signature metadata."""
+    cls = rule.__class__
+    if cls in _RULE_INVOKER_CACHE:
+        return _RULE_INVOKER_CACHE[cls]
+    method = getattr(rule, "validate", None)
+    if method is None or not callable(method):
+        method = getattr(rule, "passes", None)
+    if method is None or not callable(method):
+        raise AttributeError(
+            f"Rule {cls.__name__} must implement 'validate' or 'passes'"
+        )
+    sig = inspect.signature(method)
+    param_count = len(sig.parameters)
+    is_async = inspect.iscoroutinefunction(method)
+    info = (param_count, is_async)
+    _RULE_INVOKER_CACHE[cls] = info
+    return info
+
+
+def _rule_sort_key(rule: Any) -> int:
+    """Sort rules so type coercion executes before constraint evaluation."""
+    if isinstance(rule, (RequiredRule, NullableRule)):
+        return 0
+    if isinstance(rule, (IntRule, FloatRule, BoolRule, StrRule, EmailRule)):
+        return 1
+    return 2
 
 
 @dataclass(slots=True)
@@ -78,6 +111,7 @@ class Validator:
         schema: dict[str, Any],
         registry: RuleRegistry | None = None,
     ) -> None:
+        self.is_payload_dict = isinstance(data, dict)
         self.data: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
         self.schema = schema
         self.registry = registry or default_registry
@@ -89,9 +123,23 @@ class Validator:
         Fields are validated concurrently via asyncio.gather outside transactions,
         or sequentially when an active transaction is present (P3-D4).
         """
+        if not self.is_payload_dict:
+            return ValidationResult(
+                is_valid=False,
+                errors={"body": ["The request body must be a JSON object."]},
+                validated_data={},
+            )
+
         parsed_schema: dict[str, list[Any]] = {}
         for field_name, rule_def in self.schema.items():
-            parsed_schema[field_name] = self.registry.parse_rules(rule_def)
+            if isinstance(rule_def, list) and all(
+                not isinstance(r, str)
+                and (hasattr(r, "validate") or hasattr(r, "passes"))
+                for r in rule_def
+            ):
+                parsed_schema[field_name] = rule_def
+            else:
+                parsed_schema[field_name] = self.registry.parse_rules(rule_def)
 
         errors: dict[str, list[str]] = {}
         validated_data: dict[str, Any] = {}
@@ -113,9 +161,6 @@ class Validator:
                 errors[field_name] = field_errors
             elif coerced_val is not _UNSET:
                 validated_data[field_name] = coerced_val
-
-        # Include unvalidated extra fields that were present in data if no schema errors?
-        # Standard validation keeps validated fields in validated_data.
 
         return ValidationResult(
             is_valid=len(errors) == 0,
@@ -150,8 +195,11 @@ class Validator:
 
         coerced_value = raw_value
 
+        # Sort rules so type coercion executes before magnitude/constraint rules
+        sorted_rules = sorted(rules, key=_rule_sort_key)
+
         # 3. Evaluate rules sequentially for this field
-        for rule in rules:
+        for rule in sorted_rules:
             if isinstance(rule, NullableRule):
                 continue
 
@@ -187,6 +235,8 @@ class Validator:
                         coerced_value = True
                     elif str_val in ("false", "0"):
                         coerced_value = False
+                elif isinstance(rule, EmailRule) and isinstance(coerced_value, str):
+                    coerced_value = rule.normalize(coerced_value)
 
         return field_name, field_errors, coerced_value
 
@@ -201,20 +251,16 @@ class Validator:
                 f"Rule {rule.__class__.__name__} must implement 'validate' or 'passes'"
             )
 
-        sig = inspect.signature(method)
-        param_count = len(sig.parameters)
+        param_count, is_async = _get_rule_invoker_info(rule)
 
-        try:
-            if param_count <= 2:
-                res = method(field_name, value)
-            else:
-                res = method(field_name, value, self.data)
-        except TypeError:
-            # Fallback if variable args
-            try:
-                res = method(field_name, value, self.data)
-            except TypeError:
-                res = method(field_name, value)
+        if param_count <= 2:
+            res = method(field_name, value)
+        else:
+            res = method(field_name, value, self.data)
+
+        if is_async or inspect.isawaitable(res):
+            return bool(await res)
+        return bool(res)
 
         if inspect.isawaitable(res):
             return bool(await res)

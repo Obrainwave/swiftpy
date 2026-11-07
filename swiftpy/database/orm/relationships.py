@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Sequence
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, overload
 
 from swiftpy.database.orm.registry import _MODEL_REGISTRY
-from swiftpy.database.query_builder import Column
+from swiftpy.database.query_builder import Column, Query
 from swiftpy.support.strings import snake_case
 
 if TYPE_CHECKING:
@@ -12,10 +12,19 @@ if TYPE_CHECKING:
 
 
 _MISSING = object()
+_CHUNK_SIZE = 1000
+
+
+def _chunk_list[T](items: list[T], chunk_size: int = _CHUNK_SIZE) -> list[list[T]]:
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
 class RelationNotLoadedError(RuntimeError):
     """Raised when attempting to synchronously access an un-eager-loaded relationship."""
+
+
+class LazyLoadingDisabledError(RuntimeError):
+    """Raised when attempting to access an unloaded relationship while prevent_lazy_loading is enabled."""
 
 
 class LoadedList(list[Any]):
@@ -81,6 +90,30 @@ class Relation:
         """Construct a query builder scoped to this relationship."""
         raise NotImplementedError
 
+    @overload
+    def __get__(self, instance: None, owner: Any) -> Self: ...
+
+    @overload
+    def __get__(self, instance: object, owner: Any) -> Any: ...
+
+    def __get__(self, instance: object, owner: Any = None) -> Any:
+        if instance is None:
+            return self
+
+        if hasattr(instance, "_loaded_relations") and self.name in instance._loaded_relations:
+            return instance._loaded_relations[self.name]
+
+        if getattr(instance, "prevent_lazy_loading", False) or getattr(
+            owner, "prevent_lazy_loading", False
+        ):
+            raise LazyLoadingDisabledError(
+                f"Lazy loading is disabled on {instance.__class__.__name__}. "
+                f"Relation '{self.name}' must be eager-loaded using with_()."
+            )
+
+        builder = self.build_lazy_query(instance)  # type: ignore[arg-type]
+        return RelationshipQueryBuilder(instance, self, builder)  # type: ignore[arg-type]
+
 
 class HasMany(Relation):
     """One-to-many relationship."""
@@ -109,7 +142,10 @@ class HasMany(Relation):
                 inst._loaded_relations[self.name] = LoadedList()
             return
 
-        related_instances = await target_model.where(fk, "IN", unique_keys).get()
+        related_instances: list[Model] = []
+        for chunk in _chunk_list(unique_keys):
+            rows = await target_model.where(fk, "IN", chunk).get()
+            related_instances.extend(rows)
 
         grouped: dict[Any, list[Model]] = {}
         for rel in related_instances:
@@ -159,7 +195,11 @@ class HasOne(Relation):
                 inst._loaded_relations[self.name] = None
             return
 
-        related = await target_model.where(fk, "IN", unique_keys).get()
+        related: list[Model] = []
+        for chunk in _chunk_list(unique_keys):
+            rows = await target_model.where(fk, "IN", chunk).get()
+            related.extend(rows)
+
         mapped: dict[Any, Model] = {}
         for r in related:
             key = getattr(r, fk, None)
@@ -203,9 +243,11 @@ class BelongsTo(Relation):
                 inst._loaded_relations[self.name] = None
             return
 
-        related_instances = await target_model.where(
-            self.local_key, "IN", unique_keys
-        ).get()
+        related_instances: list[Model] = []
+        for chunk in _chunk_list(unique_keys):
+            rows = await target_model.where(self.local_key, "IN", chunk).get()
+            related_instances.extend(rows)
+
         mapped = {getattr(rel, self.local_key, None): rel for rel in related_instances}
 
         for inst in instances:
@@ -270,26 +312,28 @@ class BelongsToMany(Relation):
                 inst._loaded_relations[self.name] = LoadedList()
             return
 
-        builder = target.query().builder
-        builder.select(
-            f"{target.__table__}.*",
-            Column(f"{pivot_table}.{fpk}", alias="_pivot_parent_key"),
-        )
-        builder.join(
-            pivot_table,
-            f"{target.__table__}.{self.related_key}",
-            "=",
-            f"{pivot_table}.{rpk}",
-        )
-        builder.where(f"{pivot_table}.{fpk}", "IN", unique_keys)
+        rows: list[dict[str, Any]] = []
+        for chunk in _chunk_list(unique_keys):
+            b = target.query().builder
+            b.select(
+                f"{target.__table__}.*",
+                Column(f"{pivot_table}.{fpk}", alias="_pivot_parent_key"),
+            )
+            b.join(
+                pivot_table,
+                f"{target.__table__}.{self.related_key}",
+                "=",
+                f"{pivot_table}.{rpk}",
+            )
+            b.where(f"{pivot_table}.{fpk}", "IN", chunk)
+            chunk_rows = await b.get()
+            rows.extend(chunk_rows)
 
-        rows = await builder.get()
         grouped: dict[Any, list[Model]] = {}
 
         for row in rows:
             pivot_parent_key = row.pop("_pivot_parent_key")
-            item = target(**row)
-            item._mark_persisted(row.keys())
+            item = target._hydrate(row)
             grouped.setdefault(pivot_parent_key, []).append(item)
 
         for inst in instances:
@@ -408,13 +452,60 @@ class RelationshipQueryBuilder[T: Model]:
         """Return True if at least one related record exists."""
         return await self._builder.exists()
 
+    async def attach(self, model_or_id: Any, **pivot_extra: Any) -> None:
+        """Attach a related model to this parent model in the pivot table."""
+        if not isinstance(self._relation, BelongsToMany):
+            raise TypeError("attach() is only supported on BelongsToMany relationships.")
+        target_model = self._relation.get_target_model()
+        target_id = (
+            model_or_id.get_primary_key()
+            if hasattr(model_or_id, "get_primary_key")
+            else model_or_id
+        )
+        parent_id = getattr(self._instance, self._relation.parent_key, None)
+        parent_cls = self._relation.owner_cls or self._instance.__class__
+        pivot_table = self._relation._resolve_pivot_table(parent_cls)
+        fpk = self._relation.foreign_pivot_key or f"{snake_case(parent_cls.__name__)}_id"
+        rpk = self._relation.related_pivot_key or f"{snake_case(target_model.__name__)}_id"
+
+        data = {fpk: parent_id, rpk: target_id, **pivot_extra}
+        await Query.table(pivot_table).insert(data)
+
+    async def detach(self, model_or_id: Any = None) -> int:
+        """Detach related model(s) from this parent model in the pivot table."""
+        if not isinstance(self._relation, BelongsToMany):
+            raise TypeError("detach() is only supported on BelongsToMany relationships.")
+        target_model = self._relation.get_target_model()
+        parent_id = getattr(self._instance, self._relation.parent_key, None)
+        parent_cls = self._relation.owner_cls or self._instance.__class__
+        pivot_table = self._relation._resolve_pivot_table(parent_cls)
+        fpk = self._relation.foreign_pivot_key or f"{snake_case(parent_cls.__name__)}_id"
+        rpk = self._relation.related_pivot_key or f"{snake_case(target_model.__name__)}_id"
+
+        q = Query.table(pivot_table).where(fpk, parent_id)
+        if model_or_id is not None:
+            target_id = (
+                model_or_id.get_primary_key()
+                if hasattr(model_or_id, "get_primary_key")
+                else model_or_id
+            )
+            q = q.where(rpk, target_id)
+        res = await q.delete()
+        if isinstance(res, str) and res.startswith("DELETE"):
+            try:
+                return int(res.split()[-1])
+            except ValueError:
+                return 1
+        return 1 if res else 0
+
+    async def sync(self, ids_or_models: Sequence[Any]) -> None:
+        """Sync pivot table connections to match the provided list of models or ids."""
+        await self.detach()
+        for item in ids_or_models:
+            await self.attach(item)
+
     async def create(self, *args: dict[str, Any], **kwargs: Any) -> T:
         """Create a new model instance pre-bound to this relationship."""
-        if isinstance(self._relation, BelongsToMany):
-            raise NotImplementedError(
-                "create() would leave the new row unlinked; use attach()."
-            )
-
         target_model = self._relation.get_target_model()
         data: dict[str, Any] = {}
         if args:
@@ -429,6 +520,13 @@ class RelationshipQueryBuilder[T: Model]:
             )
             fk = self._relation.foreign_key or f"{snake_case(owner_name)}_id"
             data[fk] = getattr(self._instance, self._relation.local_key, None)
+            created = await target_model.create(**data)
+            return created  # type: ignore[return-value]
+
+        if isinstance(self._relation, BelongsToMany):
+            raise NotImplementedError(
+                "create() would leave the new row unlinked; use attach()."
+            )
 
         created = await target_model.create(**data)
         return created  # type: ignore[return-value]
@@ -452,6 +550,10 @@ class RelationshipQueryBuilder[T: Model]:
         raise self._not_loaded_error()
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            )
         if hasattr(self._builder, name):
             return getattr(self._builder, name)
         raise self._not_loaded_error(name)
@@ -464,15 +566,29 @@ class RelationDescriptor:
         self.name = name
         self.relation = relation
 
-    def __get__(self, instance: Model | None, owner: type[Model]) -> Any:
+    @overload
+    def __get__(self, instance: None, owner: Any) -> Relation: ...
+
+    @overload
+    def __get__(self, instance: object, owner: Any) -> Any: ...
+
+    def __get__(self, instance: object, owner: Any = None) -> Any:
         if instance is None:
             return self.relation
 
-        if self.name in instance._loaded_relations:
+        if hasattr(instance, "_loaded_relations") and self.name in instance._loaded_relations:
             return instance._loaded_relations[self.name]
 
-        builder = self.relation.build_lazy_query(instance)
-        return RelationshipQueryBuilder(instance, self.relation, builder)
+        if getattr(instance, "prevent_lazy_loading", False) or getattr(
+            owner, "prevent_lazy_loading", False
+        ):
+            raise LazyLoadingDisabledError(
+                f"Lazy loading is disabled on {instance.__class__.__name__}. "
+                f"Relation '{self.name}' must be eager-loaded using with_()."
+            )
+
+        builder = self.relation.build_lazy_query(instance)  # type: ignore[arg-type]
+        return RelationshipQueryBuilder(instance, self.relation, builder)  # type: ignore[arg-type]
 
     def __set__(self, instance: Model, value: Any) -> None:
         instance._loaded_relations[self.name] = value
@@ -483,6 +599,7 @@ __all__ = [
     "BelongsToMany",
     "HasMany",
     "HasOne",
+    "LazyLoadingDisabledError",
     "LoadedList",
     "Relation",
     "RelationDescriptor",

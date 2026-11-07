@@ -41,6 +41,7 @@ class Role(Model):
     id: int
     name: str
     users = BelongsToMany("User", pivot_table="orm_user_roles")
+    __guarded__: ClassVar[list[str]] = []
 
 
 class Profile(Model):
@@ -49,6 +50,7 @@ class Profile(Model):
     user_id: int
     bio: str
     user = BelongsTo("User", foreign_key="user_id")
+    __guarded__: ClassVar[list[str]] = []
 
 
 class Post(Model):
@@ -59,6 +61,7 @@ class Post(Model):
     published: bool = True
     deleted_at: Any = None
     user = BelongsTo("User", foreign_key="user_id")
+    __guarded__: ClassVar[list[str]] = []
 
 
 class User(Model):
@@ -70,6 +73,7 @@ class User(Model):
     posts = HasMany("Post", foreign_key="user_id")
     profile = HasOne("Profile", foreign_key="user_id")
     roles = BelongsToMany("Role", pivot_table="orm_user_roles")
+    __guarded__: ClassVar[list[str]] = []
 
 
 class AdminUser(User):

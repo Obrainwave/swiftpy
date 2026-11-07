@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncpg
+
 from swiftpy.core.container import get_container
 from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.pool import DatabasePool
@@ -32,30 +34,33 @@ class ExistsRule:
 
         query = f'SELECT 1 FROM "{self.table}" WHERE "{self.column}" = $1 LIMIT 1'
 
-        active_conn = get_active_connection()
-        if active_conn is not None and self.pool is None:
-            row = await active_conn.fetchval(query, value)
+        try:
+            active_conn = get_active_connection()
+            if active_conn is not None and self.pool is None:
+                row = await active_conn.fetchval(query, value)
+                return row is not None
+
+            active_pool = self.pool
+            if active_pool is None:
+                try:
+                    container = get_container()
+                    if container.has(DatabasePool):
+                        active_pool = container.resolve(DatabasePool)
+                except RuntimeError:
+                    pass
+
+            if active_pool is None:
+                raise RuntimeError(
+                    "DatabasePool is required for ExistsRule validation. Ensure it is registered in the container or passed explicitly."
+                )
+
+            db = active_pool.get_pool()
+            async with db.acquire() as conn:
+                row = await conn.fetchval(query, value)
+
             return row is not None
-
-        active_pool = self.pool
-        if active_pool is None:
-            try:
-                container = get_container()
-                if container.has(DatabasePool):
-                    active_pool = container.resolve(DatabasePool)
-            except RuntimeError:
-                pass
-
-        if active_pool is None:
-            raise RuntimeError(
-                "DatabasePool is required for ExistsRule validation. Ensure it is registered in the container or passed explicitly."
-            )
-
-        db = active_pool.get_pool()
-        async with db.acquire() as conn:
-            row = await conn.fetchval(query, value)
-
-        return row is not None
+        except (asyncpg.DataError, ValueError, TypeError):
+            return False
 
     def message(self, field: str) -> str:
         return f"The selected {field} is invalid."
