@@ -9,6 +9,7 @@ from swiftpy.database.transaction import (
     TransactionClosedError,
     TransactionConnection,
     db,
+    on_commit,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "TransactionConnection",
     "db",
     "escape_like",
+    "on_commit",
 ]

@@ -414,7 +414,7 @@ if __name__ == "__main__":
     try:
         # Wait for Worker B to declare readiness
         worker_ready = False
-        for _ in range(50):
+        for _ in range(150):
             val = await client.get(ready_key)
             if val == "1":
                 worker_ready = True

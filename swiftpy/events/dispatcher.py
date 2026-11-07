@@ -11,24 +11,91 @@ from swiftpy.core.container import get_container
 EventHandler = Callable[..., Any]
 
 
+def _build_invoker(handler: EventHandler) -> Callable[[str, Any], Any]:
+    """Inspect and precompile an invocation strategy for the given handler."""
+    try:
+        sig = inspect.signature(handler)
+    except (ValueError, TypeError):
+        def _fallback(event: str, payload: Any) -> Any:
+            try:
+                return handler(payload)
+            except TypeError:
+                return handler()
+
+        return _fallback
+
+    params = list(sig.parameters.values())
+
+    # Check for *args or **kwargs
+    has_varargs = any(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in params
+    )
+    if has_varargs:
+        return lambda event, payload: handler(payload)
+
+    kw_only = [p for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY]
+    if kw_only:
+        kw_names = tuple(p.name for p in kw_only)
+        pos_params = [
+            p
+            for p in params
+            if p.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        num_pos = len(pos_params)
+
+        def _kw_invoker(event: str, payload: Any) -> Any:
+            kwargs: dict[str, Any] = {}
+            for name in kw_names:
+                if name == "payload":
+                    kwargs["payload"] = payload
+                elif name == "event":
+                    kwargs["event"] = event
+            if num_pos == 0:
+                return handler(**kwargs)
+            if num_pos == 1:
+                return handler(payload, **kwargs)
+            return handler(event, payload, **kwargs)
+
+        return _kw_invoker
+
+    required_params = [p for p in params if p.default is inspect.Parameter.empty]
+    num_req = len(required_params)
+
+    if num_req == 0:
+        if len(params) >= 1:
+            return lambda event, payload: handler(payload)
+        return lambda event, payload: handler()
+    if num_req == 1:
+        return lambda event, payload: handler(payload)
+    return lambda event, payload: handler(event, payload)
+
+
 @dataclass(slots=True)
 class _ListenerRegistration:
     pattern: str
     regex: re.Pattern[str] | None
     handler: EventHandler
     order: int
+    invoker: Callable[[str, Any], Any]
 
 
 class EventDispatcher:
     """
     In-process event dispatcher supporting synchronous and asynchronous listeners,
     exact and segment-scoped wildcard event patterns, global registration-order
-    execution, and fail-fast exception propagation.
+    execution, signature caching, and fail-fast exception propagation.
     """
 
     _instance: ClassVar[EventDispatcher | None] = None
 
     def __init__(self) -> None:
+        self._exact_registry: dict[str, list[_ListenerRegistration]] = {}
+        self._wildcard_registry: list[_ListenerRegistration] = []
         self._registry: list[_ListenerRegistration] = []
         self._seq: int = 0
 
@@ -90,40 +157,52 @@ class EventDispatcher:
         Example patterns: 'user.created', 'user.*', '*.created', 'user.**', '*'
         """
         regex = self._compile_pattern(event)
+        invoker = _build_invoker(handler)
         reg = _ListenerRegistration(
             pattern=event,
             regex=regex,
             handler=handler,
             order=self._seq,
+            invoker=invoker,
         )
         self._seq += 1
         self._registry.append(reg)
+        if regex is None:
+            self._exact_registry.setdefault(event, []).append(reg)
+        else:
+            self._wildcard_registry.append(reg)
 
     def has_listeners(self, event: str) -> bool:
         """Determine whether any listeners match the given event."""
-        for reg in self._registry:
-            if reg.regex is None:
-                if reg.pattern == event:
-                    return True
-            elif reg.regex.match(event):
+        if self._exact_registry.get(event):
+            return True
+        for reg in self._wildcard_registry:
+            if reg.regex is not None and reg.regex.match(event):
                 return True
         return False
+
+    def get_matching_registrations(self, event: str) -> list[_ListenerRegistration]:
+        """
+        Retrieve all matching registrations for an event in global registration order.
+        """
+        matching: list[_ListenerRegistration] = []
+        exact = self._exact_registry.get(event)
+        if exact:
+            matching.extend(exact)
+        for reg in self._wildcard_registry:
+            if reg.regex is not None and reg.regex.match(event):
+                matching.append(reg)
+
+        if len(matching) > 1:
+            matching.sort(key=lambda r: r.order)
+        return matching
 
     def get_listeners(self, event: str) -> list[EventHandler]:
         """
         Retrieve all matching handlers for an event in global registration order,
         interleaving exact and wildcard registrations deterministically.
         """
-        matching: list[tuple[int, EventHandler]] = []
-        for reg in self._registry:
-            if reg.regex is None:
-                if reg.pattern == event:
-                    matching.append((reg.order, reg.handler))
-            elif reg.regex.match(event):
-                matching.append((reg.order, reg.handler))
-
-        matching.sort(key=lambda item: item[0])
-        return [handler for _, handler in matching]
+        return [reg.handler for reg in self.get_matching_registrations(event)]
 
     async def dispatch(self, event: str, payload: Any = None) -> list[Any]:
         """
@@ -134,13 +213,13 @@ class EventDispatcher:
         halts, subsequent handlers are not invoked, and the exception is propagated
         to the caller without modifying dispatcher registration state.
         """
-        handlers = self.get_listeners(event)
-        if not handlers:
+        matching = self.get_matching_registrations(event)
+        if not matching:
             return []
 
         results: list[Any] = []
-        for handler in handlers:
-            res = self._invoke_handler(handler, event, payload)
+        for reg in matching:
+            res = reg.invoker(event, payload)
             if inspect.isawaitable(res):
                 res = await res
             results.append(res)
@@ -149,60 +228,12 @@ class EventDispatcher:
 
     def _invoke_handler(self, handler: EventHandler, event: str, payload: Any) -> Any:
         """Invoke a handler with appropriate arguments based on its signature."""
-        try:
-            sig = inspect.signature(handler)
-        except (ValueError, TypeError):
-            # Fallback for callables whose signature cannot be inspected
-            try:
-                return handler(payload)
-            except TypeError:
-                return handler()
+        invoker = _build_invoker(handler)
+        return invoker(event, payload)
 
-        params = list(sig.parameters.values())
-
-        # Check for *args or **kwargs
-        has_varargs = any(
-            p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-            for p in params
-        )
-        if has_varargs:
-            return handler(payload)
-
-        # Check for keyword-only parameters
-        kw_only = [p for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY]
-        if kw_only:
-            kwargs: dict[str, Any] = {}
-            for p in kw_only:
-                if p.name == "payload":
-                    kwargs["payload"] = payload
-                elif p.name == "event":
-                    kwargs["event"] = event
-
-            pos_params = [
-                p
-                for p in params
-                if p.kind
-                in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                )
-            ]
-            if len(pos_params) == 0:
-                return handler(**kwargs)
-            if len(pos_params) == 1:
-                return handler(payload, **kwargs)
-            return handler(event, payload, **kwargs)
-
-        required_params = [p for p in params if p.default is inspect.Parameter.empty]
-
-        if len(required_params) == 0:
-            if len(params) >= 1:
-                return handler(payload)
-            return handler()
-        if len(required_params) == 1:
-            return handler(payload)
-        # If 2 or more required arguments, pass event name and payload
-        return handler(event, payload)
+    def remove_listener(self, event: str, handler: EventHandler) -> bool:
+        """Alias for unsubscribe."""
+        return self.unsubscribe(event, handler)
 
     def unsubscribe(self, event: str, handler: EventHandler) -> bool:
         """Unsubscribe a specific handler from an event or pattern."""
@@ -210,6 +241,17 @@ class EventDispatcher:
         self._registry = [
             reg
             for reg in self._registry
+            if not (reg.pattern == event and reg.handler == handler)
+        ]
+        if event in self._exact_registry:
+            self._exact_registry[event] = [
+                reg for reg in self._exact_registry[event] if reg.handler != handler
+            ]
+            if not self._exact_registry[event]:
+                del self._exact_registry[event]
+        self._wildcard_registry = [
+            reg
+            for reg in self._wildcard_registry
             if not (reg.pattern == event and reg.handler == handler)
         ]
         return len(self._registry) < initial_len
@@ -221,5 +263,11 @@ class EventDispatcher:
         """
         if event is None:
             self._registry.clear()
+            self._exact_registry.clear()
+            self._wildcard_registry.clear()
         else:
             self._registry = [reg for reg in self._registry if reg.pattern != event]
+            self._exact_registry.pop(event, None)
+            self._wildcard_registry = [
+                reg for reg in self._wildcard_registry if reg.pattern != event
+            ]

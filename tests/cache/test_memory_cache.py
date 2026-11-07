@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from typing import Any
 
 import pytest
@@ -173,7 +174,7 @@ async def test_memory_cache_prefix_isolated_flush() -> None:
     Verify that flushing a driver instance only purges keys matching its configured prefix,
     leaving keys belonging to other prefixes intact in shared storage.
     """
-    shared_storage: dict[str, tuple[Any, float | None]] = {}
+    shared_storage: OrderedDict[str, tuple[Any, float | None]] = OrderedDict()
     driver_a = MemoryDriver(prefix="store_a:")
     driver_a._storage = shared_storage
     driver_b = MemoryDriver(prefix="store_b:")

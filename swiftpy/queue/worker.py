@@ -4,17 +4,22 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import signal
 import time
 import uuid
 from typing import Any
 
-from redis.exceptions import RedisError
+from redis.exceptions import NoScriptError, RedisError
 
+from swiftpy.core.container import get_container
+from swiftpy.database.pool import DatabasePool
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job, JobSerializationError
 
 logger = logging.getLogger("swiftpy.queue")
+
+_QUEUE_NAME_REGEX = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 # Atomic Lua script to migrate due delayed jobs into the active queue list
 _PROMOTE_DELAYED_LUA = """
@@ -32,6 +37,8 @@ class QueueWorker:
     Queue worker process responsible for consuming jobs from Redis queues,
     migrating scheduled delayed jobs, managing backoff retries, and recording
     failed jobs into the Dead Letter Queue.
+
+    Queue delivery operates with at-least-once semantics; job handlers must be idempotent.
     """
 
     def __init__(
@@ -43,11 +50,22 @@ class QueueWorker:
         stop_when_empty: bool = False,
         timeout: float | None = None,
         worker_id: str | None = None,
+        concurrency: int = 1,
     ) -> None:
         if isinstance(queues, str):
-            self.queues = [q.strip() for q in queues.split(",") if q.strip()]
+            raw_queues = [q.strip() for q in queues.split(",") if q.strip()]
         else:
-            self.queues = list(queues) if queues else ["default"]
+            raw_queues = list(queues) if queues else []
+
+        if not raw_queues:
+            raise ValueError("Invalid queue name: queue name cannot be empty")
+
+        for q in raw_queues:
+            if not _QUEUE_NAME_REGEX.fullmatch(q):
+                raise ValueError(
+                    f"Invalid queue name '{q}': must match ^[A-Za-z0-9_.-]{{1,64}}$"
+                )
+        self.queues = raw_queues
 
         self._owns_dispatcher = dispatcher is None
         self.dispatcher: QueueDispatcher = (
@@ -58,12 +76,17 @@ class QueueWorker:
         self.stop_when_empty = stop_when_empty
         self.timeout = timeout
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        self.concurrency = max(1, int(concurrency))
+        self._semaphore = asyncio.Semaphore(self.concurrency)
+        self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._original_handlers: dict[signal.Signals, Any] = {}
 
         self._should_stop: bool = False
         self._is_working: bool = False
         self.jobs_processed: int = 0
         self.jobs_failed: int = 0
         self._promote_script_sha: str | None = None
+        self._last_promoted_at: float = 0.0
 
     def stop(self) -> None:
         """Signal the worker process to gracefully stop."""
@@ -76,30 +99,81 @@ class QueueWorker:
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 try:
+                    self._original_handlers[sig] = signal.getsignal(sig)
+                except (ValueError, AttributeError):
+                    pass
+                try:
                     loop.add_signal_handler(sig, self.stop)
                 except (NotImplementedError, RuntimeError):
                     signal.signal(sig, lambda s, f: self.stop())
         except (RuntimeError, ValueError):
             for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    self._original_handlers[sig] = signal.getsignal(sig)
+                except (ValueError, AttributeError):
+                    pass
                 signal.signal(sig, lambda s, f: self.stop())
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore original signal handlers on worker exit."""
+        for sig, handler in self._original_handlers.items():
+            try:
+                loop = asyncio.get_running_loop()
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+            try:
+                if handler is not None:
+                    signal.signal(sig, handler)
+            except (ValueError, AttributeError):
+                pass
+        self._original_handlers.clear()
 
     async def _promote_delayed_jobs(self, queue: str) -> int:
         """
         Atomically move scheduled jobs with score <= now from delayed ZSET to active queue list.
+        Uses SHA-cached EVALSHA for efficiency.
         """
+        if not hasattr(self.dispatcher, "get_client"):
+            return 0
         client = await self.dispatcher.get_client()
         delayed_key = self.dispatcher._delayed_key(queue)
         queue_key = self.dispatcher._queue_key(queue)
         now_str = str(time.time())
 
         try:
-            res = await client.eval(
-                _PROMOTE_DELAYED_LUA,
-                2,
-                delayed_key,
-                queue_key,
-                now_str,
-            )
+            if self._promote_script_sha is None:
+                try:
+                    self._promote_script_sha = await client.script_load(_PROMOTE_DELAYED_LUA)
+                except (RedisError, ConnectionError, OSError):
+                    logger.debug("Could not pre-load promote script SHA", exc_info=True)
+
+            if self._promote_script_sha is not None:
+                try:
+                    res = await client.evalsha(
+                        self._promote_script_sha,
+                        2,
+                        delayed_key,
+                        queue_key,
+                        now_str,
+                    )
+                except NoScriptError:
+                    self._promote_script_sha = await client.script_load(_PROMOTE_DELAYED_LUA)
+                    res = await client.evalsha(
+                        self._promote_script_sha,
+                        2,
+                        delayed_key,
+                        queue_key,
+                        now_str,
+                    )
+            else:
+                res = await client.eval(
+                    _PROMOTE_DELAYED_LUA,
+                    2,
+                    delayed_key,
+                    queue_key,
+                    now_str,
+                )
             return int(res) if res is not None else 0
         except (TimeoutError, RedisError, ConnectionError, OSError) as exc:
             logger.warning(
@@ -109,24 +183,30 @@ class QueueWorker:
 
     async def _pop_next_job(self) -> tuple[str, str] | None:
         """
-        Check all monitored queues in order and pop the first available job payload.
+        Check all monitored queues in order, promote delayed jobs, reap expired leases,
+        and atomically pop & lease the first available job payload.
         """
-        client = await self.dispatcher.get_client()
         for queue in self.queues:
-            # First promote any delayed jobs due for this queue
+            # 1. Promote any delayed jobs due for this queue
             await self._promote_delayed_jobs(queue)
 
-            queue_key = self.dispatcher._queue_key(queue)
-            raw_payload = await client.lpop(queue_key)
-            if isinstance(raw_payload, str):
+            # 2. Reap expired leases across workers
+            await self.dispatcher.reap_expired_leases(queue)
+
+            # 3. Atomically pop from ready queue to worker processing list with lease
+            lease_duration = (self.timeout + 30.0) if self.timeout else 60.0
+            raw_payload = await self.dispatcher.pop_and_lease(
+                queue,
+                self.worker_id,
+                lease_duration=lease_duration,
+            )
+            if raw_payload is not None:
                 return queue, raw_payload
-            if isinstance(raw_payload, bytes):
-                return queue, raw_payload.decode("utf-8")
         return None
 
     async def _all_queues_empty(self) -> bool:
         """
-        Check whether all monitored active queues and delayed queues have zero jobs.
+        Check whether all monitored active queues, delayed queues, and in-flight processing lists have zero jobs.
         """
         for queue in self.queues:
             active_size = await self.dispatcher.size(queue)
@@ -134,6 +214,9 @@ class QueueWorker:
                 return False
             delayed_size = await self.dispatcher.delayed_size(queue)
             if delayed_size > 0:
+                return False
+            proc_size = await self.dispatcher.processing_size(queue)
+            if proc_size > 0:
                 return False
         return True
 
@@ -144,8 +227,18 @@ class QueueWorker:
         """
         # 1. Parse JSON envelope
         try:
-            data: dict[str, Any] = json.loads(raw_payload)
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+            data = json.loads(raw_payload)
+            if not isinstance(data, dict):
+                raise JobSerializationError(
+                    f"Invalid job envelope: expected dict, got {type(data).__name__}"
+                )
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TypeError,
+            ValueError,
+            JobSerializationError,
+        ) as exc:
             logger.error(
                 "Worker %s encountered unparseable JSON payload: %s",
                 self.worker_id,
@@ -157,13 +250,20 @@ class QueueWorker:
                 queue=queue,
                 payload={"raw": raw_payload},
             )
+            await self.dispatcher.ack(queue, self.worker_id, raw_payload)
             self.jobs_failed += 1
             return False
 
         # 2. Reconstruct Job instance
         try:
             job = Job.deserialize(data)
-        except JobSerializationError as exc:
+        except (
+            JobSerializationError,
+            TypeError,
+            ValueError,
+            KeyError,
+            AttributeError,
+        ) as exc:
             logger.error(
                 "Worker %s failed to deserialize job envelope: %s",
                 self.worker_id,
@@ -175,6 +275,7 @@ class QueueWorker:
                 queue=queue,
                 payload=data,
             )
+            await self.dispatcher.ack(queue, self.worker_id, raw_payload)
             self.jobs_failed += 1
             return False
 
@@ -199,13 +300,20 @@ class QueueWorker:
             else:
                 await job.handle()
         except asyncio.CancelledError:
-            # Worker task was cancelled mid-execution: preserve job by returning it to active queue
+            # Worker task was cancelled mid-execution: preserve job and attempts by re-queuing at head
             logger.warning(
                 "Worker %s cancelled while processing job %s; re-queueing",
                 self.worker_id,
                 job.job_id,
             )
-            await self.dispatcher.push_raw(queue, raw_payload)
+            requeue_payload = json.dumps(job.serialize(), ensure_ascii=False)
+            await self.dispatcher.release(
+                queue,
+                self.worker_id,
+                raw_payload,
+                delay=0,
+                new_payload=requeue_payload,
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - user job handler can raise any standard Exception
             await self._handle_job_failure(job, queue, raw_payload, data, exc)
@@ -217,6 +325,7 @@ class QueueWorker:
                 job.job_id,
                 job.__class__.__name__,
             )
+            await self.dispatcher.ack(queue, self.worker_id, raw_payload)
             self.jobs_processed += 1
             return True
 
@@ -251,7 +360,14 @@ class QueueWorker:
                 job.attempts + 1,
                 job.tries,
             )
-            await self.dispatcher.push(job, queue=queue, delay=delay)
+            requeue_payload = json.dumps(job.serialize(), ensure_ascii=False)
+            await self.dispatcher.release(
+                queue,
+                self.worker_id,
+                raw_payload,
+                delay=delay,
+                new_payload=requeue_payload,
+            )
         else:
             # Retries exhausted -> Dead Letter Queue
             logger.error(
@@ -276,7 +392,15 @@ class QueueWorker:
                 queue=queue,
                 payload=data,
             )
+            await self.dispatcher.ack(queue, self.worker_id, raw_payload)
             self.jobs_failed += 1
+
+    async def _run_job_with_semaphore(self, queue: str, raw_payload: str) -> None:
+        """Run job inside concurrency semaphore."""
+        try:
+            await self.process_job(queue, raw_payload)
+        finally:
+            self._semaphore.release()
 
     async def work(self) -> None:
         """
@@ -284,10 +408,22 @@ class QueueWorker:
         """
         self._setup_signal_handlers()
         self._is_working = True
+
+        # Initialize DatabasePool if available in the application container
+        try:
+            container = get_container()
+            if container.has(DatabasePool):
+                pool = container.resolve(DatabasePool)
+                if not getattr(pool, "is_initialized", False):
+                    await pool.init()
+        except RuntimeError:
+            pass
+
         logger.info(
-            "Worker %s started monitoring queues: %s",
+            "Worker %s started monitoring queues: %s (concurrency=%d)",
             self.worker_id,
             ", ".join(self.queues),
+            self.concurrency,
         )
 
         try:
@@ -307,7 +443,31 @@ class QueueWorker:
                 job_data = await self._pop_next_job()
                 if job_data is not None:
                     queue, raw_payload = job_data
-                    await self.process_job(queue, raw_payload)
+                    if self.concurrency > 1:
+                        await self._semaphore.acquire()
+                        task = asyncio.create_task(
+                            self._run_job_with_semaphore(queue, raw_payload)
+                        )
+                        self._active_tasks.add(task)
+
+                        def _on_done(t: asyncio.Task[Any]) -> None:
+                            self._active_tasks.discard(t)
+                            if not t.cancelled() and t.exception() is not None:
+                                logger.exception(
+                                    "Queue worker task failed",
+                                    exc_info=t.exception(),
+                                )
+
+                        task.add_done_callback(_on_done)
+                    else:
+                        try:
+                            await self.process_job(queue, raw_payload)
+                        except Exception:
+                            logger.exception(
+                                "Worker %s encountered unexpected error processing job on queue '%s'",
+                                self.worker_id,
+                                queue,
+                            )
                     continue
 
                 # No active job available
@@ -318,9 +478,12 @@ class QueueWorker:
                     )
                     break
 
-                await asyncio.sleep(min(self.sleep, 0.1))
+                await asyncio.sleep(self.sleep)
         finally:
             self._is_working = False
+            if self._active_tasks:
+                await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            self._restore_signal_handlers()
             if self._owns_dispatcher:
                 await self.dispatcher.close()
             logger.info(

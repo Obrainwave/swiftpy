@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+logger = logging.getLogger("swiftpy.cache")
+
 _SENTINEL = object()
+
+
+class _LockWithRef:
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
 
 
 class CacheDriver(ABC):
@@ -15,7 +26,7 @@ class CacheDriver(ABC):
     """
 
     def __init__(self) -> None:
-        self._remember_locks: dict[str, asyncio.Lock] = {}
+        self._remember_locks: dict[str, _LockWithRef] = {}
         self._meta_lock = asyncio.Lock()
 
     @abstractmethod
@@ -87,11 +98,13 @@ class CacheDriver(ABC):
             return False
         return await self.set(key, value, ttl)
 
-    async def increment(self, key: str, value: int = 1) -> int:
+    async def increment(
+        self, key: str, value: int = 1, ttl: float | None = None
+    ) -> int:
         """
         Increment the value of an item in the cache.
 
-        If the key does not exist, it is initialized to the given value.
+        If the key does not exist, it is initialized to the given value with optional TTL.
         """
         current = await self.get(key, 0)
         try:
@@ -100,39 +113,58 @@ class CacheDriver(ABC):
             raise TypeError(
                 f"Cannot increment non-numeric cached value of type {type(current).__name__}"
             )
-        await self.set(key, new_value)
+        await self.set(key, new_value, ttl)
         return new_value
 
-    async def decrement(self, key: str, value: int = 1) -> int:
+    async def decrement(
+        self, key: str, value: int = 1, ttl: float | None = None
+    ) -> int:
         """
         Decrement the value of an item in the cache.
         """
-        return await self.increment(key, -value)
+        return await self.increment(key, -value, ttl)
 
     async def remember(
         self,
         key: str,
         ttl: float | None,
         callback: Callable[[], Any] | Callable[[], Awaitable[Any]],
+        lock_timeout: float = 10.0,
     ) -> Any:
         """
         Get an item from the cache, or execute the given callback and store the result.
 
         Includes stampede protection via per-key locking so that concurrent
         requests for a missing key execute the callback exactly once.
+        If lock acquisition times out, computes the value without caching and logs a warning.
         """
         # Fast path check
         cached = await self.get(key, _SENTINEL)
         if cached is not _SENTINEL:
             return cached
 
-        # Stampede protection: acquire key-specific lock
+        # Stampede protection: acquire key-specific lock with reference counting
         async with self._meta_lock:
             if key not in self._remember_locks:
-                self._remember_locks[key] = asyncio.Lock()
-            lock = self._remember_locks[key]
+                self._remember_locks[key] = _LockWithRef()
+            entry = self._remember_locks[key]
+            entry.refs += 1
 
-        async with lock:
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(entry.lock.acquire(), timeout=lock_timeout)
+                acquired = True
+            except TimeoutError:
+                logger.warning(
+                    "Cache lock timed out waiting for key '%s'; computing value directly without caching",
+                    key,
+                )
+                if inspect.iscoroutinefunction(callback):
+                    return await callback()
+                res = callback()
+                return await res if inspect.isawaitable(res) else res
+
             # Double-checked locking
             cached = await self.get(key, _SENTINEL)
             if cached is not _SENTINEL:
@@ -150,6 +182,13 @@ class CacheDriver(ABC):
 
             await self.set(key, result, ttl)
             return result
+        finally:
+            if acquired:
+                entry.lock.release()
+            async with self._meta_lock:
+                entry.refs -= 1
+                if entry.refs <= 0:
+                    self._remember_locks.pop(key, None)
 
     async def close(self) -> None:
         """

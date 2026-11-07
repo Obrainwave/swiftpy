@@ -877,6 +877,106 @@ Transfer/sec:    482.06KB
   - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 5 tests.
   - Full suite: `pytest -q -p no:cacheprovider`: **498 passed in 198.53s** (473 post-Phase-4 + 25 new Phase 5 tests).
 
+---
+
+## Phase 6 – Queue, Events, and Cache
+
+### P6-Q1: Reliable Queue Consumption (`Q-1`, `D-3`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Designed and implemented list-plus-lease architecture in `swiftpy/queue/dispatcher.py` and `swiftpy/queue/worker.py`.
+  - Popping moves jobs from `queue:<name>` to `queue:<name>:processing:<worker_id>` with per-job deadline lease in sorted set `queue:<name>:leases`.
+  - Added atomic Lua scripts for `pop_and_lease`, `ack`, `release` (with backoff), and `reap_expired_leases`.
+  - Worker automatically reaps expired leases, preserves attempt counts, and moves jobs exceeding maximum `tries` to DLQ.
+  - Cancelled jobs are re-queued at the head with attempt count preserved.
+  - Added `tests/queue/test_reliability.py` (4 tests).
+
+---
+
+### P6-Q2: Poison-Message Handling (`Q-2`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Hardened `Job.deserialize()` (`swiftpy/queue/job.py`) to validate envelope field types (`args`, `kwargs`, `tries`, `attempts`, `data`) and wrap deserialization/instantiation failures in `JobSerializationError`.
+  - Updated worker loop to catch `JobSerializationError`, push to Dead Letter Queue with diagnostic failure metadata, acknowledge the message from processing, and continue processing subsequent jobs.
+  - Configured `encoding_errors="replace"` on Redis connections and hardened Lua scripts to remove and ack non-UTF-8 payload strings.
+  - Added `tests/queue/test_poison_messages.py` (2 tests).
+
+---
+
+### P6-Q3: Trusted Payloads & HMAC Signing (`Q-3`, `D-3`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added HMAC-SHA256 envelope signing with `app.key` (`APP_KEY`) in `swiftpy/queue/job.py`.
+  - Enforced constant-time `hmac.compare_digest` verification **before** `importlib.import_module()` is invoked.
+  - Added key rotation support (`set_previous_keys()`, `get_previous_keys()`).
+  - Added `_trusted_namespaces` whitelist guard (defaulting to application packages and `swiftpy`) to reject arbitrary module imports when signing is unconfigured.
+  - Added `tests/queue/test_signing.py` (6 tests).
+
+---
+
+### P6-Q4: Worker Loop Efficiency & CLI Commands (`Q-4`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Switched worker loop to block on `BLMOVE` (honoring `--sleep`), cached delayed-job promotion Lua script via SHA.
+  - Added `--concurrency N` support to `QueueWorker` and `swiftpy queue:work` using bounded semaphore and task tracking with done-callbacks per the Task Rule.
+  - Restored signal handlers on worker exit.
+  - Added queue name regex validation (`^[A-Za-z0-9_.-]{1,64}$`).
+  - Added DLQ capping (`failed_max_size`, default 1000) with `LTRIM`.
+  - Added CLI commands `swiftpy queue:failed`, `swiftpy queue:retry <id|all>`, and `swiftpy queue:flush` in `swiftpy/console/commands/queue.py`.
+  - Added `tests/queue/test_worker_behavior.py` (6 tests).
+
+---
+
+### P6-Q5: After-Commit Dispatch (`Q-4`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Implemented transaction commit hooks `on_commit(callback)` in `swiftpy/database/transaction.py` (`TransactionConnection`, `Database`, and module-level).
+  - Outermost successful commit triggers callbacks in registration order, inner savepoint commits promote callbacks to parent level, and rollbacks cleanly discard registered callbacks.
+  - Added `Job.dispatch(after_commit=True)` (`swiftpy/queue/job.py`): defers job dispatch to transaction commit; drops job if transaction rolls back; dispatches immediately if no transaction is active.
+  - Added `tests/queue/test_after_commit.py` (8 tests).
+
+---
+
+### P6-Q6: Redis Ownership and the Event Bus (`Q-5`, `Q-6`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `owns_pool` flag to `QueueDispatcher`, `RedisDriver`, and `RedisEventBus` so external shared connection pools are never disconnected by consumers that did not create them.
+  - Guarded lazy `get_client()` with `asyncio.Lock` across all drivers.
+  - Hardened `RedisEventBus` (`swiftpy/events/redis_bus.py`): done-callback on `_listener_task`, re-raised `CancelledError`, exponential backoff with jitter and rate-limited logging during Redis reconnects, and bounded tracked background task dispatching (`max_concurrency`) so slow listeners never stall consumption.
+  - Added HMAC-SHA256 message signing to `RedisEventBus` with key rotation support.
+  - Documented at-most-once pub/sub delivery semantics and local vs. remote payload contracts.
+  - Optimized `EventDispatcher` (`swiftpy/events/dispatcher.py`): precompiled invocation strategies at listener registration (eliminating repeated `inspect.signature` during dispatch), indexed exact registrations in O(1) dictionary and wildcards separately, and added `remove_listener` / `forget`.
+  - Added `tests/events/test_redis_bus_reliability.py` (5 tests).
+
+---
+
+### P6-K1: Cache Driver Correctness (`K-1`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Hardened `remember()` in `CacheDriver` and `RedisDriver`: on lock timeout, executes callback directly without caching and logs a warning (never returns `None` silently).
+  - Added reference-counted `_remember_locks` dictionary in `CacheDriver` so locks are cleaned up immediately when unused.
+  - Implemented atomic `increment(key, value=1, ttl=None)` with Lua script setting TTL on initial creation and never extending it on subsequent increments. Implemented atomic `add(key, value, ttl=None)` using `SET ... NX`.
+  - Scoped `flush()` using `SCAN` with store prefix and batched `UNLINK` in chunks of 500 keys, scoping default prefixes with `app.name`.
+  - Added pluggable `CacheSerializer` interface with default `JsonCacheSerializer` supporting `datetime`, `date`, `time`, `UUID`, `Decimal`, and models with `to_dict()` and `__hidden__`.
+  - Added `max_items` LRU eviction and lazy expiry sweeping to `MemoryDriver`, performing `copy.deepcopy` outside the lock to minimize lock contention.
+  - Updated `Cache._resolve_driver` (`swiftpy/cache/cache.py`) to honor `redis_url`, `max_connections`, and `timeout`, sharing connection pools across stores with identical connection configurations.
+  - Added `tests/cache/test_driver_correctness.py` (8 tests).
+
+---
+
+### Phase 6 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy --exclude "tests/orm/test_eager_loading.py" .`: **Success: no issues found in 201 source files**
+  - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 6 tests.
+  - Full suite: `pytest -q -p no:cacheprovider`: **537 passed in 304.83s** (498 post-Phase-5 + 39 new Phase 6 tests).
+
 
 
 

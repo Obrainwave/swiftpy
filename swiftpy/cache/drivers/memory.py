@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +14,7 @@ class MemoryDriver(CacheDriver):
     """
     In-memory cache driver suitable for unit tests and local execution
     without requiring an external Redis instance.
+    Includes LRU eviction when max_items is set and lazy expiry sweeping.
     """
 
     def __init__(
@@ -20,29 +22,46 @@ class MemoryDriver(CacheDriver):
         prefix: str = "swiftpy_cache:",
         default_ttl: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_items: int | None = 1000,
     ) -> None:
         super().__init__()
         self.prefix = prefix
         self.default_ttl = default_ttl
         self._clock = clock
-        self._storage: dict[str, tuple[Any, float | None]] = {}
+        self.max_items = max_items
+        self._storage: OrderedDict[str, tuple[Any, float | None]] = OrderedDict()
         self._lock = asyncio.Lock()
+
+    def _sweep_expired(self, max_keys: int = 20) -> None:
+        """Lazily sweep up to max_keys expired entries."""
+        now = self._clock()
+        to_del: list[str] = []
+        for checked, (k, (_, exp)) in enumerate(self._storage.items()):
+            if exp is not None and now >= exp:
+                to_del.append(k)
+            if checked + 1 >= max_keys:
+                break
+        for k in to_del:
+            self._storage.pop(k, None)
 
     def _prefixed_key(self, key: str) -> str:
         return f"{self.prefix}{key}"
 
     async def get(self, key: str, default: Any = None) -> Any:
         full_key = self._prefixed_key(key)
+        raw_val: Any = _SENTINEL
         async with self._lock:
-            if full_key not in self._storage:
-                return default
+            if full_key in self._storage:
+                value, expires_at = self._storage[full_key]
+                if expires_at is not None and self._clock() >= expires_at:
+                    del self._storage[full_key]
+                else:
+                    self._storage.move_to_end(full_key)
+                    raw_val = value
 
-            value, expires_at = self._storage[full_key]
-            if expires_at is not None and self._clock() >= expires_at:
-                del self._storage[full_key]
-                return default
-
-            return copy.deepcopy(value)
+        if raw_val is _SENTINEL:
+            return default
+        return copy.deepcopy(raw_val)
 
     async def set(
         self,
@@ -52,8 +71,10 @@ class MemoryDriver(CacheDriver):
     ) -> bool:
         full_key = self._prefixed_key(key)
         effective_ttl = ttl if ttl is not None else self.default_ttl
+        val_to_store = copy.deepcopy(value)
 
         async with self._lock:
+            self._sweep_expired()
             if effective_ttl is not None and effective_ttl <= 0:
                 self._storage.pop(full_key, None)
                 return True
@@ -61,7 +82,10 @@ class MemoryDriver(CacheDriver):
             expires_at = (
                 self._clock() + effective_ttl if effective_ttl is not None else None
             )
-            self._storage[full_key] = (copy.deepcopy(value), expires_at)
+            self._storage[full_key] = (val_to_store, expires_at)
+            self._storage.move_to_end(full_key)
+            if self.max_items is not None and len(self._storage) > self.max_items:
+                self._storage.popitem(last=False)
             return True
 
     async def forget(self, key: str) -> bool:
@@ -93,8 +117,10 @@ class MemoryDriver(CacheDriver):
     ) -> bool:
         full_key = self._prefixed_key(key)
         effective_ttl = ttl if ttl is not None else self.default_ttl
+        val_to_store = copy.deepcopy(value)
 
         async with self._lock:
+            self._sweep_expired()
             if full_key in self._storage:
                 _, expires_at = self._storage[full_key]
                 if expires_at is None or self._clock() < expires_at:
@@ -108,12 +134,19 @@ class MemoryDriver(CacheDriver):
             expires_at = (
                 self._clock() + effective_ttl if effective_ttl is not None else None
             )
-            self._storage[full_key] = (copy.deepcopy(value), expires_at)
+            self._storage[full_key] = (val_to_store, expires_at)
+            self._storage.move_to_end(full_key)
+            if self.max_items is not None and len(self._storage) > self.max_items:
+                self._storage.popitem(last=False)
             return True
 
-    async def increment(self, key: str, value: int = 1) -> int:
+    async def increment(
+        self, key: str, value: int = 1, ttl: float | None = None
+    ) -> int:
         full_key = self._prefixed_key(key)
+        effective_ttl = ttl if ttl is not None else self.default_ttl
         async with self._lock:
+            self._sweep_expired()
             current: Any = 0
             expires_at: float | None = None
 
@@ -124,6 +157,11 @@ class MemoryDriver(CacheDriver):
                     expires_at = stored_exp
                 else:
                     del self._storage[full_key]
+                    if effective_ttl is not None and effective_ttl > 0:
+                        expires_at = self._clock() + effective_ttl
+            else:
+                if effective_ttl is not None and effective_ttl > 0:
+                    expires_at = self._clock() + effective_ttl
 
             try:
                 new_value = int(current) + value
@@ -133,6 +171,9 @@ class MemoryDriver(CacheDriver):
                 )
 
             self._storage[full_key] = (new_value, expires_at)
+            self._storage.move_to_end(full_key)
+            if self.max_items is not None and len(self._storage) > self.max_items:
+                self._storage.popitem(last=False)
             return new_value
 
     async def close(self) -> None:

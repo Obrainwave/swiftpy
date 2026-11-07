@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import os
+import random
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -13,6 +17,7 @@ from uuid import UUID
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
+from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import get_container
 from swiftpy.events.dispatcher import EventDispatcher, EventHandler
 from swiftpy.support.redis_config import resolve_redis_params
@@ -24,9 +29,80 @@ class RedisEventBus:
     """
     Cross-process event delivery bus backed by Redis Pub/Sub.
     Allows workers in different processes or containers to publish and listen for events.
+
+    Delivery Semantics:
+      Pub/sub messages operate with at-most-once delivery semantics.
+      If a subscriber is offline or disconnected when an event is published, the event is not retained.
+
+    Payload Contract:
+      - Local dispatch (local=True): Listeners in the current process receive the exact Python object.
+      - Remote dispatch: Payloads are serialized to JSON (converting datetimes, UUIDs, and models to dicts/strings).
+        Subscribers in remote processes receive the deserialized dicts/primitives.
+      - When APP_KEY is configured, envelopes are signed with HMAC-SHA256 to ensure authenticity.
     """
 
     _instance: ClassVar[RedisEventBus | None] = None
+    _app_key: ClassVar[str | None] = None
+    _previous_keys: ClassVar[list[str]] = []
+
+    @classmethod
+    def set_app_key(cls, key: str | None) -> None:
+        """Set the active application key for signing bus messages."""
+        cls._app_key = key
+
+    @classmethod
+    def get_app_key(cls) -> str | None:
+        """Return the active application key for signing bus messages."""
+        if cls._app_key is not None:
+            return cls._app_key
+        try:
+            cfg = Config.get_instance()
+            val = cfg.get("app.key")
+            if val and isinstance(val, str):
+                return val
+        except ConfigurationError:
+            pass
+        return os.getenv("APP_KEY")
+
+    @classmethod
+    def set_previous_keys(cls, keys: list[str]) -> None:
+        """Set previous keys for rotation verification."""
+        cls._previous_keys = list(keys)
+
+    @classmethod
+    def get_previous_keys(cls) -> list[str]:
+        """Return previous keys for key rotation verification."""
+        if cls._previous_keys:
+            return cls._previous_keys
+        try:
+            cfg = Config.get_instance()
+            val = cfg.get("app.previous_keys")
+            if isinstance(val, list):
+                return [str(k) for k in val]
+            if isinstance(val, str) and val.strip():
+                return [k.strip() for k in val.split(",") if k.strip()]
+        except ConfigurationError:
+            pass
+        env_prev = os.getenv("APP_PREVIOUS_KEYS")
+        if env_prev:
+            return [k.strip() for k in env_prev.split(",") if k.strip()]
+        return []
+
+    @classmethod
+    def _compute_signature(cls, envelope: dict[str, Any], key: str) -> str:
+        """Compute an HMAC-SHA256 signature over the canonical representation of the envelope."""
+        canonical_fields = {k: v for k, v in envelope.items() if k != "signature"}
+        canonical_json = json.dumps(
+            canonical_fields,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hmac.new(
+            key.encode("utf-8"),
+            canonical_json.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
     def __init__(
         self,
@@ -42,6 +118,7 @@ class RedisEventBus:
         ignore_self: bool = True,
         max_connections: int | None = None,
         timeout: float = 30.0,
+        max_concurrency: int = 50,
     ) -> None:
         self.bus_id: str = uuid.uuid4().hex
         self.dispatcher: EventDispatcher = (
@@ -58,12 +135,17 @@ class RedisEventBus:
         self.ignore_self = ignore_self
         self.max_connections = max_connections or 20
         self.timeout = timeout
+        self.max_concurrency = max_concurrency
         self._owns_client = redis_client is None
+        self._owns_pool = connection_pool is None and redis_client is None
+        self._client_lock = asyncio.Lock()
 
         self._running: bool = False
         self._listener_task: asyncio.Task[None] | None = None
         self._pubsub: aioredis.client.PubSub | None = None
         self._ready_event: asyncio.Event = asyncio.Event()
+        self._dispatch_semaphore = asyncio.Semaphore(self.max_concurrency)
+        self._active_dispatch_tasks: set[asyncio.Task[Any]] = set()
 
     @classmethod
     def get_instance(cls) -> RedisEventBus:
@@ -102,7 +184,11 @@ class RedisEventBus:
 
     async def get_client(self) -> aioredis.Redis:
         """Lazily initialize and return the async Redis client."""
-        if self._client is None:
+        if self._client is not None:
+            return self._client
+        async with self._client_lock:
+            if self._client is not None:
+                return self._client
             if self._redis_url:
                 self._client = aioredis.from_url(
                     self._redis_url,
@@ -132,7 +218,7 @@ class RedisEventBus:
                     decode_responses=True,
                 )
             self._owns_client = True
-        return self._client
+            return self._client
 
     def subscribe(self, event: str, handler: EventHandler) -> None:
         """Subscribe a listener to events received by this worker."""
@@ -195,12 +281,16 @@ class RedisEventBus:
         Returns the number of subscribers that received the message.
         """
         serialized_payload = self._serialize_value(payload)
-        envelope = {
+        envelope: dict[str, Any] = {
             "event": event,
             "payload": serialized_payload,
             "sender_id": self.bus_id,
             "timestamp": time.time(),
         }
+
+        key = self.get_app_key()
+        if key:
+            envelope["signature"] = self._compute_signature(envelope, key)
 
         channel = f"{self.channel_prefix}{event}"
         raw_message = json.dumps(envelope)
@@ -233,6 +323,14 @@ class RedisEventBus:
         self._listener_task = asyncio.create_task(
             self._listener_loop(self._pubsub, pattern)
         )
+
+        def _on_listener_done(t: asyncio.Task[None]) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                logger.exception(
+                    "RedisEventBus listener task crashed", exc_info=t.exception()
+                )
+
+        self._listener_task.add_done_callback(_on_listener_done)
         return self._listener_task
 
     async def wait_until_ready(self, timeout: float = 5.0) -> None:
@@ -247,18 +345,28 @@ class RedisEventBus:
     async def _listener_loop(
         self, pubsub: aioredis.client.PubSub, pattern: str
     ) -> None:
-        """Background loop reading Redis pub/sub messages."""
+        """Background loop reading Redis pub/sub messages with backoff and reconnection."""
+        backoff = 0.1
+        last_error_log = 0.0
         try:
             while self._running:
                 try:
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True, timeout=0.5
                     )
+                    backoff = 0.1
                 except (RedisError, OSError) as exc:
                     if not self._running:
                         break
-                    logger.warning("Redis bus connection error: %s", exc)
-                    await asyncio.sleep(0.1)
+                    now = time.monotonic()
+                    if now - last_error_log > 10.0:
+                        logger.warning(
+                            "Redis bus connection error: %s (backing off)", exc
+                        )
+                        last_error_log = now
+                    jitter = 0.8 + 0.4 * random.random()
+                    await asyncio.sleep(backoff * jitter)
+                    backoff = min(30.0, backoff * 2.0)
                     continue
 
                 if message is None:
@@ -270,8 +378,6 @@ class RedisEventBus:
                     data = message.get("data")
                     if isinstance(data, (str, bytes)):
                         await self._handle_raw_message(data)
-        except asyncio.CancelledError:
-            pass
         finally:
             try:
                 await pubsub.punsubscribe(pattern)
@@ -280,7 +386,7 @@ class RedisEventBus:
                 logger.debug("Error closing pubsub subscriber: %s", exc)
 
     async def _handle_raw_message(self, data: str | bytes) -> None:
-        """Deserialize message envelope and route event to dispatcher."""
+        """Deserialize message envelope, verify signature, and route event to dispatcher concurrently."""
         try:
             if isinstance(data, bytes):
                 text = data.decode("utf-8")
@@ -294,6 +400,32 @@ class RedisEventBus:
         if not isinstance(envelope, dict):
             return
 
+        # HMAC signature verification if APP_KEY is configured
+        key = self.get_app_key()
+        if key:
+            sig = envelope.get("signature")
+            if not sig or not isinstance(sig, str):
+                logger.warning(
+                    "Dropping unsigned Redis bus message for event '%s'",
+                    envelope.get("event"),
+                )
+                return
+            expected_sig = self._compute_signature(envelope, key)
+            if not hmac.compare_digest(sig, expected_sig):
+                matched = False
+                for prev_key in self.get_previous_keys():
+                    if hmac.compare_digest(
+                        sig, self._compute_signature(envelope, prev_key)
+                    ):
+                        matched = True
+                        break
+                if not matched:
+                    logger.warning(
+                        "Dropping tampered Redis bus message for event '%s'",
+                        envelope.get("event"),
+                    )
+                    return
+
         sender_id = envelope.get("sender_id")
         if self.ignore_self and sender_id == self.bus_id:
             return
@@ -302,13 +434,27 @@ class RedisEventBus:
         payload = envelope.get("payload")
 
         if isinstance(event, str):
-            try:
-                await self.dispatcher.dispatch(event, payload)
-            except Exception:
-                logger.exception(
-                    "Error executing listener for cross-process event '%s'",
-                    event,
-                )
+            async def _dispatch_task(evt: str, pay: Any) -> None:
+                async with self._dispatch_semaphore:
+                    try:
+                        await self.dispatcher.dispatch(evt, pay)
+                    except Exception:
+                        logger.exception(
+                            "Error executing listener for cross-process event '%s'",
+                            evt,
+                        )
+
+            task = asyncio.create_task(_dispatch_task(event, payload))
+            self._active_dispatch_tasks.add(task)
+
+            def _on_task_done(t: asyncio.Task[Any]) -> None:
+                self._active_dispatch_tasks.discard(t)
+                if not t.cancelled() and t.exception() is not None:
+                    logger.exception(
+                        "Event dispatch task failed", exc_info=t.exception()
+                    )
+
+            task.add_done_callback(_on_task_done)
 
     async def stop_listening(self) -> None:
         """Stop background message consumer and release subscriptions."""
@@ -321,7 +467,7 @@ class RedisEventBus:
                 await self._listener_task
             except asyncio.CancelledError:
                 pass
-            except (RedisError, OSError) as exc:
+            except (RedisError, OSError, RuntimeError) as exc:
                 logger.debug("Error during listener task shutdown: %s", exc)
             self._listener_task = None
 
@@ -332,6 +478,10 @@ class RedisEventBus:
                 logger.debug("Error closing pubsub: %s", exc)
             self._pubsub = None
 
+        if self._active_dispatch_tasks:
+            await asyncio.gather(*self._active_dispatch_tasks, return_exceptions=True)
+            self._active_dispatch_tasks.clear()
+
     async def close(self) -> None:
         """Stop listening and close Redis connections."""
         await self.stop_listening()
@@ -340,7 +490,7 @@ class RedisEventBus:
             await self._client.aclose()
             self._client = None
 
-        if self._pool is not None:
+        if self._owns_pool and self._pool is not None:
             await self._pool.disconnect()
             self._pool = None
 

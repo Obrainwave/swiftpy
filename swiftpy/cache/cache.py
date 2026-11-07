@@ -3,10 +3,13 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import redis.asyncio as aioredis
+
 from swiftpy.cache.driver import CacheDriver
 from swiftpy.cache.drivers.memory import MemoryDriver
 from swiftpy.cache.drivers.redis import RedisDriver
 from swiftpy.core.config import Config
+from swiftpy.support.redis_config import resolve_redis_params
 
 
 class Cache:
@@ -33,6 +36,7 @@ class Cache:
         self._default_driver_name = default_driver
         self._drivers: dict[str, CacheDriver] = {}
         self._custom_creators: dict[str, Callable[..., CacheDriver]] = {}
+        self._shared_pools: dict[tuple[Any, ...], aioredis.ConnectionPool] = {}
 
     @property
     def default_driver_name(self) -> str:
@@ -92,11 +96,21 @@ class Cache:
             return MemoryDriver(prefix=prefix, default_ttl=ttl_val)
 
         if driver_type == "redis":
-            prefix = str(
+            app_name = str(self.config.get("app.name", "")).strip()
+            raw_prefix = str(
                 store_config.get(
                     "prefix", self.config.get("cache.prefix", "swiftpy_cache:")
                 )
             )
+            if (
+                app_name
+                and not raw_prefix.startswith(f"{app_name}:")
+                and not raw_prefix.startswith(f"{app_name}_")
+            ):
+                prefix = f"{app_name}:{raw_prefix}"
+            else:
+                prefix = raw_prefix
+
             default_ttl = store_config.get(
                 "ttl", self.config.get("cache.default_ttl", None)
             )
@@ -105,14 +119,61 @@ class Cache:
             port = store_config.get("port")
             password = store_config.get("password")
             database = store_config.get("database", 0)
+            redis_url = store_config.get(
+                "url", self.config.get("cache.redis_url") or self.config.get("cache.url")
+            )
+            max_connections = int(
+                store_config.get(
+                    "max_connections", self.config.get("cache.max_connections", 50)
+                )
+            )
+            timeout = float(
+                store_config.get("timeout", self.config.get("cache.timeout", 30.0))
+            )
+
+            pool_key = (
+                redis_url,
+                str(host) if host is not None else None,
+                int(port) if port is not None else None,
+                str(password) if password is not None else None,
+                int(database) if database is not None else 0,
+                max_connections,
+                timeout,
+            )
+
+            if pool_key not in self._shared_pools:
+                if redis_url:
+                    pool = aioredis.ConnectionPool.from_url(
+                        redis_url,
+                        decode_responses=True,
+                        max_connections=max_connections,
+                        timeout=timeout,
+                    )
+                else:
+                    params = resolve_redis_params(
+                        section="cache",
+                        host=str(host) if host is not None else None,
+                        port=int(port) if port is not None else None,
+                        password=str(password) if password is not None else None,
+                        database=int(database) if database is not None else 0,
+                    )
+                    pool = aioredis.BlockingConnectionPool(
+                        host=params["host"],
+                        port=params["port"],
+                        db=params["database"],
+                        password=params["password"] or None,
+                        decode_responses=True,
+                        max_connections=max_connections,
+                        timeout=timeout,
+                    )
+                self._shared_pools[pool_key] = pool
 
             return RedisDriver(
-                host=str(host) if host is not None else None,
-                port=int(port) if port is not None else None,
-                password=str(password) if password is not None else None,
-                database=int(database) if database is not None else 0,
+                connection_pool=self._shared_pools[pool_key],
                 prefix=prefix,
                 default_ttl=ttl_val,
+                max_connections=max_connections,
+                timeout=timeout,
             )
 
         raise ValueError(f"Unsupported cache driver: '{name}'")
@@ -166,6 +227,9 @@ class Cache:
         for drv in self._drivers.values():
             await drv.close()
         self._drivers.clear()
+        for pool in self._shared_pools.values():
+            await pool.disconnect()
+        self._shared_pools.clear()
 
 
 # CacheManager is an alias for Cache for consistency across naming styles

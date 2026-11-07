@@ -276,14 +276,17 @@ def test_job_deserialization_errors() -> None:
     with pytest.raises(JobSerializationError, match="Invalid job class identifier"):
         Job.deserialize({"job_class": "NoDelimiters"})
 
-    with pytest.raises(JobSerializationError, match="Could not import module"):
+    with pytest.raises(JobSerializationError, match="not in trusted namespaces"):
         Job.deserialize({"job_class": "non_existent_module:SomeJob"})
+
+    with pytest.raises(JobSerializationError, match="Could not import module"):
+        Job.deserialize({"job_class": "tests.non_existent_module:SomeJob"})
 
     with pytest.raises(JobSerializationError, match="not found in module"):
         Job.deserialize({"job_class": "test_queue:NonExistentJob"})
 
     with pytest.raises(JobSerializationError, match="not a subclass of Job"):
-        Job.deserialize({"job_class": "json:decoder.JSONDecoder"})
+        Job.deserialize({"job_class": "test_queue:test_job_deserialization_errors"})
 
 
 def test_backoff_delay_calculation() -> None:

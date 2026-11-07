@@ -113,6 +113,44 @@ All notable changes to SwiftPY will be documented in this file.
 - **P5-C6 (Core – Safe Package-Based Provider Discovery):**
   - **Breaking:** `discover_providers()` no longer inserts `app/providers` into `sys.path` (preventing provider files named `queue.py` or `logging.py` from shadowing Python standard library modules) and raises `ConfigurationError` on broken provider modules by default (`strict=True`; pass `strict=False` or `Application(strict_providers=False)` to skip broken providers). Added `project_root` support to `discover_providers()` and `Application`.
 
+### Phase 6 – Queue, Events, and Cache
+- **P6-Q1 (Queue – Reliable Queue Consumption):**
+  - **Breaking:** Replaced fire-and-forget queue popping with reliable delivery based on list-plus-lease architecture (Decision `D-3`).
+  - Active jobs are moved from `queue:<name>` to per-worker processing lists `queue:<name>:processing:<worker_id>` via `LMOVE`/`BLMOVE`, with lease deadlines tracked in sorted set `queue:<name>:leases`.
+  - Atomic Lua scripts handle job popping and lease creation (`pop_and_lease`), job acknowledgment (`ack`), and delayed backoff retries (`release`).
+  - Added background lease reaper (`reap_expired_leases`) that re-queues expired jobs at the head of the queue preserving attempt counts, and moves jobs exceeding maximum `tries` to the Dead Letter Queue.
+  - Jobs cancelled mid-flight re-queue at the head with attempt counts intact.
+  - Documented at-least-once queue delivery semantics and idempotency requirements.
+- **P6-Q2 (Queue – Poison-Message Handling):**
+  - Hardened `Job.deserialize()` to strictly validate envelope field types (`args` as list, `kwargs` as dict, `tries` as int >= 1, `attempts` as int >= 0, `data` as dict) and wrap deserialization/instantiation failures in `JobSerializationError`.
+  - Workers catch `JobSerializationError` and malformed payloads, record them in the failed DLQ with failure diagnostics, ack them from processing queues, and continue processing without loop termination.
+  - Configured Redis connection readers with `encoding_errors="replace"` and hardened Lua acknowledgment scripts to safely handle non-UTF-8 binary payloads.
+- **P6-Q3 (Queue – Trusted Payloads & HMAC Envelope Signing):**
+  - **Breaking:** Queue envelopes are signed with HMAC-SHA256 using `app.key` (`APP_KEY`). Verification is performed using `hmac.compare_digest` **before** any class or module is imported via `importlib.import_module()`.
+  - Added `set_app_key()`, `get_app_key()`, and key rotation support via `set_previous_keys()` / `get_previous_keys()`.
+  - Enforced `_trusted_namespaces` (defaulting to application packages and `swiftpy`) to reject arbitrary module imports even when signing is unconfigured.
+- **P6-Q4 (Queue / CLI – Worker Loop Efficiency & CLI Commands):**
+  - Converted worker loop to block via Redis `BLMOVE` (honoring `--sleep`), promoted delayed jobs using cached Lua scripts, and restored original signal handlers on worker exit.
+  - Added `--concurrency N` support to `QueueWorker` and `swiftpy queue:work` using bounded semaphores and task tracking with done-callbacks per the Task Rule.
+  - Enforced queue name validation (`^[A-Za-z0-9_.-]{1,64}$`), added DLQ capping (`failed_max_size`, default 1000), and added CLI commands `swiftpy queue:failed`, `swiftpy queue:retry <id|all>`, and `swiftpy queue:flush`.
+- **P6-Q5 (Queue / Database – After-Commit Dispatch):**
+  - Added transaction commit hook mechanism: `on_commit(callback)` in `swiftpy.database.transaction` (supported on `TransactionConnection`, `Database`, and module-level).
+  - Outermost successful commit triggers callbacks in registration order, inner savepoint commits promote callbacks to parent level, and rollbacks cleanly discard registered callbacks.
+  - Added `Job.dispatch(after_commit=True)`: defers pushing the job until the active database transaction successfully commits; drops the job on rollback; falls back to immediate dispatch when no transaction is active.
+- **P6-Q6 (Events – Redis Ownership, Event Bus Hardening & Dispatcher Optimization):**
+  - Added `owns_pool` flag to `QueueDispatcher`, `RedisDriver`, and `RedisEventBus` so external shared connection pools are never disconnected by consumers that did not create them. Guarded lazy `get_client()` with `asyncio.Lock` across all drivers.
+  - Hardened `RedisEventBus`: added done-callback on `_listener_task`, re-raised `CancelledError`, implemented exponential backoff with jitter and rate-limited logging during Redis reconnects, and dispatched incoming messages in bounded tracked background tasks (`max_concurrency`) so slow listeners never stall consumption.
+  - Added HMAC-SHA256 message signing to `RedisEventBus` with key rotation support; dropped unsigned or tampered messages.
+  - Documented at-most-once pub/sub delivery semantics and local vs. remote payload contracts.
+  - Optimized `EventDispatcher`: precompiled invocation strategies at listener registration (eliminating repeated `inspect.signature` during dispatch), indexed exact registrations in O(1) dictionary and wildcards separately, and added `remove_listener` / `forget`.
+- **P6-K1 (Cache – Driver Correctness, Atomicity & Memory LRU Eviction):**
+  - Hardened `remember()`: on lock timeout, executes the callback directly without caching and logs a warning (never returns `None` silently). Reference-counted `_remember_locks` dictionary so locks are cleaned up immediately when unused.
+  - Implemented atomic `increment(key, value=1, ttl=None)` with Lua script setting TTL on initial creation and never extending it on subsequent increments. Implemented atomic `add(key, value, ttl=None)` using `SET ... NX`.
+  - Scoped `flush()` using `SCAN` with store prefix and batched `UNLINK` in chunks of 500 keys, scoping default prefixes with `app.name`.
+  - Added pluggable `CacheSerializer` interface with default `JsonCacheSerializer` supporting `datetime`, `date`, `time`, `UUID`, `Decimal`, and models with `to_dict()` and `__hidden__`.
+  - Added `max_items` LRU eviction and lazy expiry sweeping to `MemoryDriver`, performing `copy.deepcopy` outside the lock to minimize lock contention.
+  - Updated `Cache._resolve_driver` to honor `redis_url`, `max_connections`, and `timeout`, sharing connection pools across stores with identical connection configurations.
+
 
 
 
