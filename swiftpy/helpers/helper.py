@@ -4,8 +4,9 @@ import os
 from typing import Any
 
 from swiftpy.cache.cache import Cache
-from swiftpy.core.bootstrap import get_container
 from swiftpy.core.config import Config
+from swiftpy.core.container import get_container
+from swiftpy.core.container_exceptions import BindingNotFoundError, ResolutionError
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
@@ -20,11 +21,16 @@ def app() -> Any:
 
 def cache(driver_name: str | None = None) -> Any:
     """Retrieve the application Cache manager or a specific driver."""
-
     try:
-        c = get_container().resolve(Cache)
-    except RuntimeError:
-        c = Cache()
+        c_inst = get_container()
+    except RuntimeError as exc:
+        raise ResolutionError("Application container not bootstrapped") from exc
+
+    if not c_inst.has(Cache):
+        raise BindingNotFoundError(
+            "Cache is not registered in the container. Ensure CacheServiceProvider is registered."
+        )
+    c = c_inst.resolve(Cache)
 
     if driver_name is not None:
         return c.driver(driver_name)
@@ -34,7 +40,8 @@ def cache(driver_name: str | None = None) -> Any:
 def config(key: str | None = None, default: Any = None) -> Any:
     """Retrieve configuration values."""
     try:
-        cfg = get_container().resolve(Config)
+        c_inst = get_container()
+        cfg = c_inst.resolve(Config) if c_inst.has(Config) else Config.get_instance()
     except RuntimeError:
         cfg = Config.get_instance()
 
@@ -59,14 +66,19 @@ def env(key: str, default: Any = None) -> Any:
     return os.getenv(key, default)
 
 
-
 def dispatcher() -> EventDispatcher:
     """Retrieve the application EventDispatcher."""
     try:
-        disp: EventDispatcher = get_container().resolve(EventDispatcher)
-        return disp
-    except RuntimeError:
-        return EventDispatcher.get_instance()
+        c_inst = get_container()
+    except RuntimeError as exc:
+        raise ResolutionError("Application container not bootstrapped") from exc
+
+    if not c_inst.has(EventDispatcher):
+        raise BindingNotFoundError(
+            "EventDispatcher is not registered in the container. Ensure EventServiceProvider is registered."
+        )
+    disp: EventDispatcher = c_inst.resolve(EventDispatcher)
+    return disp
 
 
 async def event(event_name: str, payload: Any = None) -> list[Any]:
@@ -78,10 +90,16 @@ async def event(event_name: str, payload: Any = None) -> list[Any]:
 def queue() -> QueueDispatcher:
     """Retrieve the application QueueDispatcher."""
     try:
-        q: QueueDispatcher = get_container().resolve(QueueDispatcher)
-        return q
-    except RuntimeError:
-        return QueueDispatcher.get_instance()
+        c_inst = get_container()
+    except RuntimeError as exc:
+        raise ResolutionError("Application container not bootstrapped") from exc
+
+    if not c_inst.has(QueueDispatcher):
+        raise BindingNotFoundError(
+            "QueueDispatcher is not registered in the container. Ensure QueueServiceProvider is registered."
+        )
+    q: QueueDispatcher = c_inst.resolve(QueueDispatcher)
+    return q
 
 
 async def dispatch(
@@ -97,10 +115,16 @@ async def dispatch(
 def websocket_manager() -> WebSocketManager:
     """Retrieve the application WebSocketManager."""
     try:
-        wm: WebSocketManager = get_container().resolve(WebSocketManager)
-        return wm
-    except RuntimeError:
-        return WebSocketManager.get_instance()
+        c_inst = get_container()
+    except RuntimeError as exc:
+        raise ResolutionError("Application container not bootstrapped") from exc
+
+    if not c_inst.has(WebSocketManager):
+        raise BindingNotFoundError(
+            "WebSocketManager is not registered in the container."
+        )
+    wm: WebSocketManager = c_inst.resolve(WebSocketManager)
+    return wm
 
 
 def ws_manager() -> WebSocketManager:

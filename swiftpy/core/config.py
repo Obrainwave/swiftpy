@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -8,7 +9,11 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import Any
 
+from swiftpy.core.container import get_container
+
 logger = logging.getLogger("swiftpy.core.config")
+
+_MISSING = object()
 
 
 class ConfigurationError(ValueError):
@@ -24,12 +29,21 @@ class Config:
     _instance: Config | None = None
 
     def __init__(self, data: dict[str, Any] | None = None) -> None:
-        self._data: dict[str, Any] = data or {}
-        Config._instance = self
+        self._data: dict[str, Any] = copy.deepcopy(data) if data else {}
 
     @classmethod
     def get_instance(cls) -> Config:
-        """Get the singleton or most recently loaded Config instance."""
+        """
+        Retrieve the active application's Config from the current container,
+        falling back to a default loaded Config when no application is active.
+        """
+        try:
+            container = get_container()
+            if container.has(cls):
+                return container.resolve(cls)
+        except RuntimeError:
+            pass
+
         if cls._instance is None:
             cls._instance = cls.load()
         return cls._instance
@@ -37,18 +51,22 @@ class Config:
     @classmethod
     def load(
         cls,
-        config_dir: str = "config",
+        config_dir: str | Path = "config",
         env: dict[str, str] | None = None,
+        *,
+        strict: bool = True,
     ) -> Config:
         """
         Load configuration files from config_dir and merge with environment variables.
+        When `strict=True` (the default), broken or invalid config files raise `ConfigurationError`.
+        When `strict=False`, broken config files log a warning and are skipped.
         """
         data: dict[str, Any] = {}
         config_path = Path(config_dir)
 
         if config_path.is_dir():
             for file in sorted(config_path.glob("*.py")):
-                if file.name.startswith("__"):
+                if file.name.startswith(("_", ".")):
                     continue
 
                 spec = spec_from_file_location(file.stem, file)
@@ -56,7 +74,11 @@ class Config:
                     module = module_from_spec(spec)
                     try:
                         spec.loader.exec_module(module)
-                    except Exception:
+                    except Exception as exc:
+                        if strict:
+                            raise ConfigurationError(
+                                f"Failed to load configuration file '{file}': {exc}"
+                            ) from exc
                         logger.warning(
                             "Failed to load config file: %s",
                             file,
@@ -64,8 +86,14 @@ class Config:
                         )
                         continue
 
-                    if hasattr(module, "CONFIG") and isinstance(module.CONFIG, dict):
-                        data[file.stem] = dict(module.CONFIG)
+                    if hasattr(module, "CONFIG"):
+                        if isinstance(module.CONFIG, dict):
+                            data[file.stem] = copy.deepcopy(module.CONFIG)
+                        elif strict:
+                            raise ConfigurationError(
+                                f"Configuration file '{file}' must define CONFIG as a dict, "
+                                f"got {type(module.CONFIG).__name__}."
+                            )
 
         # Merge environment variables
         env_vars = os.environ if env is None else env
@@ -93,6 +121,8 @@ class Config:
 
         def _index_paths(current: dict[str, Any], prefix: str = "") -> None:
             for k, v in current.items():
+                if not k:
+                    continue
                 path = f"{prefix}.{k}" if prefix else k
                 norm_key = path.upper().replace(".", "_")
                 existing_paths[norm_key] = path
@@ -112,13 +142,19 @@ class Config:
         sorted_env_items = sorted(env_vars.items(), key=lambda item: _get_tier(item[0]))
 
         for raw_key, raw_val in sorted_env_items:
+            if not raw_key:
+                continue
             key = raw_key.removeprefix("SWIFTPY_")
+            if not key or key.startswith("_") or key.endswith("_"):
+                continue
 
             # 1. Double-underscore nested syntax
             if "__" in key:
                 parts = [p.lower() for p in key.split("__")]
+                if any(not p or p.startswith("_") or p.endswith("_") for p in parts):
+                    continue
                 dotted_key = ".".join(parts)
-                existing_val = cls._get_from_dict(data, dotted_key)
+                existing_val = cls._get_from_dict(data, dotted_key, _MISSING)
                 coerced = cls._coerce_value(raw_val, existing_val, key=dotted_key)
                 cls._set_in_dict(data, dotted_key, coerced)
                 continue
@@ -127,7 +163,7 @@ class Config:
             norm_key = key.upper()
             if norm_key in existing_paths:
                 dotted_key = existing_paths[norm_key]
-                existing_val = cls._get_from_dict(data, dotted_key)
+                existing_val = cls._get_from_dict(data, dotted_key, _MISSING)
                 coerced = cls._coerce_value(raw_val, existing_val, key=dotted_key)
                 cls._set_in_dict(data, dotted_key, coerced)
                 continue
@@ -137,9 +173,11 @@ class Config:
                 parts = key.split("_", 1)
                 top = parts[0].lower()
                 rest = parts[1].lower()
+                if not top or not rest:
+                    continue
                 if top in data and isinstance(data[top], dict):
                     dotted_key = f"{top}.{rest}"
-                    existing_val = cls._get_from_dict(data, dotted_key)
+                    existing_val = cls._get_from_dict(data, dotted_key, _MISSING)
                     coerced = cls._coerce_value(raw_val, existing_val, key=dotted_key)
                     cls._set_in_dict(data, dotted_key, coerced)
 
@@ -147,45 +185,40 @@ class Config:
     def _coerce_value(
         cls,
         val: str,
-        existing: Any = None,
+        existing: Any = _MISSING,
         key: str = "",
     ) -> Any:
-        """Coerce raw string environment variable to appropriate typed value."""
-        if existing is not None and isinstance(existing, bool):
-            return val.lower() in ("true", "1", "yes", "on")
-        if (
-            existing is not None
-            and isinstance(existing, int)
-            and not isinstance(existing, bool)
+        """
+        Coerce raw string environment variable based on the declared type of `existing` (Decision D-8).
+        When no typed default exists, strings are preserved without blind numeric/boolean coercion.
+        """
+        if (existing is not _MISSING and isinstance(existing, bool)) or key in (
+            "app.debug",
+            "debug",
         ):
-            try:
-                return int(val)
-            except ValueError as exc:
-                raise ConfigurationError(
-                    f"Configuration key '{key}' expects an integer, got '{val}'"
-                ) from exc
-        if existing is not None and isinstance(existing, float):
-            try:
-                res = float(val)
-                if math.isfinite(res):
-                    return res
-                raise ConfigurationError(
-                    f"Configuration key '{key}' expects a finite float, got '{val}'"
-                )
-            except ValueError as exc:
-                raise ConfigurationError(
-                    f"Configuration key '{key}' expects a float, got '{val}'"
-                ) from exc
+            return val.strip().lower() in ("true", "1", "yes", "on")
+        if existing is not _MISSING and existing is not None:
+            if isinstance(existing, int):
+                try:
+                    return int(val)
+                except ValueError as exc:
+                    raise ConfigurationError(
+                        f"Configuration key '{key}' expects an integer, got '{val}'"
+                    ) from exc
+            if isinstance(existing, float):
+                try:
+                    res = float(val)
+                    if math.isfinite(res):
+                        return res
+                    raise ConfigurationError(
+                        f"Configuration key '{key}' expects a finite float, got '{val}'"
+                    )
+                except ValueError as exc:
+                    raise ConfigurationError(
+                        f"Configuration key '{key}' expects a float, got '{val}'"
+                    ) from exc
 
-        val_lower = val.lower()
-        if val_lower == "true":
-            return True
-        if val_lower == "false":
-            return False
-        if val_lower in ("null", "none"):
-            return None
-
-        # Try JSON (arrays / objects)
+        # JSON arrays / objects
         if (val.startswith("{") and val.endswith("}")) or (
             val.startswith("[") and val.endswith("]")
         ):
@@ -196,36 +229,35 @@ class Config:
                     f"Configuration key '{key}' contains malformed JSON: '{val}'"
                 ) from exc
 
-        # Try int
-        try:
-            return int(val)
-        except ValueError:
-            pass
-
-        # Try float
-        try:
-            f = float(val)
-            if math.isfinite(f) and "." in val:
-                return f
-        except ValueError:
-            pass
-
         return val
 
     @classmethod
-    def _get_from_dict(cls, data: dict[str, Any], key: str) -> Any:
+    def _get_from_dict(
+        cls,
+        data: dict[str, Any],
+        key: str,
+        default: Any = _MISSING,
+    ) -> Any:
+        if not key:
+            return default
         keys = key.split(".")
         current: Any = data
         for k in keys:
+            if not k:
+                return default
             if isinstance(current, dict) and k in current:
                 current = current[k]
             else:
-                return None
+                return default
         return current
 
     @classmethod
     def _set_in_dict(cls, data: dict[str, Any], key: str, value: Any) -> None:
+        if not key:
+            return
         keys = key.split(".")
+        if any(not k for k in keys):
+            return
         current = data
         for k in keys[:-1]:
             if k not in current or not isinstance(current[k], dict):
@@ -234,9 +266,12 @@ class Config:
         current[keys[-1]] = value
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Retrieve a configuration value using dot notation."""
-        val = self._get_from_dict(self._data, key)
-        return default if val is None else val
+        """
+        Retrieve a configuration value using dot notation.
+        Distinguishes a missing key (returns `default`) from an explicit `None` value (returns `None`).
+        """
+        val = self._get_from_dict(self._data, key, _MISSING)
+        return default if val is _MISSING else val
 
     def set(self, key: str, value: Any) -> None:
         """Set a configuration value using dot notation."""
@@ -244,18 +279,11 @@ class Config:
 
     def has(self, key: str) -> bool:
         """Check if a configuration key exists."""
-        keys = key.split(".")
-        current: Any = self._data
-        for k in keys:
-            if isinstance(current, dict) and k in current:
-                current = current[k]
-            else:
-                return False
-        return True
+        return self._get_from_dict(self._data, key, _MISSING) is not _MISSING
 
     def all(self) -> dict[str, Any]:
-        """Return a copy of the complete configuration dictionary."""
-        return dict(self._data)
+        """Return a deep copy of the complete configuration dictionary."""
+        return copy.deepcopy(self._data)
 
     def __getitem__(self, key: str) -> Any:
         if not self.has(key):

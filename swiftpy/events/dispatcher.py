@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from swiftpy.core.container import get_container
+
 EventHandler = Callable[..., Any]
 
 
@@ -32,15 +34,31 @@ class EventDispatcher:
 
     @classmethod
     def get_instance(cls) -> EventDispatcher:
-        """Retrieve the global or fallback EventDispatcher instance."""
+        """Retrieve the active application's EventDispatcher from the container, or fallback instance."""
+        try:
+            container = get_container()
+            if container.has(cls):
+                return container.resolve(cls)
+        except RuntimeError:
+            pass
+
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     @classmethod
     def set_instance(cls, dispatcher: EventDispatcher | None) -> None:
-        """Override or reset the global EventDispatcher instance."""
+        """Override or reset the EventDispatcher instance in the active container and fallback."""
         cls._instance = dispatcher
+        try:
+            container = get_container()
+            if container.has(cls):
+                if dispatcher is not None:
+                    container.instance(cls, dispatcher)
+                else:
+                    container.singleton(cls, lambda _: cls())
+        except RuntimeError:
+            pass
 
     def _compile_pattern(self, pattern: str) -> re.Pattern[str] | None:
         """

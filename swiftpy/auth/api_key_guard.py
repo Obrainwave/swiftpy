@@ -447,17 +447,21 @@ class ApiKeyGuard(Middleware):
             pool=pool,
         )
 
+    async def authenticate(self, request: Request | None = None) -> dict[str, Any]:
+        """Authenticate the request using this guard's configured table, columns, header, and pepper."""
+        return await require_api_key(
+            request,
+            table=self.table,
+            prefix_column=self.prefix_column,
+            hash_column=self.hash_column,
+            header_name=self.header_name,
+            pepper=self.pepper,
+            pool=self.pool,
+        )
+
     async def handle(self, request: Request, next_handler: Handler) -> Response:
         try:
-            await require_api_key(
-                request,
-                table=self.table,
-                prefix_column=self.prefix_column,
-                hash_column=self.hash_column,
-                header_name=self.header_name,
-                pepper=self.pepper,
-                pool=self.pool,
-            )
+            await self.authenticate(request)
         except AuthenticationError as exc:
             return unauthorized(exc.message, headers=exc.headers)
         except AuthenticationServiceUnavailableError as exc:

@@ -14,7 +14,11 @@ from typing import (
 )
 
 from swiftpy.database.identifiers import validate_identifier
-from swiftpy.database.orm.registry import _MODEL_REGISTRY
+from swiftpy.database.orm.registry import (
+    _MODEL_REGISTRY,
+    restore_model_registry,
+    snapshot_model_registry,
+)
 from swiftpy.database.orm.relationships import (
     BelongsTo,
     BelongsToMany,
@@ -578,4 +582,11 @@ class Model:
         return hash(id(self))
 
 
-__all__ = ["Model", "ModelQueryBuilder", "PrimaryKeyError"]
+__all__ = [
+    "_MODEL_REGISTRY",
+    "Model",
+    "ModelQueryBuilder",
+    "PrimaryKeyError",
+    "restore_model_registry",
+    "snapshot_model_registry",
+]

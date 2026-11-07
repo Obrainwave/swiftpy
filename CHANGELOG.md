@@ -86,5 +86,33 @@ All notable changes to SwiftPY will be documented in this file.
   - Removed duck-typing on `.errors` in `ExceptionHandler` (only `ValidationError` and `ValidationException` produce 422), selected custom exception handlers by MRO specificity, logged 4xx `HttpException` at `INFO` and 5xx at `ERROR` without request/response bodies, and ran global middleware around `_dispatch_http` so global middleware post-processes 200, 404, 405, 422, and 500 responses.
   - Added `SecurityHeadersMiddleware` (`SecurityHeaders`), `RequestIdMiddleware` (`RequestId`, validating `[A-Za-z0-9._-]{1,128}` and binding `request_id` into `Context`), and `CORSMiddleware` (`CORS`, backed by `config/cors.py` with deny-all defaults and rejecting `allow_origins=["*"]` with `allow_credentials=True`).
 
+### Phase 5 – Lifecycle, Container, and Config
+- **P5-C1 (Core – Async Startup/Shutdown Lifecycle & Lifespan Integration):**
+  - Added optional `async def startup(self) -> None` and `async def shutdown(self) -> None` hooks to `ServiceProvider` (default no-ops).
+  - Added `FrameworkServiceProvider` registered first on `Application`: initializes `DatabasePool` on `startup()` when database config is present, and on `shutdown()` closes active WebSocket connections with code `1001` (`Going Away`), stops and closes `RedisEventBus`, closes Redis clients (`Cache`, `QueueDispatcher`, `TokenBlacklist`), and closes `DatabasePool`.
+  - Updated ASGI `lifespan` handling in `Application` (`startup()` runs providers in registration order and rolls back already-started providers in reverse order on failure before sending `lifespan.startup.failed`; `shutdown()` runs providers in reverse order, catching/logging individual errors, before sending `lifespan.shutdown.complete`).
+  - Added `startup()`, `shutdown()`, and `async with TestClient(app)` lifespan context manager support to `TestClient`.
+- **P5-C2 (Core – Container Rebind Invalidation, Scoped Disposal & Child-Task Isolation):**
+  - **Breaking:** Calling `Container.bind()`, `Container.singleton()`, or `Container.scoped()` now invalidates any cached singleton or current-task scoped instance for that interface (Decision `D-7`).
+  - **Breaking:** `Scope.SCOPED` instances cached in `Context` are now keyed to the current `asyncio.Task` and are no longer inherited by child tasks spawned via `asyncio.create_task` or `asyncio.gather` (each child task resolves its own scoped instances).
+  - Cached `None` singleton results via a sentinel so `None`-returning singleton factories execute only once.
+  - Wrapped `NameError`/`TypeError`/`ValueError` from `get_type_hints()` and `inspect.signature()` in `ResolutionError` naming the target class/callable.
+  - Added `await container.aclose_scoped()` and `async with container.scope():` disposing scoped instances implementing `aclose()`, `__aexit__()`, `close()`, or `__exit__()` in reverse creation order at the end of every HTTP/WebSocket request scope.
+- **P5-C3 (Auth – Guard Dispatch by Registered Name & Lazy `CurrentUser` Resolution):**
+  - `AuthManager.authenticate()` now dispatches to the guard instance registered for the configured name (`g.authenticate(request)`) instead of bypassing custom guards via hardcoded `require_jwt` / `require_api_key` calls; `"jwt"` and `"api_key"` are registered as default guard factories and `AuthManager.extend(name, creator)` invalidates any cached guard instance for `name`.
+  - `CurrentUser` resolved from the container before authentication runs is no longer cached as an unauthenticated instance in scope and syncs lazily from `Context` on attribute access.
+  - Enforced canonical base64url verification in `_base64url_decode` (`swiftpy.auth.jwt_issuer`) to reject non-zero padding bits in tampered JWT signatures.
+- **P5-C4 (Core – Instance-Scoped Singletons & Container-Resolved Helpers):**
+  - **Breaking:** `Config`, `WebSocketManager`, `EventDispatcher`, `QueueDispatcher`, and `RedisEventBus` are now created and owned per `Application` / `Container` instance rather than shared via process-global class attributes. `get_instance()` resolves from the active `Container` when bound. `Config.__init__` no longer overwrites `Config._instance`.
+  - **Breaking:** `helpers.dispatcher()`, `helpers.queue()`, `helpers.cache()`, and `helpers.websocket_manager()` now raise `BindingNotFoundError` (`ResolutionError`) when the corresponding service is not registered in the active container instead of auto-wiring a new leaked instance per call.
+  - Added `snapshot_model_registry()` and `restore_model_registry()` in `swiftpy.database.orm.registry` to isolate process-global ORM class metadata across tests.
+- **P5-C5 (Core – Config Typed Coercion, Strict File Loading & Deep-Copy Accessors):**
+  - **Breaking:** `Config` environment variable merging now coerces `bool`, `int`, and `float` values only when the target key has an existing typed default (or is a known boolean flag like `app.debug`), preserving string values such as `APP__SECRET="0012345678"` without stripping leading zeros (Decision `D-8`).
+  - **Breaking:** `Config.load()` now defaults to `strict=True` and raises `ConfigurationError` when a configuration file in `config_dir` fails to load or defines a non-dict `CONFIG` (pass `strict=False` for lenient CLI tooling).
+  - Ignored malformed environment variable keys with empty path segments (`__WEIRD__KEY`, `APP____EMPTY`, `TRAILING__`), updated `Config.get()` to distinguish missing keys from explicit `None` values via a sentinel, updated `Config.all()` and `Config.__init__()` to deep-copy dictionaries, and replaced direct `os.getenv` reads in `RedisEventBus` and `QueueDispatcher` with `Config` / `resolve_redis_params`.
+- **P5-C6 (Core – Safe Package-Based Provider Discovery):**
+  - **Breaking:** `discover_providers()` no longer inserts `app/providers` into `sys.path` (preventing provider files named `queue.py` or `logging.py` from shadowing Python standard library modules) and raises `ConfigurationError` on broken provider modules by default (`strict=True`; pass `strict=False` or `Application(strict_providers=False)` to skip broken providers). Added `project_root` support to `discover_providers()` and `Application`.
+
+
 
 

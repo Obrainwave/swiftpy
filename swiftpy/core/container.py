@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
-from collections.abc import Callable
+import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from types import TracebackType
 from typing import Any, TypeVar, cast, get_type_hints
 
 from swiftpy.core.context import Context
@@ -15,6 +19,8 @@ from .container_exceptions import (
     PrimitiveResolutionError,
     ResolutionError,
 )
+
+logger = logging.getLogger("swiftpy.core.container")
 
 T = TypeVar("T")
 
@@ -33,6 +39,19 @@ PRIMITIVE_TYPES: tuple[type[Any], ...] = (
 )
 
 _DI_RESOLVING_KEY = "__swiftpy_di_resolving__"
+_DI_SCOPED_INSTANCES_KEY = "__swiftpy_di_scoped_instances__"
+_NONE_SENTINEL = object()
+
+
+def _current_task_or_none() -> asyncio.Task[Any] | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _scoped_context_key(interface: type[Any]) -> str:
+    return f"__swiftpy_di__:{interface.__module__}.{interface.__qualname__}"
 
 _container_var: ContextVar[Container | None] = ContextVar(
     "swiftpy_container", default=None
@@ -112,6 +131,18 @@ class Container:
         else:
             resolved_factory = factory
 
+        if interface in self._singletons:
+            self._singletons.pop(interface, None)
+            logger.debug(
+                "Rebinding '%s' (%s); invalidated cached singleton instance.",
+                getattr(interface, "__name__", str(interface)),
+                scope,
+            )
+
+        scoped_key = _scoped_context_key(interface)
+        if Context.has(scoped_key):
+            Context.set(scoped_key, None)
+
         self._bindings[interface] = Binding(
             interface=interface,
             factory=resolved_factory,
@@ -121,7 +152,7 @@ class Container:
     def singleton(
         self,
         interface: type[T],
-        factory: Factory | None = None,
+        factory: Factory | type[T] | None = None,
     ) -> None:
         """Register a singleton binding."""
 
@@ -134,7 +165,7 @@ class Container:
     def scoped(
         self,
         interface: type[T],
-        factory: Callable[[Container], T] | None = None,
+        factory: Callable[[Container], T] | type[T] | None = None,
     ) -> None:
         """Register a task-scoped binding."""
 
@@ -157,7 +188,16 @@ class Container:
             scope=Scope.SINGLETON,
         )
 
-        self._singletons[interface] = instance_obj
+        self._singletons[interface] = (
+            _NONE_SENTINEL if instance_obj is None else instance_obj
+        )
+
+    def get_singleton(self, interface: type[T]) -> T | None:
+        """Return an already-instantiated singleton if present, or None."""
+        if interface not in self._singletons:
+            return None
+        val = self._singletons[interface]
+        return None if val is _NONE_SENTINEL else cast(T, val)
 
     def has(self, interface: type[Any]) -> bool:
         """Determine whether an interface or service has been registered in the container."""
@@ -244,7 +284,7 @@ class Container:
 
         if target in self._singletons:
             item = self._singletons[target]
-            return cast(T, item)
+            return cast(T, None if item is _NONE_SENTINEL else item)
 
         if target in resolving_stack:
             chain = " -> ".join(dependency.__name__ for dependency in resolving_stack)
@@ -260,26 +300,38 @@ class Container:
 
             if binding is not None:
                 if binding.scope is Scope.SINGLETON:
-                    cached = self._singletons.get(target)
-
-                    if cached is not None:
-                        return cast(T, cached)
+                    if target in self._singletons:
+                        cached = self._singletons[target]
+                        return cast(T, None if cached is _NONE_SENTINEL else cached)
 
                     instance = binding.factory(self)
-                    self._singletons[target] = instance
+                    self._singletons[target] = (
+                        _NONE_SENTINEL if instance is None else instance
+                    )
 
                     return cast(T, instance)
 
                 if binding.scope is Scope.SCOPED:
-                    context_key = (
-                        f"__swiftpy_di__:{target.__module__}.{target.__qualname__}"
-                    )
+                    context_key = _scoped_context_key(target)
+                    cur_task = _current_task_or_none()
 
                     if Context.has(context_key):
-                        return cast(T, Context.get(context_key))
+                        cached_entry = Context.get(context_key)
+                        if (
+                            isinstance(cached_entry, tuple)
+                            and len(cached_entry) == 2
+                            and cached_entry[0] is cur_task
+                        ):
+                            return cast(T, cached_entry[1])
 
                     instance = binding.factory(self)
-                    Context.set(context_key, instance)
+                    if getattr(instance, "_cache_in_scope", True) is not False:
+                        Context.set(context_key, (cur_task, instance))
+                        scoped_list: list[
+                            tuple[asyncio.Task[Any] | None, str, Any]
+                        ] = list(Context.get(_DI_SCOPED_INSTANCES_KEY, []))
+                        scoped_list.append((cur_task, context_key, instance))
+                        Context.set(_DI_SCOPED_INSTANCES_KEY, scoped_list)
 
                     return cast(T, instance)
 
@@ -292,6 +344,71 @@ class Container:
 
         finally:
             Context.pop(_DI_RESOLVING_KEY)
+
+    async def aclose_scoped(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> None:
+        """
+        Dispose all task-scoped instances created in the current task in reverse creation order.
+        Supports `aclose()`, `__aexit__()`, `close()`, and `__exit__()`.
+        """
+        raw_list = Context.get(_DI_SCOPED_INSTANCES_KEY)
+        if not raw_list or not isinstance(raw_list, list):
+            return
+
+        cur_task = _current_task_or_none()
+        owned = [
+            entry
+            for entry in raw_list
+            if isinstance(entry, tuple) and len(entry) == 3 and entry[0] is cur_task
+        ]
+        remaining = [
+            entry
+            for entry in raw_list
+            if not (
+                isinstance(entry, tuple) and len(entry) == 3 and entry[0] is cur_task
+            )
+        ]
+        Context.set(_DI_SCOPED_INSTANCES_KEY, remaining)
+
+        for _, context_key, inst in reversed(owned):
+            Context.set(context_key, None)
+            if inst is None:
+                continue
+            try:
+                if hasattr(inst, "aclose") and callable(inst.aclose):
+                    res = inst.aclose()
+                    if inspect.isawaitable(res):
+                        await res
+                elif hasattr(inst, "__aexit__") and callable(inst.__aexit__):
+                    await inst.__aexit__(exc_type, exc_val, exc_tb)
+                elif hasattr(inst, "close") and callable(inst.close):
+                    res = inst.close()
+                    if inspect.isawaitable(res):
+                        await res
+                elif hasattr(inst, "__exit__") and callable(inst.__exit__):
+                    inst.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                logger.exception("Error disposing scoped instance %r", inst)
+
+    @asynccontextmanager
+    async def scope(self) -> AsyncIterator[Container]:
+        """Async context manager that disposes task-scoped dependencies on exit."""
+        exc_info: tuple[
+            type[BaseException] | None,
+            BaseException | None,
+            TracebackType | None,
+        ] = (None, None, None)
+        try:
+            yield self
+        except BaseException as exc:
+            exc_info = (type(exc), exc, exc.__traceback__)
+            raise
+        finally:
+            await self.aclose_scoped(*exc_info)
 
     def call(
         self,
@@ -334,8 +451,16 @@ class Container:
         if extra_kwargs is None:
             extra_kwargs = {}
 
-        signature = inspect.signature(func)
-        type_hints = get_type_hints(func)
+        try:
+            signature = inspect.signature(func)
+            type_hints = get_type_hints(func)
+        except (NameError, TypeError, ValueError) as exc:
+            callable_name = getattr(
+                func, "__qualname__", getattr(func, "__name__", str(func))
+            )
+            raise ResolutionError(
+                f"Failed to resolve type hints for '{callable_name}': {exc}"
+            ) from exc
 
         resolved_kwargs: dict[str, Any] = {}
 

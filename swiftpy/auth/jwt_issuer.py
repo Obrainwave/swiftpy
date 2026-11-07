@@ -51,14 +51,19 @@ def _base64url_encode(data: bytes) -> str:
 
 
 def _base64url_decode(data: str) -> bytes:
-    """Decode a base64url string, adding required padding if necessary."""
-    rem = len(data) % 4
-    if rem > 0:
-        data += "=" * (4 - rem)
+    """Decode a canonical base64url string, rejecting non-canonical padding bits."""
+    unpadded = data.rstrip("=")
+    rem = len(unpadded) % 4
+    if rem == 1:
+        raise InvalidTokenError("Invalid base64url length")
+    padded = unpadded + ("=" * (4 - rem) if rem > 0 else "")
     try:
-        return base64.urlsafe_b64decode(data.encode("ascii"))
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
     except Exception as exc:
         raise InvalidTokenError(f"Base64 decoding failed: {exc}") from exc
+    if _base64url_encode(decoded) != unpadded:
+        raise InvalidSignatureError("Non-canonical base64url encoding")
+    return decoded
 
 
 def _is_valid_timestamp(value: Any) -> bool:

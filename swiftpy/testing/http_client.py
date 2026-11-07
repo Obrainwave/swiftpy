@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from types import TracebackType
-from typing import Any
+from typing import Any, Self
 from urllib.parse import urlencode
 
 from swiftpy.http.response import ResponseHeaders
@@ -168,6 +168,83 @@ class TestClient:
         self.app = app
         self.base_url = base_url.rstrip("/")
         self._default_headers: dict[str, str] = dict(default_headers or {})
+        self._lifespan_to_app: asyncio.Queue[dict[str, Any]] | None = None
+        self._lifespan_from_app: asyncio.Queue[dict[str, Any]] | None = None
+        self._lifespan_task: asyncio.Task[None] | None = None
+        self._lifespan_started = False
+
+    async def startup(self) -> None:
+        """Run the ASGI lifespan startup sequence against the application."""
+        if self._lifespan_started:
+            return
+
+        to_app: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        from_app: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._lifespan_to_app = to_app
+        self._lifespan_from_app = from_app
+
+        async def receive() -> dict[str, Any]:
+            return await to_app.get()
+
+        async def send(message: dict[str, Any]) -> None:
+            await from_app.put(message)
+
+        scope: dict[str, Any] = {
+            "type": "lifespan",
+            "asgi": {"version": "3.0", "spec_version": "2.0"},
+        }
+        task = asyncio.create_task(self.app(scope, receive, send))
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                logger.debug(
+                    "Lifespan task ended with exception", exc_info=t.exception()
+                )
+
+        task.add_done_callback(_on_done)
+        self._lifespan_task = task
+
+        await to_app.put({"type": "lifespan.startup"})
+        msg = await asyncio.wait_for(from_app.get(), timeout=15.0)
+        if msg.get("type") == "lifespan.startup.failed":
+            await asyncio.wait_for(task, timeout=5.0)
+            self._lifespan_task = None
+            raise RuntimeError(msg.get("message") or "Lifespan startup failed")
+        if msg.get("type") != "lifespan.startup.complete":
+            raise RuntimeError(f"Unexpected lifespan message: {msg}")
+        self._lifespan_started = True
+
+    async def shutdown(self) -> None:
+        """Run the ASGI lifespan shutdown sequence against the application."""
+        if not self._lifespan_started or self._lifespan_to_app is None or self._lifespan_from_app is None:
+            return
+
+        to_app = self._lifespan_to_app
+        from_app = self._lifespan_from_app
+        task = self._lifespan_task
+        self._lifespan_started = False
+        self._lifespan_to_app = None
+        self._lifespan_from_app = None
+        self._lifespan_task = None
+
+        await to_app.put({"type": "lifespan.shutdown"})
+        msg = await asyncio.wait_for(from_app.get(), timeout=15.0)
+        if task is not None and not task.done():
+            await asyncio.wait_for(task, timeout=5.0)
+        if msg.get("type") == "lifespan.shutdown.failed":
+            raise RuntimeError(msg.get("message") or "Lifespan shutdown failed")
+
+    async def __aenter__(self) -> Self:
+        await self.startup()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.shutdown()
 
     def with_headers(self, headers: dict[str, str]) -> TestClient:
         """Return a new TestClient with additional default headers."""

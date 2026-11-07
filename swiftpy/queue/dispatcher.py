@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import traceback
 import uuid
@@ -10,10 +9,23 @@ from typing import Any, ClassVar, Self
 
 import redis.asyncio as aioredis
 
+from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.container import get_container
 from swiftpy.queue.job import Job, set_dispatch_handler
 from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.queue")
+
+
+def _default_queue_prefix() -> str:
+    try:
+        cfg = Config.get_instance()
+        val = cfg.get("queue.connections.redis.prefix") or cfg.get("queue.prefix")
+        if val and isinstance(val, str):
+            return val
+    except ConfigurationError:
+        logger.debug("Falling back to default queue prefix", exc_info=True)
+    return "swiftpy_queue:"
 
 
 class QueueDispatcher:
@@ -44,26 +56,38 @@ class QueueDispatcher:
         self.port = port
         self.password = password
         self.database = database
-        self.prefix = (
-            prefix
-            if prefix is not None
-            else os.getenv("QUEUE_PREFIX", "swiftpy_queue:")
-        )
+        self.prefix = prefix if prefix is not None else _default_queue_prefix()
         self.max_connections = max_connections or 50
         self.timeout = timeout
         self._owns_client = redis_client is None
 
     @classmethod
     def get_instance(cls) -> QueueDispatcher:
-        """Retrieve the global or fallback QueueDispatcher instance."""
+        """Retrieve the active application's QueueDispatcher from the container, or fallback instance."""
+        try:
+            container = get_container()
+            if container.has(cls):
+                return container.resolve(cls)
+        except RuntimeError:
+            pass
+
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     @classmethod
     def set_instance(cls, dispatcher: QueueDispatcher | None) -> None:
-        """Override or reset the global QueueDispatcher instance."""
+        """Override or reset the QueueDispatcher instance in the active container and fallback."""
         cls._instance = dispatcher
+        try:
+            container = get_container()
+            if container.has(cls):
+                if dispatcher is not None:
+                    container.instance(cls, dispatcher)
+                else:
+                    container.singleton(cls, lambda _: cls())
+        except RuntimeError:
+            pass
 
     async def get_client(self) -> aioredis.Redis:
         """Lazily initialize and return the async Redis client."""

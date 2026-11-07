@@ -173,14 +173,18 @@ class JWTGuard(Middleware):
         self.blacklist = blacklist
         self.token_type = token_type
 
+    async def authenticate(self, request: Request | None = None) -> dict[str, Any]:
+        """Authenticate the request using this guard's configured JWTIssuer and TokenBlacklist."""
+        return await require_jwt(
+            request,
+            issuer=self.issuer,
+            blacklist=self.blacklist,
+            token_type=self.token_type,
+        )
+
     async def handle(self, request: Request, next_handler: Handler) -> Response:
         try:
-            await require_jwt(
-                request,
-                issuer=self.issuer,
-                blacklist=self.blacklist,
-                token_type=self.token_type,
-            )
+            await self.authenticate(request)
         except AuthenticationError as exc:
             return unauthorized(exc.message, headers=exc.headers)
         except AuthenticationServiceUnavailableError as exc:

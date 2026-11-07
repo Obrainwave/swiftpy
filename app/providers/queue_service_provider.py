@@ -11,7 +11,7 @@ class QueueServiceProvider(ServiceProvider):
 
     def register(self) -> None:
         self.container.singleton(
-            QueueDispatcher, lambda c: QueueDispatcher.get_instance()
+            QueueDispatcher, lambda _: QueueDispatcher()
         )
 
     def boot(self) -> None:

@@ -21,5 +21,15 @@ class ServiceProvider(ABC):
 
     def boot(self) -> None:
         """
-        Optional startup hook.
+        Optional synchronous boot hook.
+        """
+
+    async def startup(self) -> None:
+        """
+        Optional asynchronous startup hook invoked during ASGI lifespan startup.
+        """
+
+    async def shutdown(self) -> None:
+        """
+        Optional asynchronous shutdown hook invoked during ASGI lifespan shutdown.
         """

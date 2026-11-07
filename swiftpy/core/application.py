@@ -11,11 +11,15 @@ from pathlib import Path
 from typing import Any, Self, TypeVar
 
 from swiftpy.auth.auth_manager import CurrentUser
+from swiftpy.auth.token_blacklist import TokenBlacklist
+from swiftpy.cache.cache import Cache
 from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, set_container
 from swiftpy.core.context import Context
 from swiftpy.core.exceptions import ExceptionHandler
 from swiftpy.core.providers.base import ServiceProvider
+from swiftpy.database.pool import DatabasePool
+from swiftpy.events.redis_bus import RedisEventBus
 from swiftpy.http.exceptions import ClientDisconnect, HttpException
 from swiftpy.http.middleware import Middleware, MiddlewarePipeline
 from swiftpy.http.request import DEFAULT_MAX_BODY_SIZE, Request
@@ -25,6 +29,7 @@ from swiftpy.http.response import (
     not_found,
 )
 from swiftpy.http.router import PathParamCoercionError, Route, RouteGroup, Router
+from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.validation.exceptions import ValidationException
 from swiftpy.validation.form_request import FormRequest
 from swiftpy.validation.validator import validate
@@ -39,28 +44,117 @@ logger = logging.getLogger("swiftpy")
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+class FrameworkServiceProvider(ServiceProvider):
+    """
+    Built-in framework service provider managing core infrastructure lifecycle:
+    - Initializes and closes `DatabasePool` (when database configuration is present).
+    - Stops `RedisEventBus` and closes Redis clients (`Cache`, `QueueDispatcher`, `TokenBlacklist`).
+    - Closes active WebSocket connections with code 1001 (`Going Away`) on shutdown.
+    """
+
+    def register(self) -> None:
+        if self.container.has(Config):
+            cfg = self.container.resolve(Config)
+            db_cfg = cfg.get("database")
+            if (
+                isinstance(db_cfg, dict)
+                and (db_cfg.get("connections") or db_cfg.get("default"))
+                and not self.container.has(DatabasePool)
+            ):
+                self.container.singleton(DatabasePool)
+
+    async def startup(self) -> None:
+        if self.container.has(Config) and self.container.has(DatabasePool):
+            cfg = self.container.resolve(Config)
+            db_cfg = cfg.get("database")
+            if isinstance(db_cfg, dict) and (
+                db_cfg.get("connections") or db_cfg.get("default")
+            ):
+                pool = self.container.resolve(DatabasePool)
+                await pool.init()
+
+    async def shutdown(self) -> None:
+        # 1. Close active WebSocket connections with 1001 (Going Away)
+        ws_manager = self.container.get_singleton(WebSocketManager)
+        if isinstance(ws_manager, WebSocketManager):
+            for conn in list(ws_manager.get_connections()):
+                try:
+                    if conn.is_connected:
+                        await conn.close(code=1001, reason="Server shutting down")
+                except Exception:
+                    logger.exception("Error closing WebSocket connection during shutdown")
+                try:
+                    await ws_manager.disconnect(conn)
+                except Exception:
+                    logger.exception(
+                        "Error disconnecting WebSocket connection during shutdown"
+                    )
+
+        # 2. Stop RedisEventBus and close its Redis connection
+        bus = self.container.get_singleton(RedisEventBus)
+        if isinstance(bus, RedisEventBus):
+            try:
+                await bus.close()
+            except Exception:
+                logger.exception("Error closing RedisEventBus during shutdown")
+
+        # 3. Close Redis clients (Cache, QueueDispatcher, TokenBlacklist)
+        for service_cls in (Cache, QueueDispatcher, TokenBlacklist):
+            inst = self.container.get_singleton(service_cls)
+            if inst is not None and hasattr(inst, "close"):
+                try:
+                    await inst.close()
+                except Exception:
+                    logger.exception(
+                        "Error closing %s during shutdown", service_cls.__name__
+                    )
+
+        # 4. Close DatabasePool
+        pool = self.container.get_singleton(DatabasePool)
+        if isinstance(pool, DatabasePool):
+            try:
+                await pool.close()
+            except Exception:
+                logger.exception("Error closing DatabasePool during shutdown")
+
+
 def discover_providers(
     providers_path: str | Path | None = None,
+    *,
+    project_root: str | Path | None = None,
+    strict: bool = True,
 ) -> list[type[ServiceProvider]]:
     """
     Dynamically discover all ServiceProvider subclasses in the application providers directory.
-    Defaults to `app/providers` relative to the current working directory.
+    Imports providers by package path (`app.providers.<name>`) relative to `project_root`
+    without inserting `app/providers` into `sys.path`.
+    When `strict=True` (the default), import or syntax errors in provider modules raise `ConfigurationError`.
     """
-    project_root = Path.cwd()
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+    if project_root is not None:
+        root = Path(project_root).resolve()
+    elif providers_path is not None:
+        resolved_prov = Path(providers_path).resolve()
+        if resolved_prov.name == "providers" and resolved_prov.parent.name == "app":
+            root = resolved_prov.parent.parent
+        else:
+            root = Path.cwd().resolve()
+    else:
+        root = Path.cwd().resolve()
 
-    target_dir = (
-        Path(providers_path) if providers_path else project_root / "app" / "providers"
-    )
-    if not target_dir.is_absolute():
-        target_dir = project_root / target_dir
+    if providers_path is not None:
+        target_dir = Path(providers_path)
+        if not target_dir.is_absolute():
+            target_dir = (root / target_dir).resolve()
+        else:
+            target_dir = target_dir.resolve()
+    else:
+        target_dir = (root / "app" / "providers").resolve()
 
     if not target_dir.is_dir():
         return []
 
-    if str(target_dir) not in sys.path:
-        sys.path.insert(0, str(target_dir))
+    if target_dir.is_relative_to(root) and str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
     discovered: list[type[ServiceProvider]] = []
 
@@ -68,28 +162,50 @@ def discover_providers(
         if file.name.startswith(("_", ".")):
             continue
 
+        resolved_file = file.resolve()
+        package_module_name: str | None = None
         try:
-            rel_path = file.relative_to(project_root).with_suffix("")
-            module_name = ".".join(rel_path.parts)
+            rel_path = resolved_file.relative_to(root).with_suffix("")
+            if len(rel_path.parts) >= 2:
+                package_module_name = ".".join(rel_path.parts)
         except ValueError:
-            module_name = file.stem
+            package_module_name = None
 
+        can_use_package_import = False
+        if package_module_name is not None:
+            top_pkg = package_module_name.split(".", 1)[0]
+            existing_top = sys.modules.get(top_pkg)
+            if existing_top is None:
+                can_use_package_import = True
+            else:
+                top_file = getattr(existing_top, "__file__", None)
+                top_paths = getattr(existing_top, "__path__", None)
+                if (top_file and Path(top_file).resolve().is_relative_to(root)) or (
+                    top_paths
+                    and any(Path(p).resolve().is_relative_to(root) for p in top_paths)
+                ):
+                    can_use_package_import = True
+
+        display_name = package_module_name or file.stem
         try:
-            mod = importlib.import_module(module_name)
-        except (ImportError, ModuleNotFoundError):
-            try:
-                spec = spec_from_file_location(module_name, file)
-                if spec and spec.loader:
-                    mod = module_from_spec(spec)
-                    sys.modules[module_name] = mod
-                    spec.loader.exec_module(mod)
-                else:
+            if can_use_package_import and package_module_name is not None:
+                mod = importlib.import_module(package_module_name)
+            else:
+                synthetic_name = f"_swiftpy_providers.{file.stem}"
+                spec = spec_from_file_location(synthetic_name, resolved_file)
+                if spec is None or spec.loader is None:
                     continue
-            except (ImportError, AttributeError, ValueError, RuntimeError) as exc:
-                logger.warning(
-                    "Could not auto-load provider module %s: %s", module_name, exc
-                )
-                continue
+                mod = module_from_spec(spec)
+                spec.loader.exec_module(mod)
+        except Exception as exc:
+            if strict:
+                raise ConfigurationError(
+                    f"Failed to load service provider '{file.stem}' ({display_name}): {exc}"
+                ) from exc
+            logger.warning(
+                "Could not auto-load provider module %s: %s", display_name, exc
+            )
+            continue
 
         for attr_name in dir(mod):
             attr = getattr(mod, attr_name)
@@ -121,6 +237,8 @@ class Application:
         middleware: Sequence[type[Middleware]] | None = None,
         auto_discover_providers: bool = True,
         providers_path: str | Path | None = None,
+        project_root: str | Path | None = None,
+        strict_providers: bool = True,
         max_body_size: int | None = None,
         **kwargs: Any,
     ) -> None:
@@ -132,12 +250,17 @@ class Application:
         self.container = Container()
         self.router = Router(container=self.container)
         self._providers: list[ServiceProvider] = []
+        self._started_providers: list[ServiceProvider] = []
         self._middleware: list[type[Middleware]] = list(middleware or [])
         self._booted = False
+        self._started = False
 
         # 1. Load or bind configuration
         if config is None:
-            self.config = Config.load("config")
+            config_dir = (
+                Path(project_root) / "config" if project_root is not None else "config"
+            )
+            self.config = Config.load(config_dir)
         elif isinstance(config, Config):
             self.config = config
         else:
@@ -177,7 +300,7 @@ class Application:
         self.exception_handler = ExceptionHandler(debug=self.debug)
 
         # 3. Register core singletons and default scoped bindings into container
-        self.websocket_manager = WebSocketManager.get_instance()
+        self.websocket_manager = WebSocketManager()
         self.container.instance(Application, self)
         self.container.instance(Container, self.container)
         self.container.instance(Router, self.router)
@@ -186,19 +309,26 @@ class Application:
         self.container.instance(WebSocketManager, self.websocket_manager)
         self.container.scoped(
             CurrentUser,
-            lambda _: CurrentUser(Context.get("__swiftpy_current_user__") or {}),
+            lambda _: CurrentUser(),
         )
 
         # 4. Bind active container globally
         set_container(self.container)
 
-        # 4. Auto-discover and register service providers from app/providers
+        # 5. Register built-in framework lifecycle provider first (starts first, shuts down last)
+        self.register(FrameworkServiceProvider)
+
+        # 6. Auto-discover and register service providers from app/providers
         if auto_discover_providers:
-            discovered = discover_providers(providers_path)
+            discovered = discover_providers(
+                providers_path,
+                project_root=project_root,
+                strict=strict_providers,
+            )
             for provider_cls in discovered:
                 self.register(provider_cls)
 
-        # 5. Register explicitly passed service providers
+        # 7. Register explicitly passed service providers
         if providers:
             for provider_cls in providers:
                 if not any(isinstance(p, provider_cls) for p in self._providers):
@@ -227,6 +357,59 @@ class Application:
 
         self._booted = True
         self._compile_routes()
+
+    async def startup(self) -> None:
+        """
+        Execute asynchronous startup hooks on all registered service providers in registration order.
+        If any provider fails to start, already-started providers are shut down in reverse order.
+        """
+        if self._started:
+            return
+
+        set_container(self.container)
+        if not self._booted:
+            self.boot()
+
+        started: list[ServiceProvider] = []
+        try:
+            for provider in self._providers:
+                await provider.startup()
+                started.append(provider)
+        except Exception:
+            for provider in reversed(started):
+                try:
+                    await provider.shutdown()
+                except Exception:
+                    logger.exception(
+                        "Error rolling back provider %s after startup failure",
+                        type(provider).__name__,
+                    )
+            raise
+
+        self._started_providers = started
+        self._started = True
+
+    async def shutdown(self) -> None:
+        """
+        Execute asynchronous shutdown hooks in reverse registration order.
+        Errors in individual providers are logged and do not block remaining shutdown hooks.
+        """
+        set_container(self.container)
+        providers_to_stop = (
+            list(reversed(self._started_providers))
+            if self._started_providers
+            else list(reversed(self._providers))
+        )
+        self._started_providers = []
+        self._started = False
+
+        for provider in providers_to_stop:
+            try:
+                await provider.shutdown()
+            except Exception:
+                logger.exception(
+                    "Error during shutdown of provider %s", type(provider).__name__
+                )
 
     def _wrap_handler(self, route: Route) -> Any:
         handler = route.handler
@@ -457,13 +640,19 @@ class Application:
                     message = await receive()
                     if message["type"] == "lifespan.startup":
                         try:
-                            self.boot()
+                            await self.startup()
                             await send({"type": "lifespan.startup.complete"})
                         except Exception as exc:
                             logger.exception("Lifespan startup failed")
-                            await send({"type": "lifespan.startup.failed", "message": str(exc)})
+                            await send(
+                                {
+                                    "type": "lifespan.startup.failed",
+                                    "message": str(exc),
+                                }
+                            )
                             return
                     elif message["type"] == "lifespan.shutdown":
+                        await self.shutdown()
                         await send({"type": "lifespan.shutdown.complete"})
                         return
 
@@ -501,6 +690,7 @@ class Application:
                         if connection.is_connected:
                             await connection.close(code=1011, reason="Internal Server Error")
                 finally:
+                    await self.container.aclose_scoped()
                     Context.clear()
                 return
 
@@ -543,6 +733,7 @@ class Application:
 
             finally:
                 if scope.get("type") == "http":
+                    await self.container.aclose_scoped()
                     Context.clear()
 
             if request is not None and request.method.upper() == "HEAD":

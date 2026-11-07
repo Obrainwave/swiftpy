@@ -794,6 +794,90 @@ Transfer/sec:    482.06KB
   - Targeted: `pytest -q -p no:cacheprovider tests/http/ tests/core/ tests/validation/ tests/websockets/ tests/testing/`: **148 passed in 71.61s**.
   - Full suite: `pytest -q -p no:cacheprovider`: **473 passed in 250.95s** (433 post-Phase-3 + 40 new Phase 4 tests).
 
+---
+
+## [Code Review Fix Plan – Phase 5: Lifecycle, Container, and Config (`P5-C1`…`P5-C6`)]
+
+### P5-C1: Async Startup/Shutdown Lifecycle (`C-1`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added optional `async def startup(self) -> None` and `async def shutdown(self) -> None` default no-op lifecycle hooks to `ServiceProvider` (`swiftpy/core/providers/base.py`).
+  - Added `FrameworkServiceProvider` (`swiftpy/core/application.py`) registered first on `Application` (starts first, shuts down last): initializes `DatabasePool` on `startup()` when database config exists, and on `shutdown()` closes active WebSocket connections with code `1001` (`Going Away`), stops and closes `RedisEventBus`, closes Redis clients (`Cache`, `QueueDispatcher`, `TokenBlacklist`), and closes `DatabasePool`.
+  - Added `Application.startup()` (runs provider `startup()` in registration order and rolls back already-started providers in reverse order on failure before sending `lifespan.startup.failed`) and `Application.shutdown()` (runs provider `shutdown()` in reverse order, catching/logging individual errors, before sending `lifespan.shutdown.complete`).
+  - Added `startup()`, `shutdown()`, `__aenter__()`, and `__aexit__()` to `TestClient` (`swiftpy/testing/http_client.py`).
+  - Created `tests/core/test_lifespan.py` (5 tests).
+
+---
+
+### P5-C2: Container Semantics (`C-2`, `C-3`, `D-7`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Updated `Container.bind()`, `Container.singleton()`, and `Container.scoped()` (`swiftpy/core/container.py`) to invalidate any cached singleton or current-task scoped entry for that interface (Decision `D-7`).
+  - Wrapped `NameError`/`TypeError`/`ValueError` from `get_type_hints()` and `inspect.signature()` in `_resolve_callable_dependencies` as `ResolutionError` naming the target class/callable.
+  - Cached `None` singleton results via `_NONE_SENTINEL` and added `Container.get_singleton(interface)`.
+  - Keyed `Scope.SCOPED` cache entries in `Context` with `(cur_task, instance)` so child tasks spawned via `asyncio.create_task` or `asyncio.gather` do not inherit the parent task's scoped instances.
+  - Added `await container.aclose_scoped()` and `async with container.scope():` disposing scoped instances implementing `aclose()`, `__aexit__()`, `close()`, or `__exit__()` in reverse creation order at scope exit (wired into HTTP and WebSocket request scopes in `Application.__call__`).
+  - Created `tests/concurrency/test_container_semantics.py` (6 tests).
+
+---
+
+### P5-C3: Auth Manager Honors Configured Guards (`C-3`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `authenticate(request)` methods to `JWTGuard` (`swiftpy/auth/jwt_guard.py`) and `ApiKeyGuard` (`swiftpy/auth/api_key_guard.py`).
+  - Registered default `"jwt"` and `"api_key"` guard factories in `AuthManager._custom_creators` (`swiftpy/auth/auth_manager.py`), invalidated `self._guards.pop(name, None)` on `AuthManager.extend(name, creator)`, and updated `AuthManager.authenticate()` to dispatch to the registered guard instance (`g.authenticate(request)`).
+  - Updated `CurrentUser` to sync lazily from `Context.get("__swiftpy_current_user__")` when initialized with `data=None` and expose `_cache_in_scope = False` while unauthenticated so `Container.resolve(CurrentUser)` never caches an unauthenticated `CurrentUser` in scope.
+  - Enforced canonical base64url verification in `_base64url_decode` (`swiftpy/auth/jwt_issuer.py`) to reject non-zero padding bits in tampered JWT signatures.
+  - Created `tests/auth/test_auth_manager.py` (3 tests).
+
+---
+
+### P5-C4: Instance-Scoped Singletons (`C-4`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Removed `Config._instance = self` from `Config.__init__` (`swiftpy/core/config.py`).
+  - Scoped `Config`, `WebSocketManager`, `EventDispatcher`, `QueueDispatcher`, and `RedisEventBus` per `Application` / `Container` instance (`get_instance()` resolves from the active `Container` when bound).
+  - Updated `helpers.dispatcher()`, `helpers.queue()`, `helpers.cache()`, and `helpers.websocket_manager()` (`swiftpy/helpers/helper.py`) to raise `BindingNotFoundError` (`ResolutionError`) when the service is not registered in the active container instead of auto-wiring a new leaked instance per call.
+  - Added `snapshot_model_registry()` and `restore_model_registry()` in `swiftpy/database/orm/registry.py`.
+  - Created `tests/core/test_instance_singletons.py` (4 tests).
+
+---
+
+### P5-C5: Config Correctness (`C-5`, `D-8`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Updated `Config._coerce_value()` (`swiftpy/core/config.py`) to coerce `bool`, `int`, and `float` only when the target key has an existing typed default (or is `app.debug`/`debug`), preserving strings such as `APP__SECRET="0012345678"` (Decision `D-8`).
+  - Ignored malformed environment variable keys with empty path segments (`__WEIRD__KEY`, `APP____EMPTY`, `TRAILING__`).
+  - Updated `Config.load(..., strict=True)` to raise `ConfigurationError` on broken config files (`strict=False` preserves warning+skip mode for CLI tooling).
+  - Updated `Config.get()` to distinguish missing keys from explicit `None` values via `_MISSING`, and updated `Config.all()` and `Config.__init__()` to use `copy.deepcopy`.
+  - Replaced raw `os.getenv` reads in `swiftpy/events/redis_bus.py` and `swiftpy/queue/dispatcher.py` with `resolve_redis_params` and `Config.get_instance()`.
+  - Extended `tests/core/test_config.py` with 4 new tests (11 total).
+
+---
+
+### P5-C6: Provider Discovery (`C-6`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Updated `discover_providers()` (`swiftpy/core/application.py`) to stop inserting `app/providers` (`target_dir`) into `sys.path` (preventing provider files named `queue.py` or `logging.py` from shadowing Python stdlib modules), import providers by package path (`app.providers.<name>`) relative to `project_root`, and raise `ConfigurationError` on broken provider modules when `strict=True` (default).
+  - Added `project_root` and `strict_providers` parameters to `Application.__init__`.
+  - Extended `tests/app/test_application_providers.py` with 3 new tests (9 total).
+* **Quality Gate Results:** see the "Phase 5 closing gate" section below.
+
+---
+
+### Phase 5 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy swiftpy app config tests/http tests/core tests/validation tests/websockets tests/testing tests/concurrency tests/auth tests/app`: **Success: no issues found in 166 source files**
+  - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 5 tests.
+  - Full suite: `pytest -q -p no:cacheprovider`: **498 passed in 198.53s** (473 post-Phase-4 + 25 new Phase 5 tests).
+
+
 
 
 

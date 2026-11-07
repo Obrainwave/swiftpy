@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -14,7 +13,9 @@ from uuid import UUID
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
+from swiftpy.core.container import get_container
 from swiftpy.events.dispatcher import EventDispatcher, EventHandler
+from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.events")
 
@@ -66,15 +67,38 @@ class RedisEventBus:
 
     @classmethod
     def get_instance(cls) -> RedisEventBus:
-        """Retrieve the global or fallback RedisEventBus instance."""
+        """Retrieve the active application's RedisEventBus from the container, or fallback instance."""
+        try:
+            container = get_container()
+            if container.has(cls):
+                return container.resolve(cls)
+        except RuntimeError:
+            pass
+
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     @classmethod
     def set_instance(cls, bus: RedisEventBus | None) -> None:
-        """Override or reset the global RedisEventBus instance."""
+        """Override or reset the RedisEventBus instance in the active container and fallback."""
         cls._instance = bus
+        try:
+            container = get_container()
+            if container.has(cls):
+                if bus is not None:
+                    container.instance(cls, bus)
+                else:
+                    container.singleton(
+                        cls,
+                        lambda c: cls(
+                            dispatcher=c.resolve(EventDispatcher)
+                            if c.has(EventDispatcher)
+                            else None
+                        ),
+                    )
+        except RuntimeError:
+            pass
 
     async def get_client(self) -> aioredis.Redis:
         """Lazily initialize and return the async Redis client."""
@@ -86,23 +110,19 @@ class RedisEventBus:
                 )
             else:
                 if self._pool is None:
-                    host = self.host or os.getenv("REDIS_HOST", "127.0.0.1")
-                    port = (
-                        self.port
-                        if self.port is not None
-                        else int(os.getenv("REDIS_PORT", "6379"))
-                    )
-                    password = (
-                        self.password
-                        if self.password is not None
-                        else os.getenv("REDIS_PASSWORD", None)
+                    params = resolve_redis_params(
+                        section="events",
+                        host=self.host,
+                        port=self.port,
+                        password=self.password,
+                        database=self.database if self.database != 0 else None,
                     )
 
                     self._pool = aioredis.BlockingConnectionPool(
-                        host=host,
-                        port=port,
-                        db=self.database,
-                        password=password or None,
+                        host=params["host"],
+                        port=params["port"],
+                        db=params["database"],
+                        password=params["password"] or None,
                         decode_responses=True,
                         max_connections=self.max_connections,
                         timeout=self.timeout,

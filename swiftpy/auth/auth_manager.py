@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Callable, Iterator
 from typing import Any
 
-from swiftpy.auth.api_key_guard import ApiKeyGuard, require_api_key
-from swiftpy.auth.jwt_guard import JWTGuard, require_jwt
+from swiftpy.auth.api_key_guard import ApiKeyGuard
+from swiftpy.auth.jwt_guard import JWTGuard
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist
 from swiftpy.core.config import Config
@@ -18,28 +19,78 @@ class CurrentUser(dict[str, Any]):
     """
     Task-scoped authenticated user context resolvable through the DI container.
 
-    Can be injected directly into route handlers or service constructors:
-        async def profile(request: Request, user: CurrentUser) -> Response:
-            ...
+    Resolves lazily from `Context` at access time when constructed without explicit
+    payload data, and is never cached in the container scope while unauthenticated.
     """
 
     def __init__(self, data: dict[str, Any] | None = None) -> None:
+        self._lazy = data is None
         if data is None:
             ctx_user = Context.get("__swiftpy_current_user__")
             data = ctx_user if isinstance(ctx_user, dict) else {}
         super().__init__(data)
 
+    def _sync(self) -> None:
+        if self._lazy and not super().__len__():
+            ctx_user = Context.get("__swiftpy_current_user__")
+            if isinstance(ctx_user, dict) and ctx_user:
+                super().update(ctx_user)
+
+    @property
+    def _cache_in_scope(self) -> bool:
+        self._sync()
+        return super().__len__() > 0
+
+    def __getitem__(self, key: str) -> Any:
+        self._sync()
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self._sync()
+        return super().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        self._sync()
+        return super().__contains__(key)
+
+    def __len__(self) -> int:
+        self._sync()
+        return super().__len__()
+
+    def __bool__(self) -> bool:
+        self._sync()
+        return super().__len__() > 0
+
+    def __iter__(self) -> Iterator[str]:
+        self._sync()
+        return super().__iter__()
+
+    def keys(self) -> Any:
+        self._sync()
+        return super().keys()
+
+    def values(self) -> Any:
+        self._sync()
+        return super().values()
+
+    def items(self) -> Any:
+        self._sync()
+        return super().items()
+
     @property
     def id(self) -> Any:
-        return self.get("id") or self.get("sub")
+        self._sync()
+        return super().get("id") or super().get("sub")
 
     @property
     def email(self) -> Any:
-        return self.get("email")
+        self._sync()
+        return super().get("email")
 
     @property
     def is_authenticated(self) -> bool:
-        return bool(self)
+        self._sync()
+        return super().__len__() > 0
 
 
 def current_user() -> Any:
@@ -62,7 +113,22 @@ class AuthManager:
     def __init__(self, container: Container | None = None) -> None:
         self._container = container
         self._guards: dict[str, Any] = {}
-        self._custom_creators: dict[str, Callable[[Container], Any]] = {}
+        self._custom_creators: dict[str, Callable[[Container], Any]] = {
+            "jwt": self._create_default_jwt_guard,
+            "api_key": self._create_default_api_key_guard,
+        }
+
+    @staticmethod
+    def _create_default_jwt_guard(c: Container) -> JWTGuard:
+        issuer = c.resolve(JWTIssuer) if c.has(JWTIssuer) else None
+        blacklist = c.resolve(TokenBlacklist) if c.has(TokenBlacklist) else None
+        return JWTGuard(issuer=issuer, blacklist=blacklist)
+
+    @staticmethod
+    def _create_default_api_key_guard(c: Container) -> ApiKeyGuard:
+        cfg = c.resolve(Config) if c.has(Config) else None
+        pool = c.resolve(DatabasePool) if c.has(DatabasePool) else None
+        return ApiKeyGuard.from_config(config=cfg, pool=pool)
 
     @property
     def container(self) -> Container:
@@ -98,38 +164,13 @@ class AuthManager:
         return guard_instance
 
     def extend(self, name: str, creator: Callable[[Container], Any]) -> None:
-        """Register a custom guard creator factory."""
+        """Register or override a guard creator factory and invalidate any cached guard."""
         self._custom_creators[name] = creator
+        self._guards.pop(name, None)
 
     def _resolve(self, name: str) -> Any:
         if name in self._custom_creators:
             return self._custom_creators[name](self.container)
-
-        if name == "jwt":
-            issuer = (
-                self.container.resolve(JWTIssuer)
-                if self.container.has(JWTIssuer)
-                else None
-            )
-            blacklist = (
-                self.container.resolve(TokenBlacklist)
-                if self.container.has(TokenBlacklist)
-                else None
-            )
-            return JWTGuard(issuer=issuer, blacklist=blacklist)
-
-        if name == "api_key":
-            cfg = (
-                self.container.resolve(Config)
-                if self.container.has(Config)
-                else None
-            )
-            pool = (
-                self.container.resolve(DatabasePool)
-                if self.container.has(DatabasePool)
-                else None
-            )
-            return ApiKeyGuard.from_config(config=cfg, pool=pool)
 
         raise ValueError(f"Auth guard [{name}] is not defined.")
 
@@ -139,24 +180,25 @@ class AuthManager:
         guard_name: str | None = None,
     ) -> Any:
         """
-        Authenticate the request using the specified or default guard.
+        Authenticate the request by dispatching to the guard instance registered
+        for `guard_name` (or the default configured guard).
         """
-        g = self.guard(guard_name)
-        if hasattr(g, "authenticate"):
-            return await g.authenticate(request)
+        resolved_name = guard_name or self.default_guard_name()
+        g = self.guard(resolved_name)
 
-        # If guard is a middleware with require_jwt or require_api_key
-        if guard_name == "jwt" or (
-            guard_name is None and self.default_guard_name() == "jwt"
-        ):
-            return await require_jwt(request)
+        if hasattr(g, "authenticate") and callable(g.authenticate):
+            res = g.authenticate(request)
+            if inspect.isawaitable(res):
+                return await res
+            return res
 
-        if guard_name == "api_key" or (
-            guard_name is None and self.default_guard_name() == "api_key"
-        ):
-            return await require_api_key(request)
+        if callable(g):
+            res = g(request)
+            if inspect.isawaitable(res):
+                return await res
+            return res
 
-        raise TypeError(f"Guard [{guard_name}] does not support authenticate()")
+        raise TypeError(f"Guard [{resolved_name}] does not support authenticate()")
 
     def current_user(self) -> Any:
         """Return the current user from task-scoped context."""
@@ -171,5 +213,5 @@ class AuthManager:
         c.instance(AuthManager, self)
         c.scoped(
             CurrentUser,
-            lambda _: CurrentUser(Context.get("__swiftpy_current_user__") or {}),
+            lambda _: CurrentUser(),
         )

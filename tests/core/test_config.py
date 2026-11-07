@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from swiftpy.core.application import Application
@@ -53,16 +55,16 @@ def test_config_dotted_get_and_set() -> None:
 
 def test_config_env_variable_merging() -> None:
     mock_env = {
-        # Double underscore notation
+        # Double underscore notation on typed defaults (int, float, bool)
         "DATABASE__POOL__MAX_SIZE": "88",
-        # Top-level prefix mapping
+        "DATABASE__POOL__COMMAND_TIMEOUT": "12.5",
+        # Top-level prefix mapping on typed defaults
         "APP_DEBUG": "true",
         "APP_NAME": "Overridden Name",
         # SWIFTPY_ prefix
         "SWIFTPY_APP__ENV": "production",
-        # Custom nested key
-        "CACHE__REDIS__PORT": "6379",
-        "FEATURE__ENABLED": "1",
+        # Custom untyped nested keys remain strings unless JSON
+        "APP__SECRET": "0012345678",
         "FEATURE__COUNT": "42",
         "FEATURE__RATIO": "3.14",
         "FEATURE__CONFIG": '{"flag": true, "items": [1, 2]}',
@@ -71,18 +73,69 @@ def test_config_env_variable_merging() -> None:
     # Load with custom env dict
     cfg = Config.load(config_dir="config", env=mock_env)
 
-    # Test overridden database pool max_size
+    # Test overridden typed defaults
     assert cfg.get("database.pool.max_size") == 88
+    assert cfg.get("database.pool.command_timeout") == 12.5
     # Test top-level mappings
     assert cfg.get("app.debug") is True
     assert cfg.get("app.name") == "Overridden Name"
     # Test SWIFTPY_ prefix
     assert cfg.get("app.env") == "production"
-    # Test dynamic nested additions
-    assert cfg.get("cache.redis.port") == 6379
-    assert cfg.get("feature.count") == 42
-    assert cfg.get("feature.ratio") == 3.14
+    # Decision D-8: untyped dynamic keys are not blindly coerced to int/float/bool
+    assert cfg.get("app.secret") == "0012345678"
+    assert isinstance(cfg.get("app.secret"), str)
+    assert cfg.get("feature.count") == "42"
+    assert cfg.get("feature.ratio") == "3.14"
     assert cfg.get("feature.config") == {"flag": True, "items": [1, 2]}
+
+
+def test_config_weird_env_keys_do_not_create_empty_segments() -> None:
+    """Env keys with leading/trailing/empty segments must be ignored without creating '' keys."""
+    mock_env = {
+        "__WEIRD__KEY": "val1",
+        "APP____EMPTY": "val2",
+        "TRAILING__": "val3",
+        "SWIFTPY___LEADING": "val4",
+        "_SINGLE_LEADING": "val5",
+        "SINGLE_TRAILING_": "val6",
+    }
+    cfg = Config.load(config_dir="config", env=mock_env)
+    all_data = cfg.all()
+    assert "" not in all_data
+    assert "" not in all_data.get("app", {})
+
+
+def test_config_load_broken_file_raises_configuration_error(tmp_path: Path) -> None:
+    """Syntax errors or runtime exceptions in config files must fail Config.load(strict=True)."""
+    broken_file = tmp_path / "broken.py"
+    broken_file.write_text("CONFIG = {\n    'unclosed': 123\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="Failed to load configuration file"):
+        Config.load(config_dir=tmp_path, env={})
+
+    # Lenient mode logs a warning and skips broken files
+    cfg = Config.load(config_dir=tmp_path, env={}, strict=False)
+    assert not cfg.has("broken")
+
+
+def test_config_get_distinguishes_explicit_none_from_missing() -> None:
+    """cfg.get('key', 'default') must return None when 'key' is explicitly None."""
+    cfg = Config({"app": {"nullable_setting": None, "name": "SwiftPY"}})
+    assert cfg.get("app.nullable_setting", "default_val") is None
+    assert cfg.get("app.missing_setting", "default_val") == "default_val"
+    assert cfg.has("app.nullable_setting") is True
+    assert cfg.has("app.missing_setting") is False
+
+
+def test_config_all_returns_deep_copy() -> None:
+    """Mutating cfg.all() must not mutate the internal state of cfg."""
+    cfg = Config({"app": {"name": "SwiftPY", "hosts": ["localhost"]}})
+    snapshot = cfg.all()
+    snapshot["app"]["name"] = "Mutated"
+    snapshot["app"]["hosts"].append("evil.example.com")
+
+    assert cfg.get("app.name") == "SwiftPY"
+    assert cfg.get("app.hosts") == ["localhost"]
 
 
 def test_config_single_underscore_flattened_matching() -> None:
@@ -105,10 +158,12 @@ def test_application_startup_automatically_loads_config_modules() -> None:
     assert isinstance(app.config.get("database.pool.max_size"), int)
 
 
-def test_config_environment_variable_precedence_hierarchy() -> None:
+def test_config_environment_variable_precedence_hierarchy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Verify precedence order:
-    SWIFTPY_ prefix (highest) > double-underscore (medium) > single-underscore / prefix (lowest).
+    explicit Application overrides > SWIFTPY_ prefix > double-underscore > single-underscore > config file.
     """
     # 1. Double underscore overrides single-underscore normalized path
     mock_env_1 = {
@@ -126,6 +181,11 @@ def test_config_environment_variable_precedence_hierarchy() -> None:
     }
     cfg_2 = Config.load(config_dir="config", env=mock_env_2)
     assert cfg_2.get("database.pool.max_size") == 99
+
+    # 3. Explicit Application(config=...) overrides SWIFTPY_ env
+    monkeypatch.setenv("SWIFTPY_DATABASE__POOL__MAX_SIZE", "99")
+    app = Application(config={"database": {"pool": {"max_size": 120}}})
+    assert app.config.get("database.pool.max_size") == 120
 
 
 def test_config_malformed_values_raise_configuration_error() -> None:

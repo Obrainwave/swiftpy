@@ -11,7 +11,7 @@ class EventServiceProvider(ServiceProvider):
 
     def register(self) -> None:
         self.container.singleton(
-            EventDispatcher, lambda c: EventDispatcher.get_instance()
+            EventDispatcher, lambda _: EventDispatcher()
         )
         self.container.singleton(
             RedisEventBus,

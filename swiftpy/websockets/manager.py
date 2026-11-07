@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
+from swiftpy.core.container import get_container
 from swiftpy.websockets.connection import (
     WebSocketConnection,
     WebSocketDisconnect,
@@ -31,15 +32,29 @@ class WebSocketManager:
 
     @classmethod
     def get_instance(cls) -> WebSocketManager:
-        """Retrieve the global WebSocketManager singleton instance."""
+        """Retrieve the active application's WebSocketManager from the container, or fallback singleton."""
+        try:
+            container = get_container()
+            if container.has(cls):
+                return container.resolve(cls)
+        except RuntimeError:
+            pass
+
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     @classmethod
     def reset_instance(cls) -> None:
-        """Reset the global singleton instance (primarily for isolated test environments)."""
+        """Reset the fallback singleton instance and clear the active container's manager if present."""
         cls._instance = None
+        try:
+            container = get_container()
+            if container.has(cls):
+                fresh = cls()
+                container.instance(cls, fresh)
+        except RuntimeError:
+            pass
 
     @property
     def active_count(self) -> int:

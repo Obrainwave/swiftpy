@@ -8,7 +8,6 @@ from swiftpy.auth import (
     get_server_pepper,
 )
 from swiftpy.core.config import Config
-from swiftpy.core.context import Context
 from swiftpy.core.providers.base import ServiceProvider
 
 
@@ -34,7 +33,7 @@ class AuthServiceProvider(ServiceProvider):
         self.container.singleton(AuthManager)
         self.container.scoped(
             CurrentUser,
-            lambda _: CurrentUser(Context.get("__swiftpy_current_user__") or {}),
+            lambda _: CurrentUser(),
         )
 
     def boot(self) -> None:
