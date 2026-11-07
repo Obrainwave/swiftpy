@@ -5,6 +5,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
+from swiftpy.database.transaction import get_active_connection
 from swiftpy.validation.rules.builtin import (
     BoolRule,
     FloatRule,
@@ -80,11 +81,13 @@ class Validator:
         self.data: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
         self.schema = schema
         self.registry = registry or default_registry
+        self._db_rule_lock = asyncio.Lock()
 
     async def validate(self) -> ValidationResult:
         """
         Execute validation across all schema rules non-blockingly.
-        Fields are validated concurrently via asyncio.gather.
+        Fields are validated concurrently via asyncio.gather outside transactions,
+        or sequentially when an active transaction is present (P3-D4).
         """
         parsed_schema: dict[str, list[Any]] = {}
         for field_name, rule_def in self.schema.items():
@@ -93,13 +96,17 @@ class Validator:
         errors: dict[str, list[str]] = {}
         validated_data: dict[str, Any] = {}
 
-        # Validate each field concurrently
-        tasks = [
-            self._validate_field(field_name, rules)
-            for field_name, rules in parsed_schema.items()
-        ]
-
-        results = await asyncio.gather(*tasks)
+        if get_active_connection() is not None:
+            results = [
+                await self._validate_field(field_name, rules)
+                for field_name, rules in parsed_schema.items()
+            ]
+        else:
+            tasks = [
+                self._validate_field(field_name, rules)
+                for field_name, rules in parsed_schema.items()
+            ]
+            results = list(await asyncio.gather(*tasks))
 
         for field_name, field_errors, coerced_val in results:
             if field_errors:
@@ -148,7 +155,14 @@ class Validator:
             if isinstance(rule, NullableRule):
                 continue
 
-            passed = await self._run_rule(rule, field_name, coerced_value)
+            if (
+                getattr(rule, "requires_db", False)
+                and get_active_connection() is not None
+            ):
+                async with self._db_rule_lock:
+                    passed = await self._run_rule(rule, field_name, coerced_value)
+            else:
+                passed = await self._run_rule(rule, field_name, coerced_value)
             if not passed:
                 msg = self._get_rule_message(rule, field_name)
                 field_errors.append(msg)

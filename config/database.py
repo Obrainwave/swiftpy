@@ -9,12 +9,13 @@ CONFIG: dict[str, object] = {
             "database": env("DB_DATABASE", "swiftpy"),
             "user": env("DB_USERNAME", "postgres"),
             "password": env("DB_PASSWORD", ""),
-            "ssl": env("DB_SSL", "false").lower() == "true",
+            "ssl": env("DB_SSL", "disable"),
+            "ssl_ca_file": env("DB_SSL_CA_FILE", ""),
         },
     },
     "pool": {
         "min_size": int(env("DB_POOL_MIN_SIZE", "5")),
-        "max_size": int(env("DB_POOL_MAX_SIZE", "50")),
+        "max_size": int(env("DB_POOL_MAX_SIZE", "20")),
         "max_queries": int(env("DB_POOL_MAX_QUERIES", "50000")),
         "max_inactive_connection_lifetime": float(
             env("DB_POOL_MAX_INACTIVE_LIFETIME", "300.0")

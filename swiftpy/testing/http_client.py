@@ -7,6 +7,7 @@ from types import TracebackType
 from typing import Any
 from urllib.parse import urlencode
 
+from swiftpy.http.response import ResponseHeaders
 from swiftpy.websockets.connection import WebSocketDisconnect
 
 logger = logging.getLogger("swiftpy.testing")
@@ -23,11 +24,15 @@ class TestResponse:
     def __init__(
         self,
         status_code: int,
-        headers: dict[str, str],
+        headers: dict[str, str] | list[tuple[str, str]] | ResponseHeaders,
         body: bytes,
     ) -> None:
         self.status_code = status_code
-        self.headers = headers
+        self.headers: ResponseHeaders = (
+            headers
+            if isinstance(headers, ResponseHeaders)
+            else ResponseHeaders(headers)
+        )
         self.body = body
         self._text: str | None = None
         self._json: Any = None
@@ -236,7 +241,7 @@ class TestClient:
         }
 
         status_code = 0
-        resp_headers: dict[str, str] = {}
+        resp_headers = ResponseHeaders()
         resp_body = bytearray()
         body_sent = False
 
@@ -258,8 +263,7 @@ class TestClient:
                 for k, v in message.get("headers", []):
                     h_key = k.decode("latin-1")
                     h_val = v.decode("latin-1")
-                    resp_headers[h_key] = h_val
-                    resp_headers[h_key.lower()] = h_val
+                    resp_headers.add(h_key, h_val)
             elif message["type"] == "http.response.body":
                 resp_body.extend(message.get("body", b""))
 
@@ -337,6 +341,24 @@ class TestClient:
         query: dict[str, Any] | None = None,
     ) -> TestResponse:
         return await self.request("DELETE", path, headers=headers, query=query)
+
+    async def head(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> TestResponse:
+        return await self.request("HEAD", path, headers=headers, query=query)
+
+    async def options(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> TestResponse:
+        return await self.request("OPTIONS", path, headers=headers, query=query)
 
     def websocket_connect(
         self,

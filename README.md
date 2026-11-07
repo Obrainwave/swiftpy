@@ -47,9 +47,21 @@ No ugly provider lists or manual bootstrapping required—create your applicatio
 ```python
 # main.py
 from app.http.middleware.test_middleware import TestMiddleware
-from swiftpy import Application, Request, Response, RouteGroup, json_response
+from swiftpy import (
+    CORS,
+    Application,
+    CurrentUser,
+    Request,
+    RequestId,
+    Response,
+    RouteGroup,
+    SecurityHeaders,
+    json_response,
+    require_jwt,
+)
 
 app = Application(title="SwiftPY Store API", version="1.0.0")
+app.middleware([RequestId, SecurityHeaders, CORS])
 
 
 @app.get("/ping")
@@ -62,6 +74,10 @@ def v1_routes(group: RouteGroup) -> None:
     @group.get("/users/{user_id}")
     async def show_user(request: Request, user_id: int) -> Response:
         return json_response({"user_id": user_id, "ok": True})
+
+    @group.get("/me", middleware=[require_jwt()])
+    async def me(user: CurrentUser) -> Response:
+        return json_response({"user": dict(user)})
 ```
 
 ### 2. Active Record Models & Relationships

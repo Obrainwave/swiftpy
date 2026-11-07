@@ -6,8 +6,13 @@ import traceback
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from swiftpy.http.exceptions import HttpException
+from swiftpy.http.exceptions import (
+    ClientDisconnect,
+    HttpException,
+    PayloadTooLargeError,
+)
 from swiftpy.http.response import Response, json_response, unprocessable
+from swiftpy.validation.exceptions import ValidationException
 
 if TYPE_CHECKING:
     from swiftpy.http.request import Request
@@ -120,9 +125,15 @@ class ExceptionHandler:
         request: Request | None = None,
     ) -> Response:
         """Process an exception and return a typed HTTP Response."""
-        # 1. Custom exception handlers
-        for exc_cls, handler in self._custom_handlers.items():
-            if isinstance(exc, exc_cls):
+        req_method = request.method if request is not None else "-"
+        req_path = request.path if request is not None else "-"
+
+        # 1. Custom exception handlers selected by MRO specificity
+        for cls in type(exc).__mro__:
+            if not issubclass(cls, Exception):
+                continue
+            handler = self._custom_handlers.get(cls)
+            if handler is not None:
                 try:
                     res = handler(exc, request)
                     if inspect.isawaitable(res):
@@ -133,13 +144,22 @@ class ExceptionHandler:
                 except Exception:
                     logger.exception(
                         "Custom exception handler for %s raised an unhandled error",
-                        exc_cls.__name__,
+                        cls.__name__,
                     )
-                    break
+                    return json_response(
+                        {"detail": "Internal Server Error"},
+                        status_code=500,
+                    )
 
-        # 2. Validation errors (ValidationError or ValidationException)
-        if hasattr(exc, "errors") and isinstance(exc.errors, dict):
-            headers = getattr(exc, "headers", None) or {}
+        # 2. Framework validation errors ONLY (no duck-typing on .errors)
+        if isinstance(exc, (ValidationError, ValidationException)):
+            logger.info(
+                "HTTP 422 %s %s: %s",
+                req_method,
+                req_path,
+                exc.message,
+            )
+            headers = exc.headers or {}
             resp = unprocessable(exc.errors)
             if headers:
                 resp.headers.update(headers)
@@ -147,6 +167,22 @@ class ExceptionHandler:
 
         # 3. HTTP Exceptions (HttpException, NotFoundError, UnauthorizedError, etc.)
         if isinstance(exc, HttpException):
+            if exc.status_code >= 500:
+                logger.error(
+                    "HTTP %d %s %s: %s",
+                    exc.status_code,
+                    req_method,
+                    req_path,
+                    exc.message,
+                )
+            else:
+                logger.info(
+                    "HTTP %d %s %s: %s",
+                    exc.status_code,
+                    req_method,
+                    req_path,
+                    exc.message,
+                )
             headers = exc.headers or {}
             resp = json_response(
                 {"detail": exc.message},
@@ -179,12 +215,14 @@ class ExceptionHandler:
 
 __all__ = [
     "BadRequestError",
+    "ClientDisconnect",
     "ExceptionHandler",
     "ForbiddenError",
     "HttpException",
     "InternalServerError",
     "MethodNotAllowedError",
     "NotFoundError",
+    "PayloadTooLargeError",
     "UnauthorizedError",
     "ValidationError",
 ]

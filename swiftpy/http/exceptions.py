@@ -19,4 +19,23 @@ class HttpException(Exception):
         super().__init__(message)
 
 
-__all__ = ["HttpException"]
+class PayloadTooLargeError(HttpException):
+    """Exception mapped automatically to HTTP 413 Payload Too Large."""
+
+    def __init__(
+        self,
+        message: str = "Payload Too Large",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message=message, status_code=413, headers=headers)
+
+
+class ClientDisconnect(Exception):
+    """Raised when the ASGI client disconnects before the request body is fully read."""
+
+
+__all__ = [
+    "ClientDisconnect",
+    "HttpException",
+    "PayloadTooLargeError",
+]

@@ -18,11 +18,13 @@ from swiftpy.console.commands.make import MakeCommand
 from swiftpy.core.bootstrap import create_app, get_container
 from swiftpy.database.migrations import (
     Blueprint,
+    ColumnDefinition,
     MigrationLock,
     MigrationLockError,
     Migrator,
     Schema,
     SchemaGrammar,
+    raw,
 )
 from swiftpy.database.orm.model import Model
 from swiftpy.database.pool import DatabasePool
@@ -699,6 +701,180 @@ async def test_updated_at_maintained_on_save(
         await Schema.drop_if_exists(table_name)
 
     print("PASS: Model updated_at automatically maintained upon update save")
+
+
+def test_blueprint_validation_and_raw_defaults() -> None:
+    """Verify length/precision/scale range validation, type_name whitelist, 63-char identifier limit, and raw() defaults."""
+    bp = Blueprint("valid_table", is_create=True)
+
+    # 1. Invalid string lengths
+    with pytest.raises(ValueError, match="Column length"):
+        bp.string("bad_len_zero", 0)
+    with pytest.raises(ValueError, match="Column length"):
+        bp.string("bad_len_neg", -5)
+    with pytest.raises(ValueError, match="Column length"):
+        bp.string("bad_len_huge", 20_000_000)
+    with pytest.raises(ValueError, match="Column length"):
+        bp.string("bad_len_bool", True)
+
+    # 2. Invalid decimal precision/scale
+    with pytest.raises(ValueError, match="Decimal precision"):
+        bp.decimal("bad_prec_zero", precision=0, scale=0)
+    with pytest.raises(ValueError, match="Decimal precision"):
+        bp.decimal("bad_prec_huge", precision=1001, scale=2)
+    with pytest.raises(ValueError, match="Decimal scale"):
+        bp.decimal("bad_scale_neg", precision=8, scale=-1)
+    with pytest.raises(ValueError, match="Decimal scale"):
+        bp.decimal("bad_scale_gt_prec", precision=5, scale=6)
+
+    # 3. Unknown type_name rejected
+    with pytest.raises(ValueError, match="Unsupported column type"):
+        ColumnDefinition("col", "varchar(50); DROP TABLE users;--")
+
+    # 4. Identifier > 63 chars rejected
+    with pytest.raises(ValueError, match="Invalid SQL identifier"):
+        Blueprint("a" * 64)
+    with pytest.raises(ValueError, match="Invalid SQL identifier"):
+        bp.string("b" * 64)
+
+    # Generated index name > 63 chars rejected during compilation
+    long_bp = Blueprint("a" * 40, is_create=True)
+    long_bp.string("b" * 30).index()
+    with pytest.raises(ValueError, match="Invalid SQL identifier"):
+        SchemaGrammar.compile_create(long_bp)
+
+    # 5. raw() default vs deprecated magic string vs literal escaping
+    bp_defaults = Blueprint("defaults_table", is_create=True)
+    bp_defaults.timestamp("ts_raw").default(raw("now()"))
+    bp_defaults.string("author").default("O'Reilly")
+    sql_list = SchemaGrammar.compile_create(bp_defaults)
+    assert '"ts_raw" TIMESTAMPTZ NOT NULL DEFAULT now()' in sql_list[0]
+    assert "\"author\" VARCHAR(255) NOT NULL DEFAULT 'O''Reilly'" in sql_list[0]
+
+    with pytest.deprecated_call(match="use raw"):
+        assert SchemaGrammar._format_default_value("NOW()") == "NOW()"
+
+    with pytest.raises(ValueError, match="finite"):
+        SchemaGrammar._format_default_value(float("nan"))
+
+
+@pytest.mark.asyncio
+async def test_migrator_checksum_drift_and_out_of_order(
+    tmp_path: Path,
+    ensure_db_pool: DatabasePool,
+) -> None:
+    """Verify checksum storage, checksum drift detection, out-of-order migration detection, and step validation."""
+    m_dir = tmp_path / "drift_migrations"
+    m_dir.mkdir(parents=True, exist_ok=True)
+
+    m1 = m_dir / "2026_10_18_000001_first.py"
+    m1_original = """from swiftpy.database.migrations import Migration
+
+class FirstMig(Migration):
+    async def up(self) -> None:
+        pass
+    async def down(self) -> None:
+        pass
+"""
+    m1.write_text(m1_original, encoding="utf-8")
+
+    m3 = m_dir / "2026_10_18_000003_third.py"
+    m3.write_text(
+        """from swiftpy.database.migrations import Migration
+
+class ThirdMig(Migration):
+    async def up(self) -> None:
+        pass
+    async def down(self) -> None:
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    migrator = Migrator(
+        pool=ensure_db_pool,
+        migrations_dir=m_dir,
+        table_name="test_mig_checksums",
+    )
+    await Schema.drop_if_exists("test_mig_checksums")
+
+    try:
+        # Invalid step values rejected
+        with pytest.raises(ValueError, match="step must be an integer >= 1"):
+            await migrator.run(step=0)
+        with pytest.raises(ValueError, match="steps must be an integer >= 1"):
+            await migrator.rollback(steps=0)
+
+        applied = await migrator.run()
+        assert applied == [
+            "2026_10_18_000001_first",
+            "2026_10_18_000003_third",
+        ]
+
+        statuses = await migrator.status()
+        assert all(s["checksum_valid"] is True for s in statuses)
+
+        # 1. Modify already-applied m1 on disk -> checksum drift error
+        m1.write_text(m1_original + "\n# modified after apply\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="checksum drift"):
+            await migrator.run()
+
+        # Restore m1
+        m1.write_text(m1_original, encoding="utf-8")
+
+        # 2. Add out-of-order unapplied migration 000002 (sorts before applied 000003)
+        m2 = m_dir / "2026_10_18_000002_second_out_of_order.py"
+        m2.write_text(m1_original, encoding="utf-8")
+        with pytest.raises(RuntimeError, match="Out-of-order unapplied migration"):
+            await migrator.run()
+    finally:
+        await Schema.drop_if_exists("test_mig_checksums")
+
+
+@pytest.mark.asyncio
+async def test_cli_step_validation_and_production_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify CLI rejects --step < 1 and refuses production migrations without --force."""
+    m_dir = tmp_path / "prod_cli_migrations"
+    cli = CLI()
+    cli.run(["make:migration", "create_prod_guard_items_table", "--path", str(m_dir)])
+    await Schema.drop_if_exists("prod_guard_items")
+
+    try:
+        # 1. Negative or zero --step exits non-zero
+        with pytest.raises(SystemExit) as exc_info:
+            cli.run(["migrate", "--path", str(m_dir), "--step", "0"])
+        assert exc_info.value.code == 1
+
+        with pytest.raises(SystemExit) as exc_info2:
+            cli.run(["migrate", "--path", str(m_dir), "--step", "-1"])
+        assert exc_info2.value.code == 1
+
+        with pytest.raises(SystemExit) as exc_info3:
+            cli.run(["migrate:rollback", "--path", str(m_dir), "--step", "0"])
+        assert exc_info3.value.code == 1
+
+        # 2. Production guard refuses migrate / rollback / reset without --force
+        monkeypatch.setenv("APP_ENV", "production")
+        with pytest.raises(SystemExit) as prod_exc:
+            cli.run(["migrate", "--path", str(m_dir)])
+        assert prod_exc.value.code == 1
+        assert not await Schema.has_table("prod_guard_items")
+
+        # 3. With --force, migrate and migrate:reset succeed in production
+        cli.run(["migrate", "--path", str(m_dir), "--force"])
+        assert await Schema.has_table("prod_guard_items")
+
+        with pytest.raises(SystemExit) as reset_exc:
+            cli.run(["migrate:reset", "--path", str(m_dir)])
+        assert reset_exc.value.code == 1
+
+        cli.run(["migrate:reset", "--path", str(m_dir), "--force"])
+        assert not await Schema.has_table("prod_guard_items")
+    finally:
+        await Schema.drop_if_exists("prod_guard_items")
 
 
 async def main() -> None:

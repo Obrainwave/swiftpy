@@ -545,18 +545,18 @@ Transfer/sec:    482.06KB
 
 ### P2-A2: API Key Guard Overhaul (Decision D-2)
 * **Status:** PASSED
-* **Date:** 2026-10-28
+* **Date:** 2026-10-28 (updated 2026-11-07)
 * **Changes:**
   - Redesigned API key format into `<prefix>.<secret>` (`generate_api_key`) with unique indexed column `key_prefix` (Decision D-2).
   - Removed the legacy unsegmented full-table `SELECT *` fallback entirely; keys without `<prefix>.<secret>` (or with empty prefix/secret) are rejected upfront with `InvalidApiKeyError` before any database access.
-  - Replaced O(N) full-table scan and event-loop-blocking bcrypt loop with a single indexed query (`SELECT * FROM "{table}" WHERE "{prefix_column}" = $1 LIMIT 1`) and constant-time HMAC-SHA256 verification (`hash_api_key`, `verify_api_key_hash`) using server pepper (`AUTH_KEY_PEPPER`).
+  - Replaced O(N) full-table scan and event-loop-blocking bcrypt loop with a single indexed query (`SELECT * FROM "{table}" WHERE "{prefix_column}" = $1 LIMIT 1`) and constant-time HMAC-SHA256 verification (`hash_api_key`, `verify_api_key_hash`) using server pepper (`AUTH_KEY_PEPPER`, enforcing `MIN_PEPPER_BYTES = 32` across `get_server_pepper`, `hash_api_key`, `verify_api_key_hash`, `require_api_key`, `ApiKeyGuard`, and non-debug `AuthServiceProvider.boot`).
   - Offloaded legacy `$2...` bcrypt row verification to `loop.run_in_executor` (`_verify_api_key_hash_async`) so the asyncio event loop is never blocked.
   - Added dummy constant-time HMAC comparison when a prefix does not match any row, preventing prefix-enumeration timing side-channels.
   - Wired `get_active_connection()` from `swiftpy.database.transaction` before falling back to `DatabasePool.get_pool().acquire()` so tests using `db.transaction()` rollback fixtures share the active transaction connection.
   - Added `ApiKeyGuard.from_config(config, pool)` and wired `AuthManager._resolve("api_key")` to construct the guard from configuration.
   - Stripped `hash_column`, `key_hash`, `secret`, `password`, and `password_hash` from `request.state["user"]` and `Context` before returning.
   - Added `swiftpy/console/stubs/migration.api_keys.stub` and `swiftpy make:api-key` CLI command (`--prefix`, `--pepper`, `-m`/`--migration`, `--path`).
-  - Added `tests/auth/test_api_key_guard.py` (8 tests covering prefix generation, peppered HMAC verification, production pepper enforcement, legacy format rejection, `from_config`, single-query count across a 40-row table, concurrent event-loop non-blocking ticker assertion, and active `db.transaction()` connection reuse).
+  - Added `tests/auth/test_api_key_guard.py` (10 tests covering prefix generation, peppered HMAC verification, production/short pepper enforcement, non-debug boot fail-fast, legacy format rejection, `from_config`, single-query count across a 40-row table, concurrent event-loop non-blocking ticker assertion, and active `db.transaction()` connection reuse).
 * **Quality Gate Results:** see the "Phase 2 closing gate" section below.
 
 ---
@@ -615,12 +615,186 @@ Transfer/sec:    482.06KB
 
 ---
 
-### Phase 2 closing gate (measured 2026-10-29, tests run in the `swiftpy_app` Docker container)
+### Phase 2 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
   - `ruff check .`: **All checks passed!** (0 errors)
   - `mypy swiftpy app config tests/auth tests/console`: **Success: no issues found in 142 source files**
   - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 2 tests (checked 182 source files).
-  - Targeted: `pytest -q tests/auth/ tests/console/test_stubs_and_make.py`: **77 passed in 29.58s**.
-  - Full suite: `pytest -q`: **406 passed in 165.53s** (0:02:45).
+  - Targeted: `pytest -q tests/auth/ tests/console/test_stubs_and_make.py`: **79 passed in 25.92s**.
+  - Full suite: `pytest -q`: **408 passed** (406 baseline + 2 new pepper/boot tests).
+
+---
+
+## Code Review Remediation – Phase 3: Database Correctness and Safety
+
+### P3-D1: `count()` and Terminal Methods Must Not Mutate the Builder
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `QueryBuilder.clone()` and `ModelQueryBuilder.clone()`.
+  - Updated `QueryBuilder.first()`, `QueryBuilder._aggregate()` (`count`, `sum`, `avg`, `min`, `max`), and `ModelQueryBuilder.first()` to operate on `self.clone()`, preserving `_columns`, `_limit`, and `_order_column` on the original builder across repeated terminal calls.
+  - Cleared `_order_column` inside `_aggregate()` and `exists()` so PostgreSQL never raises `GroupingError` when `.order_by()` was chained prior to `.count()`, `.exists()`, or aggregate helpers.
+  - Added `.exists()` on `QueryBuilder`, `ModelQueryBuilder`, and `RelationshipQueryBuilder` (`SELECT EXISTS(SELECT 1 FROM ... LIMIT 1)`), and added `.sum()`, `.avg()`, `.min()`, and `.max()` on `ModelQueryBuilder`.
+  - Created `tests/db/test_query_builder_terminals.py` (2 tests verifying builder immutability across `order_by` + `count` + `exists` + `first` + `get`, and `ModelQueryBuilder` aggregate/terminal immutability).
+
+---
+
+### P3-D2: Arbitrary Primary Keys (`int`, `UUID`, Custom String Keys)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `QueryBuilder.insert_returning(data, *, returning=None) -> dict[str, Any]` and overloaded `QueryBuilder.insert(data, *, returning=None)` so `insert(data)` preserves `int` return semantics for default callers while `insert_returning(data)` returns the full `RETURNING *` row dictionary.
+  - Updated `Model.create()` and `Model.save()` (on insert) to hydrate the model instance directly from `insert_returning(data)` in **1 query**, eliminating the redundant second `SELECT` (`cls.find()`) and supporting `UUID` and custom string primary keys (`__primary_key__ = "code"`).
+  - Added `PrimaryKeyError(RuntimeError, ValueError)`: `Model.__init_subclass__` rejects composite or non-string `__primary_key__` definitions, and `Model.save()` on an existing model with `pk is None` raises `PrimaryKeyError`.
+  - Created `tests/db/test_arbitrary_primary_keys.py` (5 tests covering 1-query `Model.create()`, `UUID` primary key lifecycle, custom string `code` primary key lifecycle, unset primary key on existing model raising `PrimaryKeyError`, and composite primary key rejection).
+
+---
+
+### P3-D3: Unguarded Mass Writes and Invalid SQL Compilation (Decision D-10)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `QueryError(ValueError, RuntimeError)` and `escape_like(value, escape_char="\\")`.
+  - Added `.allow_all()` to `QueryBuilder` and `ModelQueryBuilder`; `update()` and `delete()` without any `WHERE` clause now raise `QueryError` unless `.allow_all()` was explicitly called.
+  - Raised `QueryError` on `insert({})` and `update({})`.
+  - Compiled `IN []` to `FALSE` and `NOT IN []` to `TRUE`, while rejecting non-list/non-`QueryBuilder` operands for `IN`/`NOT IN` with `QueryError`.
+  - Rejected `None` with comparison/pattern/set operators (`<`, `>`, `<=`, `>=`, `LIKE`, `ILIKE`, `IN`, `NOT IN`) with `QueryError`.
+  - Added `where_in()`, `where_not_in()`, `where_like()`, and `where_ilike()` (emitting `ESCAPE '\'` and escaping `%`, `_`, and `\` literals).
+  - Created `tests/db/test_mass_writes.py` (5 tests covering unguarded `update`/`delete` vs `.allow_all()`, empty `insert({})`/`update({})`, empty/invalid `IN`/`NOT IN`, `None` comparison operators, `where_like`/`where_ilike` literal escaping, and SQL parameter binding assertions).
+
+---
+
+### P3-D4: Transaction and Connection Ownership
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `TransactionClosedError(RuntimeError)` and `TransactionConnection` wrapper in `swiftpy/database/transaction.py` (and wrapped `transactional_test` in `swiftpy/testing/fixtures.py`), enforcing a `closed` state flag when a transaction block exits and serializing concurrent operations (`fetch`, `fetchrow`, `fetchval`, `execute`, `executemany`, and nested savepoint `transaction()`) on the same connection via a per-transaction `asyncio.Lock`.
+  - Reset `_active_connection` via `ContextVar.reset(token)` after marking the handle closed.
+  - Wired `UniqueRule` (`swiftpy/validation/rules/unique.py`) and `ExistsRule` (`swiftpy/validation/rules/exists.py`) with `requires_db = True` and `get_active_connection()` reuse before acquiring from `DatabasePool`.
+  - Updated `Validator.validate()` (`swiftpy/validation/validator.py`) to execute field and rule validation sequentially when `get_active_connection() is not None`.
+  - Eliminated circular imports by importing `get_container` from `swiftpy.core.container` instead of `swiftpy.core.bootstrap`.
+  - Created `tests/db/test_transaction_isolation.py` (5 tests covering child task post-exit `TransactionClosedError`, serialized `asyncio.gather` queries inside `transaction()`, `Validator` with `unique` + `exists` seeing uncommitted rows inside `transaction()`, `max_size=1` pool + `transaction()` + `unique` non-deadlock, and exception/cancellation connection release).
+
+---
+
+### P3-D5: Pool Configuration, SSL Modes & Safe Shutdown
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Guarded `DatabasePool.init()` with an `asyncio.Lock` so concurrent callers share a single pool initialization.
+  - Added `_build_ssl_context()` supporting `disable`, `require`, `verify-ca`, and `verify-full` plus `ssl_ca_file`, mapping boolean `True` / `"true"` to `require` with a logged warning for backward compatibility, and raising `ConfigurationError` on unsupported SSL modes.
+  - Wired `database.timeouts.statement` (`server_settings={"statement_timeout": ...}`) and `database.pool.command_timeout` into `asyncpg.create_pool()`.
+  - Updated `DatabasePool.close(timeout=5.0)` to use `asyncio.wait_for` and fall back to `pool.terminate()` on timeout so shutdown never hangs with in-flight connections.
+  - Lowered default `database.pool.max_size` from `50` to `20` in `swiftpy/database/pool.py` and `config/database.py`, and enforced non-empty database passwords in production/non-debug mode (`ConfigurationError` raised outside debug mode; warning logged in debug mode).
+  - Created `tests/db/test_pool_config.py` (5 tests covering SSL mode mapping, concurrent `init()`, `statement_timeout`/`max_size` wiring, production empty-password rejection, and `close(timeout=0.1)` with an in-flight connection).
+
+---
+
+### P3-D6: Migrations Hardening
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Whitelisted `ALLOWED_COLUMN_TYPES` in `ColumnDefinition` and `SchemaGrammar._compile_column`, and validated `length` (`1..10_485_760`), `precision` (`1..1000`), and `scale` (`0..precision`) as non-boolean integers in range.
+  - Validated all generated constraint and index names (`idx_`, `uq_`, `pk_`, `fk_`) via `validate_identifier` (enforcing the 63-character limit).
+  - Added `DefaultRaw` / `raw(sql)` helper for SQL default expressions (`Blueprint.timestamps()` now uses `raw("CURRENT_TIMESTAMP")`); legacy magic strings in `.default("NOW()")` emit a `DeprecationWarning`, while arbitrary strings and objects are single-quote escaped and non-finite floats raise `ValueError`.
+  - Updated `Migrator` to store SHA-256 checksums in `"checksum" VARCHAR(64)` (auto-upgrading existing migration tables with `ADD COLUMN IF NOT EXISTS`), fail with `RuntimeError` on checksum drift or out-of-order unapplied migrations, and validate `step >= 1` / `steps >= 1` with `ValueError`.
+  - Updated `swiftpy migrate`, `swiftpy migrate:rollback`, and added `swiftpy migrate:reset` in `swiftpy/console/commands/migrate.py` with `--step >= 1` validation and a production guard refusing execution when `APP_ENV=production` unless `--force` is passed.
+  - Extended `tests/migrations/test_migrations.py` with `test_blueprint_validation_and_raw_defaults`, `test_migrator_checksum_drift_and_out_of_order`, and `test_cli_step_validation_and_production_guard` (17 migration tests total).
+* **Quality Gate Results:** see the "Phase 3 closing gate" section below.
+
+---
+
+### Phase 3 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy swiftpy app config tests/db tests/migrations`: **Success: no issues found in 147 source files**
+  - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 3 tests (checked 187 source files).
+  - Targeted: `pytest -q tests/db/ tests/migrations/ tests/orm/ tests/validation/`: **121 passed in 63.47s**.
+  - Full suite: `pytest -q`: **433 passed in 182.79s** (408 post-Phase-2 + 25 new Phase 3 tests).
+
+---
+
+## Code Review Remediation – Phase 4: HTTP Correctness
+
+### P4-H1: `Response` Body, Multi-Value Headers (`Set-Cookie`) & CRLF Injection Prevention
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `ResponseHeaders(MutableMapping[str, str])` in `swiftpy/http/response.py` backed by an ordered list of `(name, value)` pairs, supporting case-insensitive dict-style access while preserving duplicate headers via `.add(name, value)`, `.getlist(name)`, and `.raw_items()`.
+  - Added `Response.set_cookie(...)` appending a `Set-Cookie` header without overwriting earlier cookies.
+  - Added `_validate_header_pair()` rejecting `\r`, `\n`, and `\x00` in header names and values with `ValueError`.
+  - Encoded `str` bodies as UTF-8, defaulted `Content-Type: text/plain; charset=utf-8` for `str` bodies when unset, and set `Content-Length` automatically on non-streaming responses (except `1xx`, `204`, `304`).
+  - Updated `TestResponse` and `TestClient` in `swiftpy/testing/http_client.py` to expose `ResponseHeaders` (`.getlist()`) and `.head()` / `.options()` helpers.
+
+---
+
+### P4-H2: JSON Encoding (`encode_json`) & `Model.__hidden__`
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `encode_json()` and `_json_default()` (`allow_nan=False`) in `swiftpy/http/response.py` supporting `datetime`/`date`/`time` (ISO-8601), `UUID` (`str`), `Decimal` (`str`), `Enum` (`.value`), and objects with `.to_dict()`, while rejecting `bytes` and `NaN`/`Infinity` with `TypeError`/`ValueError`.
+  - Added `__hidden__: ClassVar[set[str] | list[str] | tuple[str, ...]] = ()` on `Model` (`swiftpy/database/orm/model.py`) and updated `Model.to_dict()` to omit `__hidden__` fields and relations while preserving raw Python types on `.to_dict()`.
+  - Created `tests/http/test_response.py` (24 tests covering `P4-H1` and `P4-H2`).
+
+---
+
+### P4-H3: Router Precedence, Regex Escaping, Strict Path Coercion, WebSocket Isolation & Auto `HEAD`/`OPTIONS`
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Escaped literal path segments with `re.escape` in `Route.__post_init__` (`swiftpy/http/router.py`).
+  - Implemented static-first route precedence key `(num_dynamic, segment_kinds, -static_chars, order)` and per-method route lookup index `_routes_by_method`.
+  - Added duplicate `(method, normalized_path)` detection raising `RouteRegistrationError(ConfigurationError, TypeError)`.
+  - Added strict `_coerce_bool` (`true/false/1/0/yes/no`, case-insensitive) and finite `_coerce_float` (rejecting `NaN`/`Infinity`), raising `PathParamCoercionError(ValidationError)` (HTTP 422).
+  - Isolated `WEBSOCKET` routes to `match_websocket()`; HTTP requests with method `"WEBSOCKET"` never match WebSocket routes, and `add_route("WEBSOCKET", ...)` without `is_websocket=True` raises `RouteRegistrationError`.
+  - Added automatic `HEAD` fallback to `GET` (preserving `Content-Length` and stripping the response body) and automatic `OPTIONS` returning `204 No Content` with the `Allow` header.
+
+---
+
+### P4-H4: Dependency Injection into Handlers & Registration-Time Signature Caching
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `Container.can_resolve(target)` in `swiftpy/core/container.py` and updated `CurrentUser.__init__` in `swiftpy/auth/auth_manager.py` to default to reading `Context.get("__swiftpy_current_user__")`.
+  - Precomputed `inspect.signature`, `get_type_hints` (including caller-frame `localns`), `param_coercers`, and `param_specs` (`"request"`, `"path"`, `"form"`, `"di"`, `"default"`, `"websocket"`) once at route registration time in `swiftpy/http/router.py` and `swiftpy/core/application.py` (zero `inspect.signature` calls per request).
+  - Removed `.schema`/`.rules` duck-typing and the untyped first-parameter `Request` fallback; only `issubclass(ann, FormRequest)` is a body validator and only `issubclass(ann, Request)` injects `Request`. Unsatisfiable or untyped parameters without defaults raise `RouteRegistrationError` at registration time naming both the handler and the parameter.
+  - Created `tests/http/test_router.py` (29 tests covering `P4-H3` and `P4-H4`).
+
+---
+
+### P4-H5: Request Body Size Limits, Disconnect Handling, Header `getlist` & Cached Query Params
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `PayloadTooLargeError(HttpException)` (status 413) and `ClientDisconnect(Exception)` in `swiftpy/http/exceptions.py`.
+  - Enforced `max_body_size` (default `DEFAULT_MAX_BODY_SIZE = 2 MiB`, configurable on `Application` and per-route) in `Request.body()` (`swiftpy/http/request.py`) both up-front via `Content-Length` and while streaming chunks.
+  - Handled `{"type": "http.disconnect"}` mid-stream by raising `ClientDisconnect` and catching it in `Application.__call__` so the handler is not invoked and no 500 error is logged or sent.
+  - Added `RequestHeaders(Mapping[str, str])` decoding headers as `latin-1`, caching the result, and supporting `.getlist(name)` (preserving duplicates) and last-wins case-insensitive dict access.
+  - Cached `query_params` and `query_param_list` (decoded as UTF-8 with `errors="replace"`), moved `from urllib.parse import parse_qs` to top of `swiftpy/http/request.py`, and mapped direct `await request.json()` syntax/encoding/recursion errors to `HttpException(status_code=400)`.
+  - Created `tests/http/test_request.py` (9 tests covering `P4-H5`).
+
+---
+
+### P4-H6: Error Handling Pipeline, Production Debug Guard & Built-In Security Middleware
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Removed duck-typing on `.errors` in `ExceptionHandler` (`swiftpy/core/exceptions.py`); only `ValidationError` and `ValidationException` map to HTTP 422.
+  - Selected custom exception handlers by MRO specificity (`for cls in type(exc).__mro__:`), logged 4xx `HttpException` at `logger.info` and 5xx at `logger.error` without bodies, and guarded custom handlers and `ExceptionHandler.handle` with a safe 500 fallback.
+  - Refused `Application(debug=True)` when `APP_ENV=production` (`ConfigurationError`).
+  - Added `app.middleware([...])` global middleware pipeline wrapping `_dispatch_http` so global middleware executes before route-group middleware and post-processes 200, 404, 405, 422, and 500 responses.
+  - Populated `config/cors.py` with deny-all defaults (`allowed_origins: []`) and implemented `SecurityHeadersMiddleware` (`SecurityHeaders`), `RequestIdMiddleware` (`RequestId`), and `CORSMiddleware` (`CORS`) in `swiftpy/http/middleware.py`.
+  - Created `tests/http/test_error_pipeline.py` (10 tests covering `P4-H6`).
+* **Quality Gate Results:** see the "Phase 4 closing gate" section below.
+
+---
+
+### Phase 4 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy swiftpy app config tests/http tests/core tests/validation tests/websockets tests/testing`: **Success: no issues found in 154 source files**
+  - `mypy .`: 25 errors in 1 file (`tests/orm/test_eager_loading.py`). These are the same relation-typing errors recorded in the Phase 0 baseline and scheduled for P7-M6. Zero errors in `swiftpy/` or Phase 4 tests (checked 191 source files).
+  - Targeted: `pytest -q -p no:cacheprovider tests/http/ tests/core/ tests/validation/ tests/websockets/ tests/testing/`: **148 passed in 71.61s**.
+  - Full suite: `pytest -q -p no:cacheprovider`: **473 passed in 250.95s** (433 post-Phase-3 + 40 new Phase 4 tests).
+
+
 
 
 

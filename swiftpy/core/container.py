@@ -163,6 +163,69 @@ class Container:
         """Determine whether an interface or service has been registered in the container."""
         return interface in self._bindings or interface in self._singletons
 
+    def can_resolve(
+        self,
+        target: Any,
+        _seen: frozenset[type[Any]] | None = None,
+    ) -> bool:
+        """
+        Determine whether `target` can be satisfied by this container
+        (either via an explicit binding or constructor auto-wiring).
+        """
+        if target is inspect.Parameter.empty or target is Any or target is object:
+            return False
+
+        try:
+            if self.has(target):
+                return True
+        except TypeError:
+            return False
+
+        if target in PRIMITIVE_TYPES or not inspect.isclass(target):
+            return False
+
+        if inspect.isabstract(target):
+            return False
+
+        seen = _seen or frozenset()
+        if target in seen:
+            return False
+
+        init_method = target.__init__
+        if init_method is object.__init__:
+            return True
+
+        try:
+            signature = inspect.signature(init_method)
+        except (TypeError, ValueError):
+            return False
+
+        try:
+            type_hints = get_type_hints(init_method)
+        except (NameError, TypeError, ValueError):
+            type_hints = {}
+
+        parameters = list(signature.parameters.items())
+        if parameters:
+            parameters = parameters[1:]
+
+        next_seen = seen | {target}
+        for name, parameter in parameters:
+            if parameter.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+
+            if parameter.default is not inspect.Parameter.empty:
+                continue
+
+            param_type = type_hints.get(name, parameter.annotation)
+            if not self.can_resolve(param_type, next_seen):
+                return False
+
+        return True
+
     def resolve(self, target: type[T]) -> T:
         """
         Resolve a dependency from the container.

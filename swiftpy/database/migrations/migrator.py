@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import time
@@ -12,7 +13,7 @@ from typing import Any
 
 import asyncpg
 
-from swiftpy.core.bootstrap import get_container
+from swiftpy.core.container import get_container
 from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.migrations.lock import MigrationLock
 from swiftpy.database.migrations.migration import Migration, MigrationProtocol
@@ -36,6 +37,7 @@ class MigrationRecord:
     migration: str
     batch: int
     applied_at: datetime
+    checksum: str | None = None
 
 
 class _FunctionMigrationAdapter:
@@ -81,6 +83,11 @@ class Migrator:
         self.table_name: str = validate_identifier(table_name)
         self.lock_timeout: float = lock_timeout
 
+    @staticmethod
+    def compute_checksum(file: MigrationFile) -> str:
+        """Compute the SHA-256 hex digest of a migration file's contents."""
+        return hashlib.sha256(file.path.read_bytes()).hexdigest()
+
     def get_migration_files(self) -> list[MigrationFile]:
         """Discover all migration Python files in the migrations directory, sorted by timestamp prefix."""
         if not self.migrations_dir.exists():
@@ -103,10 +110,14 @@ class Migrator:
                 "id" SERIAL PRIMARY KEY,
                 "migration" VARCHAR(255) NOT NULL UNIQUE,
                 "batch" INTEGER NOT NULL,
+                "checksum" VARCHAR(64),
                 "applied_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
         """
         await conn.execute(sql)
+        await conn.execute(
+            f'ALTER TABLE "{self.table_name}" ADD COLUMN IF NOT EXISTS "checksum" VARCHAR(64);'
+        )
 
     async def get_ran_migrations(self, conn: asyncpg.Connection) -> list[str]:
         """Fetch all migration names that have already been executed."""
@@ -114,6 +125,20 @@ class Migrator:
             f'SELECT "migration" FROM "{self.table_name}" ORDER BY "batch" ASC, "id" ASC;'
         )
         return [str(r["migration"]) for r in rows]
+
+    async def _get_ran_checksums(
+        self, conn: asyncpg.Connection
+    ) -> dict[str, str | None]:
+        """Fetch applied migration names mapped to their recorded SHA-256 checksums."""
+        rows = await conn.fetch(
+            f'SELECT "migration", "checksum" FROM "{self.table_name}" ORDER BY "batch" ASC, "id" ASC;'
+        )
+        return {
+            str(r["migration"]): (
+                str(r["checksum"]) if r["checksum"] is not None else None
+            )
+            for r in rows
+        }
 
     async def get_last_batch(self, conn: asyncpg.Connection) -> int:
         """Fetch the highest batch number recorded."""
@@ -178,6 +203,11 @@ class Migrator:
         Run all pending migrations within a transactional advisory lock.
         Returns the list of migration names applied in this batch.
         """
+        if step is not None and (
+            isinstance(step, bool) or not isinstance(step, int) or step < 1
+        ):
+            raise ValueError(f"step must be an integer >= 1, got {step!r}")
+
         raw_pool = self.pool.get_pool()
 
         async with (
@@ -187,13 +217,35 @@ class Migrator:
             await self.ensure_repository(conn)
 
             files = self.get_migration_files()
-            ran = await self.get_ran_migrations(conn)
+            ran_checksums = await self._get_ran_checksums(conn)
+            ran = list(ran_checksums.keys())
 
-            pending = [f for f in files if f.name not in ran]
+            # Verify no checksum drift on already-applied migrations
+            for file in files:
+                if file.name in ran_checksums:
+                    recorded = ran_checksums[file.name]
+                    current = self.compute_checksum(file)
+                    if recorded is not None and recorded != current:
+                        raise RuntimeError(
+                            f"Migration checksum drift detected for '{file.name}': "
+                            f"recorded {recorded}, current file {current}"
+                        )
+
+            pending = [f for f in files if f.name not in ran_checksums]
             if not pending:
                 return []
 
-            if step is not None and step > 0:
+            # Detect out-of-order unapplied migrations that sort before an already-applied migration
+            if ran:
+                max_applied = max(ran)
+                for file in pending:
+                    if file.name < max_applied:
+                        raise RuntimeError(
+                            f"Out-of-order unapplied migration '{file.name}' precedes "
+                            f"already-applied migration '{max_applied}'."
+                        )
+
+            if step is not None:
                 pending = pending[:step]
 
             next_batch = (await self.get_last_batch(conn)) + 1
@@ -204,14 +256,17 @@ class Migrator:
             try:
                 for file in pending:
                     started = time.perf_counter()
+                    checksum = self.compute_checksum(file)
                     instance = self.resolve_migration_instance(file)
 
                     async with conn.transaction():
                         await instance.up()
                         await conn.execute(
-                            f'INSERT INTO "{self.table_name}" ("migration", "batch") VALUES ($1, $2);',
+                            f'INSERT INTO "{self.table_name}" ("migration", "batch", "checksum") '
+                            f"VALUES ($1, $2, $3);",
                             file.name,
                             next_batch,
+                            checksum,
                         )
                     duration_ms = (time.perf_counter() - started) * 1000
                     applied.append(file.name)
@@ -231,8 +286,8 @@ class Migrator:
         Roll back the last batch of migrations (or the last N batches if steps > 1).
         Returns the list of migration names rolled back.
         """
-        if steps <= 0:
-            return []
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"steps must be an integer >= 1, got {steps!r}")
 
         raw_pool = self.pool.get_pool()
 
@@ -352,7 +407,7 @@ class Migrator:
             await self.ensure_repository(conn)
 
             rows = await conn.fetch(
-                f'SELECT "migration", "batch", "applied_at" FROM "{self.table_name}";'
+                f'SELECT "migration", "batch", "checksum", "applied_at" FROM "{self.table_name}";'
             )
             records = {str(r["migration"]): r for r in rows}
 
@@ -361,12 +416,24 @@ class Migrator:
 
             for f in files:
                 rec = records.get(f.name)
+                current_checksum = self.compute_checksum(f)
+                recorded_checksum = (
+                    str(rec["checksum"])
+                    if rec is not None and rec["checksum"] is not None
+                    else None
+                )
                 statuses.append(
                     {
                         "migration": f.name,
                         "ran": rec is not None,
                         "batch": rec["batch"] if rec else None,
                         "applied_at": rec["applied_at"] if rec else None,
+                        "checksum": recorded_checksum or current_checksum,
+                        "checksum_valid": (
+                            True
+                            if recorded_checksum is None
+                            else recorded_checksum == current_checksum
+                        ),
                     }
                 )
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import (
     Any,
@@ -10,8 +10,10 @@ from typing import (
     TypeVar,
     get_origin,
     get_type_hints,
+    overload,
 )
 
+from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.orm.registry import _MODEL_REGISTRY
 from swiftpy.database.orm.relationships import (
     BelongsTo,
@@ -29,6 +31,10 @@ T = TypeVar("T", bound="Model")
 _MISSING = object()
 
 
+class PrimaryKeyError(RuntimeError, ValueError):
+    """Raised when a primary key is invalid, composite, or missing on a persisted model."""
+
+
 class ModelQueryBuilder[T: Model]:
     """Hydrates database records into strongly typed Active Record Model instances."""
 
@@ -37,11 +43,54 @@ class ModelQueryBuilder[T: Model]:
         self.builder = Query.table(model_cls.__table__)
         self._eager_loads: list[str] = []
 
+    def clone(self) -> Self:
+        """Create an independent copy of this ModelQueryBuilder."""
+        cloned = self.__class__(self.model_cls)
+        cloned.builder = self.builder.clone()
+        cloned._eager_loads = list(self._eager_loads)
+        return cloned
+
+    def allow_all(self) -> Self:
+        """Explicitly permit mass UPDATE or DELETE queries without a WHERE clause (Decision D-10)."""
+        self.builder.allow_all()
+        return self
+
     def where(self, column: str, operator_or_value: Any, value: Any = _MISSING) -> Self:
         if value is _MISSING:
             self.builder.where(column, operator_or_value)
         else:
             self.builder.where(column, operator_or_value, value)
+        return self
+
+    def where_in(self, column: str, values: list[Any]) -> Self:
+        self.builder.where_in(column, values)
+        return self
+
+    def where_not_in(self, column: str, values: list[Any]) -> Self:
+        self.builder.where_not_in(column, values)
+        return self
+
+    def where_like(
+        self,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> Self:
+        self.builder.where_like(
+            column, value, case_insensitive=case_insensitive, match=match
+        )
+        return self
+
+    def where_ilike(
+        self,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> Self:
+        self.builder.where_ilike(column, value, match=match)
         return self
 
     def where_null(self, column: str) -> Self:
@@ -72,8 +121,23 @@ class ModelQueryBuilder[T: Model]:
         self.builder.select(*columns)
         return self
 
-    async def count(self) -> int:
-        return await self.builder.count()
+    async def count(self, column: str = "*") -> int:
+        return await self.builder.count(column)
+
+    async def exists(self) -> bool:
+        return await self.builder.exists()
+
+    async def sum(self, column: str) -> Any:
+        return await self.builder.sum(column)
+
+    async def min(self, column: str) -> Any:
+        return await self.builder.min(column)
+
+    async def max(self, column: str) -> Any:
+        return await self.builder.max(column)
+
+    async def avg(self, column: str) -> Any:
+        return await self.builder.avg(column)
 
     async def get(self) -> list[T]:
         rows = await self.builder.get()
@@ -90,12 +154,32 @@ class ModelQueryBuilder[T: Model]:
         return instances
 
     async def first(self) -> T | None:
-        self.limit(1)
-        res = await self.get()
+        res = await self.clone().limit(1).get()
         return res[0] if res else None
 
-    async def insert(self, data: dict[str, Any]) -> int:
-        return await self.builder.insert(data)
+    async def insert_returning(
+        self,
+        data: dict[str, Any],
+        *,
+        returning: Sequence[str] | str | None = None,
+    ) -> dict[str, Any]:
+        return await self.builder.insert_returning(data, returning=returning)
+
+    @overload
+    async def insert(self, data: dict[str, Any], *, returning: None = None) -> int: ...
+
+    @overload
+    async def insert(
+        self, data: dict[str, Any], *, returning: Sequence[str] | str
+    ) -> Any: ...
+
+    async def insert(
+        self,
+        data: dict[str, Any],
+        *,
+        returning: Sequence[str] | str | None = None,
+    ) -> Any:
+        return await self.builder.insert(data, returning=returning)
 
     async def update(self, data: dict[str, Any]) -> str:
         return await self.builder.update(data)
@@ -122,6 +206,7 @@ class Model:
     __table__: ClassVar[str]
     __primary_key__: ClassVar[str] = "id"
     __fillable__: ClassVar[set[str] | list[str] | tuple[str, ...] | None] = None
+    __hidden__: ClassVar[set[str] | list[str] | tuple[str, ...]] = ()
 
     __fields__: ClassVar[dict[str, Any]]
     __field_defaults__: ClassVar[dict[str, Any]]
@@ -129,6 +214,15 @@ class Model:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
+
+        # 0. Validate primary key declaration (composite keys are explicitly unsupported)
+        raw_pk = getattr(cls, "__primary_key__", "id")
+        if not isinstance(raw_pk, str) or "," in raw_pk or not raw_pk.strip():
+            raise PrimaryKeyError(
+                f"Composite or non-string primary keys are not supported on {cls.__name__}; "
+                "__primary_key__ must be a single valid column identifier."
+            )
+        cls.__primary_key__ = validate_identifier(raw_pk, param_name="__primary_key__")
 
         # 1. Determine table name if not explicitly set (overridable via __table__)
         if "__table__" not in cls.__dict__:
@@ -281,14 +375,10 @@ class Model:
             if isinstance(val, Model):
                 data[key] = val.get_primary_key()
 
-        pk = await cls.query().insert(data)
-        instance = await cls.find(pk)
-
-        if instance is None:
-            inst = cls(**data)
-            setattr(inst, cls.__primary_key__, pk)
-            inst._mark_persisted([*data, cls.__primary_key__])
-            instance = inst
+        row = await cls.query().insert_returning(data)
+        merged = {**data, **row}
+        instance = cls(**merged)
+        instance._mark_persisted(merged.keys())
 
         await EventDispatcher.get_instance().dispatch(
             f"{snake_case(cls.__name__)}.created", instance
@@ -300,7 +390,12 @@ class Model:
         pk_name = self.__primary_key__
         pk = getattr(self, pk_name, None)
 
-        if self._exists and pk is not None:
+        if self._exists:
+            if pk is None:
+                raise PrimaryKeyError(
+                    f"Cannot save existing {self.__class__.__name__} without primary key '{pk_name}'."
+                )
+
             changed = {
                 name: self._persistable(getattr(self, name))
                 for name, original in self._original.items()
@@ -323,12 +418,21 @@ class Model:
         data = {
             name: self._persistable(getattr(self, name))
             for name in self.__fields__
-            if name != pk_name
-            and (name in self._init_keys or getattr(self, name, None) is not None)
+            if (
+                (
+                    name != pk_name
+                    and (
+                        name in self._init_keys or getattr(self, name, None) is not None
+                    )
+                )
+                or (name == pk_name and getattr(self, name, None) is not None)
+            )
         }
-        pk = await self.__class__.query().insert(data)
-        setattr(self, pk_name, pk)
-        self._mark_persisted([*data, pk_name])
+        row = await self.__class__.query().insert_returning(data)
+        for col, val in row.items():
+            if col in self.__fields__ or col == pk_name:
+                setattr(self, col, val)
+        self._mark_persisted([*data, *row])
         await EventDispatcher.get_instance().dispatch(
             f"{snake_case(self.__class__.__name__)}.created", self
         )
@@ -381,9 +485,14 @@ class Model:
         return attrs
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the model and its loaded relations to a dictionary."""
-        data = self.get_attributes()
+        """Convert the model and its loaded relations to a raw dictionary, omitting __hidden__ fields."""
+        hidden = set(getattr(self, "__hidden__", ()) or ())
+        data = {
+            k: v for k, v in self.get_attributes().items() if k not in hidden
+        }
         for rel_name, rel_value in self._loaded_relations.items():
+            if rel_name in hidden:
+                continue
             if isinstance(rel_value, list):
                 data[rel_name] = [
                     item.to_dict() if isinstance(item, Model) else item
@@ -469,4 +578,4 @@ class Model:
         return hash(id(self))
 
 
-__all__ = ["Model", "ModelQueryBuilder"]
+__all__ = ["Model", "ModelQueryBuilder", "PrimaryKeyError"]

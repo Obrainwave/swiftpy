@@ -16,6 +16,7 @@ from swiftpy.auth.api_key_guard import (
     verify_api_key_hash,
 )
 from swiftpy.auth.exceptions import InvalidApiKeyError
+from swiftpy.core.application import Application
 from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, set_container
 from swiftpy.database.pool import DatabasePool
@@ -69,6 +70,56 @@ def test_missing_pepper_in_production_fails(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.delenv("API_KEY_PEPPER", raising=False)
     with pytest.raises(ConfigurationError, match=r"(?i)pepper"):
         get_server_pepper(cfg)
+
+
+def test_short_pepper_rejected_everywhere() -> None:
+    cfg = Config({
+        "app": {"debug": True},
+        "auth": {"guards": {"api_key": {"pepper": "too-short-pepper"}}},
+    })
+    with pytest.raises(ConfigurationError, match=r"(?i)at least 32 bytes"):
+        get_server_pepper(cfg)
+
+    with pytest.raises(ConfigurationError, match=r"(?i)at least 32 bytes"):
+        hash_api_key("secret", pepper="short")
+
+    with pytest.raises(ConfigurationError, match=r"(?i)at least 32 bytes"):
+        verify_api_key_hash("secret", "0" * 64, pepper=b"short")
+
+    with pytest.raises(ConfigurationError, match=r"(?i)at least 32 bytes"):
+        ApiKeyGuard(pepper="short-pepper")
+
+
+def test_application_boot_missing_or_short_pepper_non_debug_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AUTH_KEY_PEPPER", raising=False)
+    monkeypatch.delenv("API_KEY_PEPPER", raising=False)
+    app_missing = Application(
+        debug=False,
+        config={
+            "app": {"debug": False, "env": "production"},
+            "auth": {
+                "defaults": {"guard": "api_key"},
+                "guards": {"api_key": {"pepper": None}},
+            },
+        },
+    )
+    with pytest.raises(ConfigurationError, match=r"(?i)AUTH_KEY_PEPPER"):
+        app_missing.boot()
+
+    app_short = Application(
+        debug=False,
+        config={
+            "app": {"debug": False, "env": "production"},
+            "auth": {
+                "defaults": {"guard": "api_key"},
+                "guards": {"api_key": {"pepper": "short-pepper"}},
+            },
+        },
+    )
+    with pytest.raises(ConfigurationError, match=r"(?i)at least 32 bytes"):
+        app_short.boot()
 
 
 def test_api_key_guard_from_config() -> None:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from collections.abc import Sequence
+from typing import Any, cast, overload
 
 import asyncpg
 
-from swiftpy.core.bootstrap import get_container
+from swiftpy.core.container import get_container
 from swiftpy.database.identifiers import (
     quote_identifier,
     validate_column_identifier,
@@ -48,6 +49,15 @@ class Raw:
 SelectExpression = str | Column | Raw
 
 
+class QueryError(ValueError, RuntimeError):
+    """Raised when constructing or executing an invalid or unguarded SQL query."""
+
+
+def escape_like(value: str) -> str:
+    """Escape SQL LIKE/ILIKE wildcard characters (\\, %, _) for literal substring matching."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class QueryBuilder:
     def __init__(self, table_name: str) -> None:
         self._table = validate_identifier(table_name, allow_dotted=True)
@@ -58,6 +68,25 @@ class QueryBuilder:
         self._order_column: str | None = None
         self._order_direction: str = "ASC"
         self._limit_value: int | None = None
+        self._allow_all: bool = False
+
+    def clone(self) -> QueryBuilder:
+        """Create an independent copy of this QueryBuilder so terminal operations do not mutate it."""
+        cloned = QueryBuilder(self._table)
+        cloned._columns = list(self._columns)
+        cloned._wheres = list(self._wheres)
+        cloned._joins = list(self._joins)
+        cloned._raw_wheres = list(self._raw_wheres)
+        cloned._order_column = self._order_column
+        cloned._order_direction = self._order_direction
+        cloned._limit_value = self._limit_value
+        cloned._allow_all = self._allow_all
+        return cloned
+
+    def allow_all(self) -> QueryBuilder:
+        """Explicitly permit mass UPDATE or DELETE queries without a WHERE clause (Decision D-10)."""
+        self._allow_all = True
+        return self
 
     def select(self, *columns: SelectExpression) -> QueryBuilder:
 
@@ -88,7 +117,24 @@ class QueryBuilder:
             value = operator_or_value
 
         else:
-            operator = str(operator_or_value).upper()
+            operator = " ".join(str(operator_or_value).upper().split())
+
+        allowed = {
+            "=",
+            "!=",
+            "<>",
+            "<",
+            ">",
+            "<=",
+            ">=",
+            "LIKE",
+            "ILIKE",
+            "IN",
+            "NOT IN",
+        }
+
+        if operator not in allowed:
+            raise QueryError(f"Unsupported operator: {operator}")
 
         if value is None:
             if operator == "=":
@@ -99,14 +145,66 @@ class QueryBuilder:
                 self._wheres.append((column, "IS NOT", None))
                 return self
 
-        allowed = {"=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "ILIKE", "IN"}
+            raise QueryError(
+                f"Cannot compare NULL using operator '{operator}'. Use '=' / '!=' or where_null() / where_not_null()."
+            )
 
-        if operator not in allowed:
-            raise ValueError(f"Unsupported operator: {operator}")
+        if operator in {"IN", "NOT IN"} and not isinstance(value, (list, QueryBuilder)):
+            raise QueryError(
+                f"Operator '{operator}' requires a list or QueryBuilder subquery, got {type(value).__name__}."
+            )
 
         self._wheres.append((column, operator, value))
 
         return self
+
+    def where_in(self, column: str, values: list[Any] | QueryBuilder) -> QueryBuilder:
+        """Add a WHERE column IN (...) clause."""
+        return self.where(column, "IN", values)
+
+    def where_not_in(
+        self, column: str, values: list[Any] | QueryBuilder
+    ) -> QueryBuilder:
+        """Add a WHERE column NOT IN (...) clause."""
+        return self.where(column, "NOT IN", values)
+
+    def where_like(
+        self,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> QueryBuilder:
+        """
+        Add a safe LIKE / ILIKE clause that escapes %, _, and \\ wildcards in user input
+        and emits an explicit ESCAPE '\\' clause.
+        """
+        escaped = escape_like(str(value))
+        match_mode = match.lower()
+        if match_mode == "contains":
+            pattern = f"%{escaped}%"
+        elif match_mode in {"starts_with", "prefix"}:
+            pattern = f"{escaped}%"
+        elif match_mode in {"ends_with", "suffix"}:
+            pattern = f"%{escaped}"
+        elif match_mode == "exact":
+            pattern = escaped
+        else:
+            raise QueryError(f"Unsupported LIKE match mode: {match}")
+
+        op = "ILIKE" if case_insensitive else "LIKE"
+        return self.where(column, op, pattern)
+
+    def where_ilike(
+        self,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> QueryBuilder:
+        """Add a safe case-insensitive ILIKE clause with escaped wildcards."""
+        return self.where_like(column, value, case_insensitive=True, match=match)
 
     def where_raw(self, sql: str, bindings: list[Any] | None = None) -> QueryBuilder:
         """
@@ -261,7 +359,11 @@ class QueryBuilder:
 
                 continue
 
-            if operator == "IN" and isinstance(value, list):
+            if operator in {"IN", "NOT IN"} and isinstance(value, list):
+                if not value:
+                    clauses.append("FALSE" if operator == "IN" else "TRUE")
+                    continue
+
                 placeholders: list[str] = []
 
                 for item in value:
@@ -269,12 +371,18 @@ class QueryBuilder:
                     bindings.append(item)
                     idx += 1
 
-                clauses.append(f"{col_quoted} IN ({', '.join(placeholders)})")
+                clauses.append(f"{col_quoted} {operator} ({', '.join(placeholders)})")
 
                 continue
 
             if value is None and operator in {"IS", "IS NOT"}:
                 clauses.append(f"{col_quoted} {operator} NULL")
+                continue
+
+            if operator in {"LIKE", "ILIKE"}:
+                clauses.append(f"{col_quoted} {operator} ${idx} ESCAPE '\\'")
+                bindings.append(value)
+                idx += 1
                 continue
 
             clauses.append(f"{col_quoted} {operator} ${idx}")
@@ -339,24 +447,25 @@ class QueryBuilder:
             await self._release(conn)
 
     async def first(self) -> dict[str, Any] | None:
-        self.limit(1)
-
-        rows = await self.get()
-
+        rows = await self.clone().limit(1).get()
         return rows[0] if rows else None
 
+    async def exists(self) -> bool:
+        """Return True if at least one row matches the current query."""
+        cloned = self.clone()
+        cloned._columns = [Raw("1")]
+        cloned._order_column = None
+        row = await cloned.first()
+        return row is not None
+
     async def _aggregate(self, function: str, column: str) -> Any:
-        col_safe = quote_identifier(column) if column != "*" else "*"
-
-        # Store original columns to restore later
-        original = self._columns
-
-        try:
-            self._columns = [Raw(f"{function}({col_safe}) AS agg_result")]
-            row = await self.first()
-        finally:
-            self._columns = original
-
+        col_safe = (
+            quote_identifier(column, allow_wildcard=False) if column != "*" else "*"
+        )
+        cloned = self.clone()
+        cloned._columns = [Raw(f"{function}({col_safe}) AS agg_result")]
+        cloned._order_column = None
+        row = await cloned.first()
         return row["agg_result"] if row else None
 
     async def count(self, column: str = "*") -> int:
@@ -374,7 +483,16 @@ class QueryBuilder:
     async def avg(self, column: str) -> Any:
         return await self._aggregate("AVG", column)
 
-    async def insert(self, data: dict[str, Any]) -> int:
+    async def insert_returning(
+        self,
+        data: dict[str, Any],
+        *,
+        returning: Sequence[str] | str | None = None,
+    ) -> dict[str, Any]:
+        """Insert a row and return the RETURNING row as a dictionary."""
+        if not isinstance(data, dict) or not data:
+            raise QueryError("Cannot execute INSERT with empty data dictionary.")
+
         columns = [
             quote_identifier(column, allow_dotted=False, allow_wildcard=False)
             for column in data
@@ -384,11 +502,26 @@ class QueryBuilder:
 
         placeholders = [f"${i}" for i in range(1, len(values) + 1)]
 
+        if returning is None or returning == "*":
+            returning_clause = "*"
+        elif isinstance(returning, str):
+            returning_clause = quote_identifier(
+                returning, allow_dotted=False, allow_wildcard=False
+            )
+        else:
+            returning_cols = [
+                quote_identifier(col, allow_dotted=False, allow_wildcard=False)
+                for col in returning
+            ]
+            if not returning_cols:
+                raise ValueError("returning list cannot be empty")
+            returning_clause = ", ".join(returning_cols)
+
         sql = (
             f"INSERT INTO {quote_identifier(self._table)} "
             f"({', '.join(columns)}) "
             f"VALUES ({', '.join(placeholders)}) "
-            f"RETURNING *"
+            f"RETURNING {returning_clause}"
         )
 
         conn = await self._connection()
@@ -399,18 +532,51 @@ class QueryBuilder:
             if row is None:
                 raise RuntimeError("Insert failed")
 
-            if "id" in row and row["id"] is not None:
-                try:
-                    return int(row["id"])
-                except (ValueError, TypeError):
-                    return 0
-
-            return 0
+            return dict(row)
 
         finally:
             await self._release(conn)
 
+    @overload
+    async def insert(self, data: dict[str, Any], *, returning: None = None) -> int: ...
+
+    @overload
+    async def insert(
+        self, data: dict[str, Any], *, returning: Sequence[str] | str
+    ) -> Any: ...
+
+    async def insert(
+        self,
+        data: dict[str, Any],
+        *,
+        returning: Sequence[str] | str | None = None,
+    ) -> Any:
+        row = await self.insert_returning(data, returning=returning)
+
+        if returning is not None:
+            if isinstance(returning, str) and returning != "*":
+                return row.get(returning)
+            if not isinstance(returning, str) and len(returning) == 1:
+                return row.get(returning[0])
+            return row
+
+        if "id" in row and row["id"] is not None:
+            try:
+                return int(row["id"])
+            except (ValueError, TypeError):
+                return 0
+
+        return 0
+
     async def update(self, data: dict[str, Any]) -> str:
+        if not isinstance(data, dict) or not data:
+            raise QueryError("Cannot execute UPDATE with empty data dictionary.")
+
+        if not self._wheres and not self._raw_wheres and not self._allow_all:
+            raise QueryError(
+                "Refusing to execute UPDATE without a WHERE clause. Call .allow_all() to update all rows explicitly."
+            )
+
         bindings: list[Any] = []
 
         sets: list[str] = []
@@ -441,6 +607,11 @@ class QueryBuilder:
             await self._release(conn)
 
     async def delete(self) -> str:
+        if not self._wheres and not self._raw_wheres and not self._allow_all:
+            raise QueryError(
+                "Refusing to execute DELETE without a WHERE clause. Call .allow_all() to delete all rows explicitly."
+            )
+
         where_sql, bindings, _ = self._compile_where()
 
         sql = f"DELETE FROM {quote_identifier(self._table)}{where_sql}"

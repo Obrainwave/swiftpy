@@ -30,13 +30,24 @@ logger = logging.getLogger("swiftpy.auth.api_key")
 
 _EPHEMERAL_PEPPER: bytes | None = None
 _DUMMY_HASH: str = "0" * 64
+MIN_PEPPER_BYTES: int = 32
+
+
+def _validate_pepper_bytes(pepper: str | bytes, *, source: str = "AUTH_KEY_PEPPER") -> bytes:
+    """Validate that a server pepper is at least MIN_PEPPER_BYTES (32 bytes) in UTF-8."""
+    pepper_bytes = pepper.encode("utf-8") if isinstance(pepper, str) else bytes(pepper)
+    if len(pepper_bytes) < MIN_PEPPER_BYTES:
+        raise ConfigurationError(
+            f"{source} must be at least {MIN_PEPPER_BYTES} bytes (got {len(pepper_bytes)} bytes)."
+        )
+    return pepper_bytes
 
 
 def get_server_pepper(config: Config | None = None) -> bytes:
     """
     Retrieve the server pepper used for HMAC-SHA256 API key hashing (Decision D-2).
 
-    In production (debug=False), fails fast if AUTH_KEY_PEPPER is missing.
+    In production (debug=False), fails fast if AUTH_KEY_PEPPER is missing or <32 bytes.
     In debug/development mode, if missing, generates a per-process ephemeral pepper and logs a warning.
     """
     global _EPHEMERAL_PEPPER
@@ -55,7 +66,10 @@ def get_server_pepper(config: Config | None = None) -> bytes:
         or cfg.get("api_key_pepper")
     )
     if raw_pepper is not None and str(raw_pepper).strip():
-        return str(raw_pepper).encode("utf-8")
+        return _validate_pepper_bytes(
+            raw_pepper if isinstance(raw_pepper, bytes) else str(raw_pepper),
+            source="AUTH_KEY_PEPPER",
+        )
 
     app_env = str(cfg.get("app.env") or cfg.get("env") or "development").lower()
     debug_val = cfg.get("app.debug") if cfg.get("app.debug") is not None else cfg.get("debug")
@@ -107,7 +121,7 @@ def hash_api_key(
     or fallback to bcrypt if rounds is explicitly provided without pepper.
     """
     if pepper is not None:
-        p_bytes = pepper.encode("utf-8") if isinstance(pepper, str) else pepper
+        p_bytes = _validate_pepper_bytes(pepper, source="Server pepper")
         return hmac.new(
             p_bytes, raw_key_or_secret.encode("utf-8"), hashlib.sha256
         ).hexdigest()
@@ -135,7 +149,7 @@ def verify_api_key_hash(
             return False
 
     if pepper is not None:
-        p_bytes = pepper.encode("utf-8") if isinstance(pepper, str) else pepper
+        p_bytes = _validate_pepper_bytes(pepper, source="Server pepper")
         computed = hmac.new(
             p_bytes, raw_key_or_secret.encode("utf-8"), hashlib.sha256
         ).hexdigest()
@@ -275,9 +289,9 @@ async def require_api_key(
         )
 
     active_pepper = (
-        pepper.encode("utf-8")
-        if isinstance(pepper, str)
-        else (pepper if pepper is not None else get_server_pepper())
+        _validate_pepper_bytes(pepper, source="Server pepper")
+        if pepper is not None
+        else get_server_pepper()
     )
 
     # 7. Single-row O(1) indexed lookup by key_prefix
@@ -374,6 +388,8 @@ class ApiKeyGuard(Middleware):
         self.prefix_column = validate_identifier(prefix_column, param_name="prefix_column")
         self.hash_column = validate_identifier(hash_column, param_name="column")
         self.header_name = header_name
+        if pepper is not None:
+            _validate_pepper_bytes(pepper, source="Server pepper")
         self.pepper = pepper
         self.pool = pool
 

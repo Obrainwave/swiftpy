@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from swiftpy.auth import AuthManager, CurrentUser, JWTIssuer, TokenBlacklist
+from swiftpy.auth import (
+    AuthManager,
+    CurrentUser,
+    JWTIssuer,
+    TokenBlacklist,
+    get_server_pepper,
+)
 from swiftpy.core.config import Config
 from swiftpy.core.context import Context
 from swiftpy.core.providers.base import ServiceProvider
@@ -48,5 +54,8 @@ class AuthServiceProvider(ServiceProvider):
             default_guard = str(
                 cfg.get("auth.defaults.guard") or cfg.get("auth.default") or "jwt"
             ).lower()
-            if not is_debug and default_guard == "jwt" and self.container.has(JWTIssuer):
-                self.container.resolve(JWTIssuer)
+            if not is_debug:
+                if default_guard == "jwt" and self.container.has(JWTIssuer):
+                    self.container.resolve(JWTIssuer)
+                elif default_guard == "api_key":
+                    get_server_pepper(cfg)

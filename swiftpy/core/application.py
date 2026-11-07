@@ -8,25 +8,27 @@ import sys
 from collections.abc import Awaitable, Callable, Sequence
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from typing import Any, TypeVar, get_type_hints
+from typing import Any, Self, TypeVar
 
-from swiftpy.core.config import Config
+from swiftpy.auth.auth_manager import CurrentUser
+from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, set_container
 from swiftpy.core.context import Context
 from swiftpy.core.exceptions import ExceptionHandler
 from swiftpy.core.providers.base import ServiceProvider
-from swiftpy.http.middleware import MiddlewarePipeline
-from swiftpy.http.request import Request
+from swiftpy.http.exceptions import ClientDisconnect, HttpException
+from swiftpy.http.middleware import Middleware, MiddlewarePipeline
+from swiftpy.http.request import DEFAULT_MAX_BODY_SIZE, Request
 from swiftpy.http.response import (
+    Response,
+    json_response,
     not_found,
-    unprocessable,
 )
-from swiftpy.http.router import PathParamCoercionError, RouteGroup, Router
+from swiftpy.http.router import PathParamCoercionError, Route, RouteGroup, Router
 from swiftpy.validation.exceptions import ValidationException
 from swiftpy.validation.form_request import FormRequest
 from swiftpy.validation.validator import validate
 from swiftpy.websockets.connection import (
-    WebSocket,
     WebSocketConnection,
     WebSocketDisconnect,
 )
@@ -116,8 +118,10 @@ class Application:
         debug: bool = False,
         config: dict[str, Any] | Config | None = None,
         providers: Sequence[type[ServiceProvider]] | None = None,
+        middleware: Sequence[type[Middleware]] | None = None,
         auto_discover_providers: bool = True,
         providers_path: str | Path | None = None,
+        max_body_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.title = title
@@ -126,8 +130,9 @@ class Application:
         self.extra = kwargs
 
         self.container = Container()
-        self.router = Router()
+        self.router = Router(container=self.container)
         self._providers: list[ServiceProvider] = []
+        self._middleware: list[type[Middleware]] = list(middleware or [])
         self._booted = False
 
         # 1. Load or bind configuration
@@ -144,12 +149,34 @@ class Application:
                 if k not in self.config._data:
                     self.config._data[k] = v
 
-        # 2. Configure debug mode and exception handler
+        cfg_max_body = self.config.get("http.max_body_size")
+        if max_body_size is not None:
+            self.max_body_size: int = int(max_body_size)
+        elif cfg_max_body is not None:
+            self.max_body_size = int(cfg_max_body)
+        else:
+            self.max_body_size = DEFAULT_MAX_BODY_SIZE
+
+        # 2. Configure debug mode and exception handler (refuse debug=True in production)
+        app_env = (
+            str(self.config.get("app.env") or self.config.get("env") or "development")
+            .strip()
+            .lower()
+        )
         if not self.debug:
-            self.debug = bool(self.config.get("app.debug", False))
+            cfg_debug = self.config.get("app.debug")
+            if cfg_debug is None:
+                cfg_debug = self.config.get("debug", False)
+            self.debug = bool(cfg_debug)
+
+        if self.debug and app_env in ("production", "prod"):
+            raise ConfigurationError(
+                "Cannot enable debug mode (debug=True) when APP_ENV is 'production'."
+            )
+
         self.exception_handler = ExceptionHandler(debug=self.debug)
 
-        # 3. Register core singletons into container
+        # 3. Register core singletons and default scoped bindings into container
         self.websocket_manager = WebSocketManager.get_instance()
         self.container.instance(Application, self)
         self.container.instance(Container, self.container)
@@ -157,6 +184,10 @@ class Application:
         self.container.instance(Config, self.config)
         self.container.instance(ExceptionHandler, self.exception_handler)
         self.container.instance(WebSocketManager, self.websocket_manager)
+        self.container.scoped(
+            CurrentUser,
+            lambda _: CurrentUser(Context.get("__swiftpy_current_user__") or {}),
+        )
 
         # 4. Bind active container globally
         set_container(self.container)
@@ -197,50 +228,23 @@ class Application:
         self._booted = True
         self._compile_routes()
 
-    def _wrap_handler(self, handler: Any) -> Any:
-        sig = inspect.signature(handler)
-        typed_params: list[tuple[str, type[Any]]] = []
-
-        try:
-            type_hints = get_type_hints(handler)
-        except (NameError, TypeError, ValueError):
-            type_hints = {}
-
-        for name, param in sig.parameters.items():
-            ann = type_hints.get(name, param.annotation)
-            if isinstance(ann, str):
-                try:
-                    closure_vars = inspect.getclosurevars(handler).nonlocals
-                    if ann in closure_vars:
-                        ann = closure_vars[ann]
-                except (TypeError, ValueError):
-                    pass
-                if isinstance(ann, str):
-                    ann = getattr(handler, "__globals__", {}).get(ann, ann)
-
-            if isinstance(ann, type) and (
-                issubclass(ann, FormRequest)
-                or hasattr(ann, "schema")
-                or hasattr(ann, "rules")
-            ):
-                typed_params.append((name, ann))
+    def _wrap_handler(self, route: Route) -> Any:
+        handler = route.handler
+        param_specs = route.param_specs
+        has_var_keyword = route.has_var_keyword
+        is_coro = inspect.iscoroutinefunction(handler)
 
         async def dispatched_handler(
             request: Request, *args: Any, **params: Any
         ) -> Any:
             call_kwargs: dict[str, Any] = {}
-            for name, param in sig.parameters.items():
-                param_ann = type_hints.get(name, param.annotation)
-                if (
-                    name == "request"
-                    or param_ann is Request
-                    or param.annotation is Request
-                ):
-                    call_kwargs[name] = request
-                elif name in params:
-                    call_kwargs[name] = params[name]
-                elif any(name == tp[0] for tp in typed_params):
-                    ann = next(tp[1] for tp in typed_params if tp[0] == name)
+            for spec in param_specs:
+                if spec.kind == "request":
+                    call_kwargs[spec.name] = request
+                elif spec.kind == "path":
+                    call_kwargs[spec.name] = params[spec.name]
+                elif spec.kind == "form":
+                    ann: type[FormRequest] = spec.annotation
                     try:
                         raw_body = await request.body()
                         if not raw_body.strip():
@@ -261,57 +265,36 @@ class Application:
                         raise ValidationException(
                             {"body": ["Invalid JSON payload"]}
                         ) from None
+                    except HttpException as exc:
+                        if exc.status_code == 400:
+                            raise ValidationException(
+                                {"body": ["Invalid JSON payload"]}
+                            ) from None
+                        raise
 
-                    if issubclass(ann, FormRequest):
-                        rules = ann.get_rules()
-                    elif hasattr(ann, "schema") and isinstance(ann.schema, dict):
-                        rules = ann.schema
-                    elif hasattr(ann, "rules") and callable(ann.rules):
-                        try:
-                            rules = ann().rules()
-                        except TypeError:
-                            rules = ann.rules()
-                    else:
-                        rules = {}
-
+                    rules = ann.get_rules()
                     result = await validate(data, rules)
                     if result.fails():
                         raise ValidationException(result.errors)
 
-                    if issubclass(ann, FormRequest):
-                        instance = ann(
-                            data=result.validated_data,
-                            raw_data=data,
-                            request=request,
-                            validation_result=result,
-                        )
-                    else:
-                        try:
-                            instance = ann(**result.validated_data)
-                        except TypeError:
-                            instance = ann(result.validated_data)
-                    call_kwargs[name] = instance
+                    instance = ann(
+                        data=result.validated_data,
+                        raw_data=data,
+                        request=request,
+                        validation_result=result,
+                    )
+                    call_kwargs[spec.name] = instance
+                elif spec.kind == "di":
+                    call_kwargs[spec.name] = self.container.resolve(spec.annotation)
+                elif spec.kind == "default" and spec.name in params:
+                    call_kwargs[spec.name] = params[spec.name]
 
-            has_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
             if has_var_keyword:
                 for k, v in params.items():
                     if k not in call_kwargs:
                         call_kwargs[k] = v
 
-            if not call_kwargs and sig.parameters:
-                first_param = next(iter(sig.parameters.values()))
-                if first_param.kind in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                ):
-                    call_kwargs[first_param.name] = request
-                for k, v in params.items():
-                    if k in sig.parameters:
-                        call_kwargs[k] = v
-
-            if inspect.iscoroutinefunction(handler):
+            if is_coro:
                 return await handler(**call_kwargs)
             res = handler(**call_kwargs)
             if inspect.isawaitable(res):
@@ -320,45 +303,32 @@ class Application:
 
         return dispatched_handler
 
-    def _wrap_websocket_handler(self, handler: Any) -> Any:
-        sig = inspect.signature(handler)
-        try:
-            type_hints = get_type_hints(handler)
-        except (NameError, TypeError, ValueError):
-            type_hints = {}
+    def _wrap_websocket_handler(self, route: Route) -> Any:
+        handler = route.handler
+        param_specs = route.param_specs
+        has_var_keyword = route.has_var_keyword
+        is_coro = inspect.iscoroutinefunction(handler)
 
         async def dispatched_ws_handler(
             websocket: WebSocketConnection, *args: Any, **params: Any
         ) -> Any:
             call_kwargs: dict[str, Any] = {}
-            for name, param in sig.parameters.items():
-                param_ann = type_hints.get(name, param.annotation)
-                if (
-                    name in ("websocket", "ws", "conn", "connection")
-                    or param_ann is WebSocketConnection
-                    or param_ann is WebSocket
-                    or param.annotation is WebSocketConnection
-                    or param.annotation is WebSocket
-                ):
-                    call_kwargs[name] = websocket
-                elif name in params:
-                    call_kwargs[name] = params[name]
+            for spec in param_specs:
+                if spec.kind == "websocket":
+                    call_kwargs[spec.name] = websocket
+                elif spec.kind == "path":
+                    call_kwargs[spec.name] = params[spec.name]
+                elif spec.kind == "di":
+                    call_kwargs[spec.name] = self.container.resolve(spec.annotation)
+                elif spec.kind == "default" and spec.name in params:
+                    call_kwargs[spec.name] = params[spec.name]
 
-            if websocket not in call_kwargs.values() and sig.parameters:
-                for name, param in sig.parameters.items():
-                    if name not in call_kwargs and name not in params:
-                        call_kwargs[name] = websocket
-                        break
-
-            has_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
             if has_var_keyword:
                 for k, v in params.items():
                     if k not in call_kwargs:
                         call_kwargs[k] = v
 
-            if inspect.iscoroutinefunction(handler):
+            if is_coro:
                 return await handler(**call_kwargs)
             res = handler(**call_kwargs)
             if inspect.isawaitable(res):
@@ -369,30 +339,55 @@ class Application:
 
     def _compile_routes(self) -> None:
         for route in self.router.routes:
-            if route.method == "WEBSOCKET":
-                route.compiled_handler = self._wrap_websocket_handler(route.handler)
+            if route.is_websocket or route.method == "WEBSOCKET":
+                route.compiled_handler = self._wrap_websocket_handler(route)
             else:
-                wrapped = self._wrap_handler(route.handler)
+                wrapped = self._wrap_handler(route)
                 pipeline = MiddlewarePipeline(self.container, route.middleware)
                 route.compiled_handler = pipeline.wrap(wrapped)
 
     def websocket(self, path: str) -> Callable[[F], F]:
         return self.router.websocket(path)
 
-    def get(self, path: str) -> Callable[[F], F]:
-        return self.router.get(path)
+    def get(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.get(path, max_body_size=max_body_size)
 
-    def post(self, path: str) -> Callable[[F], F]:
-        return self.router.post(path)
+    def post(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.post(path, max_body_size=max_body_size)
 
-    def put(self, path: str) -> Callable[[F], F]:
-        return self.router.put(path)
+    def put(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.put(path, max_body_size=max_body_size)
 
-    def patch(self, path: str) -> Callable[[F], F]:
-        return self.router.patch(path)
+    def patch(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.patch(path, max_body_size=max_body_size)
 
-    def delete(self, path: str) -> Callable[[F], F]:
-        return self.router.delete(path)
+    def delete(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.delete(path, max_body_size=max_body_size)
+
+    def head(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.head(path, max_body_size=max_body_size)
+
+    def options(
+        self, path: str, *, max_body_size: int | None = None
+    ) -> Callable[[F], F]:
+        return self.router.options(path, max_body_size=max_body_size)
+
+    def middleware(self, middleware_list: Sequence[type[Middleware]]) -> Self:
+        """Register global HTTP middleware classes that run for every HTTP request."""
+        self._middleware.extend(middleware_list)
+        return self
 
     def group(
         self,
@@ -411,6 +406,44 @@ class Application:
             return handler
 
         return decorator
+
+    async def _handle_exception_safely(
+        self,
+        exc: Exception,
+        request: Request | None = None,
+    ) -> Response:
+        try:
+            return await self.exception_handler.handle(exc, request=request)
+        except Exception:
+            logger.exception("ExceptionHandler.handle raised an unhandled error")
+            return json_response(
+                {"detail": "Internal Server Error"},
+                status_code=500,
+            )
+
+    async def _dispatch_http(self, request: Request) -> Response:
+        try:
+            route, params = self.router.match(request.method, request.path)
+            if route is None:
+                return not_found()
+
+            if route.max_body_size is not None:
+                request.max_body_size = route.max_body_size
+
+            handler = route.compiled_handler
+            if handler is None:
+                wrapped = self._wrap_handler(route)
+                handler = MiddlewarePipeline(self.container, route.middleware).wrap(
+                    wrapped
+                )
+                route.compiled_handler = handler
+
+            res: Response = await handler(request, **params)
+            return res
+        except ClientDisconnect:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return await self._handle_exception_safely(exc, request=request)
 
     async def __call__(
         self,
@@ -443,7 +476,7 @@ class Application:
                 Context.set("websocket", connection)
                 try:
                     try:
-                        route, params = self.router.match("WEBSOCKET", connection.path)
+                        route, params = self.router.match_websocket(connection.path)
                     except PathParamCoercionError:
                         await connection.close(code=1002, reason="Invalid path parameter")
                         return
@@ -454,7 +487,8 @@ class Application:
 
                     handler = route.compiled_handler
                     if handler is None:
-                        handler = self._wrap_websocket_handler(route.handler)
+                        handler = self._wrap_websocket_handler(route)
+                        route.compiled_handler = handler
 
                     try:
                         await handler(connection, **params)
@@ -478,41 +512,53 @@ class Application:
 
             set_container(self.container)
             request: Request | None = None
+            response_started = False
+
+            async def tracked_send(message: dict[str, Any]) -> None:
+                nonlocal response_started
+                if message.get("type") == "http.response.start":
+                    response_started = True
+                await send(message)
+
             try:
-                request = Request(scope, receive)
+                request = Request(
+                    scope,
+                    receive,
+                    max_body_size=self.max_body_size,
+                )
                 Context.set("request", request)
-                try:
-                    route, params = self.router.match(request.method, request.path)
-                except PathParamCoercionError as exc:
-                    response = unprocessable({exc.param: str(exc)})
-                    await response.send(send)
-                    return
 
-                if route is None:
-                    response = not_found()
-                    await response.send(send)
-                    return
+                if self._middleware:
+                    pipeline = MiddlewarePipeline(self.container, self._middleware)
+                    entry = pipeline.wrap(self._dispatch_http)
+                    response = await entry(request)
+                else:
+                    response = await self._dispatch_http(request)
 
-                handler = route.compiled_handler
-
-                if handler is None:
-                    # Route matched before boot() ran, e.g. ad hoc testing.
-                    # Not the production hot path, so rebuilding here is acceptable.
-                    wrapped = self._wrap_handler(route.handler)
-                    handler = MiddlewarePipeline(self.container, route.middleware).wrap(
-                        wrapped
-                    )
-
-                response = await handler(request, **params)
-
+            except ClientDisconnect:
+                logger.debug("Client disconnected before request completed")
+                return
             except Exception as exc:  # noqa: BLE001
-                response = await self.exception_handler.handle(exc, request=request)
+                response = await self._handle_exception_safely(exc, request=request)
 
             finally:
                 if scope.get("type") == "http":
                     Context.clear()
 
-            await response.send(send)
+            if request is not None and request.method.upper() == "HEAD":
+                response.content = b""
+
+            try:
+                await response.send(tracked_send)
+            except Exception:
+                logger.exception("Error while sending HTTP response")
+                if not response_started:
+                    fallback = json_response(
+                        {"detail": "Internal Server Error"}, status_code=500
+                    )
+                    if request is not None and request.method.upper() == "HEAD":
+                        fallback.content = b""
+                    await fallback.send(tracked_send)
 
         except Exception:
             logger.exception("Fatal error in ASGI dispatch")

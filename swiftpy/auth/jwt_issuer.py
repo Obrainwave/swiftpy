@@ -183,8 +183,9 @@ class JWTIssuer:
 
         Reads settings from 'auth.guards.jwt.*' or 'auth.jwt.*'.
         In production (debug=False), fails fast if JWT_SECRET is missing or <32 bytes.
-        In debug mode (debug=True), if JWT_SECRET is absent, generates a per-process
-        random secret and logs a loud warning.
+        In debug mode (debug=True), if JWT_SECRET is absent, generates a fresh ephemeral
+        random secret per call (cached per application via the container singleton)
+        and logs a loud warning.
         """
         if config is None:
             try:

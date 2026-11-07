@@ -26,12 +26,14 @@ from swiftpy.core.container import Container
 from swiftpy.core.container_exceptions import CircularDependencyError
 from swiftpy.core.exceptions import (
     BadRequestError,
+    ClientDisconnect,
     ExceptionHandler,
     ForbiddenError,
     HttpException,
     InternalServerError,
     MethodNotAllowedError,
     NotFoundError,
+    PayloadTooLargeError,
     UnauthorizedError,
     ValidationError,
 )
@@ -65,6 +67,15 @@ from swiftpy.helpers.helper import (
     snake_case,
     websocket_manager,
     ws_manager,
+)
+from swiftpy.http.middleware import (
+    CORS,
+    CORSMiddleware,
+    Middleware,
+    RequestId,
+    RequestIdMiddleware,
+    SecurityHeaders,
+    SecurityHeadersMiddleware,
 )
 from swiftpy.http.request import Request
 from swiftpy.http.response import (
@@ -138,6 +149,7 @@ from swiftpy.websockets import (
 )
 
 __all__ = [
+    "CORS",
     "ApiKeyGuard",
     "Application",
     "AuthManager",
@@ -146,10 +158,12 @@ __all__ = [
     "BelongsToMany",
     "BetweenRule",
     "BoolRule",
+    "CORSMiddleware",
     "Cache",
     "CacheDriver",
     "CacheManager",
     "CircularDependencyError",
+    "ClientDisconnect",
     "Config",
     "Container",
     "CurrentUser",
@@ -175,11 +189,13 @@ __all__ = [
     "MaxRule",
     "MemoryDriver",
     "MethodNotAllowedError",
+    "Middleware",
     "MinRule",
     "Model",
     "NotFoundError",
     "NotInRule",
     "NullableRule",
+    "PayloadTooLargeError",
     "QueueDispatcher",
     "QueueWorker",
     "RedisDriver",
@@ -187,9 +203,13 @@ __all__ = [
     "RegexRule",
     "RelationNotLoadedError",
     "Request",
+    "RequestId",
+    "RequestIdMiddleware",
     "RequiredRule",
     "Response",
     "RouteGroup",
+    "SecurityHeaders",
+    "SecurityHeadersMiddleware",
     "ServiceProvider",
     "StrRule",
     "TestCase",

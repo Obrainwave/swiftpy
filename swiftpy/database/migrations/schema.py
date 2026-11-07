@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import json
+import math
+import warnings
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
 import asyncpg
 
-from swiftpy.core.bootstrap import get_container
+from swiftpy.core.container import get_container
 from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.migrations.blueprint import (
     _UNSET,
+    ALLOWED_COLUMN_TYPES,
     Blueprint,
     ColumnDefinition,
+    DefaultRaw,
+    _validate_column_length,
+    _validate_decimal_params,
+    raw,
 )
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection
@@ -23,7 +30,7 @@ class SchemaGrammar:
 
     @classmethod
     def compile_create(cls, blueprint: Blueprint) -> list[str]:
-        table = blueprint.table
+        table = validate_identifier(blueprint.table)
         columns_sql: list[str] = []
         constraints_sql: list[str] = []
         post_statements: list[str] = []
@@ -35,15 +42,18 @@ class SchemaGrammar:
 
             # Standalone index on column
             if col.is_index:
-                idx_name = col.index_name or f"idx_{table}_{col.name}"
+                idx_name = validate_identifier(
+                    col.index_name or f"idx_{table}_{col.name}"
+                )
                 post_statements.append(
                     f'CREATE INDEX "{idx_name}" ON "{table}" ("{col.name}");'
                 )
 
             # Standalone named unique constraint on column
             if col.is_unique and col.index_name:
+                uq_col_name = validate_identifier(col.index_name)
                 constraints_sql.append(
-                    f'CONSTRAINT "{col.index_name}" UNIQUE ("{col.name}")'
+                    f'CONSTRAINT "{uq_col_name}" UNIQUE ("{col.name}")'
                 )
 
             # Column comments
@@ -51,7 +61,7 @@ class SchemaGrammar:
 
         # 2. Compile table-level primary key (e.g. composite primary key)
         if blueprint.primary_columns:
-            pk_name = blueprint.primary_key_name or f"pk_{table}"
+            pk_name = validate_identifier(blueprint.primary_key_name or f"pk_{table}")
             cols_joined = ", ".join(f'"{c}"' for c in blueprint.primary_columns)
             constraints_sql.append(
                 f'CONSTRAINT "{pk_name}" PRIMARY KEY ({cols_joined})'
@@ -63,10 +73,10 @@ class SchemaGrammar:
             name_suffix = "_".join(idx.columns)
 
             if idx.is_unique:
-                uq_name = idx.name or f"uq_{table}_{name_suffix}"
+                uq_name = validate_identifier(idx.name or f"uq_{table}_{name_suffix}")
                 constraints_sql.append(f'CONSTRAINT "{uq_name}" UNIQUE ({cols_joined})')
             else:
-                idx_name = idx.name or f"idx_{table}_{name_suffix}"
+                idx_name = validate_identifier(idx.name or f"idx_{table}_{name_suffix}")
                 post_statements.append(
                     f'CREATE INDEX "{idx_name}" ON "{table}" ({cols_joined});'
                 )
@@ -77,7 +87,9 @@ class SchemaGrammar:
                 raise ValueError(
                     f"Foreign key on {table}.{fk.column} must specify a referenced table via .on('table_name')"
                 )
-            fk_name = fk.name or f"fk_{table}_{fk.column}_{fk.ref_table}"
+            fk_name = validate_identifier(
+                fk.name or f"fk_{table}_{fk.column}_{fk.ref_table}"
+            )
             constraints_sql.append(
                 f'CONSTRAINT "{fk_name}" FOREIGN KEY ("{fk.column}") '
                 f'REFERENCES "{fk.ref_table}" ("{fk.ref_column}") '
@@ -93,27 +105,35 @@ class SchemaGrammar:
 
     @classmethod
     def compile_table(cls, blueprint: Blueprint) -> list[str]:
-        table = blueprint.table
+        table = validate_identifier(blueprint.table)
         statements: list[str] = []
 
         # 1. Drops first, so one blueprint can replace what it removes
         for name in blueprint.drop_foreign_list:
+            safe_name = validate_identifier(name)
             statements.append(
-                f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{name}";'
+                f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{safe_name}";'
             )
         for name in blueprint.drop_unique_list:
+            safe_name = validate_identifier(name)
             statements.append(
-                f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{name}";'
+                f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{safe_name}";'
             )
         for name in blueprint.drop_indexes_list:
-            statements.append(f'DROP INDEX IF EXISTS "{name}";')
+            safe_name = validate_identifier(name)
+            statements.append(f'DROP INDEX IF EXISTS "{safe_name}";')
         for name in blueprint.drop_columns_list:
-            statements.append(f'ALTER TABLE "{table}" DROP COLUMN IF EXISTS "{name}";')
+            safe_name = validate_identifier(name)
+            statements.append(
+                f'ALTER TABLE "{table}" DROP COLUMN IF EXISTS "{safe_name}";'
+            )
 
         # 2. Renames
         for old_name, new_name in blueprint.rename_columns_map.items():
+            safe_old = validate_identifier(old_name)
+            safe_new = validate_identifier(new_name)
             statements.append(
-                f'ALTER TABLE "{table}" RENAME COLUMN "{old_name}" TO "{new_name}";'
+                f'ALTER TABLE "{table}" RENAME COLUMN "{safe_old}" TO "{safe_new}";'
             )
 
         # 3. Adds
@@ -122,7 +142,9 @@ class SchemaGrammar:
                 f'ALTER TABLE "{table}" ADD COLUMN {cls._compile_column(col)};'
             )
             if col.is_index:
-                idx_name = col.index_name or f"idx_{table}_{col.name}"
+                idx_name = validate_identifier(
+                    col.index_name or f"idx_{table}_{col.name}"
+                )
                 statements.append(
                     f'CREATE INDEX "{idx_name}" ON "{table}" ("{col.name}");'
                 )
@@ -132,12 +154,12 @@ class SchemaGrammar:
             cols_joined = ", ".join(f'"{c}"' for c in idx.columns)
             suffix = "_".join(idx.columns)
             if idx.is_unique:
-                name = idx.name or f"uq_{table}_{suffix}"
+                name = validate_identifier(idx.name or f"uq_{table}_{suffix}")
                 statements.append(
                     f'ALTER TABLE "{table}" ADD CONSTRAINT "{name}" UNIQUE ({cols_joined});'
                 )
             else:
-                name = idx.name or f"idx_{table}_{suffix}"
+                name = validate_identifier(idx.name or f"idx_{table}_{suffix}")
                 statements.append(
                     f'CREATE INDEX "{name}" ON "{table}" ({cols_joined});'
                 )
@@ -147,7 +169,9 @@ class SchemaGrammar:
                 raise ValueError(
                     f"Foreign key on {table}.{fk.column} must specify a referenced table via .on('table_name')"
                 )
-            fk_name = fk.name or f"fk_{table}_{fk.column}_{fk.ref_table}"
+            fk_name = validate_identifier(
+                fk.name or f"fk_{table}_{fk.column}_{fk.ref_table}"
+            )
             statements.append(
                 f'ALTER TABLE "{table}" ADD CONSTRAINT "{fk_name}" '
                 f'FOREIGN KEY ("{fk.column}") REFERENCES "{fk.ref_table}" ("{fk.ref_column}") '
@@ -166,8 +190,11 @@ class SchemaGrammar:
 
     @classmethod
     def _compile_column(cls, col: ColumnDefinition) -> str:
-        parts: list[str] = [f'"{col.name}"']
-        t = col.type_name.lower()
+        col_name = validate_identifier(col.name)
+        parts: list[str] = [f'"{col_name}"']
+        t = col.type_name.strip().lower() if isinstance(col.type_name, str) else ""
+        if t not in ALLOWED_COLUMN_TYPES:
+            raise ValueError(f"Unsupported column type: {col.type_name!r}")
 
         # Type mapping
         if t == "id" or t == "big_increments":
@@ -179,7 +206,12 @@ class SchemaGrammar:
         elif t == "uuid":
             parts.append("UUID")
         elif t == "string":
-            parts.append(f"VARCHAR({col.length})" if col.length else "VARCHAR")
+            validated_length = _validate_column_length(col.length)
+            parts.append(
+                f"VARCHAR({validated_length})"
+                if validated_length is not None
+                else "VARCHAR"
+            )
         elif t == "text":
             parts.append("TEXT")
         elif t == "integer":
@@ -191,8 +223,9 @@ class SchemaGrammar:
         elif t == "boolean":
             parts.append("BOOLEAN")
         elif t == "decimal":
-            precision = col.precision or 8
-            scale = col.scale if col.scale is not None else 2
+            raw_precision = 8 if col.precision is None else col.precision
+            raw_scale = 2 if col.scale is None else col.scale
+            precision, scale = _validate_decimal_params(raw_precision, raw_scale)
             parts.append(f"NUMERIC({precision}, {scale})")
         elif t == "float":
             parts.append("DOUBLE PRECISION")
@@ -208,8 +241,6 @@ class SchemaGrammar:
             parts.append("TIMESTAMP")
         elif t == "timestamptz":
             parts.append("TIMESTAMPTZ")
-        else:
-            parts.append(col.type_name.upper())
 
         # Primary key
         if col.is_primary:
@@ -232,7 +263,7 @@ class SchemaGrammar:
 
         # Unsigned check
         if col.is_unsigned:
-            parts.append(f'CHECK ("{col.name}" >= 0)')
+            parts.append(f'CHECK ("{col_name}" >= 0)')
 
         return " ".join(parts)
 
@@ -249,8 +280,16 @@ class SchemaGrammar:
             return "NULL"
         if isinstance(val, bool):
             return "TRUE" if val else "FALSE"
-        if isinstance(val, (int, float)):
+        if isinstance(val, int):
             return str(val)
+        if isinstance(val, float):
+            if not math.isfinite(val):
+                raise ValueError(f"Default float value must be finite, got {val!r}")
+            return str(val)
+        if isinstance(val, DefaultRaw):
+            return val.sql
+        if hasattr(val, "sql") and isinstance(val.sql, str):
+            return str(val.sql).strip()
         if isinstance(val, (dict, list)):
             json_escaped = json.dumps(val).replace("'", "''")
             return f"'{json_escaped}'"
@@ -258,7 +297,7 @@ class SchemaGrammar:
             iso_escaped = val.isoformat().replace("'", "''")
             return f"'{iso_escaped}'"
         if isinstance(val, str):
-            # Check for PostgreSQL functions/keywords
+            # Legacy magic PostgreSQL functions/keywords (deprecated in favor of raw(...))
             upper = val.strip().upper()
             if upper in {
                 "CURRENT_TIMESTAMP",
@@ -270,11 +309,18 @@ class SchemaGrammar:
                 "FALSE",
                 "NULL",
             }:
+                warnings.warn(
+                    f"Passing SQL expression {val!r} as a string to .default() is deprecated; "
+                    f"use raw({val!r}) instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
                 return val.strip()
             # String literal: escape single quotes
             escaped = val.replace("'", "''")
             return f"'{escaped}'"
-        return f"'{val}'"
+        escaped = str(val).replace("'", "''")
+        return f"'{escaped}'"
 
 
 class Schema:
@@ -376,3 +422,6 @@ class Schema:
             if should_release:
                 container = get_container()
                 await container.resolve(DatabasePool).get_pool().release(conn)
+
+
+__all__ = ["Schema", "SchemaGrammar", "raw"]

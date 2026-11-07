@@ -72,7 +72,9 @@ def validate_column_identifier(column: str) -> str:
     Validate a column identifier used in projections, supporting '*' or 'table.*' or 'table.column'.
     """
     if not isinstance(column, str):
-        raise TypeError(f"Invalid SQL column identifier type: expected str, got {type(column).__name__}")
+        raise TypeError(
+            f"Invalid SQL column identifier type: expected str, got {type(column).__name__}"
+        )
     if not _COLUMN_RE.fullmatch(column):
         raise ValueError(f"Invalid SQL column identifier detected: {column}")
 

@@ -24,7 +24,10 @@ class CurrentUser(dict[str, Any]):
     """
 
     def __init__(self, data: dict[str, Any] | None = None) -> None:
-        super().__init__(data or {})
+        if data is None:
+            ctx_user = Context.get("__swiftpy_current_user__")
+            data = ctx_user if isinstance(ctx_user, dict) else {}
+        super().__init__(data)
 
     @property
     def id(self) -> Any:

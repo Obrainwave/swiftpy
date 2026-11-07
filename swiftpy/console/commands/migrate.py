@@ -64,6 +64,13 @@ class MigrateCommand:
             default=None,
             help="The number of migrations to execute",
         )
+        migrate_parser.add_argument(
+            "--force",
+            dest="force",
+            action="store_true",
+            default=False,
+            help="Force the operation to run when in production",
+        )
         migrate_parser.set_defaults(
             _handler=MigrateCommand.handle_migrate,
         )
@@ -81,11 +88,35 @@ class MigrateCommand:
             default=1,
             help="The number of migration batches to rollback",
         )
+        rollback_parser.add_argument(
+            "--force",
+            dest="force",
+            action="store_true",
+            default=False,
+            help="Force the operation to run when in production",
+        )
         rollback_parser.set_defaults(
             _handler=MigrateCommand.handle_rollback,
         )
 
-        # 3. `swiftpy migrate:status`
+        # 3. `swiftpy migrate:reset`
+        reset_parser = subparsers.add_parser(
+            "migrate:reset",
+            help="Rollback all database migrations",
+        )
+        MigrateCommand._add_common_arguments(reset_parser)
+        reset_parser.add_argument(
+            "--force",
+            dest="force",
+            action="store_true",
+            default=False,
+            help="Force the operation to run when in production",
+        )
+        reset_parser.set_defaults(
+            _handler=MigrateCommand.handle_reset,
+        )
+
+        # 4. `swiftpy migrate:status`
         status_parser = subparsers.add_parser(
             "migrate:status",
             help="Show the status of each migration",
@@ -95,12 +126,47 @@ class MigrateCommand:
             _handler=MigrateCommand.handle_status,
         )
 
+    @staticmethod
+    def _validate_step(step: int | None) -> None:
+        if step is not None and step < 1:
+            print("Error: --step must be an integer >= 1.", file=sys.stderr)
+            raise SystemExit(1)
+
+    @staticmethod
+    def _enforce_production_guard(
+        args: argparse.Namespace, app: Any | None = None
+    ) -> None:
+        if getattr(args, "force", False):
+            return
+        env_val = (
+            os.getenv("SWIFTPY_APP__ENV")
+            or os.getenv("APP_ENV")
+            or (
+                str(app.config.get("app.env") or app.config.get("env") or "")
+                if app is not None and hasattr(app, "config")
+                else ""
+            )
+        )
+        if str(env_val).strip().lower() in ("production", "prod"):
+            print(
+                "Error: Application is in production. Pass --force to run migrations in production.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
     @classmethod
     async def _init_migrator(
-        cls, args: argparse.Namespace
+        cls,
+        args: argparse.Namespace,
+        *,
+        require_guard: bool = False,
     ) -> tuple[DatabasePool, Migrator]:
         """Load application target, resolve DatabasePool, and return initialized Migrator."""
+        if require_guard:
+            cls._enforce_production_guard(args)
         app = load_application(args.app)
+        if require_guard:
+            cls._enforce_production_guard(args, app=app)
         pool = app.container.resolve(DatabasePool)
         await pool.init()
 
@@ -111,11 +177,13 @@ class MigrateCommand:
 
     @staticmethod
     def handle_migrate(args: argparse.Namespace) -> None:
+        MigrateCommand._validate_step(getattr(args, "step", None))
+        MigrateCommand._enforce_production_guard(args)
         _run_coroutine(MigrateCommand._execute_migrate(args))
 
     @classmethod
     async def _execute_migrate(cls, args: argparse.Namespace) -> None:
-        pool, migrator = await cls._init_migrator(args)
+        pool, migrator = await cls._init_migrator(args, require_guard=True)
         try:
             print(_paint("Running migrations...", "1"))
             applied = await migrator.run(
@@ -132,11 +200,13 @@ class MigrateCommand:
 
     @staticmethod
     def handle_rollback(args: argparse.Namespace) -> None:
+        MigrateCommand._validate_step(getattr(args, "step", 1))
+        MigrateCommand._enforce_production_guard(args)
         _run_coroutine(MigrateCommand._execute_rollback(args))
 
     @classmethod
     async def _execute_rollback(cls, args: argparse.Namespace) -> None:
-        pool, migrator = await cls._init_migrator(args)
+        pool, migrator = await cls._init_migrator(args, require_guard=True)
         try:
             print(_paint("Rolling back migrations...", "1"))
             rolled_back = await migrator.rollback(
@@ -148,6 +218,25 @@ class MigrateCommand:
 
             if not rolled_back:
                 print(_paint("Nothing to rollback.", "33"))
+        finally:
+            await pool.close()
+
+    @staticmethod
+    def handle_reset(args: argparse.Namespace) -> None:
+        MigrateCommand._enforce_production_guard(args)
+        _run_coroutine(MigrateCommand._execute_reset(args))
+
+    @classmethod
+    async def _execute_reset(cls, args: argparse.Namespace) -> None:
+        pool, migrator = await cls._init_migrator(args, require_guard=True)
+        try:
+            print(_paint("Resetting all migrations...", "1"))
+            rolled_back = await migrator.reset()
+            for name in rolled_back:
+                print(f"  {_paint('Rolled back:', '33')} {name}")
+
+            if not rolled_back:
+                print(_paint("Nothing to reset.", "33"))
         finally:
             await pool.close()
 

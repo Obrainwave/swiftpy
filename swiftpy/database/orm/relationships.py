@@ -400,9 +400,13 @@ class RelationshipQueryBuilder[T: Model]:
         """Fetch the first record matching the relationship scope."""
         return await self._builder.first()
 
-    async def count(self) -> int:
+    async def count(self, column: str = "*") -> int:
         """Return the count of related records."""
-        return await self._builder.count()
+        return await self._builder.count(column)
+
+    async def exists(self) -> bool:
+        """Return True if at least one related record exists."""
+        return await self._builder.exists()
 
     async def create(self, *args: dict[str, Any], **kwargs: Any) -> T:
         """Create a new model instance pre-bound to this relationship."""

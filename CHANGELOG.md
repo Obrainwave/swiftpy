@@ -12,10 +12,10 @@ All notable changes to SwiftPY will be documented in this file.
 
 ### Phase 2 – Security Blockers
 - **P2-A1 (Security / Auth – JWT Secret Enforcement):**
-  - **Breaking:** `JWTIssuer` now requires an explicit `secret` of at least 32 bytes for symmetric algorithms (`HS256`) or a valid key pair for `RS256`, raising `ConfigurationError` otherwise. Removed the hardcoded fallback secret from `config/auth.py`. In non-debug mode (`APP_DEBUG=false`), `app.boot()` and `JWTIssuer.from_config()` fail fast with `ConfigurationError` when `JWT_SECRET` is unset; in debug mode, an ephemeral per-call random secret is generated with a security warning.
+  - **Breaking:** `JWTIssuer` now requires an explicit `secret` of at least 32 bytes for symmetric algorithms (`HS256`) or a valid key pair for `RS256`, raising `ConfigurationError` otherwise. Removed the hardcoded fallback secret from `config/auth.py`. In non-debug mode (`APP_DEBUG=false`), `app.boot()` (when the default guard is `jwt`) and `JWTIssuer.from_config()` fail fast with `ConfigurationError` when `JWT_SECRET` is unset; in debug mode, an ephemeral per-call random secret is generated (cached per application via the container singleton) with a security warning.
   - Wired `issuer`, `audience`, and `leeway` into `config/auth.py` and `JWTIssuer.from_config()`.
 - **P2-A2 (Security / Auth – API Key Guard Redesign):**
-  - **Breaking:** Redesigned API keys around a `<prefix>.<secret>` format (`generate_api_key`, `hash_api_key`, `verify_api_key_hash`) backed by a single indexed `WHERE "<prefix_column>" = $1 LIMIT 1` lookup and constant-time HMAC-SHA256 verification with `AUTH_KEY_PEPPER`. Legacy unsegmented API keys without a `<prefix>.<secret>` separator are rejected upfront with `InvalidApiKeyError` (HTTP 401), and the full-table scan fallback has been removed. Existing unsegmented keys must be re-issued using `swiftpy make:api-key`.
+  - **Breaking:** Redesigned API keys around a `<prefix>.<secret>` format (`generate_api_key`, `hash_api_key`, `verify_api_key_hash`) backed by a single indexed `WHERE "<prefix_column>" = $1 LIMIT 1` lookup and constant-time HMAC-SHA256 verification with `AUTH_KEY_PEPPER` (requiring at least 32 bytes; in non-debug mode, `app.boot()` and `get_server_pepper()` fail fast with `ConfigurationError` when `AUTH_KEY_PEPPER` is unset or shorter than 32 bytes). Legacy unsegmented API keys without a `<prefix>.<secret>` separator are rejected upfront with `InvalidApiKeyError` (HTTP 401), and the full-table scan fallback has been removed. Existing unsegmented keys must be re-issued using `swiftpy make:api-key`.
   - Legacy `$2...` bcrypt hashes on prefix-matched rows are verified inside `loop.run_in_executor` so the asyncio event loop is never blocked.
   - Added `ApiKeyGuard.from_config()`, active transaction connection reuse via `get_active_connection()`, stripping of `key_hash`/`secret`/`password` fields from `request.state["user"]` and `Context`, `swiftpy make:api-key` CLI command, and `migration.api_keys.stub`.
 - **P2-A3 (Security / Auth – Token Revocation Hardening):**
@@ -29,5 +29,62 @@ All notable changes to SwiftPY will be documented in this file.
   - Enforced future `iat` and `nbf` validation with configurable `leeway` (seconds), rejected boolean (`True`/`False`) and non-finite (`NaN`, `Infinity`) timestamps, added `aud` list support, treated `expires_in=0` explicitly, validated `expires_at` column types in `ApiKeyGuard`, and removed inline imports across `swiftpy/auth/`.
 - **P2-CLI1 (Security / CLI – `make:*` Path Containment & Identifier Validation):**
   - Hardened `swiftpy make:*` commands (`make:model`, `make:migration`, `make:service`, `make:request`, `make:resource`, `make:repository`, `make:schema`, `make:api-key`) against path traversal, absolute paths, symlink escapes (`Path.resolve().is_relative_to(...)`), invalid Python identifier segments, and invalid SQL table identifiers (`validate_identifier`).
+
+### Phase 3 – Database Correctness and Safety
+- **P3-D1 (Database / ORM – Non-Mutating Terminal Query Methods):**
+  - Added `QueryBuilder.clone()` and `ModelQueryBuilder.clone()`.
+  - `count()`, `sum()`, `avg()`, `min()`, `max()`, `exists()`, and `first()` now execute on a cloned builder so calling terminal methods never mutates `_columns`, `_limit`, or `_order_column` on a shared `QueryBuilder` or `ModelQueryBuilder` instance.
+  - Cleared `ORDER BY` on aggregate and `EXISTS` subqueries so PostgreSQL never raises `GroupingError` when `.order_by()` was chained prior to `.count()`, `.exists()`, or aggregate helpers.
+  - Added `.exists()` on `QueryBuilder`, `ModelQueryBuilder`, and `RelationshipQueryBuilder` (emitting `SELECT EXISTS(SELECT 1 FROM ... LIMIT 1)`), and added `.sum()`, `.avg()`, `.min()`, and `.max()` delegating methods on `ModelQueryBuilder`.
+- **P3-D2 (Database / ORM – Arbitrary Primary Keys & Single-Query `RETURNING` Hydration):**
+  - Added `QueryBuilder.insert_returning(data, *, returning=None) -> dict[str, Any]` and updated `QueryBuilder.insert(data, *, returning=None)` to support custom primary key columns while preserving `int` return values for default `id` callers.
+  - `Model.create()` and `Model.save()` (on insert) now hydrate directly from `INSERT ... RETURNING *` in **1 query** instead of issuing a second `SELECT` via `cls.find()`, supporting `int`, `UUID`, and custom string primary keys (`__primary_key__ = "code"`), as well as caller-supplied primary keys on new instances.
+  - Added `PrimaryKeyError`: `Model.save()` on an existing model with `pk is None` raises `PrimaryKeyError`, and declaring a composite or non-string `__primary_key__` on a `Model` subclass raises `PrimaryKeyError` at class definition time.
+- **P3-D3 (Database / ORM – Unguarded Mass-Write Protection & Valid SQL Compilation):**
+  - **Breaking:** `QueryBuilder.update()`, `QueryBuilder.delete()`, `ModelQueryBuilder.update()`, and `ModelQueryBuilder.delete()` now raise `QueryError` when invoked without any `WHERE` clause unless `.allow_all()` is explicitly chained first.
+  - `insert({})` and `update({})` now raise `QueryError` instead of emitting invalid empty SQL.
+  - `WHERE col IN []` now compiles to `FALSE` and `WHERE col NOT IN []` compiles to `TRUE` instead of invalid `IN ()`; passing a non-list/non-`QueryBuilder` to `IN`/`NOT IN` raises `QueryError`.
+  - Passing `None` with comparison/pattern/set operators (`<`, `>`, `<=`, `>=`, `LIKE`, `ILIKE`, `IN`, `NOT IN`) raises `QueryError`.
+  - Added `escape_like()`, `where_in()`, `where_not_in()`, `where_like()`, and `where_ilike()` (emitting `ESCAPE '\'` and escaping `%`, `_`, and `\` in literal patterns).
+- **P3-D4 (Database / Validation – Transaction Ownership, Serialization & Connection Reuse):**
+  - Wrapped active transaction connections in `TransactionConnection` with a `closed` state flag (`TransactionClosedError` raised if a child task attempts to use a transaction connection after the `transaction()` block exits) and a per-transaction `asyncio.Lock` so concurrent queries inside a single transaction serialize safely instead of raising `asyncpg.InterfaceError`.
+  - Reset `_active_connection` via `ContextVar.reset(token)` on transaction exit.
+  - Wired `UniqueRule` and `ExistsRule` (`requires_db = True`) to check `get_active_connection()` before acquiring from `DatabasePool`, preventing pool exhaustion (`max_size=1` deadlock) and allowing validation rules to see uncommitted rows inside an active transaction.
+  - Updated `Validator.validate()` to run field/rule validation sequentially when a transaction is active in the task context.
+- **P3-D5 (Database – Connection Pool Configuration, SSL Modes & Safe Shutdown):**
+  - **Breaking (Defaults):** Lowered default `database.pool.max_size` from `50` to `20` (matching `.env.example`), and enforced non-empty database passwords in production/non-debug mode (`ConfigurationError` raised when `DB_PASSWORD` is empty outside debug mode; warning logged in debug mode).
+  - Guarded `DatabasePool.init()` with an `asyncio.Lock` so concurrent initialization calls are idempotent and create only one underlying `asyncpg` pool.
+  - Added `_build_ssl_context()` supporting `ssl` modes `disable`, `require`, `verify-ca`, and `verify-full` plus `ssl_ca_file` (`DB_SSL_CA_FILE`), mapping boolean `True` / `"true"` to `require` with a warning for backward compatibility.
+  - Wired `database.timeouts.statement` (`server_settings={"statement_timeout": ...}`) and `database.pool.command_timeout` into `asyncpg.create_pool()`, and updated `DatabasePool.close(timeout=5.0)` to fall back to `pool.terminate()` on timeout so shutdown never hangs on in-flight connections.
+- **P3-D6 (Database / Migrations / CLI – Schema Validation, `raw()` Defaults, Checksum Drift & Production Guard):**
+  - **Breaking:** Whitelisted allowed `Blueprint` / `ColumnDefinition` column types (`ALLOWED_COLUMN_TYPES`), rejecting unknown types and out-of-range `length` (`1..10_485_760`), `precision` (`1..1000`), and `scale` (`0..precision`) with `ValueError`. Enforced the 63-character identifier limit across all generated constraint and index names (`idx_`, `uq_`, `pk_`, `fk_`).
+  - Added explicit `raw(sql)` (`DefaultRaw`) helper for SQL default expressions (`table.timestamp("created_at").default(raw("now()"))`); legacy magic SQL strings in `.default("NOW()")` continue to work with a `DeprecationWarning`.
+  - `Migrator` now stores a SHA-256 `checksum` per applied migration, raises `RuntimeError` on checksum drift or out-of-order unapplied migrations, and validates `step >= 1` / `steps >= 1`.
+  - **Breaking (CLI):** `swiftpy migrate`, `swiftpy migrate:rollback`, and the new `swiftpy migrate:reset` command now refuse to run when `APP_ENV=production` unless `--force` is passed, and exit with code `1` when `--step < 1`.
+
+### Phase 4 – HTTP Correctness
+- **P4-H1 (HTTP – `Response` Body Encoding, Multi-Header `Set-Cookie` & CRLF Injection Prevention):**
+  - Added `ResponseHeaders(MutableMapping[str, str])` preserving multi-value headers (`Set-Cookie`) via `.add()`, `.getlist()`, and `.raw_items()` alongside `Response.set_cookie()`.
+  - Rejected `\r`, `\n`, and `\x00` in header names and values with `ValueError`.
+  - Encoded `str` bodies as UTF-8, defaulted `Content-Type: text/plain; charset=utf-8` for `str` bodies when unset, and set `Content-Length` automatically for non-streaming responses (except `1xx`, `204`, `304`).
+- **P4-H2 (HTTP / ORM – JSON Encoding & `Model.__hidden__`):**
+  - Added `encode_json()` (`allow_nan=False`) supporting `datetime`/`date`/`time` (ISO-8601), `UUID` (`str`), `Decimal` (`str`), `Enum` (`.value`), and objects with `.to_dict()`, while rejecting `bytes` and `NaN`/`Infinity`.
+  - Added `Model.__hidden__: ClassVar[set[str] | list[str] | tuple[str, ...]] = ()` and updated `Model.to_dict()` to omit `__hidden__` fields and relations while preserving raw Python types on `.to_dict()`.
+- **P4-H3 (HTTP – Router Precedence, Regex Escaping, Strict Path Coercion, WebSocket Isolation & Auto `HEAD`/`OPTIONS`):**
+  - **Breaking:** Static route segments now take precedence over dynamic `{param}` segments regardless of registration order (`(num_dynamic, segment_kinds, -static_chars, order)`), and registering a duplicate `(method, normalized_path)` raises `RouteRegistrationError(ConfigurationError, TypeError)`.
+  - **Breaking:** Path parameter coercion failures now raise `PathParamCoercionError(ValidationError)` (HTTP 422 instead of 400). Boolean path parameters strictly accept `true/false/1/0/yes/no` (case-insensitive) and float path parameters reject `NaN`/`Infinity`.
+  - Escaped literal path segments with `re.escape` so `/v1.0/users` does not match `/v1X0/users`, indexed routes by HTTP method, isolated `WEBSOCKET` routes to `match_websocket()`, and added automatic `HEAD` fallback to `GET` (preserving `Content-Length` with an empty body) and automatic `OPTIONS` (`204 No Content` with `Allow` header).
+- **P4-H4 (HTTP / DI – Handler Parameter Injection & Registration-Time Signature Caching):**
+  - **Breaking:** Removed duck-typing on `.schema`/`.rules` and removed the fallback that injected `Request` into an untyped first parameter; only `issubclass(ann, FormRequest)` is treated as a body validator and only `issubclass(ann, Request)` injects `Request`. Untyped or unsatisfiable parameters without defaults now raise `RouteRegistrationError` at route registration time naming both the handler and the parameter.
+  - Added container DI resolution (`Container.can_resolve` + `app.container.resolve`) for handler parameters (including `CurrentUser` and registered services) and cached `inspect.signature` and `get_type_hints` once at registration time (zero `inspect.signature` calls per request).
+- **P4-H5 (HTTP – Request Body Size Limits, Disconnect Handling, Header `getlist` & Cached Query Params):**
+  - Enforced `max_body_size` (default `2 MiB`, configurable on `Application` and per-route) both via `Content-Length` pre-check and during chunk streaming, raising `PayloadTooLargeError` (HTTP 413).
+  - Handled `{"type": "http.disconnect"}` mid-stream by raising `ClientDisconnect` and aborting cleanly without running the handler or logging a 500 error.
+  - Added `RequestHeaders` (decoded as `latin-1`, cached once, supporting `.getlist(name)` and last-wins dict access), cached `query_params` and `query_param_list` (UTF-8 with replacement), moved `parse_qs` import to module top, and mapped direct `await request.json()` syntax/encoding/recursion errors to `HttpException(status_code=400)`.
+- **P4-H6 (HTTP / Core – Exception Handler Hardening, Production Debug Guard & Built-In Security Middleware):**
+  - **Breaking:** `Application(debug=True)` now raises `ConfigurationError` when `APP_ENV=production`.
+  - Removed duck-typing on `.errors` in `ExceptionHandler` (only `ValidationError` and `ValidationException` produce 422), selected custom exception handlers by MRO specificity, logged 4xx `HttpException` at `INFO` and 5xx at `ERROR` without request/response bodies, and ran global middleware around `_dispatch_http` so global middleware post-processes 200, 404, 405, 422, and 500 responses.
+  - Added `SecurityHeadersMiddleware` (`SecurityHeaders`), `RequestIdMiddleware` (`RequestId`, validating `[A-Za-z0-9._-]{1,128}` and binding `request_id` into `Context`), and `CORSMiddleware` (`CORS`, backed by `config/cors.py` with deny-all defaults and rejecting `allow_origins=["*"]` with `allow_credentials=True`).
+
 
 

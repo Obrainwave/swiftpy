@@ -5,14 +5,91 @@ from typing import Any, Self
 from swiftpy.database.identifiers import validate_identifier
 
 __all__ = [
+    "ALLOWED_COLUMN_TYPES",
     "Blueprint",
     "ColumnDefinition",
+    "DefaultRaw",
     "ForeignKeyDefinition",
     "IndexDefinition",
+    "raw",
     "validate_identifier",
 ]
 
 _UNSET = object()
+
+ALLOWED_COLUMN_TYPES: frozenset[str] = frozenset(
+    {
+        "id",
+        "increments",
+        "big_increments",
+        "uuid",
+        "string",
+        "text",
+        "integer",
+        "big_integer",
+        "small_integer",
+        "boolean",
+        "decimal",
+        "float",
+        "json",
+        "jsonb",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+    }
+)
+
+
+def _validate_column_length(length: int | None) -> int | None:
+    if length is None:
+        return None
+    if (
+        isinstance(length, bool)
+        or not isinstance(length, int)
+        or length < 1
+        or length > 10_485_760
+    ):
+        raise ValueError(
+            f"Column length must be an integer between 1 and 10485760, got {length!r}"
+        )
+    return length
+
+
+def _validate_decimal_params(precision: int, scale: int) -> tuple[int, int]:
+    if (
+        isinstance(precision, bool)
+        or not isinstance(precision, int)
+        or precision < 1
+        or precision > 1000
+    ):
+        raise ValueError(
+            f"Decimal precision must be an integer between 1 and 1000, got {precision!r}"
+        )
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, int)
+        or scale < 0
+        or scale > precision
+    ):
+        raise ValueError(
+            f"Decimal scale must be an integer between 0 and {precision}, got {scale!r}"
+        )
+    return precision, scale
+
+
+class DefaultRaw:
+    """Explicit marker for raw SQL default expressions in migrations (e.g. raw('now()'))."""
+
+    def __init__(self, sql: str) -> None:
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("Raw SQL default expression must be a non-empty string.")
+        self.sql: str = sql.strip()
+
+
+def raw(sql: str) -> DefaultRaw:
+    """Wrap a trusted SQL expression for use in ColumnDefinition.default()."""
+    return DefaultRaw(sql)
 
 
 class ColumnDefinition:
@@ -20,7 +97,12 @@ class ColumnDefinition:
 
     def __init__(self, name: str, type_name: str) -> None:
         self.name: str = validate_identifier(name)
-        self.type_name: str = type_name
+        normalized_type = (
+            type_name.strip().lower() if isinstance(type_name, str) else ""
+        )
+        if normalized_type not in ALLOWED_COLUMN_TYPES:
+            raise ValueError(f"Unsupported column type: {type_name!r}")
+        self.type_name: str = normalized_type
         self.length: int | None = None
         self.precision: int | None = None
         self.scale: int | None = None
@@ -190,8 +272,9 @@ class Blueprint:
 
     def string(self, name: str, length: int | None = 255) -> ColumnDefinition:
         """Create a VARCHAR string column with optional max length."""
+        validated_length = _validate_column_length(length)
         col = self._add_column(name, "string")
-        col.length = length
+        col.length = validated_length
         return col
 
     def text(self, name: str) -> ColumnDefinition:
@@ -218,9 +301,12 @@ class Blueprint:
         self, name: str, precision: int = 8, scale: int = 2
     ) -> ColumnDefinition:
         """Create a fixed-point NUMERIC/DECIMAL column."""
+        validated_precision, validated_scale = _validate_decimal_params(
+            precision, scale
+        )
         col = self._add_column(name, "decimal")
-        col.precision = precision
-        col.scale = scale
+        col.precision = validated_precision
+        col.scale = validated_scale
         return col
 
     def float(self, name: str) -> ColumnDefinition:
@@ -250,8 +336,8 @@ class Blueprint:
 
     def timestamps(self, tz: bool = True) -> tuple[ColumnDefinition, ColumnDefinition]:
         """Create created_at and updated_at timestamp columns with default CURRENT_TIMESTAMP."""
-        created = self.timestamp("created_at", tz=tz).default("CURRENT_TIMESTAMP")
-        updated = self.timestamp("updated_at", tz=tz).default("CURRENT_TIMESTAMP")
+        created = self.timestamp("created_at", tz=tz).default(raw("CURRENT_TIMESTAMP"))
+        updated = self.timestamp("updated_at", tz=tz).default(raw("CURRENT_TIMESTAMP"))
         return created, updated
 
     def soft_deletes(
