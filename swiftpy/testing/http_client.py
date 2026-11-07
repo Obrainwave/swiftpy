@@ -487,6 +487,8 @@ class WebSocketTestSession:
         req_headers = dict(self.default_headers)
         if headers:
             req_headers.update(headers)
+        if "host" not in {k.lower() for k in req_headers}:
+            req_headers["host"] = "127.0.0.1:80"
 
         raw_headers = [
             (k.lower().encode("latin-1"), v.encode("latin-1"))

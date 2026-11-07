@@ -206,6 +206,46 @@ All notable changes to SwiftPY will be documented in this file.
   - Added parse-once caching (`_cached_parsed_rules`) per `FormRequest` class so static rule definitions are parsed once and reused across requests.
   - Integrated container dependency injection for `FormRequest`: constructors requiring registered services or dependencies are automatically resolved via `container.resolve(ann)`.
 
+### Phase 9 – WebSockets
+- **P9-W1 (WebSockets – Handshake Middleware, Origin Checks & Auth):**
+  - **Breaking (Security):** Implemented Origin header checks per Decision `D-14`: default is same-origin only (matching the request `Host` header or server host). Configurable via `Application(allowed_origins=[...])` or `websockets.allowed_origins` config; wildcard `*` must be explicit. Disallowed origins are rejected before accept with close code 1008 (`Policy Violation`). Missing Origin headers (CLI / mobile / non-browser clients) remain permitted.
+  - Implemented full handshake middleware pipeline running global middleware and route group middleware on a `Request(scope, receive)` **before** `ws.accept()`. If any middleware returns a response with status >= 400 (e.g. `unauthorized(401)`, `forbidden(403)`) or raises `HttpException` / `AuthenticationError`, the connection is closed with code 1008 before route handlers execute.
+  - State set on `Request.state` during handshake middleware is automatically transferred to `WebSocketConnection.state`.
+  - Added WebSocket handshake support to `JWTGuard` (`require_jwt`) and `ApiKeyGuard` (`require_api_key`), extracting credentials from `Authorization` header, `Sec-WebSocket-Protocol` subprotocols (`["bearer", token]`, `["access_token", token]`, or `["apikey", key]`), or URL query parameters (`?token=...`, `?access_token=...`, `?api_key=...`, `?key=...`) with documented log-leak warnings for query strings.
+- **P9-W2 (WebSockets – Connection Lifecycle & Safety Limits):**
+  - Added `try/finally` cleanup in `Application.__call__` ensuring `await self.websocket_manager.disconnect(connection)` is always executed on connection completion or termination, and closing active connections with code 1000.
+  - If a route handler raises an unhandled exception before `ws.accept()`, the connection is rejected with code 1008 (`Policy Violation`); unhandled exceptions after accept close with code 1011 (`Internal Server Error`).
+  - `WebSocketDisconnect` is treated as a standard exit and logged at `DEBUG` level rather than polluting application logs with errors.
+  - Added configurable `max_message_size` (default 1 MiB / 1,048,576 bytes) and `idle_timeout` to `WebSocketConnection`. Messages exceeding size limits close with code 1009 (`Message Too Large`); idle timeouts close with code 1000 (`Idle timeout`).
+- **P9-W3 (WebSockets – Broadcast Optimization & Resilience):**
+  - Optimized `WebSocketManager.broadcast`: JSON dictionary and list payloads are serialized with `json.dumps()` exactly once across all recipients ($O(1)$ serialization overhead instead of $O(N)$).
+  - Added `timeout` (default 5.0s) per connection send using `asyncio.wait_for(...)`. A stalled or hung client is cut off after the timeout window and evicted from the manager without delaying broadcast delivery to remaining clients.
+  - Implemented bounded concurrency using `asyncio.Semaphore` with configurable `max_concurrency` (default 100).
+  - Failed or disconnected clients during broadcast are automatically pruned from active connections and rooms.
+  - Added distributed cross-worker broadcast support (`distribute=True`): publishes broadcast payloads via `RedisEventBus` (`"websocket.broadcast"`) for cross-process fanout.
 
-
-
+### Phase 10 – Infra, CI, Repo Hygiene, and Documentation
+- **P10-I1 (Infra – Multi-Stage Dockerfile & Hardened Docker Compose):**
+  - Created `.dockerignore` excluding `.git`, `.venv`, caches, `__pycache__`, `*.pyc`, `.coverage`, `docs/`, and tests from production images.
+  - Upgraded `Dockerfile` to a multi-stage build creating a non-root `swiftpy:swiftpy` user (UID/GID 1000) and running `CMD ["swiftpy", "start", "--host", "0.0.0.0", "--port", "8000"]`.
+  - Hardened `docker-compose.yml`: bound PostgreSQL and Redis to `127.0.0.1` only, configured `--requirepass` for Redis, added healthchecks, and configured configurable host UID/GID.
+- **P10-C1 (CLI – `swiftpy start` Configuration & Options):**
+  - **Breaking:** `--reload` now defaults to `False` for production safety (P10-C1). To enable hot-reload during local development, pass `swiftpy start --reload`.
+  - Added CLI options: `--host`, `--port`, `--workers`, `--reload`, and `--env-file`.
+  - Refuses `--reload` combined with `--workers > 1` with an explanatory error.
+  - Added CLI unit tests in `tests/console/test_start.py` verifying argument parsing, config defaults, and uvicorn kwargs.
+- **P10-I2 (CI – Pinned GitHub Actions Workflow):**
+  - Updated `.github/workflows/ci.yml` with actions pinned by full commit SHA, PostgreSQL 16 and Redis 7 service containers, frozen dependency installation via `uv sync --frozen`, ruff linting, mypy strict type checking, pytest with coverage, and security audit steps (`bandit`, `pip-audit`).
+- **P10-R1 (Repo Hygiene – Git Untracking & `.gitignore` Hardening):**
+  - Untracked previously committed `.coverage` and `*.pyc` files from the git index (`git rm --cached`).
+  - Updated `.gitignore` to explicitly ignore `*.pyc`, `*.pyo`, `*.pyd`, `.coverage`, `.coverage.*`, and `htmlcov/`.
+  - Confirmed `docs/`, `AGENTS.md`, and `DEVLOG.md` untracked status in git per Decision `D-12`.
+- **P10-L7 (Repo Hygiene – Placeholder API Deprecation & Wheel Exclusion):**
+  - Added `"""Not implemented."""` docstrings across all 29 placeholder files in `swiftpy/ai/**`, plus empty helper modules (`params.py`, `route_cache.py`, `route_group.py`, `commands/ai.py`, `config/ai.py`, `config/logging.py`) per Decision `D-11`.
+  - Configured `[tool.hatch.build.targets.wheel]` in `pyproject.toml` to exclude `swiftpy/ai` from distributed wheels.
+  - Added CLI snapshot test in `tests/console/test_start.py` ensuring `swiftpy --help` exposes no unimplemented placeholder commands.
+- **P10-D1 (Documentation – Readme Examples Test Suite & Migration Guide):**
+  - Overhauled `README.md` to reflect completion of all 10 architectural phases and 600+ passing tests.
+  - Aligned all code examples with actual SwiftPY APIs (`app.middleware`, `app.group`, `JWTGuard`, `CurrentUser`, `Blueprint`, `Job`).
+  - Added comprehensive Configuration Reference table and Breaking Changes & Migration Guide documenting Decisions `D-1` through `D-14`.
+  - Created `tests/docs/test_readme_examples.py` executing all README code snippets under automated pytest coverage to prevent future documentation drift.

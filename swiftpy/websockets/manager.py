@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
 from swiftpy.core.container import get_container
+from swiftpy.events.redis_bus import RedisEventBus
 from swiftpy.websockets.connection import (
     WebSocketConnection,
     WebSocketDisconnect,
@@ -137,13 +139,19 @@ class WebSocketManager:
         *,
         room: str | None = None,
         filter_fn: Callable[[WebSocketConnection], bool] | None = None,
+        timeout: float = 5.0,
+        max_concurrency: int = 100,
+        distribute: bool = False,
     ) -> None:
         """
         Broadcast a message to active connections.
         - If `room` is provided, delivers only to connections in that room.
         - If `filter_fn` is provided, delivers only to connections matching the predicate.
         - If neither is provided, delivers to all active connections.
-        Failed or disconnected connections are automatically cleaned up.
+        - `timeout`: Maximum seconds to wait per connection send (prevents stalled clients from delaying others).
+        - `max_concurrency`: Bounded concurrency using asyncio.Semaphore.
+        - `distribute`: If True, also publishes the broadcast across workers via RedisEventBus.
+        Failed, timed out, or disconnected connections are automatically cleaned up.
         """
         async with self._lock:
             if room is not None:
@@ -162,26 +170,63 @@ class WebSocketManager:
         else:
             recipients = candidates
 
-        if not recipients:
-            return
+        # 1. Single serialization for JSON and text payloads (P9-W3)
+        prepared_text: str | None = None
+        prepared_bytes: bytes | None = None
 
-        async def _safe_send(conn: WebSocketConnection) -> tuple[WebSocketConnection, Exception | None]:
+        if isinstance(message, (dict, list)):
+            prepared_text = json.dumps(message)
+        elif isinstance(message, str):
+            prepared_text = message
+        elif isinstance(message, bytes):
+            prepared_bytes = message
+        else:
+            prepared_text = str(message)
+
+        if recipients:
+            sem = asyncio.Semaphore(max(1, max_concurrency))
+
+            async def _safe_send(conn: WebSocketConnection) -> tuple[WebSocketConnection, Exception | None]:
+                try:
+                    async with sem:
+                        if prepared_text is not None:
+                            await asyncio.wait_for(conn.send_text(prepared_text), timeout=timeout)
+                        elif prepared_bytes is not None:
+                            await asyncio.wait_for(conn.send_bytes(prepared_bytes), timeout=timeout)
+                    return conn, None
+                except (WebSocketDisconnect, WebSocketException) as exc:
+                    return conn, exc
+                except TimeoutError as exc:
+                    logger.warning(
+                        "Timeout (%ss) broadcasting to WebSocket connection; evicting stalled connection",
+                        timeout,
+                    )
+                    return conn, exc
+                except Exception as exc:  # noqa: BLE001
+                    # Failures on one client must not abort broadcast to remaining clients
+                    logger.warning("Error broadcasting to WebSocket connection: %s", exc)
+                    return conn, exc
+
+            results = await asyncio.gather(*[_safe_send(conn) for conn in recipients])
+
+            failed_conns = [conn for conn, exc in results if exc is not None]
+            if failed_conns:
+                for conn in failed_conns:
+                    await self.disconnect(conn)
+
+        # 2. Cross-worker distributed fan-out via RedisEventBus (P9-W3, P6-Q6)
+        if distribute:
             try:
-                await conn.send(message)
-                return conn, None
-            except (WebSocketDisconnect, WebSocketException) as exc:
-                return conn, exc
+                container = get_container()
+                if container.has(RedisEventBus):
+                    bus = container.resolve(RedisEventBus)
+                    await bus.publish(
+                        "websocket.broadcast",
+                        {"message": message, "room": room},
+                        local=False,
+                    )
             except Exception as exc:  # noqa: BLE001
-                # Failures on one client must not abort broadcast to remaining clients
-                logger.warning("Error broadcasting to WebSocket connection: %s", exc)
-                return conn, exc
-
-        results = await asyncio.gather(*[_safe_send(conn) for conn in recipients])
-
-        failed_conns = [conn for conn, exc in results if exc is not None]
-        if failed_conns:
-            for conn in failed_conns:
-                await self.disconnect(conn)
+                logger.warning("Error publishing distributed WebSocket broadcast: %s", exc)
 
 
 __all__ = ["WebSocketManager"]

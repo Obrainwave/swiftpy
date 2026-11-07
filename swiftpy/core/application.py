@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Self, TypeVar
 
 from swiftpy.auth.auth_manager import CurrentUser
+from swiftpy.auth.exceptions import AuthenticationError
 from swiftpy.auth.token_blacklist import TokenBlacklist
 from swiftpy.cache.cache import Cache
 from swiftpy.core.config import Config, ConfigurationError
@@ -36,6 +37,7 @@ from swiftpy.validation.validator import validate
 from swiftpy.websockets.connection import (
     WebSocketConnection,
     WebSocketDisconnect,
+    WebSocketState,
 )
 from swiftpy.websockets.manager import WebSocketManager
 
@@ -240,6 +242,8 @@ class Application:
         project_root: str | Path | None = None,
         strict_providers: bool = True,
         max_body_size: int | None = None,
+        allowed_origins: Sequence[str] | set[str] | None = None,
+        max_ws_message_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.title = title
@@ -279,6 +283,36 @@ class Application:
             self.max_body_size = int(cfg_max_body)
         else:
             self.max_body_size = DEFAULT_MAX_BODY_SIZE
+
+        # WebSocket origin and message size limits (D-14, P9-W1, P9-W2)
+        raw_allowed_origins = (
+            allowed_origins
+            if allowed_origins is not None
+            else (
+                self.config.get("websockets.allowed_origins")
+                or self.config.get("websocket.allowed_origins")
+            )
+        )
+        if raw_allowed_origins is not None:
+            if isinstance(raw_allowed_origins, str):
+                self.allowed_origins: set[str] | None = {
+                    o.strip() for o in raw_allowed_origins.split(",") if o.strip()
+                }
+            else:
+                self.allowed_origins = set(raw_allowed_origins)
+        else:
+            self.allowed_origins = None
+
+        if max_ws_message_size is not None:
+            self.max_ws_message_size: int = int(max_ws_message_size)
+        else:
+            cfg_ws_max = (
+                self.config.get("websockets.max_message_size")
+                or self.config.get("websocket.max_message_size")
+            )
+            self.max_ws_message_size = (
+                int(cfg_ws_max) if cfg_ws_max is not None else 1_048_576
+            )
 
         # 2. Configure debug mode and exception handler (refuse debug=True in production)
         app_env = (
@@ -528,6 +562,56 @@ class Application:
 
         return dispatched_ws_handler
 
+    def _is_origin_allowed(
+        self,
+        origin: str | None,
+        host_header: str | None,
+        scope: dict[str, Any] | None = None,
+    ) -> bool:
+        """
+        Validate incoming WebSocket Origin against allowed_origins or same-origin policy (Decision D-14).
+        If origin is None (non-browser clients like mobile/CLI/tests without Origin), allow.
+        If allowed_origins is configured:
+          - If "*" in allowed_origins: allow all.
+          - If origin in allowed_origins: allow.
+        If allowed_origins is not configured (default None):
+          - Enforce same-origin: origin must match the request Host header or server host.
+        """
+        if origin is None:
+            return True
+
+        if self.allowed_origins is not None:
+            if "*" in self.allowed_origins:
+                return True
+            clean_origin = origin.rstrip("/")
+            if clean_origin in self.allowed_origins or origin in self.allowed_origins:
+                return True
+            origin_netloc = clean_origin.split("://", 1)[-1]
+            return origin_netloc in self.allowed_origins
+
+        effective_host = host_header
+        if not effective_host and scope:
+            server_info = scope.get("server")
+            if server_info and len(server_info) == 2:
+                s_host, s_port = server_info
+                effective_host = f"{s_host}:{s_port}" if s_port not in (80, 443, None) else str(s_host)
+
+        if not effective_host:
+            return False
+
+        clean_origin = origin.rstrip("/")
+        origin_netloc = clean_origin.split("://", 1)[-1].lower()
+        clean_host = effective_host.strip().lower()
+
+        def _strip_default_port(h: str) -> str:
+            if h.endswith(":80"):
+                return h[:-3]
+            if h.endswith(":443"):
+                return h[:-4]
+            return h
+
+        return _strip_default_port(origin_netloc) == _strip_default_port(clean_host)
+
     def _compile_routes(self) -> None:
         for route in self.router.routes:
             if route.is_websocket or route.method == "WEBSOCKET":
@@ -669,7 +753,12 @@ class Application:
                     self.boot()
 
                 set_container(self.container)
-                connection = WebSocketConnection(scope, receive, send)
+                connection = WebSocketConnection(
+                    scope,
+                    receive,
+                    send,
+                    max_message_size=self.max_ws_message_size,
+                )
                 Context.set("websocket", connection)
                 try:
                     try:
@@ -682,6 +771,44 @@ class Application:
                         await connection.close(code=1000, reason="Not Found")
                         return
 
+                    # 1. Origin validation (Decision D-14)
+                    host_header = connection.headers.get("host")
+                    if not self._is_origin_allowed(connection.origin, host_header, connection.scope):
+                        await connection.close(code=1008, reason="Origin not allowed")
+                        return
+
+                    # 2. Handshake middleware pipeline (P9-W1)
+                    # Global middleware + route group middleware
+                    all_middleware = list(self._middleware) + list(route.middleware)
+                    if all_middleware:
+                        handshake_request = Request(
+                            scope,
+                            receive,
+                            max_body_size=self.max_body_size,
+                        )
+                        Context.set("request", handshake_request)
+
+                        pipeline = MiddlewarePipeline(self.container, all_middleware)
+
+                        async def _handshake_terminal(req: Request) -> Response:
+                            return Response("OK", status_code=200)
+
+                        try:
+                            entry = pipeline.wrap(_handshake_terminal)
+                            resp = await entry(handshake_request)
+                            if resp.status_code >= 400:
+                                await connection.close(code=1008, reason="Unauthorized")
+                                return
+                            # Propagate request state to connection state
+                            connection.state.update(handshake_request.state)
+                        except (AuthenticationError, HttpException):
+                            await connection.close(code=1008, reason="Unauthorized")
+                            return
+                        except Exception:
+                            logger.exception("Error in WebSocket handshake middleware")
+                            await connection.close(code=1008, reason="Handshake error")
+                            return
+
                     handler = route.compiled_handler
                     if handler is None:
                         handler = self._wrap_websocket_handler(route)
@@ -691,13 +818,26 @@ class Application:
                         await handler(connection, **params)
                         if connection.is_connected:
                             await connection.close(code=1000)
-                    except WebSocketDisconnect:
-                        pass
+                    except WebSocketDisconnect as exc:
+                        logger.debug("WebSocket disconnected: %s", exc)
                     except Exception:
-                        logger.exception("Unhandled exception in WebSocket handler")
-                        if connection.is_connected:
-                            await connection.close(code=1011, reason="Internal Server Error")
+                        if connection.client_state == WebSocketState.CONNECTING:
+                            # Handler raised before accept() -> policy violation / forbidden close code 1008
+                            await connection.close(code=1008, reason="Policy Violation")
+                        else:
+                            logger.exception("Unhandled exception in WebSocket handler")
+                            if connection.is_connected:
+                                await connection.close(code=1011, reason="Internal Server Error")
                 finally:
+                    try:
+                        await self.websocket_manager.disconnect(connection)
+                    except Exception:
+                        logger.exception("Error disconnecting WebSocket from manager in finally")
+                    if connection.is_connected:
+                        try:
+                            await connection.close(code=1000)
+                        except Exception:  # noqa: BLE001, S110
+                            pass
                     await self.container.aclose_scoped()
                     Context.clear()
                 return

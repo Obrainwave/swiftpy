@@ -1,19 +1,52 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+# ------------------------------------------------------------------------------
+# Stage 1: Build & Dependencies
+# ------------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
 
-RUN apt-get update && apt-get install -y \
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    gcc \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-COPY . .
+# Install dependencies into virtual environment
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
-RUN uv sync
+COPY pyproject.toml uv.lock* ./
 
-ENV PATH="/app/.venv/bin:$PATH"
+RUN uv sync --frozen --no-dev || uv sync --no-dev
 
-CMD ["tail", "-f", "/dev/null"]
+# ------------------------------------------------------------------------------
+# Stage 2: Production Runtime
+# ------------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ARG UID=1000
+ARG GID=1000
+
+# Create non-root user and group
+RUN groupadd -g "${GID}" swiftpy \
+    && useradd -u "${UID}" -g swiftpy -s /bin/bash -m swiftpy
+
+WORKDIR /app
+
+# Copy virtualenv and binaries from builder
+COPY --from=builder --chown=swiftpy:swiftpy /build/.venv /app/.venv
+
+# Copy application source code
+COPY --chown=swiftpy:swiftpy . /app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+USER swiftpy
+
+EXPOSE 8000
+
+CMD ["swiftpy", "start", "--host", "0.0.0.0", "--port", "8000"]

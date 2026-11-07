@@ -9,7 +9,7 @@ import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, ClassVar
 
 from swiftpy.core.config import Config, ConfigurationError
@@ -41,7 +41,7 @@ class Job(ABC):
 
     queue: str = "default"
     tries: int = 3
-    backoff: int | float | list[int | float] = 0
+    backoff: int | float | Sequence[int | float] = 0
     timeout: float | None = None
 
     _app_key: ClassVar[str | None] = None

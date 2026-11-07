@@ -33,10 +33,13 @@ async def require_jwt(
     token_type: str = "access",
 ) -> dict[str, Any]:
     """
-    Parse and validate a JWT from the HTTP Authorization header.
+    Parse and validate a JWT from the HTTP Authorization header or WebSocket credentials.
 
     Verifies:
-      1. Presence of Authorization: Bearer <token>
+      1. Presence of Authorization: Bearer <token>, or for WebSockets, Sec-WebSocket-Protocol
+         or URL query parameter ('token' / 'access_token').
+         (Note: query parameter tokens carry log-leak risks as query strings are frequently
+         recorded in server access logs and proxy logs.)
       2. Valid cryptographic signature (RS256 or HS256)
       3. Token expiration (exp claim)
       4. Algorithm authenticity (rejects 'none' or unauthorized algs)
@@ -52,7 +55,8 @@ async def require_jwt(
             "No active HTTP Request found. Pass 'request' explicitly or call within request pipeline."
         )
 
-    # 2. Extract Authorization header case-insensitively and check for duplicates
+    # 2. Extract token from Authorization header or WebSocket handshake
+    token: str | None = None
     raw_auth_headers = [
         v.decode("latin1")
         for k, v in req.scope.get("headers", [])
@@ -60,19 +64,47 @@ async def require_jwt(
     ]
     if len(raw_auth_headers) > 1:
         raise AuthenticationError("Multiple Authorization headers provided")
-    if not raw_auth_headers:
+    if raw_auth_headers:
+        auth_header = raw_auth_headers[0]
+        parts = auth_header.strip().split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise AuthenticationError(
+                "Invalid Authorization header format. Expected 'Bearer <token>'"
+            )
+        token = parts[1].strip()
+        if not token:
+            raise AuthenticationError("Bearer token is empty")
+    elif req.scope.get("type") == "websocket":
+        # Check Sec-WebSocket-Protocol (subprotocols)
+        subprotocols = req.scope.get("subprotocols", [])
+        if not subprotocols and "sec-websocket-protocol" in req.headers:
+            subprotocols = [p.strip() for p in req.headers["sec-websocket-protocol"].split(",") if p.strip()]
+
+        for i, proto in enumerate(subprotocols):
+            proto_clean = proto.strip()
+            if proto_clean.lower() in ("bearer", "access_token") and i + 1 < len(subprotocols):
+                token = subprotocols[i + 1].strip()
+                break
+            if proto_clean.lower().startswith("bearer."):
+                token = proto_clean[7:].strip()
+                break
+            if proto_clean.count(".") == 2:
+                token = proto_clean
+                break
+
+        # Check query parameters as fallback (with log-leak warning)
+        if not token:
+            token = req.query_params.get("token") or req.query_params.get("access_token")
+            if token:
+                logger.debug(
+                    "WebSocket authenticated via query parameter token. Note: Query parameter tokens "
+                    "carry log-leak risks as query strings are frequently logged in server and proxy logs."
+                )
+
+        if not token:
+            raise AuthenticationError("Missing Authorization header or WebSocket authentication credentials")
+    else:
         raise AuthenticationError("Missing Authorization header")
-
-    auth_header = raw_auth_headers[0]
-    parts = auth_header.strip().split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise AuthenticationError(
-            "Invalid Authorization header format. Expected 'Bearer <token>'"
-        )
-
-    token = parts[1].strip()
-    if not token:
-        raise AuthenticationError("Bearer token is empty")
 
     # 3. Resolve JWTIssuer from parameters, container, or default
     active_issuer = issuer

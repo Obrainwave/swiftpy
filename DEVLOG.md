@@ -1110,6 +1110,118 @@ Transfer/sec:    482.06KB
   - `mypy .`: **Success: no issues found in 210 source files** (0 errors).
   - Full suite: `pytest -q -p no:cacheprovider`: **585 passed in 381.01s** (568 post-Phase-7 + 17 new Phase 8 tests).
 
+---
+
+## Phase 9 – WebSockets
+
+### P9-W1: Handshake Middleware & Origin Checks (`W-1`, `D-14`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Implemented Origin header checks per Decision `D-14`: default same-origin check against `Host` header or server host. Configurable via `Application(allowed_origins=[...])` or `websockets.allowed_origins` configuration key; wildcard `*` allowed only when explicitly configured. Disallowed origins are rejected before accept with close code 1008 (`Policy Violation`). Missing Origin header allowed for native/CLI clients.
+  - Implemented handshake middleware pipeline running global middleware and route group middleware on a `Request(scope, receive)` before `ws.accept()`. Middleware returning status >= 400 or raising `HttpException` / `AuthenticationError` aborts the handshake with close code 1008.
+  - State set on `Request.state` during handshake middleware is automatically transferred to `WebSocketConnection.state`.
+  - Added WebSocket handshake support to `JWTGuard` (`require_jwt`) and `ApiKeyGuard` (`require_api_key`), extracting credentials from `Authorization` header, `Sec-WebSocket-Protocol` subprotocols, or URL query parameters (`token`, `access_token`, `api_key`, `key`) with documented log-leak warnings.
+  - Added `tests/websockets/test_handshake.py` (7 tests).
+
+---
+
+### P9-W2: Connection Lifecycle (`W-2`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added `try/finally` cleanup in `Application.__call__` ensuring `await self.websocket_manager.disconnect(connection)` is always executed on connection completion or termination, and closing active connections with code 1000.
+  - If a route handler raises an unhandled exception before `ws.accept()`, the connection is rejected with code 1008 (`Policy Violation`); unhandled exceptions after accept close with code 1011 (`Internal Server Error`).
+  - `WebSocketDisconnect` is treated as a standard exit and logged at `DEBUG` level rather than polluting application logs with errors.
+  - Added configurable `max_message_size` (default 1 MiB / 1,048,576 bytes) and `idle_timeout` to `WebSocketConnection`. Messages exceeding size limits close with code 1009 (`Message Too Large`); idle timeouts close with code 1000 (`Idle timeout`).
+  - Added `tests/websockets/test_lifecycle.py` (6 tests).
+
+---
+
+### P9-W3: Broadcast Optimization & Resilience (`W-3`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Optimized `WebSocketManager.broadcast`: JSON dictionary and list payloads are serialized with `json.dumps()` exactly once across all recipients ($O(1)$ serialization overhead instead of $O(N)$).
+  - Added `timeout` (default 5.0s) per connection send using `asyncio.wait_for(...)`. A stalled or hung client is cut off after the timeout window and evicted from the manager without delaying broadcast delivery to remaining clients.
+  - Implemented bounded concurrency using `asyncio.Semaphore` with configurable `max_concurrency` (default 100).
+  - Failed or disconnected clients during broadcast are automatically pruned from active connections and rooms.
+  - Added distributed cross-worker broadcast support (`distribute=True`): publishes broadcast payloads via `RedisEventBus` (`"websocket.broadcast"`) for cross-process fanout.
+  - Added `tests/websockets/test_broadcast.py` (5 tests).
+
+---
+
+## Phase 10 – Infra, CI, Repo Hygiene, and Documentation
+
+### P10-I1: Multi-Stage Dockerfile & Hardened Compose (`INF-1`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Created `.dockerignore` excluding `.git`, `.venv`, caches, `__pycache__`, `*.pyc`, `.coverage`, `docs/`, and test caches from Docker images.
+  - Converted `Dockerfile` to a multi-stage build: a build stage preparing virtual environment wheels and a runtime stage with a dedicated non-root user `swiftpy:swiftpy` (UID/GID 1000). Set `CMD ["swiftpy", "start", "--host", "0.0.0.0", "--port", "8000"]`.
+  - Hardened `docker-compose.yml`: bound PostgreSQL and Redis ports exclusively to `127.0.0.1`, added Redis password authentication (`--requirepass`), added health checks with retry policies, and mapped runtime user to host UID/GID.
+
+---
+
+### P10-C1: CLI `swiftpy start` Configuration & Options (`CLI-2`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Updated `swiftpy/console/commands/start.py` with options: `--host`, `--port`, `--workers`, `--reload` (default `False`, P10-C1), and `--env-file`.
+  - Enforced mutual exclusion between `--reload` and `--workers > 1` with a descriptive error message.
+  - Added unit test suite in `tests/console/test_start.py` (7 tests) validating argument parsing, configuration fallback, and CLI snapshot ensuring no placeholder commands are exposed.
+
+---
+
+### P10-I2: Hardened GitHub Actions CI Workflow (`INF-2`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Updated `.github/workflows/ci.yml` with actions pinned by full 40-character commit SHAs.
+  - Configured PostgreSQL 16 and Redis 7 service containers with health checks.
+  - Configured frozen dependency synchronization (`uv sync --frozen`), ruff linting, strict mypy type checking, and pytest with coverage reporting.
+  - Added security audit steps running `bandit` and `pip-audit`.
+
+---
+
+### P10-R1: Repository Hygiene & Untracked State (`REPO-1`, `D-12`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Removed tracked `.coverage` and `*.pyc` files from git index via `git rm --cached`.
+  - Hardened `.gitignore` to explicitly ignore `*.pyc`, `*.pyo`, `*.pyd`, `.coverage`, `.coverage.*`, and `htmlcov/`.
+  - Confirmed and preserved Decision `D-12` status: `docs/`, `AGENTS.md`, and `DEVLOG.md` are maintained locally and excluded from git tracking. Updated `.gitignore` rule to `/docs/` to avoid filtering `tests/docs/`.
+
+---
+
+### P10-L7: Dead & Placeholder API Cleanup (`L-7`, `L-9`, `D-11`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Added module docstrings `"""Not implemented."""` to all 29 placeholder files in `swiftpy/ai/**`, plus empty helper files (`params.py`, `route_cache.py`, `route_group.py`, `commands/ai.py`, `config/ai.py`, `config/logging.py`) per Decision `D-11`.
+  - Configured `[tool.hatch.build.targets.wheel]` in `pyproject.toml` to exclude `swiftpy/ai` from distributed wheels.
+  - Added snapshot test in `tests/console/test_start.py` confirming `swiftpy --help` exposes only implemented commands.
+
+---
+
+### P10-D1: Documentation & Verified README Test Suite (`L-8`)
+* **Status:** PASSED
+* **Date:** 2026-11-07
+* **Changes:**
+  - Overhauled `README.md` to reflect full completion of all 10 architectural and hardening phases and 600+ passing tests.
+  - Aligned all code examples with actual SwiftPY APIs (`app.middleware`, `app.group`, `JWTGuard`, `CurrentUser`, `Blueprint`, `Job`).
+  - Added comprehensive Configuration Reference table and Breaking Changes & Migration Guide documenting Decisions `D-1` through `D-14`.
+  - Created `tests/docs/test_readme_examples.py` (4 tests) executing all README snippets under automated test coverage.
+
+---
+
+### Phase 10 closing gate (measured 2026-11-07, tests run in the `swiftpy_app` Docker container)
+  - `ruff check .`: **All checks passed!** (0 errors)
+  - `mypy .`: **Success: no issues found in 215 source files** (0 errors).
+  - Full suite: `pytest -q -p no:cacheprovider`: **614 passed in 316.00s (0:05:16)** (603 post-Phase-9 + 7 new Phase 10 CLI tests + 4 new Phase 10 doc tests).
+
+
+
 
 
 

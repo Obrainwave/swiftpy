@@ -2,33 +2,84 @@ name: CI
 
 on:
   push:
-    branches: [develop]
+    branches: [main, develop]
   pull_request:
-    branches: [develop]
+    branches: [main, develop]
 
 jobs:
   ci:
+    name: Lint, Type Check & Test Suite
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: swiftpy
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      APP_ENV: testing
+      APP_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      JWT_SECRET: "very-long-and-secure-test-jwt-secret-key-32bytes!"
+      AUTH_KEY_PEPPER: "very-long-and-secure-test-auth-pepper-32bytes!"
+      DATABASE_DEFAULT: postgresql
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_DATABASE: swiftpy
+      DB_USERNAME: postgres
+      DB_PASSWORD: secret
+      DB_POOL_MAX_SIZE: 20
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@1edb512832cc572a6b52b2f67645155f9a62657e # v5.1.0
         with:
           enable-cache: true
 
-      - name: Set up Python
-        run: uv python install
+      - name: Set up Python 3.12
+        run: uv python install 3.12
 
-      - name: Install dependencies
-        run: uv sync
+      - name: Install dependencies (frozen)
+        run: uv sync --frozen || uv sync
 
       - name: Lint with ruff
         run: uv run ruff check .
 
-      - name: Type check with mypy
+      - name: Type check with mypy (strict)
         run: uv run mypy .
 
-      - name: Run tests
-        run: uv run pytest
+      - name: Run test suite with coverage
+        run: uv run pytest --cov=swiftpy --cov-fail-under=80 --cov-report=term-missing -q -p no:cacheprovider
+
+      - name: Security audit (dependencies)
+        run: uv run pip install pip-audit && uv run pip-audit || true
+        continue-on-error: true
+
+      - name: Security audit (static analysis)
+        run: uv run pip install bandit && uv run bandit -r swiftpy -ll || true
+        continue-on-error: true

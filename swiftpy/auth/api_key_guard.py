@@ -187,7 +187,7 @@ async def require_api_key(
     key_validator: Callable[[str], Awaitable[Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Parse an API key from request headers and validate it against the database (Decision D-2).
+    Parse an API key from request headers or WebSocket credentials and validate it against the database (Decision D-2).
 
     Enforces:
       1. Strict '<prefix>.<secret>' key format (legacy unsegmented keys are rejected upfront)
@@ -196,6 +196,8 @@ async def require_api_key(
       4. Active transaction connection reuse via get_active_connection()
       5. Validation of active, revoked, and timezone-aware expires_at constraints
       6. Stripping of sensitive hash/secret fields before attaching to request.state and Context
+      7. Support for WebSockets via Sec-WebSocket-Protocol or URL query parameters (with documented
+         log-leak risk for query strings).
     """
     # 1. Resolve request from argument or task Context
     req = request or Context.get("request")
@@ -204,7 +206,7 @@ async def require_api_key(
             "No active HTTP Request found. Pass 'request' explicitly or call within request pipeline."
         )
 
-    # 2. Extract API key from headers and check for duplicate headers
+    # 2. Extract API key from headers or WebSocket handshake and check for duplicate headers
     raw_key: str | None = None
 
     header_name_bytes = header_name.lower().encode("latin1")
@@ -230,6 +232,39 @@ async def require_api_key(
             parts = raw_auth_headers[0].strip().split(" ", 1)
             if len(parts) == 2 and parts[0].lower() in {"apikey", "bearer"}:
                 raw_key = parts[1].strip()
+
+    if not raw_key and req.scope.get("type") == "websocket":
+        # Check Sec-WebSocket-Protocol (subprotocols)
+        subprotocols = req.scope.get("subprotocols", [])
+        if not subprotocols and "sec-websocket-protocol" in req.headers:
+            subprotocols = [p.strip() for p in req.headers["sec-websocket-protocol"].split(",") if p.strip()]
+
+        for i, proto in enumerate(subprotocols):
+            proto_clean = proto.strip()
+            if proto_clean.lower() in ("apikey", "api_key") and i + 1 < len(subprotocols):
+                raw_key = subprotocols[i + 1].strip()
+                break
+            if proto_clean.lower().startswith("apikey."):
+                raw_key = proto_clean[7:].strip()
+                break
+            if "." in proto_clean and proto_clean.count(".") != 2:
+                # Potential prefix.secret API key
+                raw_key = proto_clean
+                break
+
+        # Check query parameters as fallback (with log-leak warning)
+        if not raw_key:
+            raw_key = (
+                req.query_params.get("api_key")
+                or req.query_params.get("key")
+                or req.query_params.get(header_name.lower())
+                or req.query_params.get(header_name.lower().replace("-", "_"))
+            )
+            if raw_key:
+                logger.debug(
+                    "WebSocket authenticated via query parameter API key. Note: Query parameter keys "
+                    "carry log-leak risks as query strings are frequently logged in server and proxy logs."
+                )
 
     if not raw_key:
         raise InvalidApiKeyError(f"Missing API key header '{header_name}'")

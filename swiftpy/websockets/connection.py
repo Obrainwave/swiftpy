@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 from collections.abc import Awaitable, Callable
@@ -37,15 +38,24 @@ class WebSocketConnection:
         scope: dict[str, Any],
         receive: Callable[[], Awaitable[dict[str, Any]]],
         send: Callable[[dict[str, Any]], Awaitable[None]],
+        max_message_size: int = 1_048_576,
+        idle_timeout: float | None = None,
     ) -> None:
         self.scope = scope
         self._receive = receive
         self._send = send
+        self.max_message_size = max_message_size
+        self.idle_timeout = idle_timeout
 
         self.client_state = WebSocketState.CONNECTING
         self.close_code: int | None = None
         self.close_reason: str = ""
         self.state: dict[str, Any] = {}
+
+    @property
+    def origin(self) -> str | None:
+        """The Origin header sent by the client, or None if absent."""
+        return self.headers.get("origin")
 
     @property
     def path(self) -> str:
@@ -139,7 +149,7 @@ class WebSocketConnection:
     async def receive(self) -> str | bytes:
         """
         Receive raw text or bytes from the WebSocket client.
-        Raises WebSocketDisconnect when the client disconnects.
+        Raises WebSocketDisconnect when the client disconnects, times out, or exceeds size limits.
         """
         if self.client_state == WebSocketState.CONNECTING:
             raise WebSocketException("Cannot receive data: WebSocket has not been accepted yet")
@@ -149,14 +159,53 @@ class WebSocketConnection:
                 reason=self.close_reason,
             )
 
-        message = await self._receive()
+        try:
+            if self.idle_timeout is not None:
+                message = await asyncio.wait_for(self._receive(), timeout=self.idle_timeout)
+            else:
+                message = await self._receive()
+        except TimeoutError:
+            self.client_state = WebSocketState.DISCONNECTED
+            self.close_code = 1000
+            self.close_reason = "Idle timeout"
+            try:
+                await self._send({"type": "websocket.close", "code": 1000, "reason": "Idle timeout"})
+            except Exception:  # noqa: BLE001, S110
+                pass
+            raise WebSocketDisconnect(code=1000, reason="Idle timeout") from None
+
         msg_type = message.get("type")
 
         if msg_type == "websocket.receive":
-            if "text" in message and message["text"] is not None:
-                return cast(str, message["text"])
-            if "bytes" in message and message["bytes"] is not None:
-                return cast(bytes, message["bytes"])
+            raw_text = message.get("text")
+            raw_bytes = message.get("bytes")
+
+            if raw_text is not None:
+                text_str = cast(str, raw_text)
+                if len(text_str.encode("utf-8")) > self.max_message_size:
+                    self.client_state = WebSocketState.DISCONNECTED
+                    self.close_code = 1009
+                    self.close_reason = "Message too large"
+                    try:
+                        await self._send({"type": "websocket.close", "code": 1009, "reason": "Message too large"})
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    raise WebSocketDisconnect(code=1009, reason="Message too large")
+                return text_str
+
+            if raw_bytes is not None:
+                bytes_val = cast(bytes, raw_bytes)
+                if len(bytes_val) > self.max_message_size:
+                    self.client_state = WebSocketState.DISCONNECTED
+                    self.close_code = 1009
+                    self.close_reason = "Message too large"
+                    try:
+                        await self._send({"type": "websocket.close", "code": 1009, "reason": "Message too large"})
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    raise WebSocketDisconnect(code=1009, reason="Message too large")
+                return bytes_val
+
             return ""
 
         if msg_type == "websocket.disconnect":

@@ -38,6 +38,12 @@ swiftpy = "swiftpy.console.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["swiftpy"]
+exclude = [
+    "swiftpy/ai",
+]
+
 [tool.uv]
 package = true
 

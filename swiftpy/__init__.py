@@ -44,6 +44,7 @@ from swiftpy.database.orm import (
     Field,
     HasMany,
     HasOne,
+    LazyLoadingDisabledError,
     Model,
     RelationNotLoadedError,
 )
@@ -186,6 +187,7 @@ __all__ = [
     "JWTIssuer",
     "Job",
     "JobSerializationError",
+    "LazyLoadingDisabledError",
     "MaxRule",
     "MemoryDriver",
     "MethodNotAllowedError",
