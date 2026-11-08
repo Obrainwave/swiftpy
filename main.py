@@ -1,7 +1,15 @@
+from app.http.benchmarks import register_benchmark_routes
 from app.http.middleware.test_middleware import TestMiddleware
 from swiftpy import Application, Request, Response, RouteGroup, json_response
+from swiftpy.admin import admin
 
 app = Application()
+
+# Mount admin panel
+admin.mount(app, prefix="/admin")
+
+# Mount benchmark suite endpoints
+register_benchmark_routes(app)
 
 
 @app.get("/")
@@ -16,6 +24,8 @@ async def root(request: Request) -> Response:
                 "ping": "/ping",
                 "show_user": "/show-user",
                 "api_user": "/api/v1/users/1",
+                "admin": "/admin",
+                "admin_login": "/admin/login",
             },
         }
     )

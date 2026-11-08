@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from swiftpy.admin import (
+    AdminSite,
+    ModelAdmin,
+    admin,
+)
+from swiftpy.ai.agents import (
+    Agent,
+    AgentMemory,
+    AgentResponse,
+    AgentTask,
+    BaseAgent,
+)
 from swiftpy.auth import (
     ApiKeyGuard,
     AuthManager,
@@ -152,10 +164,16 @@ from swiftpy.websockets import (
 
 __all__ = [
     "CORS",
+    "AdminSite",
+    "Agent",
+    "AgentMemory",
+    "AgentResponse",
+    "AgentTask",
     "ApiKeyGuard",
     "Application",
     "AuthManager",
     "BadRequestError",
+    "BaseAgent",
     "BelongsTo",
     "BelongsToMany",
     "BetweenRule",
@@ -195,6 +213,7 @@ __all__ = [
     "Middleware",
     "MinRule",
     "Model",
+    "ModelAdmin",
     "NotFoundError",
     "NotInRule",
     "NullableRule",
@@ -234,6 +253,7 @@ __all__ = [
     "WebSocketException",
     "WebSocketManager",
     "WebSocketState",
+    "admin",
     "app",
     "between",
     "bool_",

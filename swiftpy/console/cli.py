@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from swiftpy.console.commands.cache import CacheCommand
 from swiftpy.console.commands.make import MakeCommand
 from swiftpy.console.commands.migrate import MigrateCommand
 from swiftpy.console.commands.queue import QueueCommand
@@ -38,6 +39,7 @@ class CLI:
         MigrateCommand.register(self.subparsers)
         MakeCommand.register(self.subparsers)
         QueueCommand.register(self.subparsers)
+        CacheCommand.register(self.subparsers)
 
     def run(self, args: list[str] | None = None) -> None:
         """Parse arguments and dispatch."""

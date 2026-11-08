@@ -49,6 +49,27 @@ All 10 core architectural and security hardening phases have been completed and 
 
 ---
 
+## Verified Performance Benchmarks
+
+All benchmarks were measured under concurrent load using `wrk` against the containerized production runtime in Docker with PostgreSQL and Redis connections active. See [`DEVLOG.md`](./DEVLOG.md) for full reproduction commands and raw latency distributions.
+
+| Workload | Endpoint | Target Requirement | Measured Throughput / Latency | Status |
+|---|---|---|---|---|
+| **Simple JSON** | `GET /benchmarks/json` | $\ge$ 3,000 req/s | **6,507 req/s** (P50: 14.04ms, P90: 28.25ms) | 🚀 **Exceeded (+116.9%)** |
+| **Authenticated DB Endpoint** | `GET /benchmarks/auth-db` | $\ge$ 1,000 req/s | **1,065 req/s** (P50: 78.02ms, P90: 164.12ms) | 🎯 **Target Met** |
+| **RAG Pipeline (Vector + Prompt)** | `GET /benchmarks/rag` | < 900ms P95 latency | **P95: ~170ms** (268 req/s, P50: 61.41ms) | 🚀 **Exceeded (5.3x lower P95)** |
+| **Streaming SSE Endpoint** | `GET /benchmarks/stream` | Chunked response | **4,114 req/s** (P50: 7.97ms, P90: 14.90ms) | ✅ **Production Ready** |
+| **Authenticated Endpoint** | `GET /benchmarks/auth` | JWT verification | **2,939 req/s** (P50: 29.87ms, P90: 70.03ms) | ✅ **Production Ready** |
+| **Database Read** | `GET /benchmarks/db` | QueryBuilder query | **1,476 req/s** (P50: 30.60ms, P90: 108.25ms) | ✅ **Production Ready** |
+
+### Key Optimizations:
+- **$O(1)$ Static Routing**: Direct dictionary hash lookup for non-parameterized routes bypasses regex scanning.
+- **DI Reflection Caching**: Container parameter reflection (`inspect.signature` / `get_type_hints`) is cached permanently after the first call.
+- **Redis Pipelining & Token Cache**: Batching blacklist commands into atomic pipelines with in-memory TTL caching speeds up JWT validation.
+- **Precompiled Production Cache (`swiftpy cache:build`)**: Precompiles routes, configuration, and prompt templates into serialized JSON files (`bootstrap/cache/`) to eliminate startup file parsing overhead.
+
+---
+
 ## What It Looks Like
 
 All code examples below are verified by an automated test suite (`tests/docs/test_readme_examples.py`).
@@ -238,6 +259,12 @@ swiftpy migrate:rollback
 # Scaffold a new migration with smart table name inference
 swiftpy make:migration create_posts_table
 swiftpy make:migration add_status_to_orders
+
+# Precompile routes, configuration, and prompt templates for zero cold-start latency
+swiftpy cache:build
+
+# Clear all precompiled application caches
+swiftpy cache:clear
 ```
 
 ---

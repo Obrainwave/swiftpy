@@ -64,6 +64,21 @@ class StartCommand:
             help="Environment configuration file path (e.g. '.env')",
         )
 
+        parser.add_argument(
+            "--access-log",
+            dest="access_log",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable or disable uvicorn access log",
+        )
+
+        parser.add_argument(
+            "--log-level",
+            dest="log_level",
+            default=None,
+            help="Logging level (critical, error, warning, info, debug, trace)",
+        )
+
         parser.set_defaults(
             _handler=StartCommand.handle,
         )
@@ -114,6 +129,18 @@ class StartCommand:
             uvicorn_kwargs["workers"] = workers
         if env_file:
             uvicorn_kwargs["env_file"] = env_file
+
+        access_log_opt = (
+            args.access_log
+            if getattr(args, "access_log", None) is not None
+            else config.get("server.access_log")
+        )
+        if access_log_opt is not None:
+            uvicorn_kwargs["access_log"] = bool(access_log_opt)
+
+        log_level_opt = getattr(args, "log_level", None) or config.get("server.log_level")
+        if log_level_opt:
+            uvicorn_kwargs["log_level"] = str(log_level_opt).lower()
 
         uvicorn.run(target, **uvicorn_kwargs)
 

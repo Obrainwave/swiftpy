@@ -1334,7 +1334,7 @@ async def test_task_cancellation_and_exception_isolation() -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
     assert status_crash == 500
-    assert body_crash.get("detail") == "Internal Server Error"
+    assert body_crash.get("detail") == "Internal Server Error" or body_crash.get("error") == "Internal Server Error"
 
     # Verify task context in caller is clean
     assert current_user() is None

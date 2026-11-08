@@ -233,7 +233,7 @@ class Application:
         self,
         title: str = "SwiftPY Application",
         version: str = "0.1.0",
-        debug: bool = False,
+        debug: bool | None = None,
         config: dict[str, Any] | Config | None = None,
         providers: Sequence[type[ServiceProvider]] | None = None,
         middleware: Sequence[type[Middleware]] | None = None,
@@ -320,7 +320,9 @@ class Application:
             .strip()
             .lower()
         )
-        if not self.debug:
+        if debug is not None:
+            self.debug = bool(debug)
+        else:
             cfg_debug = self.config.get("app.debug")
             if cfg_debug is None:
                 cfg_debug = self.config.get("debug", False)

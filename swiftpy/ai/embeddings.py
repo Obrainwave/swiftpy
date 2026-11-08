@@ -23,6 +23,7 @@ from swiftpy.ai.exceptions import (
 )
 from swiftpy.ai.pool import AIHttpPool
 from swiftpy.core.config import Config
+from swiftpy.testing.fakes.ai_fake import AIFake
 
 PROVIDER_MAX_BATCH_SIZE: dict[str, int] = {
     "openai": 2048,
@@ -275,6 +276,14 @@ class EmbeddingsClient:
                 raise TypeError(f"Item at index {idx} must be a string, got {type(t).__name__}")
             if not t.strip():
                 raise ValueError(f"Item at index {idx} is empty or whitespace only.")
+
+        active_fake = AIFake.get_active()
+        if active_fake is not None:
+            return await active_fake.handle_embed(
+                texts,
+                model=model,
+                provider=provider,
+            )
 
         prov_name, api_key, base_url, default_model = self._resolve_provider_and_key(provider)
         target_model = model or default_model

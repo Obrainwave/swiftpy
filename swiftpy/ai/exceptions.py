@@ -65,3 +65,11 @@ class AgentLoopError(AIError):
         self.iterations = iterations
 
 
+class AIBudgetExceededError(AIError):
+    """Raised when an operation exceeds the configured daily token or cost budget."""
+
+
+class AIContentModerationError(AIError):
+    """Raised when content fails moderation policy checks."""
+
+

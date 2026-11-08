@@ -249,3 +249,116 @@ All notable changes to SwiftPY will be documented in this file.
   - Aligned all code examples with actual SwiftPY APIs (`app.middleware`, `app.group`, `JWTGuard`, `CurrentUser`, `Blueprint`, `Job`).
   - Added comprehensive Configuration Reference table and Breaking Changes & Migration Guide documenting Decisions `D-1` through `D-14`.
   - Created `tests/docs/test_readme_examples.py` executing all README code snippets under automated pytest coverage to prevent future documentation drift.
+
+### Phase 11 – AI Native Module (Week 22)
+- **P11-T1 (AI / Tools – Tool Calling Abstraction & First-Party Tools):**
+  - Added `BaseTool(ABC)`, `FunctionTool` with signature/type-hint introspection, and `@tool` decorator in `swiftpy/ai/tools/base_tool.py`.
+  - Implemented `CalculatorTool` with AST-safe expression evaluation and numerical limits, `DateTimeTool` with timezone awareness, and `WebSearchTool` in `swiftpy/ai/tools/first_party.py`.
+- **P11-T2 (AI / Tool Loop – Autonomous Multi-Turn Tool Execution):**
+  - Added `ToolLoop` in `swiftpy/ai/tools/tool_loop.py` managing multi-turn conversation loops with dual guard limits (`max_iterations`, `max_tool_calls`), parallel tool execution via `asyncio.gather()`, and safe tool exception isolation.
+  - Integrated fluent `.tools()` and `.auto_execute_tools()` on `AIClient`.
+  - Added OpenAI and Anthropic tool calling wire protocols in `swiftpy/ai/providers/`.
+
+### Phase 12 – Agent System and Admin Panel (Week 23)
+- **P12-A1 (AI / Agents – Multi-Turn BaseAgent & Iteration Limits):**
+  - Implemented `BaseAgent` (`Agent`) in `swiftpy/ai/agents/base_agent.py` wrapping the autonomous `ToolLoop`, managing memory sessions, enforcing system prompts on every turn, and enforcing iteration limits (`max_iterations`).
+  - Implemented `AgentResponse` encapsulating generated content, executed tool calls, tool results, iterations, usage metrics, and model identifier.
+  - Added strict boundary enforcement asserting exact iteration count, non-issuance of $(N+1)$th model requests, and memory preservation.
+- **P12-A2 (AI / Agents – Memory Persistence Backends & Concurrency Safety):**
+  - Implemented `BaseMemoryBackend` and `AgentMemory` in `swiftpy/ai/agents/memory.py` supporting interchangeable persistence backends:
+    - `InMemoryMemoryBackend` for tests and local sessions.
+    - `RedisMemoryBackend` using atomic `RPUSH`/`LRANGE` list operations and pipeline execution with TTL support, eliminating read-modify-write race conditions.
+    - `DatabaseMemoryBackend` using dedicated relational tables (`agent_memories_messages`, `agent_memories_state`) with atomic SQL `INSERT`s and JSON upserts on PostgreSQL.
+- **P12-A3 (AI / Agents – Non-Blocking Background Concurrency & Lifecycle Management):**
+  - Added `AgentTask` running agents as background `asyncio.Task` instances that never block the server's event loop.
+  - Adhered strictly to the Concurrency Task Rule by attaching `_on_done` callbacks that catch and log background task exceptions.
+  - Added `AgentTracker` coordinating active background agent tasks, supporting concurrent monitoring and `cancel_all()` for graceful application shutdown.
+- **P12-AD1 (Admin – Model Registration & Introspection):**
+  - Implemented `AdminSite` and `ModelAdmin` in `swiftpy/admin/registry.py` with `@admin.register(Model)` decorator and automatic model introspection (`FieldMetadata`, `RelationshipMetadata`).
+  - Added validation rejecting duplicate model registrations (`ValueError`) and non-Model subclasses (`TypeError`).
+  - Introspected all 4 relationship types: `BelongsTo`, `HasMany`, `HasOne`, and `BelongsToMany` (with pivot table reflection).
+  - Added automatic eager loading of `BelongsTo` relationships to prevent N+1 queries during list rendering.
+  - Added primary key coercion helper `_coerce_pk` mapping URL parameters to declared integer/scalar column types for PostgreSQL compatibility.
+- **P12-AD2 (Admin – CRUD Screens & Relationship Dropdowns):**
+  - Implemented responsive HTML CRUD views and JSON API endpoints in `swiftpy/admin/views.py`: dashboard, list view with relationship badges, create and edit views with `<select>` foreign key dropdowns for `BelongsTo` relationships, and delete handler.
+  - Protected fields filtering: automatically ignores submitted `id`, `created_at`, and `updated_at` fields on create/edit forms.
+  - Comprehensive XSS prevention: all dynamic model fields, option values, headers, and representation strings are escaped via `html.escape(..., quote=True)`.
+- **P12-AD3 (Admin – Session-Based Authentication & Security Hardening):**
+  - Implemented session-based cookie authentication in `swiftpy/admin/auth.py` (`ADMIN_COOKIE_NAME`, `AdminSessionStore`, `AdminAuthenticator`, `AdminUser`, `require_admin`).
+  - Strictly isolated admin authentication from the API's JWT and API key guards so admin cookies cannot access API routes and API tokens/keys cannot access admin views.
+  - Implemented HMAC-SHA256 signed CSRF token generation and validation bound to admin `session_id`, rejecting mutating POST requests without valid tokens (HTTP 403).
+  - Enforced session token verification, signature tampering rejection, payload validation, and expiration enforcement.
+  - Disallowed default credentials (`admin`/`admin123`) in production mode (`APP_ENV=production`).
+
+### Phase 13 – Prompt Manager, AI Middleware, Observability, and AI Mocking (Week 24)
+- **P13-P1 (AI / Prompts – Prompt Template Loader & Production Caching):**
+  - Implemented `PromptLoader` and `load_prompt()` in `swiftpy/ai/prompts/loader.py` loading `prompts/{name}.md` and `prompts/{name}.py` files with positional-only naming safety.
+  - Supported `{{ variable }}` interpolation with whitespace tolerance and `KeyError` enforcement on missing placeholders.
+  - Added production in-memory caching active when `APP_ENV=production` or `ai.prompts.cache=true`, with zero-delay live reload during development.
+  - Integrated fluent `.prompt(name, **variables)` on `AIClient` and facade `AI.prompt()`.
+- **P13-M1 (AI / Middleware – Rate Limiting, Token Budgets & Content Moderation):**
+  - Implemented `AIMiddlewarePipeline` in `swiftpy/ai/middleware.py` executing pre/post processing layers around LLM providers.
+  - `AIRateLimitMiddleware`: per-user sliding window rate limiting extracting identity from `request.extra` or `Context` (`auth.user`), raising `AIRateLimitError` with `retry_after`.
+  - `TokenBudgetMiddleware`: daily token consumption and estimated dollar spend enforcement per user or globally, blocking requests with `AIBudgetExceededError`.
+  - `ContentModerationMiddleware`: pre-LLM message evaluation against keyword blacklists, regex patterns, or custom async moderation API checks, raising `AIContentModerationError`.
+  - Added `.use()` / `.middleware()` on `AIClient` and global `AI.add_middleware()`.
+- **P13-O1 (AI / Observability – Telemetry Observer & Multi-Driver Persistence):**
+  - Implemented `AIObservabilityManager` in `swiftpy/ai/observability/observer.py` hooking into all LLM `send()` and `stream()` invocations, recording model, provider, tokens, latency, estimated cost, and prompt SHA-256 hash.
+  - Implemented `DatabaseObservabilityDriver` in `swiftpy/ai/observability/drivers.py` writing structured rows to the PostgreSQL `ai_observations` table with aggregate SQL analytics.
+  - Implemented non-blocking `FileObservabilityDriver` writing JSON lines to `storage/logs/ai.log` via background thread offloading (`asyncio.to_thread`).
+  - Implemented `InMemoryObservabilityDriver` for thread-safe ephemeral testing.
+  - Extracted centralized token pricing logic into `swiftpy/ai/pricing.py` to prevent circular dependencies.
+- **P13-AD1 (Admin – Observability Dashboard & Live Usage Metrics):**
+  - Wired live AI observability directly into the admin console with dedicated view `GET {clean_prefix}/ai-usage` and JSON API endpoint.
+  - Displayed metric cards (total calls, success/failure breakdown, token volumes, estimated spend, average latency), provider breakdown, model breakdown, and recent 50 observations.
+  - Embedded AI Observability quick-status card in the main admin dashboard and added navigation shortcut in the sidebar.
+- **P13-F1 (AI / Testing – AIFake Double & Telemetry Assertion Helpers):**
+  - Implemented `AIFake` in `swiftpy/testing/fakes/ai_fake.py` intercepting all LLM calls across the application with zero real external API calls made and zero credentials required.
+  - Supported string, `LLMResponse`, sequential queue, dictionary/model mapping, and custom callable fixtures, alongside realistic chunk streaming.
+  - Exposed assertion helpers: `assert_called()`, `assert_called_once()`, `assert_not_called()`, and detailed mismatch diagnostic `assert_called_with()`.
+  - Integrated `AI.fake()` and `AI.restore()` on the `AI` facade, ensuring all faked calls are recorded by the observability system.
+- **P13-R1 (AI / Middleware – Distributed Concurrency & Preflight Budget Hardening):**
+  - Added atomic Redis Lua sliding-window rate limiting script (`_LUA_SLIDING_WINDOW_RATE_LIMIT`) supporting multi-worker application deployments and preventing burst over-allocation.
+  - Added configurable `fail_closed` policy for Redis backend rate limiting and token budgets.
+  - Hardened `TokenBudgetMiddleware` with atomic preflight reservation (`mode="hard"`) and automatic reservation rollback on downstream provider failure, eliminating concurrent overspending races.
+  - Added simultaneous per-user and global daily spend enforcement.
+- **P13-R2 (AI / Testing – Task-Isolated Fake Double & Complete Entry Point Interception):**
+  - Refactored `AIFake` to use task-local `ContextVar` stack storage, guaranteeing complete task isolation across concurrent `asyncio.gather()` workers and nested context managers.
+  - Intercepted embedding calls across `AI.embed()`, `AI.embed_batch()`, and `EmbeddingsClient.embed_batch()`, recording `FakeEmbeddingCall` telemetry and providing `assert_embedding_called()`.
+  - Verified end-to-end interception across all AI entry points: `AIClient.send()`, `AIClient.stream()`, `ToolLoop`, `BaseAgent`, and `RAGPipelineBuilder`.
+  - Added network guard verification proving 0 real outbound HTTP calls are made during active fake sessions.
+- **P13-R3 (AI / Observability – Resilience, Streaming TTFT, Cancellation & Metadata Redaction):**
+  - Added `fail_closed: bool = False` isolation to `AIObservabilityManager` so telemetry driver failures never disrupt user LLM calls.
+  - Tracked streaming TTFT (`ttft_ms`), total duration (`duration_ms`), and recorded `status="cancelled"` on stream consumer disconnection.
+  - Added automatic redaction of sensitive credentials (`api_key`, `secret`, `password`, `token`, `authorization`) from observation metadata (`sanitize_metadata`).
+  - Validated SQL table identifiers in `DatabaseObservabilityDriver` via `validate_identifier`.
+  - Added date range (`start_date`, `end_date`), `provider`, `model`, and `status` query filtering and pagination (`page`, `per_page`) across all drivers and `/admin/ai-usage`.
+- **P13-R4 (AI / Prompts – Path Traversal Guard & Precedence Hardening):**
+  - Added path traversal prevention in `PromptLoader.get_template()` verifying resolved path containment (`is_relative_to`), rejecting directory traversal attempts with `ValueError`.
+  - Enforced `.md` template precedence over `.py` files.
+  - Supported escaped literal `\\{{ ... \\}}` placeholders and positional-only `(name, /)` signature preventing placeholder parameter collisions.
+
+### Phase 5 – Polish, Harden, and Launch
+- **P14-P1 (Performance / Benchmarks – Production Load Optimization & Targets):**
+  - Ran full `wrk` benchmark suite against containerized production runtime in Docker with active PostgreSQL and Redis backends.
+  - Achieved **6,507.08 req/s** on Simple JSON (`GET /benchmarks/json`), exceeding the 3,000 req/s target by +116.9%.
+  - Achieved **1,064.82 req/s** on Authenticated DB Endpoint (`GET /benchmarks/auth-db`), fulfilling the $\ge$ 1,000 req/s requirement.
+  - Achieved **~170ms P95 latency** on RAG Pipeline (`GET /benchmarks/rag`), beating the 900ms P95 latency ceiling by 5.3x.
+  - Achieved **4,113.83 req/s** on Chunked SSE Streaming Endpoint (`GET /benchmarks/stream`) and **2,938.80 req/s** on Authenticated JWT Endpoint (`GET /benchmarks/auth`).
+- **P14-P2 (Core / HTTP – $O(1)$ Static Routing Table):**
+  - Implemented $O(1)$ static route hash table lookup (`_static_routes` and `_static_websocket_routes`) in `swiftpy/http/router.py`, indexing parameter-free routes by `(method, normalized_path)`.
+  - Completely eliminated linear regular expression compilation and matching on static request paths, slashing per-request dispatch latency to sub-microsecond levels.
+  - Added `Router.add_compiled_route(route)` for dynamically compiled routes.
+- **P14-P3 (Core / DI – Reflection Caching on Hot Paths):**
+  - Added `_inspect_callable_specs(fn)` and `_callable_reflection_cache` in `swiftpy/core/container.py`, caching callable parameter reflection and type hints indefinitely.
+  - Eliminated repetitive runtime reflection overhead on controller actions, middleware adapters, and service autowiring under high concurrency.
+- **P14-P4 (Auth / Database – Redis Pipelining & In-Memory Token Caching):**
+  - Batched Redis token blacklist checks into atomic Redis pipelines (`pipe.exists(...).get(...)`) in `swiftpy/auth/token_blacklist.py`.
+  - Added a thread-safe 2-second in-memory TTL cache (`_local_cache`) for non-revoked JWT tokens, immediately purged when tokens are explicitly revoked.
+  - Optimized `QueryBuilder` connection pool acquisition with singleton caching in `_connection()` and `_release()`.
+- **P14-P5 (CLI / Cache – Precompiled Production Cache Serialization):**
+  - Implemented `swiftpy cache:build` and `swiftpy cache:clear` CLI commands.
+  - Precompiled routes to `bootstrap/cache/routes.json` via `RouteCache.build(app)`.
+  - Precompiled configuration to `bootstrap/cache/config.json` via `Config.dump_cache()`.
+  - Precompiled AI prompt templates to `bootstrap/cache/prompts.json` via `PromptLoader.dump_cache()`.
+  - Added automatic hydration in production environments (`APP_ENV=production`) completely eliminating cold-start parsing and disk exploration.

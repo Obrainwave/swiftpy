@@ -11,6 +11,8 @@ __pycache__/
 
 storage/cache/
 storage/logs/
+bootstrap/cache/*.json
+!bootstrap/cache/.gitkeep
 .venv/
 .mypy_cache/
 .pytest_cache/

@@ -411,6 +411,10 @@ class Router:
         self._http_routes: list[Route] = []
         self._routes_by_method: dict[str, list[Route]] = {}
         self._websocket_routes: list[Route] = []
+        self._static_routes: dict[str, dict[str, Route]] = {}
+        self._static_websocket_routes: dict[str, Route] = {}
+        self._dynamic_routes_by_method: dict[str, list[Route]] = {}
+        self._dynamic_websocket_routes: list[Route] = []
         self._registered_keys: set[tuple[str, str]] = set()
         self._counter = 0
 
@@ -493,6 +497,42 @@ class Router:
 
         return tuple(specs)
 
+    def add_compiled_route(self, route: Route) -> Route:
+        """Register an already-compiled Route object into all routing indexes."""
+        key = (route.method, route.normalized_path)
+        self._registered_keys.add(key)
+        if route not in self.routes:
+            self.routes.append(route)
+
+        is_static = not bool(route.param_names)
+        if route.is_websocket:
+            if route not in self._websocket_routes:
+                self._websocket_routes.append(route)
+                self._websocket_routes.sort(key=lambda r: r.precedence_key)
+            if is_static:
+                self._static_websocket_routes[route.path] = route
+            else:
+                if route not in self._dynamic_websocket_routes:
+                    self._dynamic_websocket_routes.append(route)
+                    self._dynamic_websocket_routes.sort(key=lambda r: r.precedence_key)
+        else:
+            if route not in self._http_routes:
+                self._http_routes.append(route)
+                self._http_routes.sort(key=lambda r: r.precedence_key)
+            method_list = self._routes_by_method.setdefault(route.method, [])
+            if route not in method_list:
+                method_list.append(route)
+                method_list.sort(key=lambda r: r.precedence_key)
+            if is_static:
+                self._static_routes.setdefault(route.method, {})[route.path] = route
+            else:
+                dyn_list = self._dynamic_routes_by_method.setdefault(route.method, [])
+                if route not in dyn_list:
+                    dyn_list.append(route)
+                    dyn_list.sort(key=lambda r: r.precedence_key)
+
+        return route
+
     def add_route(
         self,
         method: str,
@@ -533,21 +573,8 @@ class Router:
             )
 
         route.param_specs = self._analyze_handler(route)
-        self._registered_keys.add(key)
         self._counter += 1
-        self.routes.append(route)
-
-        if is_websocket:
-            self._websocket_routes.append(route)
-            self._websocket_routes.sort(key=lambda r: r.precedence_key)
-        else:
-            self._http_routes.append(route)
-            self._http_routes.sort(key=lambda r: r.precedence_key)
-            method_list = self._routes_by_method.setdefault(route.method, [])
-            method_list.append(route)
-            method_list.sort(key=lambda r: r.precedence_key)
-
-        return route
+        return self.add_compiled_route(route)
 
     def route(
         self,
@@ -634,7 +661,11 @@ class Router:
         self,
         path: str,
     ) -> tuple[Route | None, dict[str, Any]]:
-        for route in self._websocket_routes:
+        static_route = self._static_websocket_routes.get(path)
+        if static_route is not None:
+            return static_route, {}
+
+        for route in self._dynamic_websocket_routes:
             m = route.pattern.match(path)
             if m is not None:
                 return route, self._coerce_matched_params(route, m.groupdict())
@@ -652,15 +683,23 @@ class Router:
 
         # 1. Never match WEBSOCKET routes over HTTP
         if norm_method != "WEBSOCKET":
-            candidates = self._routes_by_method.get(norm_method, ())
-            for route in candidates:
+            # Fast path: O(1) exact static lookup
+            static_candidates = self._static_routes.get(norm_method)
+            if static_candidates is not None and path in static_candidates:
+                return static_candidates[path], {}
+
+            dynamic_candidates = self._dynamic_routes_by_method.get(norm_method, ())
+            for route in dynamic_candidates:
                 m = route.pattern.match(path)
                 if m is not None:
                     return route, self._coerce_matched_params(route, m.groupdict())
 
             # 2. Automatic HEAD fallback to GET
             if norm_method == "HEAD":
-                get_candidates = self._routes_by_method.get("GET", ())
+                static_get = self._static_routes.get("GET")
+                if static_get is not None and path in static_get:
+                    return static_get[path], {}
+                get_candidates = self._dynamic_routes_by_method.get("GET", ())
                 for route in get_candidates:
                     m = route.pattern.match(path)
                     if m is not None:
@@ -668,8 +707,12 @@ class Router:
 
         # 3. Check if any HTTP methods match this path (for automatic OPTIONS or 405)
         matched_methods: set[str] = set()
+        for meth, static_map in self._static_routes.items():
+            if meth != "WEBSOCKET" and path in static_map:
+                matched_methods.add(meth)
+
         for route in self._http_routes:
-            if route.pattern.match(path) is not None:
+            if route.param_names and route.pattern.match(path) is not None:
                 matched_methods.add(route.method)
 
         if matched_methods:

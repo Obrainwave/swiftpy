@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+import asyncio
+import time
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 from swiftpy.ai.embeddings import EmbeddingsClient
@@ -8,7 +10,14 @@ from swiftpy.ai.exceptions import (
     AIConfigurationError,
     AIModuleDisabledError,
 )
+from swiftpy.ai.middleware import AIMiddlewarePipeline
+from swiftpy.ai.observability.observer import (
+    ObservationContext,
+    compute_prompt_hash,
+    get_observability,
+)
 from swiftpy.ai.pool import AIHttpPool
+from swiftpy.ai.prompts.loader import load_prompt
 from swiftpy.ai.providers.anthropic_provider import AnthropicProvider
 from swiftpy.ai.providers.base import (
     LLMRequest,
@@ -21,6 +30,7 @@ from swiftpy.ai.tools.base_tool import BaseTool
 from swiftpy.ai.tools.tool_loop import ToolLoop
 from swiftpy.ai.vectorstore.base import VectorStore
 from swiftpy.core.config import Config
+from swiftpy.testing.fakes.ai_fake import AIFake, FixtureType
 
 if TYPE_CHECKING:
     from swiftpy.ai.conversation import Conversation
@@ -41,10 +51,11 @@ class AIClient:
         )
     """
 
-    _registry: ClassVar[dict[str, type[ProviderInterface]]] = {
+    _registry: ClassVar[dict[str, type[ProviderInterface] | ProviderInterface]] = {
         "openai": OpenAIProvider,
         "anthropic": AnthropicProvider,
     }
+    _global_middlewares: ClassVar[list[Any]] = []
 
     def __init__(
         self,
@@ -79,15 +90,46 @@ class AIClient:
         self._tool_timeout: float | None = None
         self._is_executing_tool_loop: bool = False
         self._last_tool_loop: ToolLoop | None = None
+        self._middlewares: list[Any] = []
 
     @classmethod
     def register_provider(
         cls,
         name: str,
-        provider_cls: type[ProviderInterface],
+        provider_cls: type[ProviderInterface] | ProviderInterface,
     ) -> None:
-        """Register a custom provider adapter class."""
+        """Register a custom provider adapter class or instance."""
         cls._registry[name.lower()] = provider_cls
+
+    @classmethod
+    def use_global_middleware(cls, middleware: Any) -> None:
+        """Register global middleware applied to all AIClient instances."""
+        cls._global_middlewares.append(middleware)
+
+    @classmethod
+    def clear_global_middlewares(cls) -> None:
+        """Clear all registered global middlewares."""
+        cls._global_middlewares.clear()
+
+    def use(self, middleware: Any) -> Self:
+        """Attach a middleware layer to this client builder."""
+        self._middlewares.append(middleware)
+        return self
+
+    def middleware(self, middleware: Any) -> Self:
+        """Alias for use()."""
+        return self.use(middleware)
+
+    def prompt(self, name: str, /, role: str = "user", **variables: Any) -> Self:
+        """
+        Load a prompt template from disk, interpolate variables, and append as message.
+        """
+        rendered = load_prompt(name, **variables)
+        msg = Message(role=role, content=rendered)
+        self._messages.append(msg)
+        if self._attached_conversation is not None:
+            self._attached_conversation.add_message(msg)
+        return self
 
     def system(self, content: str) -> Self:
         """Add a system message prompt."""
@@ -318,7 +360,9 @@ class AIClient:
                 f"or set the appropriate environment variable."
             )
 
-        return provider_cls(config=provider_cfg, http_pool=self._http_pool)
+        if isinstance(provider_cls, type):
+            return provider_cls(config=provider_cfg, http_pool=self._http_pool)
+        return provider_cls
 
     async def send(self) -> LLMResponse:
         """
@@ -347,8 +391,6 @@ class AIClient:
             finally:
                 self._is_executing_tool_loop = False
 
-        provider = self._resolve_provider()
-
         request = LLMRequest(
             messages=list(self._messages),
             model=self._model,
@@ -360,10 +402,48 @@ class AIClient:
             extra=dict(self._extra),
         )
 
-        response = await provider.send(request)
+        active_fake = AIFake.get_active()
+        if active_fake is not None:
+            async def fake_terminal(req: LLMRequest) -> LLMResponse:
+                return await active_fake.handle_send(self, req)
+
+            pipeline = AIMiddlewarePipeline(
+                list(self._global_middlewares) + list(self._middlewares)
+            )
+            response = await pipeline.execute(request, fake_terminal)
+            if (
+                self._attached_conversation is not None
+                and not self._is_executing_tool_loop
+                and response.content
+            ):
+                self._attached_conversation.add_assistant(response.content)
+            return response
+
+        provider = self._resolve_provider()
+        observer = get_observability()
+
+        async def provider_terminal(req: LLMRequest) -> LLMResponse:
+            async with observer.observe_call(
+                model=req.model or self._model or "unknown",
+                provider=self._provider_name or "unknown",
+                messages=req.messages,
+                metadata=dict(req.extra),
+            ) as obs_ctx:
+                resp = await provider.send(req)
+                obs_ctx.set_response(resp)
+                return resp
+
+        pipeline = AIMiddlewarePipeline(
+            list(self._global_middlewares) + list(self._middlewares)
+        )
+        response = await pipeline.execute(request, provider_terminal)
 
         # Record assistant completion in attached conversation if present
-        if self._attached_conversation is not None and not self._is_executing_tool_loop and response.content:
+        if (
+            self._attached_conversation is not None
+            and not self._is_executing_tool_loop
+            and response.content
+        ):
             self._attached_conversation.add_assistant(response.content)
 
         return response
@@ -379,8 +459,6 @@ class AIClient:
         if not self._messages:
             raise ValueError("Cannot stream request: at least one message is required.")
 
-        provider = self._resolve_provider()
-
         request = LLMRequest(
             messages=list(self._messages),
             model=self._model,
@@ -394,15 +472,78 @@ class AIClient:
         accumulated_chunks: list[str] = []
         completed = False
 
+        active_fake = AIFake.get_active()
+        if active_fake is not None:
+            gen = active_fake.handle_stream(self, request)
+            try:
+                async for chunk in gen:
+                    accumulated_chunks.append(chunk)
+                    yield chunk
+                completed = True
+            finally:
+                if not completed and isinstance(gen, AsyncGenerator):
+                    await gen.aclose()
+                if completed and self._attached_conversation is not None:
+                    self._attached_conversation.add_assistant("".join(accumulated_chunks))
+            return
+
+        provider = self._resolve_provider()
+        observer = get_observability()
+        prompt_hash = compute_prompt_hash(request.messages)
+        obs_ctx = ObservationContext(
+            model=request.model or self._model or "unknown",
+            provider=self._provider_name or "unknown",
+            prompt_hash=prompt_hash,
+            metadata={"stream": True, **dict(request.extra)},
+        )
+        stream_start = time.perf_counter()
+        first_chunk = True
+        completed = False
+
         try:
             async for chunk in provider.stream(request):
+                if first_chunk:
+                    obs_ctx.record_first_token(stream_start)
+                    first_chunk = False
                 accumulated_chunks.append(chunk)
                 yield chunk
             completed = True
+        except (asyncio.CancelledError, GeneratorExit):
+            obs_ctx.status = "cancelled"
+            obs_ctx.error_message = "Stream consumer disconnected or cancelled."
+            raise
+        except Exception as exc:
+            obs_ctx.status = "error"
+            obs_ctx.error_message = str(exc)
+            raise
         finally:
+            latency_ms = (time.perf_counter() - stream_start) * 1000.0
+            obs_ctx.duration_ms = latency_ms
+            if not completed and obs_ctx.status == "success":
+                obs_ctx.status = "cancelled"
+            full_text = "".join(accumulated_chunks)
+            output_tokens = max(1, len(full_text) // 4)
+            input_tokens = max(
+                1, sum(len(m.content or "") for m in request.messages) // 4
+            )
+            obs_ctx.set_tokens(input_tokens, output_tokens)
+            await observer.record(
+                model=obs_ctx.model,
+                provider=obs_ctx.provider,
+                input_tokens=obs_ctx.input_tokens,
+                output_tokens=obs_ctx.output_tokens,
+                latency_ms=latency_ms,
+                prompt_hash=obs_ctx.prompt_hash,
+                cost=obs_ctx.cost,
+                status=obs_ctx.status,
+                error_message=obs_ctx.error_message,
+                metadata=obs_ctx.metadata,
+                ttft_ms=obs_ctx.ttft_ms,
+                duration_ms=obs_ctx.duration_ms,
+            )
             # Only persist assistant reply if the stream completed normally (not cancelled)
             if completed and self._attached_conversation is not None:
-                self._attached_conversation.add_assistant("".join(accumulated_chunks))
+                self._attached_conversation.add_assistant(full_text)
 
 
 class AI:
@@ -422,6 +563,40 @@ class AI:
                     yield chunk
             return stream(tokens())
     """
+
+    @classmethod
+    def fake(cls, fixtures: FixtureType | None = None) -> AIFake:
+        """
+        Activate an AIFake test double that intercepts all LLM calls across the application.
+        Zero real external API calls are made while active.
+        """
+        return AIFake(fixtures).activate()
+
+    @classmethod
+    def restore(cls) -> None:
+        """Deactivate active test fake and restore normal provider execution."""
+        active = AIFake.get_active()
+        if active is not None:
+            active.restore()
+
+    @classmethod
+    def add_middleware(cls, middleware: Any) -> None:
+        """Register application-wide AI middleware."""
+        AIClient.use_global_middleware(middleware)
+
+    @classmethod
+    def prompt(
+        cls,
+        name: str,
+        /,
+        model: str | None = None,
+        provider: str | None = None,
+        **variables: Any,
+    ) -> AIClient:
+        """Start a fluent AIClient initialized with the specified prompt template."""
+        client = cls.chat(model=model, provider=provider)
+        client.prompt(name, **variables)
+        return client
 
     @classmethod
     def chat(

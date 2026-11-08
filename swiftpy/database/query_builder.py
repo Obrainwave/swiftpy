@@ -59,6 +59,10 @@ def escape_like(value: str) -> str:
 
 
 class QueryBuilder:
+    @classmethod
+    def table(cls, table_name: str) -> QueryBuilder:
+        return cls(table_name)
+
     def __init__(self, table_name: str) -> None:
         self._table = validate_identifier(table_name, allow_dotted=True)
         self._columns: list[SelectExpression] = ["*"]
@@ -282,29 +286,29 @@ class QueryBuilder:
 
         return self
 
+    @staticmethod
+    def _get_pool() -> asyncpg.Pool:
+        container = get_container()
+        db_pool = container.get_singleton(DatabasePool)
+        if db_pool is None:
+            db_pool = container.resolve(DatabasePool)
+        return db_pool.get_pool()
+
     async def _connection(self) -> asyncpg.Connection:
         tx_conn = get_active_connection()
 
         if tx_conn is not None:
             return tx_conn
 
-        container = get_container()
-
-        db_pool = container.resolve(DatabasePool)
-
-        pool = db_pool.get_pool()
-
+        pool = self._get_pool()
         return await pool.acquire()
 
     async def _release(self, conn: asyncpg.Connection) -> None:
         if get_active_connection() is not None:
             return
 
-        container = get_container()
-
-        db_pool = container.resolve(DatabasePool)
-
-        await db_pool.get_pool().release(conn)
+        pool = self._get_pool()
+        await pool.release(conn)
 
     def _compile_select(self, start_idx: int = 1) -> tuple[str, list[Any], int]:
         bindings: list[Any] = []

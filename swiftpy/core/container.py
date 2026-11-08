@@ -43,6 +43,95 @@ _DI_SCOPED_INSTANCES_KEY = "__swiftpy_di_scoped_instances__"
 _NONE_SENTINEL = object()
 
 
+@dataclass(slots=True, frozen=True)
+class _CallableParamInfo:
+    name: str
+    param_type: Any
+    default: Any
+
+
+_callable_reflection_cache: dict[tuple[Any, bool], tuple[_CallableParamInfo, ...]] = {}
+_can_resolve_init_cache: dict[type[Any], tuple[tuple[str, Any], ...] | None] = {}
+
+
+def _inspect_callable_specs(
+    func: Callable[..., Any], *, skip_first: bool = False
+) -> tuple[_CallableParamInfo, ...]:
+    cache_key = (func, skip_first)
+    cached = _callable_reflection_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        signature = inspect.signature(func)
+        type_hints = get_type_hints(func)
+    except (NameError, TypeError, ValueError) as exc:
+        callable_name = getattr(
+            func, "__qualname__", getattr(func, "__name__", str(func))
+        )
+        raise ResolutionError(
+            f"Failed to resolve type hints for '{callable_name}': {exc}"
+        ) from exc
+
+    parameters = list(signature.parameters.items())
+    if skip_first and parameters:
+        parameters = parameters[1:]
+
+    specs: list[_CallableParamInfo] = []
+    for name, parameter in parameters:
+        param_type = type_hints.get(name, parameter.annotation)
+        specs.append(
+            _CallableParamInfo(
+                name=name,
+                param_type=param_type,
+                default=parameter.default,
+            )
+        )
+
+    res = tuple(specs)
+    _callable_reflection_cache[cache_key] = res
+    return res
+
+
+def _inspect_can_resolve_params(
+    target: type[Any],
+) -> tuple[tuple[str, Any], ...] | None:
+    if target in _can_resolve_init_cache:
+        return _can_resolve_init_cache[target]
+
+    init_method = target.__init__
+    if init_method is object.__init__:
+        _can_resolve_init_cache[target] = ()
+        return ()
+
+    try:
+        signature = inspect.signature(init_method)
+        type_hints = get_type_hints(init_method)
+    except (TypeError, ValueError, NameError):
+        _can_resolve_init_cache[target] = None
+        return None
+
+    parameters = list(signature.parameters.items())
+    if parameters:
+        parameters = parameters[1:]
+
+    required: list[tuple[str, Any]] = []
+    for name, parameter in parameters:
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if parameter.default is not inspect.Parameter.empty:
+            continue
+        param_type = type_hints.get(name, parameter.annotation)
+        required.append((name, param_type))
+
+    res = tuple(required)
+    _can_resolve_init_cache[target] = res
+    return res
+
+
 def _current_task_or_none() -> asyncio.Task[Any] | None:
     try:
         return asyncio.current_task()
@@ -231,36 +320,12 @@ class Container:
         if target in seen:
             return False
 
-        init_method = target.__init__
-        if init_method is object.__init__:
-            return True
-
-        try:
-            signature = inspect.signature(init_method)
-        except (TypeError, ValueError):
+        required_params = _inspect_can_resolve_params(target)
+        if required_params is None:
             return False
 
-        try:
-            type_hints = get_type_hints(init_method)
-        except (NameError, TypeError, ValueError):
-            type_hints = {}
-
-        parameters = list(signature.parameters.items())
-        if parameters:
-            parameters = parameters[1:]
-
         next_seen = seen | {target}
-        for name, parameter in parameters:
-            if parameter.kind in (
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            ):
-                continue
-
-            if parameter.default is not inspect.Parameter.empty:
-                continue
-
-            param_type = type_hints.get(name, parameter.annotation)
+        for _, param_type in required_params:
             if not self.can_resolve(param_type, next_seen):
                 return False
 
@@ -451,33 +516,16 @@ class Container:
         if extra_kwargs is None:
             extra_kwargs = {}
 
-        try:
-            signature = inspect.signature(func)
-            type_hints = get_type_hints(func)
-        except (NameError, TypeError, ValueError) as exc:
-            callable_name = getattr(
-                func, "__qualname__", getattr(func, "__name__", str(func))
-            )
-            raise ResolutionError(
-                f"Failed to resolve type hints for '{callable_name}': {exc}"
-            ) from exc
-
+        specs = _inspect_callable_specs(func, skip_first=skip_first)
         resolved_kwargs: dict[str, Any] = {}
 
-        parameters = list(signature.parameters.items())
-
-        if skip_first and parameters:
-            parameters = parameters[1:]
-
-        for name, parameter in parameters:
+        for spec in specs:
+            name = spec.name
             if name in extra_kwargs:
                 resolved_kwargs[name] = extra_kwargs[name]
                 continue
 
-            parameter_type = type_hints.get(
-                name,
-                parameter.annotation,
-            )
+            parameter_type = spec.param_type
 
             if (
                 parameter_type is not inspect.Parameter.empty
@@ -489,18 +537,21 @@ class Container:
                 except CircularDependencyError:
                     raise
                 except ResolutionError:
-                    if parameter.default is not inspect.Parameter.empty:
-                        resolved_kwargs[name] = parameter.default
+                    if spec.default is not inspect.Parameter.empty:
+                        resolved_kwargs[name] = spec.default
                         continue
 
-            if parameter.default is not inspect.Parameter.empty:
-                resolved_kwargs[name] = parameter.default
+            if spec.default is not inspect.Parameter.empty:
+                resolved_kwargs[name] = spec.default
                 continue
 
+            callable_name = getattr(
+                func, "__qualname__", getattr(func, "__name__", str(func))
+            )
             raise ResolutionError(
                 f"Cannot resolve parameter '{name}' "
                 f"of type '{parameter_type}' "
-                f"for callable '{func.__qualname__}'."
+                f"for callable '{callable_name}'."
             )
 
         return resolved_kwargs

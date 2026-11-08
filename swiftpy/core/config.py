@@ -55,12 +55,25 @@ class Config:
         env: dict[str, str] | None = None,
         *,
         strict: bool = True,
+        ignore_cache: bool = False,
     ) -> Config:
         """
         Load configuration files from config_dir and merge with environment variables.
         When `strict=True` (the default), broken or invalid config files raise `ConfigurationError`.
         When `strict=False`, broken config files log a warning and are skipped.
         """
+        cache_path = Path("bootstrap/cache/config.json")
+        if not ignore_cache and env is None and cache_path.is_file():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                if isinstance(cached_data, dict):
+                    instance = cls(cached_data)
+                    cls._instance = instance
+                    return instance
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to load cached config %s: %s", cache_path, exc)
+
         data: dict[str, Any] = {}
         config_path = Path(config_dir)
 
@@ -300,6 +313,29 @@ class Config:
         if key is None:
             return self
         return self.get(key, default)
+
+    def dump_cache(
+        self,
+        cache_path: str | Path = "bootstrap/cache/config.json",
+    ) -> Path:
+        """Serialize configuration data to JSON cache for production performance."""
+        target = Path(cache_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2, default=str)
+        return target
+
+    @classmethod
+    def clear_cache(
+        cls,
+        cache_path: str | Path = "bootstrap/cache/config.json",
+    ) -> bool:
+        """Delete serialized configuration cache file."""
+        target = Path(cache_path)
+        if target.is_file():
+            target.unlink()
+            return True
+        return False
 
 
 __all__ = ["Config", "ConfigurationError"]

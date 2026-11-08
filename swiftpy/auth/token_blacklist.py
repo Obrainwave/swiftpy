@@ -40,6 +40,8 @@ class TokenBlacklist:
         self._config = config
         self._owns_client = redis_client is None
         self._lock = asyncio.Lock()
+        self._local_cache: dict[tuple[str, str], float] = {}
+        self._local_cache_ttl: float = 2.0
 
     async def get_client(self) -> aioredis.Redis:
         """Lazily initialize and return the async Redis client safely under lock."""
@@ -73,6 +75,7 @@ class TokenBlacklist:
         raw_ttl = ttl if (ttl is not None and ttl > 0) else self.default_ttl
         expiration = min(raw_ttl, self.max_token_lifetime)
 
+        self._local_cache.clear()
         await client.set(key, "revoked", ex=expiration)
 
     async def revoke_token(
@@ -141,6 +144,7 @@ class TokenBlacklist:
         raw_ttl = ttl if (ttl is not None and ttl > 0) else self.max_token_lifetime
         expiration = min(raw_ttl, self.max_token_lifetime)
         now = int(time.time())
+        self._local_cache.clear()
         await client.set(sub_key, str(now), ex=expiration)
 
     async def is_revoked(
@@ -156,27 +160,48 @@ class TokenBlacklist:
         if not jti and not subject:
             return False
 
+        cache_key = (jti or "", str(subject) if subject is not None else "")
+        now = time.monotonic()
+        cached_ts = self._local_cache.get(cache_key)
+        if cached_ts is not None and (now - cached_ts) < self._local_cache_ttl:
+            return False
+
         client = await self.get_client()
 
-        if jti:
-            key = f"{self.prefix}{jti}"
-            if await client.exists(key):
-                return True
+        pipe = client.pipeline()
+        has_jti = bool(jti)
+        has_sub = subject is not None
 
-        if subject is not None:
-            sub_key = f"{self.prefix}sub:{subject}"
-            sub_cutoff = await client.get(sub_key)
+        if has_jti:
+            pipe.exists(f"{self.prefix}{jti}")
+        if has_sub:
+            pipe.get(f"{self.prefix}sub:{subject}")
+
+        results = await pipe.execute()
+
+        res_idx = 0
+        if has_jti:
+            if results[res_idx]:
+                return True
+            res_idx += 1
+
+        if has_sub:
+            sub_cutoff = results[res_idx]
             if sub_cutoff is not None:
                 cutoff_ts = int(sub_cutoff)
                 if issued_at is None or issued_at <= cutoff_ts:
                     return True
 
+        if len(self._local_cache) > 10000:
+            self._local_cache.clear()
+        self._local_cache[cache_key] = now
         return False
 
     async def clear(self) -> None:
         """
         Remove all blacklisted tokens matching this prefix (primarily for tests/maintenance).
         """
+        self._local_cache.clear()
         client = await self.get_client()
         match_pattern = f"{self.prefix}*"
         cursor = 0

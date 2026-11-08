@@ -10,7 +10,7 @@ services:
         GID: "${GID:-1000}"
     container_name: swiftpy_app
     user: "${UID:-1000}:${GID:-1000}"
-    command: ["swiftpy", "start", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["swiftpy", "start", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--log-level", "warning"]
     ports:
       - "8000:8000"
     depends_on:
@@ -29,7 +29,10 @@ services:
       DB_DATABASE: swiftpy
       DB_USERNAME: postgres
       DB_PASSWORD: "${DB_PASSWORD:-secret}"
-      DB_POOL_MAX_SIZE: 20
+      DB_POOL_MIN_SIZE: 10
+      DB_POOL_MAX_SIZE: 50
+      JWT_SECRET: "super_secret_benchmark_key_must_be_at_least_32_bytes_long_12345"
+      AUTH_KEY_PEPPER: "super_secret_pepper_benchmark_and_production_key_32_bytes_min_12345"
 
       REDIS_HOST: redis
       REDIS_PORT: 6379
