@@ -1509,6 +1509,73 @@ Transfer/sec:    482.06KB
   - `pytest tests/ai/test_rag.py tests/ai/integration/test_rag_integration.py`: **36 passed, 3 skipped in 1.44s** (0 failures, 0 errors; skipped tests are environment-gated live external API / Docker tests).
   - `pytest tests/ai tests/database`: **124 passed, 56 skipped in 3.15s** (0 failures, 0 errors).
 
+---
+
+## Week 22 – Tool Calling and the Autonomous Tool Loop
+
+### Status: PASSED & FULLY VERIFIED
+* **Date:** 2026-11-08
+* **Summary:**
+  - **Tool Abstraction (`swiftpy/ai/tools/base_tool.py`):**
+    - `BaseTool(ABC)`: abstract foundation defining `@property name`, `@property description`, `@property parameters` (JSON Schema object), and `async handle(*args, **kwargs)` method.
+    - Export formatters: `to_dict()` for OpenAI function schema (`{"type": "function", "function": {...}}`) and `to_anthropic_dict()` for Anthropic tool schema (`{"name": ..., "description": ..., "input_schema": ...}`).
+    - `FunctionTool`: adapter wrapping Python async or sync callables. Automatically inspects signatures, type hints, docstrings, and defaults to construct JSON Schema definitions with advanced type inference (`Optional`, `Union`, `Literal`, `Enum`, `list`, `dict`, `bool` vs `int`, pos-only, kw-only).
+    - Local argument validation: validates incoming model arguments against declared parameter schemas and types prior to execution, safely catching missing parameters, type mismatches, and unexpected arguments.
+    - Non-blocking synchronous execution: synchronous callables are offloaded to worker threads via `asyncio.to_thread` to guarantee zero event loop freezing.
+    - `@tool` decorator: ergonomic decorator with strict `@overload` typing supporting both bare `@tool` and parameterized `@tool(name=..., description=...)` with tool name validation (`^[a-zA-Z0-9_-]+$`).
+  - **First-Party Tools (`swiftpy/ai/tools/first_party.py`):**
+    - `CalculatorTool`: safe mathematical expression evaluation using Python's `ast` module (`_safe_eval_node`), strictly forbidding insecure code execution (`eval()`, `exec()`, imports, arbitrary functions).
+      - Security: strictly rejects attribute traversals (`().__class__`, `(1).__class__.__mro__`), subscript access (`[1, 2, 3][0]`), comprehensions, lambdas, and non-whitelisted AST nodes.
+      - Resource bounds: enforces expression character length limit (`max_expression_length=500`), AST recursion depth limit (`max_ast_depth=20`), and exponent magnitude limit (`Pow.right <= 1000`).
+      - Numerical safety: rejects negative square roots (`sqrt(-1)`), intercepts calculation overflow, and rejects non-finite results (`NaN` and `Infinity`).
+    - `DateTimeTool`: provides current date, time, and ISO timestamps with precise timezone handling via Python's standard `zoneinfo` (verified exact UTC offsets, e.g. `+09:00` for `Asia/Tokyo`), with graceful fallback to UTC on unknown timezones and robust strftime format handling.
+    - `WebSearchTool`: provides a pluggable search integration with a configurable search function and a built-in synthetic fallback for development and testing. Includes search function timeout protection (`timeout=10.0`), positive `max_results` validation, result normalization (`title`, `snippet`, `url`), and error isolation.
+  - **Autonomous Tool Loop (`swiftpy/ai/tools/tool_loop.py`):**
+    - `ToolLoop`: orchestrates autonomous multi-turn interaction between LLMs and tool handlers.
+    - Flow:
+      1. Dispatches request containing registered tool schemas.
+      2. Intercepts `response.tool_calls` (or parses provider-specific raw payloads from OpenAI or Anthropic).
+      3. If no tool calls are requested, returns the final text response.
+      4. Appends assistant message turn with requested `tool_calls`.
+      5. Executes multiple tool handlers concurrently via `asyncio.gather(*tasks)` (proven overlapping execution intervals).
+      6. Safely isolates tool exceptions and timeouts without cancelling sibling tools; captures structured error payloads for the model.
+      7. Appends execution results back into conversation history in exact order as `role="tool"` messages with `tool_call_id`.
+      8. Repeats until model returns text answer or iteration/tool-call guards are triggered.
+    - **Dual Guard Semantics:** Disentangled protections for both `max_iterations` (maximum model turns requesting tools) and `max_tool_calls` (maximum cumulative individual tool executions), with positive-integer validation.
+    - **Tool Execution Policy & Permissions:** Configurable `allowed_tools` allowlist to block unauthorized tool execution, plus per-tool execution timeouts (`tool_timeout`).
+    - **Telemetry:** Exposes `.executed_calls` (`list[ToolCall]`) and `.executed_results` (`list[ToolResult]`).
+  - **Client Integration (`swiftpy/ai/client.py`):**
+    - Fluent `.tools(tools)` method accepting both instances of `BaseTool` and subclasses of `BaseTool` (automatically instantiated).
+    - Fluent `.auto_execute_tools(enable=True, max_iterations=10, max_tool_calls=..., allowed_tools=..., tool_timeout=...)` method.
+    - Property `.registered_tools` and `.last_tool_loop` exposing execution telemetry.
+    - Anti-recursion execution guard (`_is_executing_tool_loop`) ensuring inner tool loop turns cleanly dispatch provider requests, with guaranteed reset in `finally` even on cancellation or error.
+    - Safe integration with attached `Conversation` instances, recording the final assistant completion once the autonomous loop terminates.
+  - **Provider Wire Protocol Compatibility (`swiftpy/ai/providers/`):**
+    - `OpenAIProvider`: sends `request.tools` in payload, parses `choices[0].message.tool_calls` with JSON-string arguments, handles invalid JSON string fallbacks, preserves `finish_reason="tool_calls"`, and formats outgoing multi-turn `role="tool"` messages with matching `tool_call_id`.
+    - `AnthropicProvider`: maps tools to `input_schema`, parses `tool_use` blocks in content array with `stop_reason="tool_use"`, and automatically merges consecutive outgoing `role="tool"` results into a single user message containing `tool_result` blocks matching Anthropic's wire specification.
+  - **Package Integration (`swiftpy/ai/`):**
+    - Exported `AgentLoopError`, `BaseTool`, `CalculatorTool`, `DateTimeTool`, `FunctionTool`, `ToolCall`, `ToolLoop`, `ToolResult`, `WebSearchTool`, `tool` in `swiftpy.ai.__init__.py`.
+
+### Verification & Test Suite:
+* **Test Suite:** `tests/ai/test_tools.py` (15 tests, 100% pass rate, 0 skipped)
+* **Key Scenarios Verified:**
+  1. **OpenAI Wire Protocol Compatibility:** Raw HTTP response parsing with multiple tool calls, string JSON arguments, malformed JSON recovery, and outgoing message serialization.
+  2. **Anthropic Wire Protocol Compatibility:** Raw HTTP response parsing with multiple `tool_use` blocks, `stop_reason="tool_use"`, input schemas, and merging consecutive tool results into a single user message.
+  3. **Complex Schema Inference & Argument Validation:** Generates schemas for `Optional`, `Union`, `Literal`, `Enum`, `list`, `dict`, and defaults. Verifies runtime validation rejecting missing arguments, wrong types, and unexpected kwargs.
+  4. **Calculator Security & Resource Limits:** Attribute traversal rejection (`().__class__`, `(1).__class__.__mro__`), subscript rejection (`[1, 2, 3][0]`), exponent explosion limit (`2 ** 100000000`), negative sqrt (`sqrt(-1)`), length limit (>500 chars), AST depth limit (>20 levels), and non-finite output rejection.
+  5. **True Concurrent Parallel Tool Execution:** Timing verification of overlapping start/end intervals with `asyncio.gather()`, error isolation (failing tool does not abort successful parallel tools), and order preservation.
+  6. **Dual Guard Semantics:** Disentangled `max_iterations` and `max_tool_calls` protections, exact boundary termination, and validation of zero/negative limits.
+  7. **Tool Policy & Permissions:** Blocking unauthorized tools with `allowed_tools` allowlist without crashing the loop, and per-tool timeout enforcement.
+  8. **Three-Tool-Call Chain Query:** Full multi-step autonomous execution query requiring 3 distinct tool calls (`web_search` -> `calculator` -> `date_time` -> final text answer).
+  9. **Client State Isolation:** Separate `AIClient` instances maintain isolated tools and telemetry; failed loops safely reset `_is_executing_tool_loop` to `False`.
+  10. **DateTime & WebSearch Precision:** Exact UTC offset seconds verification (`+09:00` for Tokyo), search timeout handling, and custom callable search integration.
+
+### Quality Gates:
+* `ruff check swiftpy tests`: **All checks passed!** (0 errors)
+* `mypy swiftpy tests/ai`: **Success: no issues found in 149 source files** (strict mode, 0 errors).
+* `pytest tests/ai/test_tools.py`: **15 passed in 0.49s** (100% pass rate, 0 skipped).
+* `pytest tests/ai/`: **134 passed, 54 skipped in 4.90s** (0 failures, 0 errors).
+
 
 
 

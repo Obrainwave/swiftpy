@@ -24,6 +24,7 @@ from swiftpy.ai.providers.base import (
     LLMResponse,
     ProviderInterface,
     TokenUsage,
+    ToolCall,
 )
 from swiftpy.ai.streaming import parse_sse_events
 
@@ -75,6 +76,8 @@ class OpenAIProvider(ProviderInterface):
             payload["top_p"] = request.top_p
         if request.stop is not None:
             payload["stop"] = request.stop
+        if request.tools is not None:
+            payload["tools"] = request.tools
         if request.extra:
             payload.update(request.extra)
 
@@ -177,6 +180,28 @@ class OpenAIProvider(ProviderInterface):
         role = str(msg.get("role") or "assistant") if isinstance(msg, dict) else "assistant"
         finish_reason = choice.get("finish_reason")
 
+        extracted_tool_calls: list[ToolCall] = []
+        raw_tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if isinstance(raw_tool_calls, list):
+            for tc in raw_tool_calls:
+                if isinstance(tc, dict):
+                    tc_id = str(tc.get("id") or "")
+                    fn = tc.get("function") or {}
+                    fn_name = str(fn.get("name") or "") if isinstance(fn, dict) else ""
+                    args_raw = fn.get("arguments") if isinstance(fn, dict) else {}
+                    if isinstance(args_raw, str):
+                        try:
+                            args_parsed = json.loads(args_raw)
+                        except (json.JSONDecodeError, TypeError):
+                            args_parsed = {"raw": args_raw}
+                    elif isinstance(args_raw, dict):
+                        args_parsed = args_raw
+                    else:
+                        args_parsed = {}
+                    extracted_tool_calls.append(
+                        ToolCall(id=tc_id, name=fn_name, arguments=args_parsed)
+                    )
+
         raw_usage = data.get("usage")
         if isinstance(raw_usage, dict):
             usage = TokenUsage(
@@ -197,6 +222,7 @@ class OpenAIProvider(ProviderInterface):
             raw=data,
             latency_ms=round(latency_ms, 2),
             finish_reason=str(finish_reason) if finish_reason else None,
+            tool_calls=extracted_tool_calls,
         )
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[str]:
@@ -222,6 +248,8 @@ class OpenAIProvider(ProviderInterface):
             payload["top_p"] = request.top_p
         if request.stop is not None:
             payload["stop"] = request.stop
+        if request.tools is not None:
+            payload["tools"] = request.tools
         if request.extra:
             payload.update(request.extra)
 

@@ -7,6 +7,7 @@ from swiftpy.ai.embeddings import (
     generate_deterministic_embedding,
 )
 from swiftpy.ai.exceptions import (
+    AgentLoopError,
     AIAuthenticationError,
     AIConfigurationError,
     AIConnectionError,
@@ -27,6 +28,8 @@ from swiftpy.ai.providers.base import (
     Message,
     ProviderInterface,
     TokenUsage,
+    ToolCall,
+    ToolResult,
 )
 from swiftpy.ai.rag import (
     BaseReranker,
@@ -49,6 +52,15 @@ from swiftpy.ai.redis_store import (
     RedisConversationStore,
 )
 from swiftpy.ai.streaming import parse_sse_events
+from swiftpy.ai.tools import (
+    BaseTool,
+    CalculatorTool,
+    DateTimeTool,
+    FunctionTool,
+    ToolLoop,
+    WebSearchTool,
+    tool,
+)
 from swiftpy.ai.vectorstore import (
     ChromaAdapter,
     InMemoryVectorStore,
@@ -72,14 +84,19 @@ __all__ = [
     "AIModuleDisabledError",
     "AIProviderError",
     "AIRateLimitError",
+    "AgentLoopError",
     "BaseReranker",
+    "BaseTool",
+    "CalculatorTool",
     "ChromaAdapter",
     "CohereReranker",
     "ContextFormatter",
     "Conversation",
     "ConversationStore",
     "CrossEncoderReranker",
+    "DateTimeTool",
     "EmbeddingsClient",
+    "FunctionTool",
     "HistoryStrategy",
     "InMemoryConversationStore",
     "InMemoryVectorStore",
@@ -101,8 +118,12 @@ __all__ = [
     "SlidingWindowStrategy",
     "TokenBudgetStrategy",
     "TokenUsage",
+    "ToolCall",
+    "ToolLoop",
+    "ToolResult",
     "VectorRecord",
     "VectorStore",
+    "WebSearchTool",
     "XMLBlocksFormatter",
     "ai",
     "calculate_token_cost",
@@ -110,4 +131,5 @@ __all__ = [
     "parse_sse_events",
     "rag",
     "register_model_pricing",
+    "tool",
 ]

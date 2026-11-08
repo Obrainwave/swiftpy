@@ -24,6 +24,7 @@ from swiftpy.ai.providers.base import (
     LLMResponse,
     ProviderInterface,
     TokenUsage,
+    ToolCall,
 )
 from swiftpy.ai.streaming import parse_sse_events
 
@@ -70,10 +71,43 @@ class AnthropicProvider(ProviderInterface):
 
         # Separate system messages from user/assistant conversation history
         system_parts: list[str] = []
-        dialogue_messages: list[dict[str, str]] = []
+        dialogue_messages: list[dict[str, Any]] = []
         for msg in request.messages:
             if msg.role == "system":
                 system_parts.append(msg.content)
+            elif msg.role == "tool":
+                tool_result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id or "",
+                    "content": msg.content,
+                }
+                if (
+                    dialogue_messages
+                    and dialogue_messages[-1]["role"] == "user"
+                    and isinstance(dialogue_messages[-1]["content"], list)
+                    and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in dialogue_messages[-1]["content"]
+                    )
+                ):
+                    dialogue_messages[-1]["content"].append(tool_result_block)
+                else:
+                    dialogue_messages.append({
+                        "role": "user",
+                        "content": [tool_result_block],
+                    })
+            elif msg.role == "assistant" and msg.tool_calls:
+                content_blocks: list[dict[str, Any]] = []
+                if msg.content:
+                    content_blocks.append({"type": "text", "text": msg.content})
+                for tc in msg.tool_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    })
+                dialogue_messages.append({"role": "assistant", "content": content_blocks})
             else:
                 dialogue_messages.append({"role": msg.role, "content": msg.content})
 
@@ -98,6 +132,27 @@ class AnthropicProvider(ProviderInterface):
             payload["top_p"] = request.top_p
         if request.stop is not None:
             payload["stop_sequences"] = request.stop
+        if request.tools is not None:
+            anthropic_tools: list[dict[str, Any]] = []
+            for t in request.tools:
+                if "input_schema" in t:
+                    anthropic_tools.append(t)
+                elif "function" in t:
+                    fn = t["function"]
+                    anthropic_tools.append({
+                        "name": fn.get("name"),
+                        "description": fn.get("description", ""),
+                        "input_schema": fn.get("parameters", {}),
+                    })
+                elif "parameters" in t:
+                    anthropic_tools.append({
+                        "name": t.get("name"),
+                        "description": t.get("description", ""),
+                        "input_schema": t.get("parameters", {}),
+                    })
+                else:
+                    anthropic_tools.append(t)
+            payload["tools"] = anthropic_tools
         if request.extra:
             payload.update(request.extra)
 
@@ -179,10 +234,19 @@ class AnthropicProvider(ProviderInterface):
 
         raw_content = data.get("content")
         text_parts: list[str] = []
+        extracted_tool_calls: list[ToolCall] = []
         if isinstance(raw_content, list):
             for block in raw_content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(str(block.get("text") or ""))
+                if isinstance(block, dict):
+                    b_type = block.get("type")
+                    if b_type == "text":
+                        text_parts.append(str(block.get("text") or ""))
+                    elif b_type == "tool_use":
+                        tc_id = str(block.get("id") or "")
+                        tc_name = str(block.get("name") or "")
+                        tc_input = block.get("input")
+                        tc_args = tc_input if isinstance(tc_input, dict) else {}
+                        extracted_tool_calls.append(ToolCall(id=tc_id, name=tc_name, arguments=tc_args))
         content = "".join(text_parts)
 
         raw_usage = data.get("usage")
@@ -208,6 +272,7 @@ class AnthropicProvider(ProviderInterface):
             raw=data,
             latency_ms=round(latency_ms, 2),
             finish_reason=str(finish_reason) if finish_reason else None,
+            tool_calls=extracted_tool_calls,
         )
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[str]:

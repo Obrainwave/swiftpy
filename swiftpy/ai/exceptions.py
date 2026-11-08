@@ -56,3 +56,12 @@ class AIRateLimitError(AIProviderError):
 class AIConnectionError(AIProviderError):
     """Raised when an HTTP connection or network timeout error occurs while contacting a provider."""
 
+
+class AgentLoopError(AIError):
+    """Raised when an autonomous agent or tool execution loop exceeds configured bounds (e.g. max_iterations)."""
+
+    def __init__(self, message: str, iterations: int = 0) -> None:
+        super().__init__(message)
+        self.iterations = iterations
+
+

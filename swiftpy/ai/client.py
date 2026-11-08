@@ -17,6 +17,8 @@ from swiftpy.ai.providers.base import (
     ProviderInterface,
 )
 from swiftpy.ai.providers.openai_provider import OpenAIProvider
+from swiftpy.ai.tools.base_tool import BaseTool
+from swiftpy.ai.tools.tool_loop import ToolLoop
 from swiftpy.ai.vectorstore.base import VectorStore
 from swiftpy.core.config import Config
 
@@ -69,6 +71,14 @@ class AIClient:
         self._model: str | None = None
         self._extra: dict[str, Any] = {}
         self._attached_conversation: Conversation | None = None
+        self._tools: list[BaseTool] = []
+        self._auto_execute_tools: bool = False
+        self._max_iterations: int = 10
+        self._max_tool_calls: int | None = None
+        self._allowed_tools: Sequence[str] | None = None
+        self._tool_timeout: float | None = None
+        self._is_executing_tool_loop: bool = False
+        self._last_tool_loop: ToolLoop | None = None
 
     @classmethod
     def register_provider(
@@ -215,6 +225,67 @@ class AIClient:
         self._extra.update(kwargs)
         return self
 
+    def tools(self, tools: Sequence[BaseTool | type[BaseTool]]) -> Self:
+        """
+        Register tools available for LLM tool calling.
+
+        Accepts instances of BaseTool or BaseTool subclasses (which are instantiated).
+        """
+        if not isinstance(tools, Sequence):
+            raise TypeError(f"Expected a sequence for tools, got {type(tools).__name__}")
+
+        resolved: list[BaseTool] = []
+        for t in tools:
+            if isinstance(t, type) and issubclass(t, BaseTool):
+                resolved.append(t())
+            elif isinstance(t, BaseTool):
+                resolved.append(t)
+            else:
+                raise TypeError(
+                    f"Expected BaseTool instance or subclass, got {type(t).__name__}"
+                )
+        self._tools = resolved
+        return self
+
+    def auto_execute_tools(
+        self,
+        enable: bool = True,
+        max_iterations: int = 10,
+        max_tool_calls: int | None = None,
+        allowed_tools: Sequence[str] | None = None,
+        tool_timeout: float | None = None,
+    ) -> Self:
+        """
+        Configure autonomous tool execution loop.
+
+        When enabled, calling .send() will automatically detect tool use responses from the
+        LLM, execute matching tool handlers concurrently, feed tool results back, and
+        repeat until a final text response is produced or configured limits are reached.
+        """
+        if max_iterations <= 0:
+            raise ValueError(f"max_iterations must be a positive integer, got {max_iterations}")
+        if max_tool_calls is not None and max_tool_calls <= 0:
+            raise ValueError(f"max_tool_calls must be a positive integer, got {max_tool_calls}")
+        if tool_timeout is not None and tool_timeout <= 0:
+            raise ValueError(f"tool_timeout must be a positive float, got {tool_timeout}")
+
+        self._auto_execute_tools = bool(enable)
+        self._max_iterations = max_iterations
+        self._max_tool_calls = max_tool_calls
+        self._allowed_tools = allowed_tools
+        self._tool_timeout = tool_timeout
+        return self
+
+    @property
+    def registered_tools(self) -> list[BaseTool]:
+        """Return a defensive copy of currently registered tools."""
+        return list(self._tools)
+
+    @property
+    def last_tool_loop(self) -> ToolLoop | None:
+        """Return the ToolLoop instance from the most recent autonomous execution."""
+        return self._last_tool_loop
+
     def _resolve_provider(self) -> ProviderInterface:
         # Check if AI module is enabled in configuration
         is_enabled = self._config.get("ai.enabled", True)
@@ -256,6 +327,26 @@ class AIClient:
         if not self._messages:
             raise ValueError("Cannot send request: at least one message is required.")
 
+        # If auto_execute_tools is enabled and tools are registered, delegate to ToolLoop
+        if self._auto_execute_tools and self._tools and not self._is_executing_tool_loop:
+            self._is_executing_tool_loop = True
+            try:
+                loop = ToolLoop(
+                    client=self,
+                    tools=self._tools,
+                    max_iterations=self._max_iterations,
+                    max_tool_calls=self._max_tool_calls,
+                    allowed_tools=self._allowed_tools,
+                    tool_timeout=self._tool_timeout,
+                )
+                self._last_tool_loop = loop
+                final_response = await loop.run()
+                if self._attached_conversation is not None and final_response.content:
+                    self._attached_conversation.add_assistant(final_response.content)
+                return final_response
+            finally:
+                self._is_executing_tool_loop = False
+
         provider = self._resolve_provider()
 
         request = LLMRequest(
@@ -265,13 +356,14 @@ class AIClient:
             max_tokens=self._max_tokens,
             top_p=self._top_p,
             stop=self._stop,
+            tools=[t.to_dict() for t in self._tools] if self._tools else None,
             extra=dict(self._extra),
         )
 
         response = await provider.send(request)
 
         # Record assistant completion in attached conversation if present
-        if self._attached_conversation is not None:
+        if self._attached_conversation is not None and not self._is_executing_tool_loop and response.content:
             self._attached_conversation.add_assistant(response.content)
 
         return response

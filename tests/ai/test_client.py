@@ -173,8 +173,12 @@ def test_invalid_message_role_rejected(mock_config: Config) -> None:
     with pytest.raises(ValueError, match="Invalid message role 'developer'"):
         client.history([{"role": "developer", "content": "You are a bot"}])
 
-    with pytest.raises(ValueError, match="Invalid message role 'tool'"):
-        Message(role="tool", content="tool output")
+    with pytest.raises(ValueError, match="Invalid message role 'agent'"):
+        Message(role="agent", content="agent output")
+
+    # 'tool' role is valid for tool calling
+    msg = Message(role="tool", content="tool output")
+    assert msg.role == "tool"
 
 
 def test_stop_sequence_validation(mock_config: Config) -> None:

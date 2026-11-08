@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -8,7 +9,41 @@ from typing import Any
 
 from swiftpy.ai.pool import AIHttpPool
 
-VALID_ROLES: frozenset[str] = frozenset({"system", "user", "assistant"})
+VALID_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool"})
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """Represents a tool call requested by an LLM."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert ToolCall to OpenAI-compatible function call representation."""
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": (
+                    json.dumps(self.arguments)
+                    if isinstance(self.arguments, dict)
+                    else str(self.arguments)
+                ),
+            },
+        }
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """Represents the execution result of an invoked tool."""
+
+    tool_call_id: str
+    name: str
+    result: Any
+    is_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -16,8 +51,10 @@ class Message:
     """Represents a single message in an LLM conversation."""
 
     role: str
-    content: str
+    content: str = ""
     name: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    tool_call_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, str) or self.role.lower() not in VALID_ROLES:
@@ -29,13 +66,19 @@ class Message:
             raise TypeError(
                 f"Message content must be a string, got {type(self.content).__name__}"
             )
-        if not self.content.strip():
-            raise ValueError("Message content cannot be empty or whitespace only")
+        if not self.content.strip() and not self.tool_calls:
+            raise ValueError(
+                "Message content cannot be empty or whitespace only when no tool_calls are present"
+            )
 
-    def to_dict(self) -> dict[str, str]:
-        payload = {"role": self.role.lower(), "content": self.content}
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"role": self.role.lower(), "content": self.content}
         if self.name:
             payload["name"] = self.name
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
+        if self.tool_calls:
+            payload["tool_calls"] = [tc.to_dict() for tc in self.tool_calls]
         return payload
 
 
@@ -58,6 +101,7 @@ class LLMRequest:
     max_tokens: int | None = None
     top_p: float | None = None
     stop: list[str] | None = None
+    tools: list[dict[str, Any]] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -72,6 +116,8 @@ class LLMResponse:
     raw: dict[str, Any] = field(default_factory=dict)
     latency_ms: float = 0.0
     finish_reason: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
 
 
 class ProviderInterface(ABC):
