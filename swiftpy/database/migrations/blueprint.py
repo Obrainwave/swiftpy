@@ -37,6 +37,7 @@ ALLOWED_COLUMN_TYPES: frozenset[str] = frozenset(
         "time",
         "timestamp",
         "timestamptz",
+        "vector",
     }
 )
 
@@ -112,6 +113,7 @@ class ColumnDefinition:
         self.default_val: Any = _UNSET
         self.is_index: bool = False
         self.index_name: str | None = None
+        self.dimensions: int | None = None
         self.comment_text: str | None = None
         self.is_unsigned: bool = False
 
@@ -345,6 +347,16 @@ class Blueprint:
     ) -> ColumnDefinition:
         """Create a nullable deleted_at timestamp column for soft deletion."""
         return self.timestamp(name, tz=tz).nullable()
+
+    def vector(self, name: str, dimensions: int = 1536) -> ColumnDefinition:
+        """Create a pgvector vector column with specified dimensions."""
+        if not isinstance(dimensions, int) or dimensions <= 0:
+            raise ValueError(
+                f"Vector dimensions must be a positive integer, got {dimensions}"
+            )
+        col = self._add_column(name, "vector")
+        col.dimensions = dimensions
+        return col
 
     # --- Constraints & Indexes ---
 

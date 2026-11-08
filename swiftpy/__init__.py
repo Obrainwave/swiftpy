@@ -47,6 +47,7 @@ from swiftpy.database.orm import (
     LazyLoadingDisabledError,
     Model,
     RelationNotLoadedError,
+    Vector,
 )
 from swiftpy.events import (
     EventDispatcher,
@@ -226,6 +227,7 @@ __all__ = [
     "ValidationResult",
     "Validator",
     "ValidatorRule",
+    "Vector",
     "WebSocket",
     "WebSocketConnection",
     "WebSocketDisconnect",

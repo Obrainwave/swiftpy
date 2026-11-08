@@ -241,6 +241,9 @@ class SchemaGrammar:
             parts.append("TIMESTAMP")
         elif t == "timestamptz":
             parts.append("TIMESTAMPTZ")
+        elif t == "vector":
+            dim = getattr(col, "dimensions", None) or 1536
+            parts.append(f"vector({dim})")
 
         # Primary key
         if col.is_primary:

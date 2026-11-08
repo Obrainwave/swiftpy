@@ -4,6 +4,23 @@ from swiftpy import Application, Request, Response, RouteGroup, json_response
 app = Application()
 
 
+@app.get("/")
+async def root(request: Request) -> Response:
+    return json_response(
+        {
+            "message": "Welcome to SwiftPY!",
+            "framework": "SwiftPY",
+            "version": app.version,
+            "status": "online",
+            "endpoints": {
+                "ping": "/ping",
+                "show_user": "/show-user",
+                "api_user": "/api/v1/users/1",
+            },
+        }
+    )
+
+
 @app.get("/ping")
 async def ping(request: Request) -> Response:
     return json_response({"message": "pong"})

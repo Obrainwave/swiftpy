@@ -4,6 +4,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 from collections.abc import Generator, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import (
@@ -17,7 +18,7 @@ from typing import (
 )
 
 from swiftpy.database.identifiers import validate_identifier
-from swiftpy.database.orm.fields import Field, FieldInfo
+from swiftpy.database.orm.fields import Field, FieldInfo, VectorFieldInfo
 from swiftpy.database.orm.registry import (
     _MODEL_REGISTRY,
     restore_model_registry,
@@ -243,6 +244,24 @@ class ModelQueryBuilder[T: Model]:
                     await sub_builder._load_relations(related_items)
 
 
+def _validate_model_vector(field_name: str, value: Any, dimensions: int) -> list[float]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"Field '{field_name}' must be a list of floats, got {type(value).__name__}")
+    if len(value) != dimensions:
+        raise ValueError(
+            f"Field '{field_name}' vector dimension {len(value)} does not match expected {dimensions}"
+        )
+    parsed: list[float] = []
+    for idx, x in enumerate(value):
+        if not isinstance(x, (int, float)) or isinstance(x, bool):
+            raise TypeError(f"Field '{field_name}' element at index {idx} must be a number, got {type(x).__name__}")
+        fx = float(x)
+        if math.isnan(fx) or math.isinf(fx):
+            raise ValueError(f"Field '{field_name}' element at index {idx} is NaN or Infinite.")
+        parsed.append(fx)
+    return parsed
+
+
 class Model:
     """Active Record base model with typed attributes, dirty tracking, and relationship support."""
 
@@ -257,12 +276,13 @@ class Model:
     __fields__: ClassVar[dict[str, Any]]
     __field_defaults__: ClassVar[dict[str, Any]]
     __field_factories__: ClassVar[dict[str, Any]]
+    __vector_fields__: ClassVar[dict[str, VectorFieldInfo]]
     __relations_config__: ClassVar[dict[str, Relation]]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
-        # 0. Validate primary key declaration (composite keys are explicitly unsupported)
+        # Validate primary key declaration (composite keys are explicitly unsupported)
         raw_pk = getattr(cls, "__primary_key__", "id")
         if not isinstance(raw_pk, str) or "," in raw_pk or not raw_pk.strip():
             raise PrimaryKeyError(
@@ -271,11 +291,11 @@ class Model:
             )
         cls.__primary_key__ = validate_identifier(raw_pk, param_name="__primary_key__")
 
-        # 1. Determine table name if not explicitly set (overridable via __table__)
+        # Determine table name if not explicitly set (overridable via __table__)
         if "__table__" not in cls.__dict__:
             cls.__table__ = pluralize(snake_case(cls.__name__))
 
-        # 2. Inherit fields from parent Model classes
+        # Inherit fields from parent Model classes
         fields: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         factories: dict[str, Any] = {}
@@ -285,7 +305,7 @@ class Model:
             defaults.update(getattr(base, "__field_defaults__", {}))
             factories.update(getattr(base, "__field_factories__", {}))
 
-        # 3. Resolve typed class attributes using typing.get_type_hints
+        # Resolve typed class attributes using typing.get_type_hints
         globalns = getattr(inspect.getmodule(cls), "__dict__", {})
         localns: dict[str, Any] = {
             name: next(reversed(variants.values()))
@@ -307,7 +327,9 @@ class Model:
             fields[name] = hint
             if name in cls.__dict__:
                 val = cls.__dict__[name]
-                if isinstance(val, FieldInfo):
+                if isinstance(val, VectorFieldInfo):
+                    pass
+                elif isinstance(val, FieldInfo):
                     if val.primary_key:
                         cls.__primary_key__ = name
                     if val.default_factory is not None:
@@ -322,7 +344,9 @@ class Model:
         for name, val in cls.__dict__.items():
             if name.startswith("__") or name in fields:
                 continue
-            if isinstance(val, FieldInfo):
+            if isinstance(val, VectorFieldInfo):
+                fields[name] = list[float]
+            elif isinstance(val, FieldInfo):
                 fields[name] = Any
                 if val.primary_key:
                     cls.__primary_key__ = name
@@ -331,7 +355,7 @@ class Model:
                 elif val.default is not _MISSING:
                     defaults[name] = val.default
 
-        # 4. Guarantee primary key field presence
+        # Guarantee primary key field presence
         if cls.__primary_key__ not in fields:
             fields[cls.__primary_key__] = int
 
@@ -339,7 +363,16 @@ class Model:
         cls.__field_defaults__ = defaults
         cls.__field_factories__ = factories
 
-        # 5. Inherit relations from ancestors and discover newly declared relations
+        # Discover Vector fields
+        vectors: dict[str, VectorFieldInfo] = {}
+        for base in reversed(cls.__mro__[1:]):
+            vectors.update(getattr(base, "__vector_fields__", {}))
+        for name, val in cls.__dict__.items():
+            if isinstance(val, VectorFieldInfo):
+                vectors[name] = val
+        cls.__vector_fields__ = vectors
+
+        # Inherit relations from ancestors and discover newly declared relations
         relations: dict[str, Relation] = {}
         for base in reversed(cls.__mro__[1:]):
             relations.update(getattr(base, "__relations_config__", {}))
@@ -353,7 +386,7 @@ class Model:
 
         cls.__relations_config__ = relations
 
-        # 6. Register model globally under bare name and fully qualified name
+        # Register model globally under bare name and fully qualified name
         qualname = f"{cls.__module__}.{cls.__qualname__}"
         _MODEL_REGISTRY.setdefault(cls.__name__, {})[qualname] = cls
 
@@ -458,6 +491,9 @@ class Model:
             self.fill(**kwargs)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        if hasattr(self, "__vector_fields__") and name in self.__vector_fields__ and value is not None:
+            v_info = self.__vector_fields__[name]
+            value = _validate_model_vector(name, value, v_info.dimensions)
         if (
             hasattr(self, "_exists")
             and self._exists
@@ -520,6 +556,21 @@ class Model:
     @classmethod
     def _coerce_db_value(cls, field_name: str, value: Any) -> Any:
         """Coerce database values such as JSON strings back to typed Python structures if needed."""
+        if field_name in getattr(cls, "__vector_fields__", {}):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                clean_s = value.strip("[] \t\n\r")
+                if not clean_s:
+                    return []
+                try:
+                    return [float(x.strip()) for x in clean_s.split(",") if x.strip()]
+                except (ValueError, TypeError):
+                    return value
+            if isinstance(value, (list, tuple)):
+                return [float(x) for x in value]
+            return value
+
         if isinstance(value, str) and field_name in cls.__fields__:
             hint = cls.__fields__[field_name]
             origin = get_origin(hint) or hint
@@ -541,6 +592,12 @@ class Model:
     def _persistable(value: Any) -> Any:
         if isinstance(value, Model):
             return value.get_primary_key()
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value)
+        ):
+            return f"[{','.join(str(float(x)) for x in value)}]"
         if isinstance(value, (dict, list)):
             return json.dumps(value)
         return value
