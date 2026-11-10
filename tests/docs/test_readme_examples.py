@@ -132,8 +132,10 @@ class ReadmeUser(Model):
 
 @pytest.mark.asyncio
 async def test_readme_active_record_models_and_relationships(
-    ensure_db_pool: DatabasePool,
+    ensure_db_pool: DatabasePool | None,
 ) -> None:
+    if ensure_db_pool is None:
+        pytest.skip("PostgreSQL service is not available in local test environment")
     pool = ensure_db_pool.get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DROP TABLE IF EXISTS readme_example_posts CASCADE;")

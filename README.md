@@ -8,7 +8,7 @@
 [![Status: Production-Hardened](https://img.shields.io/badge/status-production--hardened-green.svg)](./DEVLOG.md)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Types: Mypy Strict](https://img.shields.io/badge/types-mypy%20strict-blue.svg)](https://mypy-lang.org/)
-[![Tests: 600+ Passing](https://img.shields.io/badge/tests-600%2B%20passing-brightgreen.svg)](./DEVLOG.md)
+[![Tests: 650+ Passing](https://img.shields.io/badge/tests-650%2B%20passing-brightgreen.svg)](./DEVLOG.md)
 
 ---
 
@@ -18,18 +18,21 @@ SwiftPY brings the joy and productivity of Laravel to the modern asynchronous Py
 
 - **FastAPI-Grade Simplicity**: Clean, intuitive entrypoint (`app = Application()`), async-first request/response cycle, automatic path parameter type coercion, and scoped route groups with middleware pipelines.
 - **Eloquent-Caliber Active Record ORM**: Typed models declaring class attributes via standard Python type hints, automatic irregular-aware table pluralization, dirty-tracking `save()`, expressive relationships (`HasMany`, `BelongsTo`, `HasOne`, `BelongsToMany`), and eager loading with strict N+1 query prevention (via model-level `prevent_lazy_loading = True`, raising `LazyLoadingDisabledError` on un-eager-loaded accesses).
+- **Query Builder, GROUP BY & Dynamic Pagination**: Full length-aware `paginate()` and lightweight `simple_paginate()`, `limit()`/`offset()` (with `take()`/`skip()`), group-aware subquery counting, and aggregate selectors (`select_count`, `select_sum`, etc.) with `having` and `or_having` logical filtering.
+- **Multi-Disk Storage & Streaming Engine**: Flysystem-inspired `Storage` abstraction supporting local and S3 disks, high-throughput streaming uploads/downloads, magic-byte validation, and `storage:link`.
+- **Form Request & Input Hardening**: Automatic 422 JSON errors, configurable body streaming limits, Content-Length checks, and JSON recursion depth caps.
 - **Database Engine & Native Transactions**: Connection pool management, automatic transaction propagation across context variables, nested transaction savepoints, and strict SQL injection prevention with full identifier quoting for reserved words.
 - **Fluent Migration DSL & Schema Builder**: Laravel-inspired `Blueprint` table definitions, safe statement ordering (drops executed before adds), column comments, unsigned checks, composite keys, and distributed PostgreSQL advisory locks.
 - **At-Least-Once Queues & Signed Bus**: Robust background jobs with Redis visibility timeout leases, HMAC-SHA256 envelope signing, dead-letter routing, and a cryptographically protected cross-worker event bus.
 - **WebSocket Gateway**: Structured WebSocket connection management, topic subscriptions, broadcast fan-out, ping/pong heartbeats, and strict same-origin handshake validation.
 - **Zero-Config Provider Auto-Discovery**: Automatic service provider discovery in `app/providers/` that registers container dependencies behind the scenes without manual entrypoint registration.
-- **Developer CLI (`swiftpy`)**: Built-in CLI for running migrations, rolling back batches, inspecting migration status, scaffolding typed migrations, running queue workers, and starting the ASGI dev server.
+- **Developer CLI (`swiftpy`)**: Built-in CLI for running migrations, rolling back batches, inspecting migration status, scaffolding typed migrations, linking public storage, running queue workers, and starting the ASGI dev server.
 
 ---
 
 ## Status & Roadmap
 
-All 10 core architectural and security hardening phases have been completed and verified against a comprehensive 600+ test suite:
+All core architectural, storage, and security hardening phases have been completed and verified against a comprehensive 650+ test suite:
 
 | Milestone | Component Focus | Status |
 |---|---|---|
@@ -39,11 +42,14 @@ All 10 core architectural and security hardening phases have been completed and 
 | **Phase 3: Database & Identifier Safety** | asyncpg connection pool, strict SQL identifier validation/quoting, nested transactions | ✅ Completed |
 | **Phase 4: HTTP Kernel & Error Pipeline** | Request streaming limits (2 MiB default), typed response factories, fail-closed error pipeline | ✅ Completed |
 | **Phase 5: Concurrency & DI Scoping** | ContextVar-backed scoped DI, async lifecycle hooks (`startup`/`shutdown`), graceful teardown | ✅ Completed |
+| **Phase 5: Filesystem & Cloud Storage** | Multi-disk abstraction (`local`, `s3`), streaming uploads/downloads, magic-byte validation, `storage:link` | ✅ Completed |
 | **Phase 6: Queues & Reliability** | At-least-once Redis queue leases, HMAC envelope signing, namespace allowlists, signed event bus | ✅ Completed |
 | **Phase 7: Active Record ORM Hardening** | Mass assignment protection (`__fillable__`/`__guarded__`), eager loading N+1 prevention, dirty tracking | ✅ Completed |
 | **Phase 8: Validation DSL Hardening** | Fail-closed FormRequest validation, hardened rule composition, input sanitization | ✅ Completed |
 | **Phase 9: Real-time WebSockets** | Handshake validation, same-origin protection (D-14), bounded broadcast fan-out, lifecycle hooks | ✅ Completed |
 | **Phase 10: Infra, CI & Hygiene** | Multi-stage Docker, pinned CI workflow, hardened compose, repo hygiene, CLI options | ✅ Completed |
+| **Week 26: Security Audit & Hardening** | SQL injection audit, JWT & bcrypt API keys, JSON depth & streaming limits, traceback suppression | ✅ Completed |
+| **Week 26: Pagination & Aggregation Subsystem** | Limit/offset parameterized SQL, length-aware `paginate()`, `simple_paginate()`, `group_by()` & `having()` | ✅ Completed |
 
 *See [`DEVLOG.md`](./DEVLOG.md) for detailed test reports and verified architectural guarantees.*
 
@@ -122,13 +128,12 @@ Declare models using Python type hints. Guard sensitive fields with `__fillable_
 
 ```python
 # app/models/user.py
-from typing import ClassVar
 from swiftpy.database.orm import HasMany, HasOne, Model
 
 
 class Post(Model):
     __table__ = "posts"
-    __fillable__: ClassVar[list[str]] = ["title", "user_id"]
+    __fillable__ = ["title", "user_id"]
 
     id: int
     title: str
@@ -137,7 +142,7 @@ class Post(Model):
 
 class Profile(Model):
     __table__ = "profiles"
-    __fillable__: ClassVar[list[str]] = ["bio", "user_id"]
+    __fillable__ = ["bio", "user_id"]
 
     id: int
     bio: str
@@ -146,7 +151,7 @@ class Profile(Model):
 
 class User(Model):
     __table__ = "users"
-    __fillable__: ClassVar[list[str]] = ["name", "email"]
+    __fillable__ = ["name", "email"]
 
     id: int
     name: str
@@ -168,7 +173,111 @@ if user is not None:
     await user.save()
 ```
 
-### 3. Fluent Migrations & Schema Builder
+### 3. Fluent Query Builder, GROUP BY & Dynamic Pagination
+
+Execute complex aggregated queries, group by columns with `HAVING`, and paginate results using length-aware `paginate()` or high-performance `simple_paginate()`:
+
+```python
+from app.models.user import User
+from swiftpy.database.pagination import Paginator, SimplePaginator
+from swiftpy.database.query_builder import Query
+
+# 1. Length-aware pagination with metadata & total group count:
+paginated_users: Paginator[User] = (
+    await User.where("status", "active")
+    .order_by("created_at", "DESC")
+    .paginate(per_page=20, page=1)
+)
+
+print(paginated_users.total)          # e.g., 145
+print(paginated_users.last_page)      # 8
+print(paginated_users.has_more_pages) # True
+
+# Export standard JSON payload with navigation metadata:
+payload = paginated_users.to_dict()
+# {
+#     "data": [...],
+#     "current_page": 1,
+#     "per_page": 20,
+#     "total": 145,
+#     "last_page": 8,
+#     "from": 1,
+#     "to": 20,
+#     "has_more_pages": True,
+#     "has_previous_page": False
+# }
+
+# 2. Fast simple pagination (avoids COUNT(*) on large tables by querying per_page + 1):
+simple_users: SimplePaginator[User] = (
+    await User.order_by("id", "ASC").simple_paginate(per_page=20, page=1)
+)
+
+# 3. GROUP BY and HAVING with subquery group counting:
+order_stats = (
+    await Query.table("orders")
+    .select("country")
+    .select_count("id", alias="total_orders")
+    .select_sum("amount", alias="total_revenue")
+    .group_by("country")
+    .having("total_orders", ">", 10)
+    .order_by("total_revenue", "DESC")
+    .paginate(per_page=5, page=1)
+)
+```
+
+### 4. Multi-Disk Storage & Streaming Engine
+
+Flysystem-inspired file storage abstraction supporting multi-disk scoping (`local`, `public`, `s3`), streaming I/O, and secure downloads:
+
+```python
+from swiftpy import Request, Response, json_response
+from swiftpy.filesystem import Storage
+
+# 1. Put file bytes or binary streams to configured disks:
+await Storage.disk("local").put("reports/annual_2026.pdf", pdf_bytes)
+
+# 2. Inspect existence, size, and metadata:
+if await Storage.exists("reports/annual_2026.pdf"):
+    size = await Storage.size("reports/annual_2026.pdf")
+    mime = await Storage.mime_type("reports/annual_2026.pdf")
+
+# 3. High-throughput chunked stream download:
+@app.get("/reports/download")
+async def download_report(request: Request) -> Response:
+    return await Storage.download(
+        "reports/annual_2026.pdf", filename="Annual_Report_2026.pdf"
+    )
+```
+
+### 5. Form Request Validation & Hardened Input
+
+Declare typed validation schemas that fail closed before your controller handler is invoked:
+
+```python
+from app.models.user import User
+from swiftpy import Request, Response, json_response
+from swiftpy.http.validation import FormRequest
+from swiftpy.validation.rules import email, min_len, required, unique
+
+
+class RegisterRequest(FormRequest):
+    def rules(self) -> dict:
+        return {
+            "name": [required(), min_len(3)],
+            "email": [required(), email(), unique("users", "email")],
+            "password": [required(), min_len(8)],
+        }
+
+
+@app.post("/register")
+async def register(form: RegisterRequest) -> Response:
+    # Automatically validated before reaching handler; invalid input yields HTTP 422 JSON
+    data = form.validated()
+    user = await User.create(name=data["name"], email=data["email"])
+    return json_response(user.to_dict(), status_code=201)
+```
+
+### 6. Fluent Migrations & Schema Builder
 
 Define and alter tables using the expressive `Blueprint` DSL with safe identifier quoting and constraint generation:
 
@@ -197,7 +306,7 @@ class CreatePostsTable(Migration):
         await Schema.drop_if_exists("posts")
 ```
 
-### 4. Asynchronous Queues & Background Jobs
+### 7. Asynchronous Queues & Background Jobs
 
 Define background jobs with automatic JSON serialization, HMAC envelope signing, retry with backoff, and dead letter queue routing:
 
@@ -260,6 +369,9 @@ swiftpy migrate:rollback
 swiftpy make:migration create_posts_table
 swiftpy make:migration add_status_to_orders
 
+# Create a symbolic link from public/storage to storage/app/public
+swiftpy storage:link
+
 # Precompile routes, configuration, and prompt templates for zero cold-start latency
 swiftpy cache:build
 
@@ -280,6 +392,9 @@ SwiftPY reads environment variables and YAML/Python configuration files with str
 | `JWT_SECRET` | `auth.jwt.secret` | None | Secret key for JWT HS256 signing (at least 32 bytes required in production). |
 | `AUTH_KEY_PEPPER` | `auth.guards.api_key.pepper` | None | Secret pepper for API key hashing (at least 32 bytes required in production). |
 | `HTTP_MAX_BODY_SIZE` | `http.max_body_size` | `2097152` (2 MiB) | Maximum allowed HTTP request body size in bytes. Returns 413 when exceeded. |
+| `HTTP_MAX_CONTENT_LENGTH` | `http.max_content_length` | `2097152` (2 MiB) | Maximum allowed Content-Length in bytes. Rejects excessive payloads before chunk accumulation. |
+| `HTTP_MAX_JSON_DEPTH` | `http.max_json_depth` | `32` | Maximum allowed JSON nesting recursion depth to prevent stack exhaustion attacks. |
+| `FILESYSTEM_DEFAULT` | `filesystem.default` | `"local"` | Default disk driver (`local`, `public`, `s3`). |
 | `WEBSOCKETS_ALLOWED_ORIGINS` | `websockets.allowed_origins` | None | Comma-separated list of allowed origins. When unset, enforces strict same-origin policy against `Host` (D-14). |
 | `WEBSOCKETS_MAX_MESSAGE_SIZE` | `websockets.max_message_size` | `1048576` (1 MiB) | Maximum allowed incoming WebSocket message size. Exceeding closes connection with code 1009. |
 | `DB_SSL` | `database.connections.postgresql.ssl` | `"disable"` | PostgreSQL SSL mode (`disable`, `require`, `verify-ca`, `verify-full`). |

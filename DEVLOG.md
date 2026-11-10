@@ -2133,10 +2133,96 @@ Implemented a first-class Filesystem and Storage subsystem inspired by Laravel's
 
 ### Quality Gates Verification
 * `ruff check .` $\rightarrow$ **All checks passed!** (0 errors).
-* `mypy swiftpy app config tests/security` $\rightarrow$ **Success: no issues found in 179 source files** (strict mode, 0 errors).
+* `mypy swiftpy app config tests/database tests/security` $\rightarrow$ **Success: no issues found in 186 source files** (strict mode, 0 errors).
 * `pytest tests/security/test_security_audit.py -v` $\rightarrow$ **20 passed, 1 skipped in 1.02s** (100% pass rate).
 * `pytest tests/core/test_exceptions.py tests/validation/test_db_rules.py -v` $\rightarrow$ **11 passed, 3 skipped in 0.72s** (100% pass rate).
 * `pytest tests/http/ -v` $\rightarrow$ **40 passed in 2.28s** (100% pass rate).
 * `pytest tests/filesystem -v` $\rightarrow$ **90 passed in 6.67s** (100% pass rate).
 * `pytest tests/ai/test_prompts_security.py -v` $\rightarrow$ **9 passed in 0.12s** (100% pass rate).
+
+---
+
+## Week 26 - Query Pagination, Aggregates & GROUP BY Subsystem
+
+### Status: PASSED
+* **Test Suites:**
+  - `tests/database/test_pagination_and_grouping.py` $\rightarrow$ **41/41 tests passed in 1.65s** (100% pass rate).
+  - `tests/database/test_pagination_pg_integration.py` $\rightarrow$ **10 integration tests** against live PostgreSQL schema.
+  - Regression suite $\rightarrow$ **225 passed, 13 skipped in 24.99s** (100% pass rate).
+
+### Architectural Overview & Verified Guarantees
+
+#### 1. Limit & Offset Foundation
+- **API:** `limit(value: int)`, `offset(value: int)`, and Laravel-style aliases `take(value: int)`, `skip(value: int)`.
+- **Validation:**
+  - Non-negative integers required (`>= 0`).
+  - Booleans strictly rejected with `TypeError` (`isinstance(v, bool)` check prevents `True`/`False` coerced as 1/0).
+  - Explicitly permits `limit(0)` and `offset(0)`.
+  - Negative values raise `ValueError`. Non-integers raise `TypeError`.
+- **PostgreSQL Parameterization:** Stored in structured query state (`_limit_value`, `_offset_value`). Compiled into parameterized SQL (`LIMIT $idx OFFSET $idx+1`) rather than string interpolation.
+
+#### 2. Group By, Having & Boolean Connectors Subsystem
+- **API:**
+  - `group_by(*columns: str | Sequence[str])`: Supports variadic arguments (`.group_by("status", "country")`) or list/tuple (`.group_by(["status", "country"])`). Dotted identifiers (`orders.status`) are safely quoted as `"orders"."status"`.
+  - **Deduplication & Accumulation:** Repeated `group_by()` calls accumulate columns; duplicate column expressions are deduplicated while preserving order.
+  - `having(column, operator, value, boolean="AND")` & `or_having(column, operator, value)`: Parameterizes values, validates column identifiers immediately, supports logical grouping via `AND`/`OR`. Resolves `SELECT` aliases back to underlying aggregate expressions for PostgreSQL compatibility (e.g. `HAVING COUNT("id") > $1 OR COUNT("id") < $2`).
+  - `having_raw(sql, bindings, boolean="AND")` & `or_having_raw(sql, bindings)`: Safely compiles raw HAVING predicates with parameterized bindings and boolean operators.
+- **SQL Compilation Order:**
+  `SELECT` $\rightarrow$ `FROM` $\rightarrow$ `JOIN` $\rightarrow$ `WHERE` $\rightarrow$ `GROUP BY` $\rightarrow$ `HAVING` $\rightarrow$ `ORDER BY` $\rightarrow$ `LIMIT` $\rightarrow$ `OFFSET`.
+
+#### 3. Aggregate Selection vs. Terminal Aggregation
+- **Distinction Maintained:**
+  - Terminal methods (`count()`, `sum()`, `avg()`, `min()`, `max()`) execute queries and return scalar values. Strips `_limit_value` and `_offset_value` to execute clean aggregate statements.
+  - Selection helpers (`select_count`, `select_sum`, `select_avg`, `select_min`, `select_max`, `select_raw`) append aggregate expressions to the SQL `SELECT` projection for grouped and aggregated queries without executing them immediately.
+- **Security Contract for `select_raw` & `having_raw`:**
+  - The `sql` parameter is trusted, application-authored SQL. Dynamic user input must never be concatenated into raw SQL strings.
+  - All dynamic values must be passed via `bindings` (using `?` in `sql`), which are safely compiled into numbered PostgreSQL placeholders (`$1, $2, ...`).
+
+#### 4. Full Pagination (`Paginator`)
+- **API:** `await query.paginate(per_page=20, page=1)`
+- **Response Structure:** Typed `Paginator[T]` implementing `PaginatorContract[T]` and container protocols (`__iter__`, `__len__`, `__getitem__`):
+  ```python
+  {
+      "data": [...],
+      "current_page": 2,
+      "per_page": 20,
+      "total": 145,
+      "last_page": 8,
+      "from": 21,
+      "to": 40,
+      "has_more_pages": True,
+      "has_previous_page": True,
+  }
+  ```
+- **Boundary Conditions & Invariants:**
+  - `last_page` calculation: `max(1, math.ceil(total / per_page))`. Verified for total=0 (`last_page=1`), exact multiples, and per_page=1.
+  - Requesting a page beyond `last_page`: preserves the requested `current_page`, returns empty items list, sets `first_item = None` and `last_item = None` without mutating the caller's page parameter.
+  - Full page (Page 1) has `first_item = 1`, `last_item = per_page`, `has_previous_page = False`.
+  - Empty page has `first_item = None`, `last_item = None`, `from = None`, `to = None`.
+  - Constructor input validation strictly rejects non-integers, booleans, negative totals, and values $< 1$ for `per_page` and `current_page`.
+- **Query Cloning & State Isolation:** Clones the query builder prior to execution. Deep-copies raw expressions and bindings to guarantee zero shared mutable state between original query and clone.
+- **Subquery Group Counting:** When queries contain `GROUP BY` or `HAVING`, standard `COUNT(*)` produces inaccurate row totals. The paginator automatically wraps grouped queries into a subquery:
+  ```sql
+  SELECT COUNT(*) AS total FROM (
+      SELECT "country", COUNT("id") AS "total_orders"
+      FROM "orders"
+      GROUP BY "country"
+      HAVING COUNT("id") > $1
+  ) AS grouped_results
+  ```
+- **Sequential Execution:** Executes count and data queries sequentially on the active database connection, guaranteeing compliance with asyncpg single-task connection ownership.
+
+#### 5. Simple Pagination (`SimplePaginator`)
+- **API:** `await query.simple_paginate(per_page=20, page=1)`
+- **Optimization:** Avoids costly `COUNT(*)` queries on large datasets by fetching `per_page + 1` records:
+  - Executes a single data query (`LIMIT 21 OFFSET 0`). Executes zero count queries.
+  - If 21 records returned, pops the 21st record and sets `has_more_pages = True`.
+  - If 20 or fewer returned, returns all records and sets `has_more_pages = False`.
+  - Returns `SimplePaginator[T]` exposing `items`, `per_page`, `current_page`, `has_more_pages`, `has_previous_page`, and `to_dict()`.
+
+#### 6. ORM & Model Integration
+- **Hydration & Eager Loading:** `ModelQueryBuilder.paginate()` and `ModelQueryBuilder.simple_paginate()` hydrate raw database records into model instances and execute registered relationship eager loading before populating the paginator.
+- **Classmethod Delegation:** `Model.limit()`, `Model.offset()`, `Model.take()`, `Model.skip()`, `Model.order_by()`, `Model.group_by()`, `Model.having()`, `Model.or_having()`, `Model.paginate()`, and `Model.simple_paginate()` provide direct model-level access.
+
+
 

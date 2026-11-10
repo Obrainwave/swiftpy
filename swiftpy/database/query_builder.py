@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any, cast, overload
 
@@ -11,6 +12,8 @@ from swiftpy.database.identifiers import (
     validate_column_identifier,
     validate_identifier,
 )
+from swiftpy.database.pagination.paginator import Paginator
+from swiftpy.database.pagination.simple_paginator import SimplePaginator
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection
 
@@ -72,18 +75,35 @@ class QueryBuilder:
         self._order_column: str | None = None
         self._order_direction: str = "ASC"
         self._limit_value: int | None = None
+        self._offset_value: int | None = None
+        self._groups: list[str] = []
+        self._havings: list[tuple[str, str, str, Any]] = []
+        self._raw_havings: list[tuple[str, Raw]] = []
+        self._select_aliases: dict[str, str] = {}
         self._allow_all: bool = False
 
     def clone(self) -> QueryBuilder:
         """Create an independent copy of this QueryBuilder so terminal operations do not mutate it."""
         cloned = QueryBuilder(self._table)
-        cloned._columns = list(self._columns)
+        cloned._columns = [
+            Raw(col.sql, list(col.bindings)) if isinstance(col, Raw) else col
+            for col in self._columns
+        ]
         cloned._wheres = list(self._wheres)
         cloned._joins = list(self._joins)
-        cloned._raw_wheres = list(self._raw_wheres)
+        cloned._raw_wheres = [
+            Raw(rw.sql, list(rw.bindings)) for rw in self._raw_wheres
+        ]
         cloned._order_column = self._order_column
         cloned._order_direction = self._order_direction
         cloned._limit_value = self._limit_value
+        cloned._offset_value = self._offset_value
+        cloned._groups = list(self._groups)
+        cloned._havings = list(self._havings)
+        cloned._raw_havings = [
+            (b, Raw(rh.sql, list(rh.bindings))) for b, rh in self._raw_havings
+        ]
+        cloned._select_aliases = dict(self._select_aliases)
         cloned._allow_all = self._allow_all
         return cloned
 
@@ -109,6 +129,124 @@ class QueryBuilder:
 
         self._columns = selected
 
+        return self
+
+    def select_raw(
+        self, sql: str, bindings: list[Any] | None = None
+    ) -> QueryBuilder:
+        """
+        Add a raw SQL expression to the SELECT projection.
+
+        SECURITY CONTRACT:
+        - The `sql` parameter is trusted, application-authored SQL. Never interpolate
+          or concatenate untrusted user input directly into `sql`.
+        - All dynamic, user-supplied values MUST be passed as parameterized positional
+          placeholders via `bindings` (using `?` in `sql`), which are safely compiled into
+          numbered PostgreSQL placeholders (`$1, $2, ...`).
+        """
+        if not isinstance(sql, str):
+            raise TypeError("select_raw SQL expression must be a string.")
+        if self._columns == ["*"]:
+            self._columns = []
+        self._columns.append(Raw(sql, bindings or []))
+        return self
+
+    def select_count(
+        self, column: str = "*", alias: str | None = None
+    ) -> QueryBuilder:
+        """Add a COUNT aggregate expression to the SELECT projection."""
+        if column != "*":
+            safe_col = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
+            expr = f"COUNT({safe_col})"
+        else:
+            expr = "COUNT(*)"
+
+        if alias is not None:
+            safe_alias = validate_identifier(alias, allow_dotted=False, allow_wildcard=False)
+            self._select_aliases[safe_alias] = expr
+            sql_expr = f'{expr} AS "{safe_alias}"'
+        else:
+            sql_expr = expr
+
+        if self._columns == ["*"]:
+            self._columns = []
+        self._columns.append(Raw(sql_expr))
+        return self
+
+    def select_sum(
+        self, column: str, alias: str | None = None
+    ) -> QueryBuilder:
+        """Add a SUM aggregate expression to the SELECT projection."""
+        safe_col = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
+        expr = f"SUM({safe_col})"
+
+        if alias is not None:
+            safe_alias = validate_identifier(alias, allow_dotted=False, allow_wildcard=False)
+            self._select_aliases[safe_alias] = expr
+            sql_expr = f'{expr} AS "{safe_alias}"'
+        else:
+            sql_expr = expr
+
+        if self._columns == ["*"]:
+            self._columns = []
+        self._columns.append(Raw(sql_expr))
+        return self
+
+    def select_avg(
+        self, column: str, alias: str | None = None
+    ) -> QueryBuilder:
+        """Add an AVG aggregate expression to the SELECT projection."""
+        safe_col = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
+        expr = f"AVG({safe_col})"
+
+        if alias is not None:
+            safe_alias = validate_identifier(alias, allow_dotted=False, allow_wildcard=False)
+            self._select_aliases[safe_alias] = expr
+            sql_expr = f'{expr} AS "{safe_alias}"'
+        else:
+            sql_expr = expr
+
+        if self._columns == ["*"]:
+            self._columns = []
+        self._columns.append(Raw(sql_expr))
+        return self
+
+    def select_min(
+        self, column: str, alias: str | None = None
+    ) -> QueryBuilder:
+        """Add a MIN aggregate expression to the SELECT projection."""
+        safe_col = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
+        expr = f"MIN({safe_col})"
+
+        if alias is not None:
+            safe_alias = validate_identifier(alias, allow_dotted=False, allow_wildcard=False)
+            self._select_aliases[safe_alias] = expr
+            sql_expr = f'{expr} AS "{safe_alias}"'
+        else:
+            sql_expr = expr
+
+        if self._columns == ["*"]:
+            self._columns = []
+        self._columns.append(Raw(sql_expr))
+        return self
+
+    def select_max(
+        self, column: str, alias: str | None = None
+    ) -> QueryBuilder:
+        """Add a MAX aggregate expression to the SELECT projection."""
+        safe_col = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
+        expr = f"MAX({safe_col})"
+
+        if alias is not None:
+            safe_alias = validate_identifier(alias, allow_dotted=False, allow_wildcard=False)
+            self._select_aliases[safe_alias] = expr
+            sql_expr = f'{expr} AS "{safe_alias}"'
+        else:
+            sql_expr = expr
+
+        if self._columns == ["*"]:
+            self._columns = []
+        self._columns.append(Raw(sql_expr))
         return self
 
     def where(
@@ -276,15 +414,147 @@ class QueryBuilder:
         return self
 
     def limit(self, value: int) -> QueryBuilder:
-        if type(value) is not int:
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError("LIMIT must be an integer.")
-
         if value < 0:
             raise ValueError("LIMIT cannot be negative.")
-
         self._limit_value = value
+        return self
+
+    def offset(self, value: int) -> QueryBuilder:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("OFFSET must be an integer.")
+        if value < 0:
+            raise ValueError("OFFSET cannot be negative.")
+        self._offset_value = value
+        return self
+
+    def take(self, value: int) -> QueryBuilder:
+        """Alias for limit() matching Laravel query conventions."""
+        return self.limit(value)
+
+    def skip(self, value: int) -> QueryBuilder:
+        """Alias for offset() matching Laravel query conventions."""
+        return self.offset(value)
+
+    def group_by(self, *columns: str | Sequence[str]) -> QueryBuilder:
+        """Add one or more column expressions to the GROUP BY clause."""
+        if not columns:
+            return self
+
+        flat_cols: list[str] = []
+        for item in columns:
+            if isinstance(item, (list, tuple)):
+                for sub in item:
+                    if isinstance(sub, bool) or not isinstance(sub, str):
+                        raise TypeError(
+                            f"Group by column must be a str, got {type(sub).__name__}."
+                        )
+                    flat_cols.append(sub)
+            elif isinstance(item, str):
+                flat_cols.append(item)
+            else:
+                raise TypeError(
+                    f"Group by column must be a str, got {type(item).__name__}."
+                )
+
+        for col in flat_cols:
+            safe_col = quote_identifier(col, allow_dotted=True, allow_wildcard=False)
+            if safe_col not in self._groups:
+                self._groups.append(safe_col)
 
         return self
+
+    def having(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        """Add a condition to the HAVING clause filtering grouped aggregates."""
+        if not isinstance(column, str) or not column.strip():
+            raise TypeError("HAVING column or expression must be a non-empty string.")
+
+        if value is _MISSING:
+            operator = "="
+            val = operator_or_value
+        else:
+            operator = " ".join(str(operator_or_value).upper().split())
+            val = value
+
+        allowed_operators = {
+            "=",
+            "!=",
+            "<>",
+            "<",
+            ">",
+            "<=",
+            ">=",
+            "LIKE",
+            "ILIKE",
+            "NOT LIKE",
+            "NOT ILIKE",
+            "IS",
+            "IS NOT",
+        }
+        if operator not in allowed_operators:
+            raise ValueError(f"Operator '{operator}' is not allowed in HAVING clause.")
+
+        if (
+            column.strip() not in self._select_aliases
+            and not any(
+                column.strip().upper().startswith(fn)
+                for fn in ("COUNT(", "SUM(", "AVG(", "MIN(", "MAX(")
+            )
+        ):
+            validate_identifier(column.strip(), allow_dotted=True, allow_wildcard=False)
+
+        bool_op = boolean.upper().strip()
+        if bool_op not in {"AND", "OR"}:
+            raise ValueError("HAVING boolean operator must be 'AND' or 'OR'.")
+
+        self._havings.append((bool_op, column.strip(), operator, val))
+        return self
+
+    def or_having(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+    ) -> QueryBuilder:
+        """Add an OR condition to the HAVING clause filtering grouped aggregates."""
+        return self.having(column, operator_or_value, value, boolean="OR")
+
+    def having_raw(
+        self,
+        sql: str,
+        bindings: list[Any] | None = None,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        """
+        Add a raw SQL condition to the HAVING clause with parameter bindings.
+
+        SECURITY CONTRACT:
+        - The `sql` parameter is trusted, application-authored SQL. Never interpolate
+          or concatenate untrusted user input directly into `sql`.
+        - All dynamic, user-supplied values MUST be passed via `bindings` (using `?` in `sql`),
+          which are safely converted into numbered PostgreSQL placeholders (`$1, $2, ...`).
+        """
+        if not isinstance(sql, str):
+            raise TypeError("HAVING raw expression must be a string.")
+
+        bool_op = boolean.upper().strip()
+        if bool_op not in {"AND", "OR"}:
+            raise ValueError("HAVING boolean operator must be 'AND' or 'OR'.")
+        self._raw_havings.append((bool_op, Raw(sql, bindings or [])))
+        return self
+
+    def or_having_raw(
+        self, sql: str, bindings: list[Any] | None = None
+    ) -> QueryBuilder:
+        """Add an OR raw SQL condition to the HAVING clause with parameter bindings."""
+        return self.having_raw(sql, bindings, boolean="OR")
 
     @staticmethod
     def _get_pool() -> asyncpg.Pool:
@@ -424,20 +694,79 @@ class QueryBuilder:
             idx,
         )
 
+    def _compile_groups(self) -> str:
+        if not self._groups:
+            return ""
+        return " GROUP BY " + ", ".join(self._groups)
+
+    def _compile_having(self, start_idx: int = 1) -> tuple[str, list[Any], int]:
+        clauses: list[tuple[str, str]] = []
+        bindings: list[Any] = []
+        idx = start_idx
+
+        for bool_op, column, operator, value in self._havings:
+            if column in self._select_aliases:
+                expr = self._select_aliases[column]
+            elif any(
+                column.upper().startswith(fn)
+                for fn in ("COUNT(", "SUM(", "AVG(", "MIN(", "MAX(")
+            ):
+                expr = column
+            else:
+                expr = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
+
+            if operator in {"IS", "IS NOT"}:
+                if value is not None:
+                    raise ValueError(
+                        f"Operator '{operator}' in HAVING clause only supports None/NULL value."
+                    )
+                clauses.append((bool_op, f"{expr} {operator} NULL"))
+                continue
+
+            clauses.append((bool_op, f"{expr} {operator} ${idx}"))
+            bindings.append(value)
+            idx += 1
+
+        for bool_op, raw in self._raw_havings:
+            sql = raw.sql
+            for binding in raw.bindings:
+                sql = sql.replace("?", f"${idx}", 1)
+                bindings.append(binding)
+                idx += 1
+            clauses.append((bool_op, sql))
+
+        if not clauses:
+            return "", [], idx
+
+        sql_parts: list[str] = [clauses[0][1]]
+        for bool_op, clause_str in clauses[1:]:
+            sql_parts.append(f"{bool_op} {clause_str}")
+
+        return " HAVING " + " ".join(sql_parts), bindings, idx
+
     def to_sql(self, start_idx: int = 1) -> tuple[str, list[Any]]:
         """Compiles the entire query to raw SQL and bindings."""
         select_sql, select_bindings, idx = self._compile_select(start_idx)
         join_sql = self._compile_joins()
         where_sql, where_bindings, idx = self._compile_where(idx)
+        group_sql = self._compile_groups()
+        having_sql, having_bindings, idx = self._compile_having(idx)
 
-        bindings = select_bindings + where_bindings
-        sql = f"SELECT {select_sql} FROM {quote_identifier(self._table)}{join_sql}{where_sql}"
+        bindings = select_bindings + where_bindings + having_bindings
+        sql = f"SELECT {select_sql} FROM {quote_identifier(self._table)}{join_sql}{where_sql}{group_sql}{having_sql}"
 
         if self._order_column:
             sql += f" ORDER BY {self._order_column} {self._order_direction}"
 
         if self._limit_value is not None:
-            sql += f" LIMIT {self._limit_value}"
+            sql += f" LIMIT ${idx}"
+            bindings.append(self._limit_value)
+            idx += 1
+
+        if self._offset_value is not None:
+            sql += f" OFFSET ${idx}"
+            bindings.append(self._offset_value)
+            idx += 1
 
         return sql, bindings
 
@@ -469,8 +798,10 @@ class QueryBuilder:
         cloned = self.clone()
         cloned._columns = [Raw(f"{function}({col_safe}) AS agg_result")]
         cloned._order_column = None
-        row = await cloned.first()
-        return row["agg_result"] if row else None
+        cloned._limit_value = None
+        cloned._offset_value = None
+        rows = await cloned.get()
+        return rows[0]["agg_result"] if rows else None
 
     async def count(self, column: str = "*") -> int:
         return cast(int, await self._aggregate("COUNT", column))
@@ -486,6 +817,91 @@ class QueryBuilder:
 
     async def avg(self, column: str) -> Any:
         return await self._aggregate("AVG", column)
+
+    async def paginate(
+        self, per_page: int = 15, page: int = 1
+    ) -> Paginator[dict[str, Any]]:
+        """
+        Execute the query with length-aware pagination, counting total matching records or groups.
+        """
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise TypeError("page must be an integer.")
+        if page < 1:
+            raise ValueError("page must be >= 1.")
+        if isinstance(per_page, bool) or not isinstance(per_page, int):
+            raise TypeError("per_page must be an integer.")
+        if per_page < 1:
+            raise ValueError("per_page must be >= 1.")
+
+        offset = (page - 1) * per_page
+
+        count_builder = self.clone()
+        count_builder._limit_value = None
+        count_builder._offset_value = None
+        count_builder._order_column = None
+
+        if (
+            count_builder._groups
+            or count_builder._havings
+            or count_builder._raw_havings
+        ):
+            if count_builder._columns == ["*"] and count_builder._groups:
+                count_builder._columns = list(count_builder._groups)
+
+            inner_sql, inner_bindings = count_builder.to_sql(1)
+            count_sql = f"SELECT COUNT(*) AS total FROM ({inner_sql}) AS grouped_results"
+            conn = await count_builder._connection()
+            try:
+                val = await conn.fetchval(count_sql, *inner_bindings)
+                total = int(val or 0)
+            finally:
+                await count_builder._release(conn)
+        else:
+            total = await count_builder.count()
+
+        data_builder = self.clone()
+        data_builder.limit(per_page).offset(offset)
+        items = await data_builder.get()
+
+        last_page = max(1, math.ceil(total / per_page))
+        return Paginator(
+            items=items,
+            total=total,
+            per_page=per_page,
+            current_page=page,
+            last_page=last_page,
+        )
+
+    async def simple_paginate(
+        self, per_page: int = 15, page: int = 1
+    ) -> SimplePaginator[dict[str, Any]]:
+        """
+        Execute the query with lightweight pagination without counting total records.
+        """
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise TypeError("page must be an integer.")
+        if page < 1:
+            raise ValueError("page must be >= 1.")
+        if isinstance(per_page, bool) or not isinstance(per_page, int):
+            raise TypeError("per_page must be an integer.")
+        if per_page < 1:
+            raise ValueError("per_page must be >= 1.")
+
+        offset = (page - 1) * per_page
+
+        data_builder = self.clone()
+        data_builder.limit(per_page + 1).offset(offset)
+        raw_items = await data_builder.get()
+
+        has_more = len(raw_items) > per_page
+        items = raw_items[:per_page] if has_more else raw_items
+
+        return SimplePaginator(
+            items=items,
+            per_page=per_page,
+            current_page=page,
+            has_more=has_more,
+        )
 
     async def insert_returning(
         self,

@@ -32,6 +32,7 @@ from swiftpy.database.orm.relationships import (
     Relation,
     RelationDescriptor,
 )
+from swiftpy.database.pagination import Paginator, SimplePaginator
 from swiftpy.database.query_builder import Query
 from swiftpy.database.transaction import get_active_connection
 from swiftpy.events.dispatcher import EventDispatcher
@@ -128,6 +129,89 @@ class ModelQueryBuilder[T: Model]:
         self.builder.limit(value)
         return self
 
+    def offset(self, value: int) -> Self:
+        self.builder.offset(value)
+        return self
+
+    def take(self, value: int) -> Self:
+        self.builder.take(value)
+        return self
+
+    def skip(self, value: int) -> Self:
+        self.builder.skip(value)
+        return self
+
+    def group_by(self, *columns: str | Sequence[str]) -> Self:
+        self.builder.group_by(*columns)
+        return self
+
+    def having(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        boolean: str = "AND",
+    ) -> Self:
+        self.builder.having(column, operator_or_value, value, boolean=boolean)
+        return self
+
+    def or_having(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        self.builder.or_having(column, operator_or_value, value)
+        return self
+
+    def having_raw(
+        self,
+        sql: str,
+        bindings: list[Any] | None = None,
+        boolean: str = "AND",
+    ) -> Self:
+        self.builder.having_raw(sql, bindings, boolean=boolean)
+        return self
+
+    def or_having_raw(
+        self, sql: str, bindings: list[Any] | None = None
+    ) -> Self:
+        self.builder.or_having_raw(sql, bindings)
+        return self
+
+    def select_raw(
+        self, sql: str, bindings: list[Any] | None = None
+    ) -> Self:
+        self.builder.select_raw(sql, bindings)
+        return self
+
+    def select_count(
+        self, column: str = "*", alias: str | None = None
+    ) -> Self:
+        self.builder.select_count(column, alias)
+        return self
+
+    def select_sum(
+        self, column: str, alias: str | None = None
+    ) -> Self:
+        self.builder.select_sum(column, alias)
+        return self
+
+    def select_avg(
+        self, column: str, alias: str | None = None
+    ) -> Self:
+        self.builder.select_avg(column, alias)
+        return self
+
+    def select_min(
+        self, column: str, alias: str | None = None
+    ) -> Self:
+        self.builder.select_min(column, alias)
+        return self
+
+    def select_max(
+        self, column: str, alias: str | None = None
+    ) -> Self:
+        self.builder.select_max(column, alias)
+        return self
+
     def order_by(self, column: str, direction: str = "ASC") -> Self:
         self.builder.order_by(column, direction)
         return self
@@ -170,6 +254,94 @@ class ModelQueryBuilder[T: Model]:
     async def first(self) -> T | None:
         res = await self.clone().limit(1).get()
         return res[0] if res else None
+
+    async def paginate(
+        self, per_page: int = 15, page: int = 1
+    ) -> Paginator[T]:
+        """
+        Execute the model query with length-aware pagination, counting total records/groups.
+        """
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise TypeError("page must be an integer.")
+        if page < 1:
+            raise ValueError("page must be >= 1.")
+        if isinstance(per_page, bool) or not isinstance(per_page, int):
+            raise TypeError("per_page must be an integer.")
+        if per_page < 1:
+            raise ValueError("per_page must be >= 1.")
+
+        offset = (page - 1) * per_page
+
+        count_builder = self.clone()
+        count_builder.builder._limit_value = None
+        count_builder.builder._offset_value = None
+        count_builder.builder._order_column = None
+
+        if (
+            count_builder.builder._groups
+            or count_builder.builder._havings
+            or count_builder.builder._raw_havings
+        ):
+            if (
+                count_builder.builder._columns == ["*"]
+                and count_builder.builder._groups
+            ):
+                count_builder.builder._columns = list(count_builder.builder._groups)
+
+            inner_sql, inner_bindings = count_builder.builder.to_sql(1)
+            count_sql = f"SELECT COUNT(*) AS total FROM ({inner_sql}) AS grouped_results"
+            conn = await count_builder.builder._connection()
+            try:
+                val = await conn.fetchval(count_sql, *inner_bindings)
+                total = int(val or 0)
+            finally:
+                await count_builder.builder._release(conn)
+        else:
+            total = await count_builder.count()
+
+        data_builder = self.clone()
+        data_builder.limit(per_page).offset(offset)
+        items = await data_builder.get()
+
+        last_page = max(1, math.ceil(total / per_page))
+        return Paginator(
+            items=items,
+            total=total,
+            per_page=per_page,
+            current_page=page,
+            last_page=last_page,
+        )
+
+    async def simple_paginate(
+        self, per_page: int = 15, page: int = 1
+    ) -> SimplePaginator[T]:
+        """
+        Execute the model query with lightweight pagination without counting total records.
+        """
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise TypeError("page must be an integer.")
+        if page < 1:
+            raise ValueError("page must be >= 1.")
+        if isinstance(per_page, bool) or not isinstance(per_page, int):
+            raise TypeError("per_page must be an integer.")
+        if per_page < 1:
+            raise ValueError("per_page must be >= 1.")
+
+        offset = (page - 1) * per_page
+
+        data_builder = self.clone()
+        data_builder.limit(per_page + 1).offset(offset)
+        raw_items = await data_builder.get()
+
+        has_more = len(raw_items) > per_page
+        items = raw_items[:per_page] if has_more else raw_items
+
+        return SimplePaginator(
+            items=items,
+            per_page=per_page,
+            current_page=page,
+            has_more=has_more,
+        )
 
     async def insert_returning(
         self,
@@ -645,6 +817,87 @@ class Model:
     async def all(cls) -> list[Self]:
         """Retrieve all model instances."""
         return await cls.query().get()
+
+    @classmethod
+    def limit(cls, value: int) -> ModelQueryBuilder[Self]:
+        """Set query result limit."""
+        return cls.query().limit(value)
+
+    @classmethod
+    def offset(cls, value: int) -> ModelQueryBuilder[Self]:
+        """Set query result offset."""
+        return cls.query().offset(value)
+
+    @classmethod
+    def take(cls, value: int) -> ModelQueryBuilder[Self]:
+        """Alias for limit()."""
+        return cls.query().take(value)
+
+    @classmethod
+    def skip(cls, value: int) -> ModelQueryBuilder[Self]:
+        """Alias for offset()."""
+        return cls.query().skip(value)
+
+    @classmethod
+    def order_by(
+        cls, column: str, direction: str = "ASC"
+    ) -> ModelQueryBuilder[Self]:
+        """Order the model query by a column."""
+        return cls.query().order_by(column, direction)
+
+    @classmethod
+    def group_by(cls, *columns: str | Sequence[str]) -> ModelQueryBuilder[Self]:
+        """Add GROUP BY columns to the query."""
+        return cls.query().group_by(*columns)
+
+    @classmethod
+    def having(
+        cls,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Add a HAVING condition to the model query."""
+        return cls.query().having(column, operator_or_value, value, boolean=boolean)
+
+    @classmethod
+    def or_having(
+        cls, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR HAVING condition to the model query."""
+        return cls.query().or_having(column, operator_or_value, value)
+
+    @classmethod
+    def having_raw(
+        cls,
+        sql: str,
+        bindings: list[Any] | None = None,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Add a raw HAVING condition to the model query."""
+        return cls.query().having_raw(sql, bindings, boolean=boolean)
+
+    @classmethod
+    def or_having_raw(
+        cls, sql: str, bindings: list[Any] | None = None
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR raw HAVING condition to the model query."""
+        return cls.query().or_having_raw(sql, bindings)
+
+    @classmethod
+    async def paginate(
+        cls, per_page: int = 15, page: int = 1
+    ) -> Paginator[Self]:
+        """Execute length-aware pagination on the model."""
+        return await cls.query().paginate(per_page=per_page, page=page)
+
+    @classmethod
+    async def simple_paginate(
+        cls, per_page: int = 15, page: int = 1
+    ) -> SimplePaginator[Self]:
+        """Execute lightweight pagination on the model without total count."""
+        return await cls.query().simple_paginate(per_page=per_page, page=page)
 
     @classmethod
     async def _dispatch_lifecycle_event(
