@@ -14,6 +14,7 @@ from swiftpy.ai.exceptions import AIConnectionError
 from swiftpy.ai.providers.base import Message, ToolCall
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
+from swiftpy.database.identifiers import quote_identifier, validate_identifier
 from swiftpy.database.pool import DatabasePool
 from swiftpy.support.redis_config import resolve_redis_params
 
@@ -383,9 +384,19 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         table_name: str = "agent_memories",
     ) -> None:
         self._pool = pool
-        self.table_name = table_name
-        self.messages_table = f"{table_name}_messages" if not table_name.endswith("_messages") else table_name
-        self.state_table = f"{table_name}_state" if not table_name.endswith("_state") else f"{table_name}_kv"
+        self.table_name = validate_identifier(table_name)
+        messages_table = (
+            f"{table_name}_messages"
+            if not table_name.endswith("_messages")
+            else table_name
+        )
+        state_table = (
+            f"{table_name}_state"
+            if not table_name.endswith("_state")
+            else f"{table_name}_kv"
+        )
+        self.messages_table = validate_identifier(messages_table)
+        self.state_table = validate_identifier(state_table)
         self._table_checked = False
 
     def _get_pool(self) -> DatabasePool:
@@ -404,8 +415,11 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
             return
         pool = self._get_pool()
         raw_pool = pool.get_pool()
+        msg_table_q = quote_identifier(self.messages_table)
+        state_table_q = quote_identifier(self.state_table)
+        idx_name_q = quote_identifier(f"idx_{self.messages_table}_session")
         messages_sql = f"""
-        CREATE TABLE IF NOT EXISTS {self.messages_table} (
+        CREATE TABLE IF NOT EXISTS {msg_table_q} (
             id BIGSERIAL PRIMARY KEY,
             session_id VARCHAR(255) NOT NULL,
             role VARCHAR(50) NOT NULL,
@@ -415,10 +429,10 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
             tool_calls JSONB,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE INDEX IF NOT EXISTS idx_{self.messages_table}_session ON {self.messages_table} (session_id, id);
+        CREATE INDEX IF NOT EXISTS {idx_name_q} ON {msg_table_q} (session_id, id);
         """
         state_sql = f"""
-        CREATE TABLE IF NOT EXISTS {self.state_table} (
+        CREATE TABLE IF NOT EXISTS {state_table_q} (
             session_id VARCHAR(255) NOT NULL,
             key VARCHAR(255) NOT NULL,
             value JSONB NOT NULL,
@@ -437,7 +451,7 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         raw_pool = pool.get_pool()
         sql = f"""
         SELECT role, content, name, tool_call_id, tool_calls
-        FROM {self.messages_table}
+        FROM {quote_identifier(self.messages_table)}
         WHERE session_id = $1
         ORDER BY id ASC;
         """
@@ -476,9 +490,9 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         await self.ensure_table()
         pool = self._get_pool()
         raw_pool = pool.get_pool()
-        delete_sql = f"DELETE FROM {self.messages_table} WHERE session_id = $1;"
+        delete_sql = f"DELETE FROM {quote_identifier(self.messages_table)} WHERE session_id = $1;"
         insert_sql = f"""
-        INSERT INTO {self.messages_table} (session_id, role, content, name, tool_call_id, tool_calls)
+        INSERT INTO {quote_identifier(self.messages_table)} (session_id, role, content, name, tool_call_id, tool_calls)
         VALUES ($1, $2, $3, $4, $5, $6);
         """
         async with raw_pool.acquire() as conn, conn.transaction():
@@ -509,7 +523,7 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         pool = self._get_pool()
         raw_pool = pool.get_pool()
         insert_sql = f"""
-        INSERT INTO {self.messages_table} (session_id, role, content, name, tool_call_id, tool_calls)
+        INSERT INTO {quote_identifier(self.messages_table)} (session_id, role, content, name, tool_call_id, tool_calls)
         VALUES ($1, $2, $3, $4, $5, $6);
         """
         tc_json = (
@@ -533,22 +547,22 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         pool = self._get_pool()
         raw_pool = pool.get_pool()
         async with raw_pool.acquire() as conn, conn.transaction():
-            await conn.execute(f"DELETE FROM {self.messages_table} WHERE session_id = $1;", session_id)
-            await conn.execute(f"DELETE FROM {self.state_table} WHERE session_id = $1;", session_id)
+            await conn.execute(f"DELETE FROM {quote_identifier(self.messages_table)} WHERE session_id = $1;", session_id)
+            await conn.execute(f"DELETE FROM {quote_identifier(self.state_table)} WHERE session_id = $1;", session_id)
 
     async def exists(self, session_id: str) -> bool:
         await self.ensure_table()
         pool = self._get_pool()
         raw_pool = pool.get_pool()
         async with raw_pool.acquire() as conn:
-            row = await conn.fetchrow(f"SELECT 1 FROM {self.messages_table} WHERE session_id = $1 LIMIT 1;", session_id)
+            row = await conn.fetchrow(f"SELECT 1 FROM {quote_identifier(self.messages_table)} WHERE session_id = $1 LIMIT 1;", session_id)
         return row is not None
 
     async def get_state(self, session_id: str, key: str, default: Any = None) -> Any:
         await self.ensure_table()
         pool = self._get_pool()
         raw_pool = pool.get_pool()
-        sql = f"SELECT value FROM {self.state_table} WHERE session_id = $1 AND key = $2;"
+        sql = f"SELECT value FROM {quote_identifier(self.state_table)} WHERE session_id = $1 AND key = $2;"
         async with raw_pool.acquire() as conn:
             row = await conn.fetchrow(sql, session_id, key)
         if not row or row["value"] is None:
@@ -567,7 +581,7 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         raw_pool = pool.get_pool()
         payload = json.dumps(value)
         sql = f"""
-        INSERT INTO {self.state_table} (session_id, key, value, updated_at)
+        INSERT INTO {quote_identifier(self.state_table)} (session_id, key, value, updated_at)
         VALUES ($1, $2, $3::jsonb, CURRENT_TIMESTAMP)
         ON CONFLICT (session_id, key)
         DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;
@@ -579,7 +593,7 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         await self.ensure_table()
         pool = self._get_pool()
         raw_pool = pool.get_pool()
-        sql = f"SELECT key, value FROM {self.state_table} WHERE session_id = $1;"
+        sql = f"SELECT key, value FROM {quote_identifier(self.state_table)} WHERE session_id = $1;"
         async with raw_pool.acquire() as conn:
             rows = await conn.fetch(sql, session_id)
         result: dict[str, Any] = {}

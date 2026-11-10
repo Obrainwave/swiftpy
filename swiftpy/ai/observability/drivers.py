@@ -11,7 +11,7 @@ from typing import Any
 import asyncpg
 
 from swiftpy.core.container import get_container
-from swiftpy.database.identifiers import validate_identifier
+from swiftpy.database.identifiers import quote_identifier, validate_identifier
 from swiftpy.database.pool import DatabasePool
 
 
@@ -424,8 +424,11 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
                 return
 
             pool = await self._get_pool()
+            table_q = quote_identifier(self.table_name)
+            idx_ts_q = quote_identifier(f"idx_{self.table_name}_timestamp")
+            idx_prompt_q = quote_identifier(f"idx_{self.table_name}_prompt_hash")
             ddl = f"""
-            CREATE TABLE IF NOT EXISTS {self.table_name} (
+            CREATE TABLE IF NOT EXISTS {table_q} (
                 id VARCHAR(64) PRIMARY KEY,
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 model VARCHAR(255) NOT NULL,
@@ -442,10 +445,10 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
                 duration_ms DOUBLE PRECISION,
                 metadata JSONB
             );
-            ALTER TABLE {self.table_name} ADD COLUMN IF NOT EXISTS ttft_ms DOUBLE PRECISION;
-            ALTER TABLE {self.table_name} ADD COLUMN IF NOT EXISTS duration_ms DOUBLE PRECISION;
-            CREATE INDEX IF NOT EXISTS idx_{self.table_name}_timestamp ON {self.table_name} (timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_{self.table_name}_prompt_hash ON {self.table_name} (prompt_hash);
+            ALTER TABLE {table_q} ADD COLUMN IF NOT EXISTS ttft_ms DOUBLE PRECISION;
+            ALTER TABLE {table_q} ADD COLUMN IF NOT EXISTS duration_ms DOUBLE PRECISION;
+            CREATE INDEX IF NOT EXISTS {idx_ts_q} ON {table_q} (timestamp DESC);
+            CREATE INDEX IF NOT EXISTS {idx_prompt_q} ON {table_q} (prompt_hash);
             """
             async with pool.acquire() as conn:
                 await conn.execute(ddl)
@@ -455,7 +458,7 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
         await self.ensure_table()
         pool = await self._get_pool()
         sql = f"""
-        INSERT INTO {self.table_name} (
+        INSERT INTO {quote_identifier(self.table_name)} (
             id, timestamp, model, provider, input_tokens, output_tokens,
             total_tokens, latency_ms, cost, prompt_hash, status, error_message,
             ttft_ms, duration_ms, metadata
@@ -548,7 +551,7 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
         SELECT id, timestamp, model, provider, input_tokens, output_tokens,
                total_tokens, latency_ms, cost, prompt_hash, status, error_message,
                ttft_ms, duration_ms, metadata
-        FROM {self.table_name}
+        FROM {quote_identifier(self.table_name)}
         {where_sql}
         ORDER BY timestamp DESC
         LIMIT ${idx} OFFSET ${idx + 1};
@@ -595,6 +598,7 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
     async def get_stats(self) -> dict[str, Any]:
         await self.ensure_table()
         pool = await self._get_pool()
+        table_q = quote_identifier(self.table_name)
         sql_summary = f"""
         SELECT
             COUNT(*) as total_calls,
@@ -605,7 +609,7 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
             COALESCE(SUM(output_tokens), 0) as total_output_tokens,
             COALESCE(SUM(cost), 0.0) as total_cost,
             COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms
-        FROM {self.table_name};
+        FROM {table_q};
         """
         sql_provider = f"""
         SELECT
@@ -613,7 +617,7 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
             COUNT(*) as calls,
             COALESCE(SUM(total_tokens), 0) as tokens,
             COALESCE(SUM(cost), 0.0) as cost
-        FROM {self.table_name}
+        FROM {table_q}
         GROUP BY provider;
         """
         sql_model = f"""
@@ -622,7 +626,7 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
             COUNT(*) as calls,
             COALESCE(SUM(total_tokens), 0) as tokens,
             COALESCE(SUM(cost), 0.0) as cost
-        FROM {self.table_name}
+        FROM {table_q}
         GROUP BY model;
         """
 
@@ -685,4 +689,4 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
         await self.ensure_table()
         pool = await self._get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(f"TRUNCATE TABLE {self.table_name};")
+            await conn.execute(f"TRUNCATE TABLE {quote_identifier(self.table_name)};")

@@ -15,6 +15,8 @@ from swiftpy.validation import FormRequest, exists, unique, validate
 
 @pytest.fixture
 async def accounts_table(ensure_db_pool: DatabasePool) -> AsyncGenerator[str, None]:
+    if ensure_db_pool is None:
+        pytest.skip("PostgreSQL is not available in local test environment")
     table_name = f"test_acc_{uuid.uuid4().hex[:8]}"
     pool = ensure_db_pool.get_pool()
     async with pool.acquire() as conn:
@@ -250,7 +252,7 @@ class MissingTableRequest(FormRequest):
 async def test_db_failure_in_pipeline_does_not_leak_internals(
     ensure_db_pool: DatabasePool,
 ) -> None:
-    app = Application()
+    app = Application(debug=False)
     app.container.instance(DatabasePool, ensure_db_pool)
 
     @app.post("/register")

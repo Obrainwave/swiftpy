@@ -5,11 +5,12 @@ import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar, get_type_hints
+from typing import Any, Literal, TypeVar, get_args, get_origin, get_type_hints
 
 from swiftpy.core.config import ConfigurationError
 from swiftpy.core.container import Container
 from swiftpy.core.exceptions import MethodNotAllowedError, ValidationError
+from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response
 from swiftpy.validation.form_request import FormRequest
@@ -33,7 +34,9 @@ _BUILTIN_TYPES: dict[str, type[Any]] = {
     "Any": Any,
 }
 
-ParamKind = Literal["request", "path", "form", "di", "default", "websocket"]
+ParamKind = Literal[
+    "request", "path", "form", "di", "default", "websocket", "file", "files"
+]
 
 
 class RouteRegistrationError(ConfigurationError, TypeError):
@@ -140,6 +143,8 @@ class Route:
     is_websocket: bool = False
     order: int = 0
     max_body_size: int | None = None
+    max_content_length: int | None = None
+    max_json_depth: int | None = None
     localns: dict[str, Any] | None = field(default=None, repr=False)
     pattern: re.Pattern[str] = field(init=False)
     param_names: tuple[str, ...] = field(init=False)
@@ -262,6 +267,8 @@ class RouteGroup:
         *,
         is_websocket: bool = False,
         max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
         localns: dict[str, Any] | None = None,
     ) -> None:
         clean_path = "/" + path.strip("/") if path != "/" else ""
@@ -273,11 +280,18 @@ class RouteGroup:
             middleware=list(self.middleware),
             is_websocket=is_websocket,
             max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
             localns=localns,
         )
 
     def get(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -285,6 +299,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -292,7 +308,12 @@ class RouteGroup:
         return decorator
 
     def post(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -300,6 +321,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -307,7 +330,12 @@ class RouteGroup:
         return decorator
 
     def put(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -315,6 +343,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -322,7 +352,12 @@ class RouteGroup:
         return decorator
 
     def patch(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -330,6 +365,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -337,7 +374,12 @@ class RouteGroup:
         return decorator
 
     def delete(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -345,6 +387,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -352,7 +396,12 @@ class RouteGroup:
         return decorator
 
     def head(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -360,6 +409,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -367,7 +418,12 @@ class RouteGroup:
         return decorator
 
     def options(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         def decorator(func: F) -> F:
             self._add_route(
@@ -375,6 +431,8 @@ class RouteGroup:
                 path,
                 func,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -472,6 +530,15 @@ class Router:
 
             if isinstance(ann, type) and issubclass(ann, Request):
                 specs.append(ParamSpec(name=name, kind="request", annotation=ann))
+            elif isinstance(ann, type) and issubclass(ann, UploadedFile):
+                specs.append(ParamSpec(name=name, kind="file", annotation=ann))
+            elif (
+                get_origin(ann) is list
+                and get_args(ann)
+                and isinstance(get_args(ann)[0], type)
+                and issubclass(get_args(ann)[0], UploadedFile)
+            ):
+                specs.append(ParamSpec(name=name, kind="files", annotation=ann))
             elif name in route.param_names:
                 specs.append(ParamSpec(name=name, kind="path", annotation=ann))
             elif isinstance(ann, type) and issubclass(ann, FormRequest):
@@ -542,6 +609,8 @@ class Router:
         *,
         is_websocket: bool = False,
         max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
         localns: dict[str, Any] | None = None,
     ) -> Route:
         norm_method = method.upper().strip()
@@ -563,6 +632,8 @@ class Router:
             is_websocket=is_websocket,
             order=self._counter,
             max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
             localns=effective_locals,
         )
 
@@ -583,6 +654,8 @@ class Router:
         *,
         is_websocket: bool = False,
         max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
         if method.upper().strip() == "WEBSOCKET" and not is_websocket:
             raise RouteRegistrationError(
@@ -596,6 +669,8 @@ class Router:
                 func,
                 is_websocket=is_websocket,
                 max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
                 localns=_collect_caller_locals(func),
             )
             return func
@@ -603,39 +678,116 @@ class Router:
         return decorator
 
     def get(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("GET", path, max_body_size=max_body_size)
+        return self.route(
+            "GET",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def post(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("POST", path, max_body_size=max_body_size)
+        return self.route(
+            "POST",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def put(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("PUT", path, max_body_size=max_body_size)
+        return self.route(
+            "PUT",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def patch(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("PATCH", path, max_body_size=max_body_size)
+        return self.route(
+            "PATCH",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def delete(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("DELETE", path, max_body_size=max_body_size)
+        return self.route(
+            "DELETE",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def head(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("HEAD", path, max_body_size=max_body_size)
+        return self.route(
+            "HEAD",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def options(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.route("OPTIONS", path, max_body_size=max_body_size)
+        return self.route(
+            "OPTIONS",
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def websocket(self, path: str) -> Callable[[F], F]:
         return self.route("WEBSOCKET", path, is_websocket=True)

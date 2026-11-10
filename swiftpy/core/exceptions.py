@@ -184,8 +184,13 @@ class ExceptionHandler:
                     exc.message,
                 )
             headers = exc.headers or {}
+            detail = (
+                "Internal Server Error"
+                if (not self.debug and exc.status_code >= 500)
+                else exc.message
+            )
             resp = json_response(
-                {"detail": exc.message},
+                {"detail": detail},
                 status_code=exc.status_code,
             )
             if headers:

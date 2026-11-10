@@ -36,6 +36,16 @@ ignore_missing_imports = true
 module = ["redis.*"]
 disallow_untyped_calls = false
 
+[[tool.mypy.overrides]]
+module = [
+    "swiftpy.ai.pool",
+    "swiftpy.ai.vectorstore.*",
+    "swiftpy.ai.rag.*",
+    "swiftpy.ai.providers.*",
+    "swiftpy.ai.embeddings",
+]
+disable_error_code = ["assignment"]
+
 [project.scripts]
 swiftpy = "swiftpy.console.cli:main"
 

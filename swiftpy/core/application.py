@@ -21,9 +21,14 @@ from swiftpy.core.exceptions import ExceptionHandler
 from swiftpy.core.providers.base import ServiceProvider
 from swiftpy.database.pool import DatabasePool
 from swiftpy.events.redis_bus import RedisEventBus
+from swiftpy.filesystem.manager import FilesystemManager
 from swiftpy.http.exceptions import ClientDisconnect, HttpException
 from swiftpy.http.middleware import Middleware, MiddlewarePipeline
-from swiftpy.http.request import DEFAULT_MAX_BODY_SIZE, Request
+from swiftpy.http.request import (
+    DEFAULT_MAX_BODY_SIZE,
+    DEFAULT_MAX_JSON_DEPTH,
+    Request,
+)
 from swiftpy.http.response import (
     Response,
     json_response,
@@ -100,8 +105,8 @@ class FrameworkServiceProvider(ServiceProvider):
             except Exception:
                 logger.exception("Error closing RedisEventBus during shutdown")
 
-        # 3. Close Redis clients (Cache, QueueDispatcher, TokenBlacklist)
-        for service_cls in (Cache, QueueDispatcher, TokenBlacklist):
+        # 3. Close background clients (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager)
+        for service_cls in (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager):
             inst = self.container.get_singleton(service_cls)
             if inst is not None and hasattr(inst, "close"):
                 try:
@@ -242,6 +247,8 @@ class Application:
         project_root: str | Path | None = None,
         strict_providers: bool = True,
         max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
         allowed_origins: Sequence[str] | set[str] | None = None,
         max_ws_message_size: int | None = None,
         **kwargs: Any,
@@ -283,6 +290,22 @@ class Application:
             self.max_body_size = int(cfg_max_body)
         else:
             self.max_body_size = DEFAULT_MAX_BODY_SIZE
+
+        cfg_max_content = self.config.get("http.max_content_length")
+        if max_content_length is not None:
+            self.max_content_length: int | None = int(max_content_length)
+        elif cfg_max_content is not None:
+            self.max_content_length = int(cfg_max_content)
+        else:
+            self.max_content_length = None
+
+        cfg_max_depth = self.config.get("http.max_json_depth")
+        if max_json_depth is not None:
+            self.max_json_depth: int = int(max_json_depth)
+        elif cfg_max_depth is not None:
+            self.max_json_depth = int(cfg_max_depth)
+        else:
+            self.max_json_depth = DEFAULT_MAX_JSON_DEPTH
 
         # WebSocket origin and message size limits (D-14, P9-W1, P9-W2)
         raw_allowed_origins = (
@@ -513,6 +536,10 @@ class Application:
                     call_kwargs[spec.name] = instance
                 elif spec.kind == "di":
                     call_kwargs[spec.name] = self.container.resolve(spec.annotation)
+                elif spec.kind == "file":
+                    call_kwargs[spec.name] = await request.file(spec.name)
+                elif spec.kind == "files":
+                    call_kwargs[spec.name] = await request.files(spec.name)
                 elif spec.kind == "default" and spec.name in params:
                     call_kwargs[spec.name] = params[spec.name]
 
@@ -627,39 +654,109 @@ class Application:
         return self.router.websocket(path)
 
     def get(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.get(path, max_body_size=max_body_size)
+        return self.router.get(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def post(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.post(path, max_body_size=max_body_size)
+        return self.router.post(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def put(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.put(path, max_body_size=max_body_size)
+        return self.router.put(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def patch(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.patch(path, max_body_size=max_body_size)
+        return self.router.patch(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def delete(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.delete(path, max_body_size=max_body_size)
+        return self.router.delete(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def head(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.head(path, max_body_size=max_body_size)
+        return self.router.head(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def options(
-        self, path: str, *, max_body_size: int | None = None
+        self,
+        path: str,
+        *,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
     ) -> Callable[[F], F]:
-        return self.router.options(path, max_body_size=max_body_size)
+        return self.router.options(
+            path,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
     def middleware(self, middleware_list: Sequence[type[Middleware]]) -> Self:
         """Register global HTTP middleware classes that run for every HTTP request."""
@@ -706,6 +803,10 @@ class Application:
 
             if route.max_body_size is not None:
                 request.max_body_size = route.max_body_size
+            if route.max_content_length is not None:
+                request.max_content_length = route.max_content_length
+            if route.max_json_depth is not None:
+                request.max_json_depth = route.max_json_depth
 
             handler = route.compiled_handler
             if handler is None:
@@ -787,6 +888,8 @@ class Application:
                             scope,
                             receive,
                             max_body_size=self.max_body_size,
+                            max_content_length=self.max_content_length,
+                            max_json_depth=self.max_json_depth,
                         )
                         Context.set("request", handshake_request)
 
@@ -865,6 +968,8 @@ class Application:
                     scope,
                     receive,
                     max_body_size=self.max_body_size,
+                    max_content_length=self.max_content_length,
+                    max_json_depth=self.max_json_depth,
                 )
                 Context.set("request", request)
 
@@ -882,6 +987,8 @@ class Application:
                 response = await self._handle_exception_safely(exc, request=request)
 
             finally:
+                if request is not None:
+                    await request.close()
                 if scope.get("type") == "http":
                     await self.container.aclose_scoped()
                     Context.clear()

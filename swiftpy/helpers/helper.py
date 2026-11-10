@@ -8,6 +8,7 @@ from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
 from swiftpy.core.container_exceptions import BindingNotFoundError, ResolutionError
 from swiftpy.events.dispatcher import EventDispatcher
+from swiftpy.filesystem.manager import FilesystemManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
 from swiftpy.support.strings import pluralize, snake_case
@@ -35,6 +36,22 @@ def cache(driver_name: str | None = None) -> Any:
     if driver_name is not None:
         return c.driver(driver_name)
     return c
+
+
+def storage(disk_name: str | None = None) -> Any:
+    """Retrieve the application FilesystemManager or a specific StorageDisk."""
+    try:
+        c_inst = get_container()
+        if c_inst.has(FilesystemManager):
+            manager = c_inst.resolve(FilesystemManager)
+        else:
+            manager = FilesystemManager.get_instance()
+    except RuntimeError:
+        manager = FilesystemManager.get_instance()
+
+    if disk_name is not None:
+        return manager.disk(disk_name)
+    return manager
 
 
 def config(key: str | None = None, default: Any = None) -> Any:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any, cast
 from urllib.parse import parse_qs
 
+from swiftpy.filesystem.uploads.handlers import FormData, MultipartParser
+from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
 from swiftpy.http.exceptions import (
     ClientDisconnect,
     HttpException,
@@ -12,6 +14,29 @@ from swiftpy.http.exceptions import (
 )
 
 DEFAULT_MAX_BODY_SIZE: int = 2 * 1024 * 1024  # 2 MiB
+DEFAULT_MAX_CONTENT_LENGTH: int = 2 * 1024 * 1024  # 2 MiB
+DEFAULT_MAX_JSON_DEPTH: int = 32
+
+
+def _validate_json_depth(
+    obj: Any,
+    current_depth: int = 1,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+) -> None:
+    """Validate that nested JSON structures do not exceed maximum nesting depth."""
+    if current_depth > max_depth:
+        raise HttpException(
+            f"JSON payload exceeds maximum allowed depth of {max_depth}",
+            status_code=400,
+        )
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _validate_json_depth(v, current_depth + 1, max_depth)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _validate_json_depth(item, current_depth + 1, max_depth)
 
 
 class RequestHeaders(Mapping[str, str]):
@@ -73,10 +98,14 @@ class Request:
         receive: Any,
         *,
         max_body_size: int = DEFAULT_MAX_BODY_SIZE,
+        max_content_length: int | None = None,
+        max_json_depth: int = DEFAULT_MAX_JSON_DEPTH,
     ) -> None:
         self.scope = scope
         self._receive = receive
         self.max_body_size = max_body_size
+        self.max_content_length = max_content_length
+        self.max_json_depth = max_json_depth
 
         self._headers: RequestHeaders | None = None
         self._query_params: dict[str, str] | None = None
@@ -84,6 +113,7 @@ class Request:
         self._body: bytes | None = None
         self._json: Any = None
         self._json_parsed: bool = False
+        self._form: FormData | None = None
 
         self.state: dict[str, Any] = {}
 
@@ -142,6 +172,15 @@ class Request:
                 raise HttpException(
                     "Invalid Content-Length header", status_code=400
                 )
+            cl_limit = (
+                self.max_content_length
+                if self.max_content_length is not None
+                else limit
+            )
+            if cl_limit is not None and content_length > cl_limit:
+                raise PayloadTooLargeError(
+                    f"Request content length exceeds maximum size of {cl_limit} bytes"
+                )
             if limit is not None and content_length > limit:
                 raise PayloadTooLargeError(
                     f"Request body exceeds maximum size of {limit} bytes"
@@ -198,6 +237,55 @@ class Request:
                     raise HttpException(
                         "Invalid JSON payload", status_code=400
                     ) from None
+                _validate_json_depth(self._json, max_depth=self.max_json_depth)
             self._json_parsed = True
 
         return self._json
+
+    async def form(self) -> FormData:
+        if self._form is None:
+            content_type = self.headers.get("content-type", "")
+            if "multipart/form-data" in content_type.lower():
+                boundary = MultipartParser.extract_boundary(content_type)
+                limit = self.max_body_size
+                parser = MultipartParser(
+                    boundary,
+                    max_request_size=limit if limit is not None else 200 * 1024 * 1024,
+                )
+                if self._body is not None:
+                    async def _body_stream(raw: bytes) -> AsyncIterator[bytes]:
+                        chunk_size = 64 * 1024
+                        for i in range(0, len(raw), chunk_size):
+                            yield raw[i : i + chunk_size]
+
+                    self._form = await parser.parse(_body_stream(self._body))
+                else:
+                    self._form = await parser.parse(self._receive)
+            else:
+                raw_bytes = await self.body()
+                form_data = FormData()
+                if raw_bytes:
+                    decoded = raw_bytes.decode("utf-8", errors="replace")
+                    parsed = parse_qs(decoded, keep_blank_values=True)
+                    for k, vals in parsed.items():
+                        for v in vals:
+                            form_data.add_field(k, v)
+                self._form = form_data
+        return self._form
+
+    async def file(self, name: str) -> UploadedFile | None:
+        form_data = await self.form()
+        return form_data.get_file(name)
+
+    async def files(
+        self, name: str | None = None
+    ) -> list[UploadedFile] | dict[str, list[UploadedFile]]:
+        form_data = await self.form()
+        if name is not None:
+            return form_data.get_files(name)
+        return dict(form_data.files_list)
+
+    async def close(self) -> None:
+        if self._form is not None:
+            await self._form.close()
+            self._form = None
