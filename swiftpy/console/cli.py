@@ -6,7 +6,9 @@ import sys
 from swiftpy.console.commands.cache import CacheCommand
 from swiftpy.console.commands.make import MakeCommand
 from swiftpy.console.commands.migrate import MigrateCommand
+from swiftpy.console.commands.new import NewCommand
 from swiftpy.console.commands.queue import QueueCommand
+from swiftpy.console.commands.seed import SeedCommand
 from swiftpy.console.commands.start import StartCommand
 from swiftpy.console.commands.storage import StorageCommand
 
@@ -36,8 +38,10 @@ class CLI:
 
     def _register_commands(self) -> None:
         """Register all framework commands."""
+        NewCommand.register(self.subparsers)
         StartCommand.register(self.subparsers)
         MigrateCommand.register(self.subparsers)
+        SeedCommand.register(self.subparsers)
         MakeCommand.register(self.subparsers)
         QueueCommand.register(self.subparsers)
         CacheCommand.register(self.subparsers)

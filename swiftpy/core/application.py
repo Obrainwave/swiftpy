@@ -35,6 +35,7 @@ from swiftpy.http.response import (
     not_found,
 )
 from swiftpy.http.router import PathParamCoercionError, Route, RouteGroup, Router
+from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.validation.exceptions import ValidationException
 from swiftpy.validation.form_request import FormRequest
@@ -105,8 +106,14 @@ class FrameworkServiceProvider(ServiceProvider):
             except Exception:
                 logger.exception("Error closing RedisEventBus during shutdown")
 
-        # 3. Close background clients (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager)
-        for service_cls in (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager):
+        # 3. Close background clients (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager, MailManager)
+        for service_cls in (
+            Cache,
+            QueueDispatcher,
+            TokenBlacklist,
+            FilesystemManager,
+            MailManager,
+        ):
             inst = self.container.get_singleton(service_cls)
             if inst is not None and hasattr(inst, "close"):
                 try:
@@ -769,6 +776,19 @@ class Application:
         middleware: list[type[Any]] | None = None,
     ) -> Callable[[Callable[[RouteGroup], None]], Callable[[RouteGroup], None]]:
         return self.router.group(prefix, middleware=middleware)
+
+    def include_router(
+        self,
+        router: Router,
+        prefix: str = "",
+        middleware: list[type[Any]] | None = None,
+    ) -> None:
+        """
+        Mount a child router under an optional prefix and middleware pipeline.
+        """
+        self.router.include_router(router, prefix=prefix, middleware=middleware)
+        if self._booted:
+            self._compile_routes()
 
     def exception_handler_for(
         self, exc_type: type[Any]

@@ -365,7 +365,31 @@ class MakeCommand:
             _handler=MakeCommand.handle_schema,
         )
 
-        # 8. make:api-key
+        # 8. make:mail
+        parser_mail = subparsers.add_parser(
+            "make:mail",
+            help="Create a new Mailable class",
+        )
+        parser_mail.add_argument(
+            "name",
+            help="The name of the mailable (e.g., WelcomeEmail)",
+        )
+        parser_mail.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the mailable should be saved (defaults to app/mail)",
+        )
+        parser_mail.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the mailable if it already exists",
+        )
+        parser_mail.set_defaults(
+            _handler=MakeCommand.handle_mail,
+        )
+
+        # 9. make:api-key
         parser_api_key = subparsers.add_parser(
             "make:api-key",
             help="Generate a new prefix.secret API key and its peppered HMAC-SHA256 hash",
@@ -396,6 +420,174 @@ class MakeCommand:
         )
         parser_api_key.set_defaults(
             _handler=MakeCommand.handle_api_key,
+        )
+
+        # 10. make:controller
+        parser_controller = subparsers.add_parser(
+            "make:controller",
+            help="Create a new Controller class",
+        )
+        parser_controller.add_argument(
+            "name",
+            help="The name of the controller (e.g., UserController)",
+        )
+        parser_controller.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the controller should be saved (defaults to app/http/controllers)",
+        )
+        parser_controller.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the controller if it already exists",
+        )
+        parser_controller.set_defaults(
+            _handler=MakeCommand.handle_controller,
+        )
+
+        # 11. make:middleware
+        parser_middleware = subparsers.add_parser(
+            "make:middleware",
+            help="Create a new ASGI Middleware class",
+        )
+        parser_middleware.add_argument(
+            "name",
+            help="The name of the middleware (e.g., AuthMiddleware)",
+        )
+        parser_middleware.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the middleware should be saved (defaults to app/http/middleware)",
+        )
+        parser_middleware.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the middleware if it already exists",
+        )
+        parser_middleware.set_defaults(
+            _handler=MakeCommand.handle_middleware,
+        )
+
+        # 12. make:job
+        parser_job = subparsers.add_parser(
+            "make:job",
+            help="Create a new queued background Job class",
+        )
+        parser_job.add_argument(
+            "name",
+            help="The name of the job (e.g., SendNotificationJob)",
+        )
+        parser_job.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the job should be saved (defaults to app/jobs)",
+        )
+        parser_job.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the job if it already exists",
+        )
+        parser_job.set_defaults(
+            _handler=MakeCommand.handle_job,
+        )
+
+        # 13. make:event
+        parser_event = subparsers.add_parser(
+            "make:event",
+            help="Create a new domain Event dataclass",
+        )
+        parser_event.add_argument(
+            "name",
+            help="The name of the event (e.g., UserRegistered)",
+        )
+        parser_event.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the event should be saved (defaults to app/events)",
+        )
+        parser_event.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the event if it already exists",
+        )
+        parser_event.set_defaults(
+            _handler=MakeCommand.handle_event,
+        )
+
+        # 14. make:listener
+        parser_listener = subparsers.add_parser(
+            "make:listener",
+            help="Create a new event Listener class",
+        )
+        parser_listener.add_argument(
+            "name",
+            help="The name of the listener (e.g., SendWelcomeNotification)",
+        )
+        parser_listener.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the listener should be saved (defaults to app/listeners)",
+        )
+        parser_listener.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the listener if it already exists",
+        )
+        parser_listener.set_defaults(
+            _handler=MakeCommand.handle_listener,
+        )
+
+        # 15. make:provider
+        parser_provider = subparsers.add_parser(
+            "make:provider",
+            help="Create a new ServiceProvider class",
+        )
+        parser_provider.add_argument(
+            "name",
+            help="The name of the service provider (e.g., AppServiceProvider)",
+        )
+        parser_provider.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the provider should be saved (defaults to app/providers)",
+        )
+        parser_provider.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the provider if it already exists",
+        )
+        parser_provider.set_defaults(
+            _handler=MakeCommand.handle_provider,
+        )
+
+        # 16. make:seeder
+        parser_seeder = subparsers.add_parser(
+            "make:seeder",
+            help="Create a new database Seeder class",
+        )
+        parser_seeder.add_argument(
+            "name",
+            help="The name of the seeder (e.g., UserSeeder)",
+        )
+        parser_seeder.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the seeder should be saved (defaults to database/seeders)",
+        )
+        parser_seeder.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the seeder if it already exists",
+        )
+        parser_seeder.set_defaults(
+            _handler=MakeCommand.handle_seeder,
         )
 
     @staticmethod
@@ -626,4 +818,100 @@ class MakeCommand:
             override_path=getattr(args, "path", None),
             force=bool(getattr(args, "force", False)),
             item_type="Schema",
+        )
+
+    @staticmethod
+    def handle_mail(args: argparse.Namespace) -> None:
+        """Handle make:mail command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/mail",
+            stub_name="mail",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Mailable",
+        )
+
+    @staticmethod
+    def handle_controller(args: argparse.Namespace) -> None:
+        """Handle make:controller command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/http/controllers",
+            stub_name="controller",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Controller",
+        )
+
+    @staticmethod
+    def handle_middleware(args: argparse.Namespace) -> None:
+        """Handle make:middleware command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/http/middleware",
+            stub_name="middleware",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Middleware",
+        )
+
+    @staticmethod
+    def handle_job(args: argparse.Namespace) -> None:
+        """Handle make:job command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/jobs",
+            stub_name="job",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Job",
+        )
+
+    @staticmethod
+    def handle_event(args: argparse.Namespace) -> None:
+        """Handle make:event command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/events",
+            stub_name="event",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Event",
+        )
+
+    @staticmethod
+    def handle_listener(args: argparse.Namespace) -> None:
+        """Handle make:listener command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/listeners",
+            stub_name="listener",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Listener",
+        )
+
+    @staticmethod
+    def handle_provider(args: argparse.Namespace) -> None:
+        """Handle make:provider command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/providers",
+            stub_name="provider",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Provider",
+        )
+
+    @staticmethod
+    def handle_seeder(args: argparse.Namespace) -> None:
+        """Handle make:seeder command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="database/seeders",
+            stub_name="seeder",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Seeder",
         )

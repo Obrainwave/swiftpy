@@ -84,6 +84,20 @@ class _ListenerRegistration:
     invoker: Callable[[str, Any], Any]
 
 
+def _normalize_event_name(event: str | type[Any] | Any) -> str:
+    if isinstance(event, str):
+        return event
+    if isinstance(event, type):
+        module = getattr(event, "__module__", "")
+        qualname = getattr(event, "__qualname__", event.__name__)
+        return f"{module}.{qualname}" if module and module != "__main__" else qualname
+
+    event_type = type(event)
+    module = getattr(event_type, "__module__", "")
+    qualname = getattr(event_type, "__qualname__", event_type.__name__)
+    return f"{module}.{qualname}" if module and module != "__main__" else qualname
+
+
 class EventDispatcher:
     """
     In-process event dispatcher supporting synchronous and asynchronous listeners,
@@ -151,15 +165,16 @@ class EventDispatcher:
         escaped = escaped.replace(token, r".*")
         return re.compile(f"^{escaped}$")
 
-    def listen(self, event: str, handler: EventHandler) -> None:
+    def listen(self, event: str | type[Any], handler: EventHandler) -> None:
         """
         Register an event listener for a specific event or wildcard pattern.
         Example patterns: 'user.created', 'user.*', '*.created', 'user.**', '*'
         """
-        regex = self._compile_pattern(event)
+        event_str = _normalize_event_name(event)
+        regex = self._compile_pattern(event_str)
         invoker = _build_invoker(handler)
         reg = _ListenerRegistration(
-            pattern=event,
+            pattern=event_str,
             regex=regex,
             handler=handler,
             order=self._seq,
@@ -168,43 +183,45 @@ class EventDispatcher:
         self._seq += 1
         self._registry.append(reg)
         if regex is None:
-            self._exact_registry.setdefault(event, []).append(reg)
+            self._exact_registry.setdefault(event_str, []).append(reg)
         else:
             self._wildcard_registry.append(reg)
 
-    def has_listeners(self, event: str) -> bool:
+    def has_listeners(self, event: str | type[Any]) -> bool:
         """Determine whether any listeners match the given event."""
-        if self._exact_registry.get(event):
+        event_str = _normalize_event_name(event)
+        if self._exact_registry.get(event_str):
             return True
         for reg in self._wildcard_registry:
-            if reg.regex is not None and reg.regex.match(event):
+            if reg.regex is not None and reg.regex.match(event_str):
                 return True
         return False
 
-    def get_matching_registrations(self, event: str) -> list[_ListenerRegistration]:
+    def get_matching_registrations(self, event: str | type[Any]) -> list[_ListenerRegistration]:
         """
         Retrieve all matching registrations for an event in global registration order.
         """
+        event_str = _normalize_event_name(event)
         matching: list[_ListenerRegistration] = []
-        exact = self._exact_registry.get(event)
+        exact = self._exact_registry.get(event_str)
         if exact:
             matching.extend(exact)
         for reg in self._wildcard_registry:
-            if reg.regex is not None and reg.regex.match(event):
+            if reg.regex is not None and reg.regex.match(event_str):
                 matching.append(reg)
 
         if len(matching) > 1:
             matching.sort(key=lambda r: r.order)
         return matching
 
-    def get_listeners(self, event: str) -> list[EventHandler]:
+    def get_listeners(self, event: str | type[Any]) -> list[EventHandler]:
         """
         Retrieve all matching handlers for an event in global registration order,
         interleaving exact and wildcard registrations deterministically.
         """
         return [reg.handler for reg in self.get_matching_registrations(event)]
 
-    async def dispatch(self, event: str, payload: Any = None) -> list[Any]:
+    async def dispatch(self, event: str | type[Any] | Any, payload: Any = None) -> list[Any]:
         """
         Dispatch an event to all matching registered listeners in registration order.
         Supports both synchronous functions and async coroutine handlers.
@@ -213,13 +230,20 @@ class EventDispatcher:
         halts, subsequent handlers are not invoked, and the exception is propagated
         to the caller without modifying dispatcher registration state.
         """
-        matching = self.get_matching_registrations(event)
+        if isinstance(event, str):
+            event_name = event
+        else:
+            event_name = _normalize_event_name(event)
+            if payload is None and not isinstance(event, type):
+                payload = event
+
+        matching = self.get_matching_registrations(event_name)
         if not matching:
             return []
 
         results: list[Any] = []
         for reg in matching:
-            res = reg.invoker(event, payload)
+            res = reg.invoker(event_name, payload)
             if inspect.isawaitable(res):
                 res = await res
             results.append(res)
@@ -231,24 +255,25 @@ class EventDispatcher:
         invoker = _build_invoker(handler)
         return invoker(event, payload)
 
-    def remove_listener(self, event: str, handler: EventHandler) -> bool:
+    def remove_listener(self, event: str | type[Any], handler: EventHandler) -> bool:
         """Alias for unsubscribe."""
         return self.unsubscribe(event, handler)
 
-    def unsubscribe(self, event: str, handler: EventHandler) -> bool:
+    def unsubscribe(self, event: str | type[Any], handler: EventHandler) -> bool:
         """Unsubscribe a specific handler from an event or pattern."""
+        event_str = _normalize_event_name(event)
         initial_len = len(self._registry)
         self._registry = [
             reg
             for reg in self._registry
-            if not (reg.pattern == event and reg.handler == handler)
+            if not (reg.pattern == event_str and reg.handler == handler)
         ]
-        if event in self._exact_registry:
-            self._exact_registry[event] = [
-                reg for reg in self._exact_registry[event] if reg.handler != handler
+        if event_str in self._exact_registry:
+            self._exact_registry[event_str] = [
+                reg for reg in self._exact_registry[event_str] if reg.handler != handler
             ]
-            if not self._exact_registry[event]:
-                del self._exact_registry[event]
+            if not self._exact_registry[event_str]:
+                del self._exact_registry[event_str]
         self._wildcard_registry = [
             reg
             for reg in self._wildcard_registry

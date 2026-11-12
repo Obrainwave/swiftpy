@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+from swiftpy.core.providers.base import ServiceProvider
+
+
+class {class_name}(ServiceProvider):
+    """
+    Modular application service provider.
+    """
+
+    def register(self) -> None:
+        """Bind services and interfaces into the DI container."""
+        pass
+
+    def boot(self) -> None:
+        """Boot application services, attach listeners, and warm caches."""
+        pass
+

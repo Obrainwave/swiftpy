@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 import math
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import (
     Any,
@@ -17,6 +17,7 @@ from typing import (
     overload,
 )
 
+from swiftpy.database.exceptions import ModelNotFoundError
 from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.orm.fields import Field, FieldInfo, VectorFieldInfo
 from swiftpy.database.orm.registry import (
@@ -33,7 +34,7 @@ from swiftpy.database.orm.relationships import (
     RelationDescriptor,
 )
 from swiftpy.database.pagination import Paginator, SimplePaginator
-from swiftpy.database.query_builder import Query
+from swiftpy.database.query_builder import Query, QueryBuilder, QueryError
 from swiftpy.database.transaction import get_active_connection
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.support.strings import pluralize, snake_case
@@ -78,12 +79,49 @@ class ModelQueryBuilder[T: Model]:
             self.builder.where(column, operator_or_value, value)
         return self
 
+    def or_where(self, column: str, operator_or_value: Any, value: Any = _MISSING) -> Self:
+        if value is _MISSING:
+            self.builder.or_where(column, operator_or_value)
+        else:
+            self.builder.or_where(column, operator_or_value, value)
+        return self
+
+    def where_group(
+        self,
+        callback: Callable[[ModelQueryBuilder[T]], Any],
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        """Add a nested WHERE group with explicit boolean grouping (parentheses)."""
+        def _adapted_callback(qb: QueryBuilder) -> Any:
+            mqb = self.__class__(self.model_cls)
+            mqb.builder = qb
+            return callback(mqb)
+
+        self.builder.where_group(_adapted_callback, boolean=boolean)
+        return self
+
+    def or_where_group(
+        self,
+        callback: Callable[[ModelQueryBuilder[T]], Any],
+    ) -> Self:
+        """Add an OR nested WHERE group."""
+        return self.where_group(callback, boolean="OR")
+
     def where_in(self, column: str, values: list[Any]) -> Self:
         self.builder.where_in(column, values)
         return self
 
+    def or_where_in(self, column: str, values: list[Any]) -> Self:
+        self.builder.or_where_in(column, values)
+        return self
+
     def where_not_in(self, column: str, values: list[Any]) -> Self:
         self.builder.where_not_in(column, values)
+        return self
+
+    def or_where_not_in(self, column: str, values: list[Any]) -> Self:
+        self.builder.or_where_not_in(column, values)
         return self
 
     def where_like(
@@ -109,16 +147,71 @@ class ModelQueryBuilder[T: Model]:
         self.builder.where_ilike(column, value, match=match)
         return self
 
+    def where_between(
+        self, column: str, values: Sequence[Any], *, boolean: str = "AND"
+    ) -> Self:
+        self.builder.where_between(column, values, boolean=boolean)
+        return self
+
+    def where_not_between(
+        self, column: str, values: Sequence[Any], *, boolean: str = "AND"
+    ) -> Self:
+        self.builder.where_not_between(column, values, boolean=boolean)
+        return self
+
+    def or_where_between(self, column: str, values: Sequence[Any]) -> Self:
+        self.builder.or_where_between(column, values)
+        return self
+
+    def or_where_not_between(self, column: str, values: Sequence[Any]) -> Self:
+        self.builder.or_where_not_between(column, values)
+        return self
+
     def where_null(self, column: str) -> Self:
         self.builder.where_null(column)
+        return self
+
+    def or_where_null(self, column: str) -> Self:
+        self.builder.or_where_null(column)
         return self
 
     def where_not_null(self, column: str) -> Self:
         self.builder.where_not_null(column)
         return self
 
+    def or_where_not_null(self, column: str) -> Self:
+        self.builder.or_where_not_null(column)
+        return self
+
     def where_raw(self, sql: str, bindings: list[Any] | None = None) -> Self:
         self.builder.where_raw(sql, bindings)
+        return self
+
+    def or_where_raw(self, sql: str, bindings: list[Any] | None = None) -> Self:
+        self.builder.or_where_raw(sql, bindings)
+        return self
+
+    def join(
+        self,
+        table: str,
+        first: str,
+        operator: str,
+        second: str,
+        type_: str = "INNER",
+    ) -> Self:
+        self.builder.join(table, first, operator, second, type_=type_)
+        return self
+
+    def left_join(
+        self, table: str, first: str, operator: str, second: str
+    ) -> Self:
+        self.builder.left_join(table, first, operator, second)
+        return self
+
+    def right_join(
+        self, table: str, first: str, operator: str, second: str
+    ) -> Self:
+        self.builder.right_join(table, first, operator, second)
         return self
 
     def with_(self, *relations: str) -> Self:
@@ -212,9 +305,53 @@ class ModelQueryBuilder[T: Model]:
         self.builder.select_max(column, alias)
         return self
 
+    def distinct(self, *columns: str) -> Self:
+        """Apply DISTINCT or DISTINCT ON (columns) to the query projection."""
+        self.builder.distinct(*columns)
+        return self
+
     def order_by(self, column: str, direction: str = "ASC") -> Self:
         self.builder.order_by(column, direction)
         return self
+
+    def latest(self, column: str = "created_at") -> Self:
+        """Order records descending by the specified column (default: created_at)."""
+        self.builder.latest(column)
+        return self
+
+    def oldest(self, column: str = "created_at") -> Self:
+        """Order records ascending by the specified column (default: created_at)."""
+        self.builder.oldest(column)
+        return self
+
+    def in_random_order(self) -> Self:
+        """Order records randomly using PostgreSQL RANDOM()."""
+        self.builder.in_random_order()
+        return self
+
+    def when(
+        self,
+        condition: Any,
+        callback: Callable[[Self, Any], Any],
+        default: Callable[[Self, Any], Any] | None = None,
+    ) -> Self:
+        """Apply callback if condition is truthy, otherwise apply default callback if provided."""
+        if condition:
+            res = callback(self, condition)
+            return res if isinstance(res, self.__class__) else self
+        elif default is not None:
+            res = default(self, condition)
+            return res if isinstance(res, self.__class__) else self
+        return self
+
+    def unless(
+        self,
+        condition: Any,
+        callback: Callable[[Self, Any], Any],
+        default: Callable[[Self, Any], Any] | None = None,
+    ) -> Self:
+        """Apply callback if condition is falsy, otherwise apply default callback if provided."""
+        return self.when(not condition, callback, default)
 
     def select(self, *columns: str) -> Self:
         self.builder.select(*columns)
@@ -254,6 +391,132 @@ class ModelQueryBuilder[T: Model]:
     async def first(self) -> T | None:
         res = await self.clone().limit(1).get()
         return res[0] if res else None
+
+    async def first_or_fail(self) -> T:
+        """Fetch the first record or raise ModelNotFoundError if no record matches."""
+        instance = await self.first()
+        if instance is None:
+            raise ModelNotFoundError(model=self.model_cls)
+        return instance
+
+    async def value(self, column: str) -> Any | None:
+        """Fetch the value of a single column from the first matching row."""
+        return await self.builder.value(column)
+
+    @overload
+    async def pluck(self, column: str, key: None = None) -> list[Any]: ...
+
+    @overload
+    async def pluck(self, column: str, key: str) -> dict[Any, Any]: ...
+
+    async def pluck(
+        self, column: str, key: str | None = None
+    ) -> list[Any] | dict[Any, Any]:
+        """Retrieve an array or dictionary of values for a single column."""
+        return await self.builder.pluck(column, key=key)
+
+    async def increment(
+        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+    ) -> str:
+        """Atomically increment a column in matching database rows."""
+        return await self.builder.increment(column, amount, extra=extra)
+
+    async def decrement(
+        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+    ) -> str:
+        """Atomically decrement a column in matching database rows."""
+        return await self.builder.decrement(column, amount, extra=extra)
+
+    async def chunk(
+        self,
+        count: int,
+        callback: Callable[[list[T]], Awaitable[bool | None] | bool | None],
+    ) -> bool:
+        """
+        Process hydrated model records in batches of size count via limit and offset.
+        Returning False from callback terminates iteration early.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError("Chunk count must be an integer >= 1.")
+
+        base_query = self.clone()
+        base_query.builder._limit_value = None
+        base_query.builder._offset_value = None
+
+        page = 1
+        while True:
+            results = await base_query.clone().offset((page - 1) * count).limit(count).get()
+            if not results:
+                break
+
+            callback_res = callback(results)
+            if inspect.isawaitable(callback_res):
+                callback_res = await callback_res
+
+            if callback_res is False:
+                return False
+
+            if len(results) < count:
+                break
+            page += 1
+
+        return True
+
+    async def chunk_by_id(
+        self,
+        count: int,
+        callback: Callable[[list[T]], Awaitable[bool | None] | bool | None],
+        column: str = "id",
+    ) -> bool:
+        """
+        Process hydrated model records in batches ordered by ID, advancing past the last observed ID.
+        Safe against record updates/deletions during iteration.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError("Chunk count must be an integer >= 1.")
+
+        col = validate_identifier(column, allow_dotted=False, allow_wildcard=False)
+        last_id: Any = None
+        base_query = self.clone()
+        base_query.builder._limit_value = None
+        base_query.builder._offset_value = None
+
+        while True:
+            query = base_query.clone().order_by(col, "ASC").limit(count)
+            if last_id is not None:
+                query = query.where(col, ">", last_id)
+
+            results = await query.get()
+            if not results:
+                break
+
+            last_record = results[-1]
+            if not hasattr(last_record, col) and col not in last_record.get_attributes():
+                raise QueryError(
+                    f"Column '{col}' not present on model for chunk_by_id cursor advancement."
+                )
+            last_id = getattr(last_record, col, None)
+
+            callback_res = callback(results)
+            if inspect.isawaitable(callback_res):
+                callback_res = await callback_res
+
+            if callback_res is False:
+                return False
+
+            if len(results) < count:
+                break
+
+        return True
+
+    async def upsert(
+        self,
+        values: list[dict[str, Any]],
+        unique_by: list[str] | str,
+        update_columns: list[str] | None = None,
+    ) -> int:
+        """Perform a PostgreSQL INSERT ... ON CONFLICT (unique_by) DO UPDATE / DO NOTHING."""
+        return await self.builder.upsert(values, unique_by, update_columns=update_columns)
 
     async def paginate(
         self, per_page: int = 15, page: int = 1
@@ -782,7 +1045,69 @@ class Model:
     @classmethod
     async def find(cls, id: Any) -> Self | None:
         """Find a model instance by its primary key."""
+        if id is None:
+            return None
         return await cls.where(cls.__primary_key__, id).first()
+
+    @classmethod
+    async def find_or_fail(cls, id: Any) -> Self:
+        """Find a model instance by its primary key or raise ModelNotFoundError."""
+        if id is None:
+            raise ValueError("Primary key lookup value cannot be None.")
+        instance = await cls.find(id)
+        if instance is None:
+            raise ModelNotFoundError(model=cls, primary_key=id)
+        return instance
+
+    @classmethod
+    async def first(cls) -> Self | None:
+        """Fetch the first record matching the query, or None."""
+        return await cls.query().first()
+
+    @classmethod
+    async def first_or_fail(cls) -> Self:
+        """Fetch the first record or raise ModelNotFoundError if not found."""
+        return await cls.query().first_or_fail()
+
+    @classmethod
+    async def count(cls, column: str = "*") -> int:
+        """Count the records matching the model query."""
+        return await cls.query().count(column)
+
+    @classmethod
+    async def exists(cls) -> bool:
+        """Check if any records match the model query."""
+        return await cls.query().exists()
+
+    @classmethod
+    async def sum(cls, column: str) -> Any:
+        return await cls.query().sum(column)
+
+    @classmethod
+    async def avg(cls, column: str) -> Any:
+        return await cls.query().avg(column)
+
+    @classmethod
+    async def min(cls, column: str) -> Any:
+        return await cls.query().min(column)
+
+    @classmethod
+    async def max(cls, column: str) -> Any:
+        return await cls.query().max(column)
+
+    @classmethod
+    def select(cls, *columns: str) -> ModelQueryBuilder[Self]:
+        return cls.query().select(*columns)
+
+    @classmethod
+    def select_raw(
+        cls, sql: str, bindings: list[Any] | None = None
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().select_raw(sql, bindings)
+
+    @classmethod
+    def distinct(cls, *columns: str) -> ModelQueryBuilder[Self]:
+        return cls.query().distinct(*columns)
 
     @classmethod
     def where(
@@ -792,9 +1117,108 @@ class Model:
         return cls.query().where(column, operator_or_value, value)
 
     @classmethod
+    def or_where(
+        cls, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR WHERE clause to the query."""
+        if value is _MISSING:
+            return cls.query().or_where(column, operator_or_value)
+        return cls.query().or_where(column, operator_or_value, value)
+
+    @classmethod
+    def where_group(
+        cls,
+        callback: Callable[[ModelQueryBuilder[Self]], Any],
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Add a nested WHERE group with explicit parentheses to the query."""
+        return cls.query().where_group(callback, boolean=boolean)
+
+    @classmethod
+    def or_where_group(
+        cls,
+        callback: Callable[[ModelQueryBuilder[Self]], Any],
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR nested WHERE group with explicit parentheses to the query."""
+        return cls.query().or_where_group(callback)
+
+    @classmethod
+    def where_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+        """Add a WHERE IN clause to the query."""
+        return cls.query().where_in(column, values)
+
+    @classmethod
+    def or_where_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+        """Add an OR WHERE IN clause to the query."""
+        return cls.query().or_where_in(column, values)
+
+    @classmethod
+    def where_not_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+        """Add a WHERE NOT IN clause to the query."""
+        return cls.query().where_not_in(column, values)
+
+    @classmethod
+    def or_where_not_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+        """Add an OR WHERE NOT IN clause to the query."""
+        return cls.query().or_where_not_in(column, values)
+
+    @classmethod
+    def where_like(
+        cls,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().where_like(
+            column, value, case_insensitive=case_insensitive, match=match
+        )
+
+    @classmethod
+    def where_ilike(
+        cls,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().where_ilike(column, value, match=match)
+
+    @classmethod
+    def where_between(
+        cls, column: str, values: Sequence[Any], *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().where_between(column, values, boolean=boolean)
+
+    @classmethod
+    def where_not_between(
+        cls, column: str, values: Sequence[Any], *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().where_not_between(column, values, boolean=boolean)
+
+    @classmethod
+    def or_where_between(
+        cls, column: str, values: Sequence[Any]
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().or_where_between(column, values)
+
+    @classmethod
+    def or_where_not_between(
+        cls, column: str, values: Sequence[Any]
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().or_where_not_between(column, values)
+
+    @classmethod
     def where_null(cls, column: str) -> ModelQueryBuilder[Self]:
         """Add a where null clause to the query."""
         return cls.query().where_null(column)
+
+    @classmethod
+    def or_where_null(cls, column: str) -> ModelQueryBuilder[Self]:
+        """Add an OR where null clause to the query."""
+        return cls.query().or_where_null(column)
 
     @classmethod
     def where_not_null(cls, column: str) -> ModelQueryBuilder[Self]:
@@ -802,11 +1226,162 @@ class Model:
         return cls.query().where_not_null(column)
 
     @classmethod
+    def or_where_not_null(cls, column: str) -> ModelQueryBuilder[Self]:
+        """Add an OR where not null clause to the query."""
+        return cls.query().or_where_not_null(column)
+
+    @classmethod
     def where_raw(
         cls, sql: str, bindings: list[Any] | None = None
     ) -> ModelQueryBuilder[Self]:
         """Add a raw SQL where clause."""
         return cls.query().where_raw(sql, bindings)
+
+    @classmethod
+    def or_where_raw(
+        cls, sql: str, bindings: list[Any] | None = None
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR raw SQL where clause."""
+        return cls.query().or_where_raw(sql, bindings)
+
+    @classmethod
+    def latest(cls, column: str = "created_at") -> ModelQueryBuilder[Self]:
+        """Order records descending by the specified column (default: created_at)."""
+        return cls.query().latest(column)
+
+    @classmethod
+    def oldest(cls, column: str = "created_at") -> ModelQueryBuilder[Self]:
+        """Order records ascending by the specified column (default: created_at)."""
+        return cls.query().oldest(column)
+
+    @classmethod
+    def in_random_order(cls) -> ModelQueryBuilder[Self]:
+        """Order records randomly using PostgreSQL RANDOM()."""
+        return cls.query().in_random_order()
+
+    @classmethod
+    def when(
+        cls,
+        condition: Any,
+        callback: Callable[[ModelQueryBuilder[Self], Any], Any],
+        default: Callable[[ModelQueryBuilder[Self], Any], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().when(condition, callback, default)
+
+    @classmethod
+    def unless(
+        cls,
+        condition: Any,
+        callback: Callable[[ModelQueryBuilder[Self], Any], Any],
+        default: Callable[[ModelQueryBuilder[Self], Any], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().unless(condition, callback, default)
+
+    @classmethod
+    async def value(cls, column: str) -> Any | None:
+        return await cls.query().value(column)
+
+    @overload
+    @classmethod
+    async def pluck(cls, column: str, key: None = None) -> list[Any]: ...
+
+    @overload
+    @classmethod
+    async def pluck(cls, column: str, key: str) -> dict[Any, Any]: ...
+
+    @classmethod
+    async def pluck(
+        cls, column: str, key: str | None = None
+    ) -> list[Any] | dict[Any, Any]:
+        return await cls.query().pluck(column, key=key)
+
+    @classmethod
+    async def chunk(
+        cls,
+        count: int,
+        callback: Callable[[list[Self]], Awaitable[bool | None] | bool | None],
+    ) -> bool:
+        return await cls.query().chunk(count, callback)
+
+    @classmethod
+    async def chunk_by_id(
+        cls,
+        count: int,
+        callback: Callable[[list[Self]], Awaitable[bool | None] | bool | None],
+        column: str = "id",
+    ) -> bool:
+        return await cls.query().chunk_by_id(count, callback, column=column)
+
+    @classmethod
+    def join(
+        cls,
+        table: str,
+        first: str,
+        operator: str,
+        second: str,
+        type_: str = "INNER",
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().join(table, first, operator, second, type_=type_)
+
+    @classmethod
+    def left_join(
+        cls, table: str, first: str, operator: str, second: str
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().left_join(table, first, operator, second)
+
+    @classmethod
+    def right_join(
+        cls, table: str, first: str, operator: str, second: str
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().right_join(table, first, operator, second)
+
+    @classmethod
+    async def first_or_create(
+        cls,
+        attributes: dict[str, Any],
+        values: dict[str, Any] | None = None,
+    ) -> Self:
+        """Find the first matching record by attributes, or create it if not found."""
+        query = cls.query()
+        for k, v in attributes.items():
+            query = query.where(k, v)
+        instance = await query.first()
+        if instance is not None:
+            return instance
+
+        creation_data = dict(attributes)
+        if values:
+            creation_data.update(values)
+        return await cls.create(creation_data)
+
+    @classmethod
+    async def update_or_create(
+        cls,
+        attributes: dict[str, Any],
+        values: dict[str, Any],
+    ) -> Self:
+        """Find the first matching record and update it with values, or create it if not found."""
+        query = cls.query()
+        for k, v in attributes.items():
+            query = query.where(k, v)
+        instance = await query.first()
+        if instance is not None:
+            instance.fill(**values)
+            await instance.save()
+            return instance
+
+        creation_data = dict(attributes)
+        creation_data.update(values)
+        return await cls.create(creation_data)
+
+    @classmethod
+    async def upsert(
+        cls,
+        values: list[dict[str, Any]],
+        unique_by: list[str] | str,
+        update_columns: list[str] | None = None,
+    ) -> int:
+        return await cls.query().upsert(values, unique_by, update_columns=update_columns)
 
     @classmethod
     def with_(cls, *relations: str) -> ModelQueryBuilder[Self]:
@@ -1095,8 +1670,51 @@ class Model:
 
         self._original = dict(refreshed._original)
         self._init_keys = set(refreshed._init_keys)
+        self._modified_keys.clear()
         self._loaded_relations.clear()
         return self
+
+    async def increment(
+        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Atomically increment a column in the database and refresh this instance.
+
+        LIFECYCLE CONSISTENCY:
+        If the database update succeeds but refresh() fails (e.g., due to a temporary
+        connection disruption), the database record will contain the updated value while
+        the in-memory object remains un-refreshed. Callers can safely re-invoke
+        await instance.refresh() to synchronize state once connectivity is restored.
+        """
+        pk_name = self.__primary_key__
+        pk_val = self.get_primary_key()
+        if not self._exists or pk_val is None:
+            raise PrimaryKeyError(
+                f"Cannot increment unsaved or primary-key-less model [{self.__class__.__name__}]."
+            )
+        await self.__class__.query().where(pk_name, pk_val).increment(column, amount, extra=extra)
+        await self.refresh()
+
+    async def decrement(
+        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Atomically decrement a column in the database and refresh this instance.
+
+        LIFECYCLE CONSISTENCY:
+        If the database update succeeds but refresh() fails (e.g., due to a temporary
+        connection disruption), the database record will contain the updated value while
+        the in-memory object remains un-refreshed. Callers can safely re-invoke
+        await instance.refresh() to synchronize state once connectivity is restored.
+        """
+        pk_name = self.__primary_key__
+        pk_val = self.get_primary_key()
+        if not self._exists or pk_val is None:
+            raise PrimaryKeyError(
+                f"Cannot decrement unsaved or primary-key-less model [{self.__class__.__name__}]."
+            )
+        await self.__class__.query().where(pk_name, pk_val).decrement(column, amount, extra=extra)
+        await self.refresh()
 
     def get_primary_key(self) -> Any:
         """Return the value of the primary key field."""

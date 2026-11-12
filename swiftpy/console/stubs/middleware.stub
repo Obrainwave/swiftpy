@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+from swiftpy.http.middleware import Handler, Middleware
+from swiftpy.http.request import Request
+from swiftpy.http.response import Response
+
+
+class {class_name}(Middleware):
+    """
+    ASGI Middleware for request preprocessing and response handling.
+    """
+
+    async def handle(self, request: Request, next_handler: Handler) -> Response:
+        response = await next_handler(request)
+        return response
+

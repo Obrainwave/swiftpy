@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -24,12 +26,45 @@ def test_stubs_directory_and_files_exist() -> None:
         "resource.stub",
         "repository.stub",
         "schema.stub",
+        "mail.stub",
+        "controller.stub",
+        "middleware.stub",
+        "job.stub",
+        "event.stub",
+        "listener.stub",
+        "provider.stub",
+        "seeder.stub",
     ]
     for filename in expected_stubs:
         stub_file = STUBS_DIR / filename
         assert stub_file.is_file(), f"Expected stub file {filename} does not exist"
         content = stub_file.read_text(encoding="utf-8")
         assert len(content.strip()) > 0
+
+
+def test_all_stubs_render_and_compile() -> None:
+    """Verify that all 20 stubs render cleanly without unresolved placeholders and compile to valid Python."""
+    stub_files = list(STUBS_DIR.glob("*.stub"))
+    assert len(stub_files) == 20
+
+    for stub_path in stub_files:
+        content = stub_path.read_text(encoding="utf-8")
+        rendered = content.replace("{class_name}", "SampleTestClass").replace(
+            "{table_name}", "sample_table"
+        )
+        # Ensure no unreplaced template placeholders remain
+        unresolved = re.findall(r"\{[a-zA-Z0-9_]+\}", rendered)
+        assert not unresolved, (
+            f"Stub {stub_path.name} contains unresolved placeholders: {unresolved}"
+        )
+
+        # Verify it compiles without syntax errors
+        code_obj = compile(rendered, stub_path.name, "exec")
+        assert code_obj is not None
+
+        # Verify valid AST parse tree
+        parsed = ast.parse(rendered)
+        assert isinstance(parsed, ast.Module)
 
 
 def test_get_stub_loading() -> None:
@@ -267,8 +302,9 @@ def test_make_api_key_command_and_migration_stub_p2a2(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """P2-A2: Verifies make:api-key outputs prefix.secret key once and scaffolds api_keys migration."""
+    """P2-A2: Verifies make:api-key outputs prefix.secret key once and scaffolds api_keys migration securely."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AUTH_KEY_PEPPER", "env-pepper-secret-at-least-32-bytes!")
     cli = CLI()
 
     cli.run(
@@ -276,8 +312,6 @@ def test_make_api_key_command_and_migration_stub_p2a2(
             "make:api-key",
             "--prefix",
             "sk_live_",
-            "--pepper",
-            "cli-pepper-secret-at-least-32-bytes!",
             "-m",
             "--path",
             str(tmp_path),
@@ -294,4 +328,117 @@ def test_make_api_key_command_and_migration_stub_p2a2(
     mig_content = mig_files[0].read_text(encoding="utf-8")
     assert 'table.string("key_prefix", length=64).unique().index()' in mig_content
     assert 'table.string("key_hash", length=128)' in mig_content
+
+
+def test_scaffold_path_security_edge_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify security controls against symlink escapes, drive prefixes, and traversal forms."""
+    monkeypatch.chdir(tmp_path)
+    cli = CLI()
+
+    outside_dir = tmp_path / "outside_jail"
+    outside_dir.mkdir()
+    target_secret = outside_dir / "target_secret.py"
+    target_secret.write_text("# Sensitive secret", encoding="utf-8")
+
+    models_dir = tmp_path / "app" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Existing symlink at destination file path pointing outside
+    symlinked_file = models_dir / "secret_link.py"
+    try:
+        symlinked_file.symlink_to(target_secret)
+        with pytest.raises(SystemExit, match=r"(?i)escapes base directory|already exists|refusing"):
+            cli.run(["make:model", "SecretLink", "--force"])
+        assert target_secret.read_text(encoding="utf-8") == "# Sensitive secret"
+    finally:
+        if symlinked_file.is_symlink():
+            symlinked_file.unlink()
+
+    # 2. Existing symlinked intermediate directory pointing outside
+    symlinked_subdir = models_dir / "escaped_folder"
+    try:
+        symlinked_subdir.symlink_to(outside_dir)
+        with pytest.raises(SystemExit, match=r"(?i)escapes base directory|refusing"):
+            cli.run(["make:model", "escaped_folder/HackedModel"])
+    finally:
+        if symlinked_subdir.is_symlink():
+            symlinked_subdir.unlink()
+
+    # 3. Repeated separators / traversal patterns
+    for bad_name in ("Model//DoubleSlash", "Bad/../Traversal"):
+        with pytest.raises(
+            SystemExit,
+            match=r"(?i)Invalid .* name segment|escapes base directory|malformed paths|path traversal",
+        ):
+            cli.run(["make:model", bad_name])
+
+
+def test_make_new_generators_and_on_demand_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verifies make:controller and make:resource create their target directories on-demand,
+    and make:middleware, make:job, make:event, make:listener, make:provider, make:seeder
+    scaffold their respective layers.
+    """
+    monkeypatch.chdir(tmp_path)
+    cli = CLI()
+
+    # 1. Controller on-demand creation
+    controllers_dir = tmp_path / "app" / "http" / "controllers"
+    assert not controllers_dir.exists()
+    cli.run(["make:controller", "UserController"])
+    assert controllers_dir.is_dir()
+    ctrl_file = controllers_dir / "user_controller.py"
+    assert ctrl_file.is_file()
+    assert "class UserController:" in ctrl_file.read_text(encoding="utf-8")
+
+    # 2. Resource on-demand creation
+    resources_dir = tmp_path / "app" / "http" / "resources"
+    assert not resources_dir.exists()
+    cli.run(["make:resource", "UserResource"])
+    assert resources_dir.is_dir()
+    res_file = resources_dir / "user_resource.py"
+    assert res_file.is_file()
+    assert "class UserResource:" in res_file.read_text(encoding="utf-8")
+
+    # 3. Middleware
+    cli.run(["make:middleware", "AuthMiddleware"])
+    mw_file = tmp_path / "app" / "http" / "middleware" / "auth_middleware.py"
+    assert mw_file.is_file()
+    assert "class AuthMiddleware(Middleware):" in mw_file.read_text(encoding="utf-8")
+
+    # 4. Job
+    cli.run(["make:job", "SendNotificationJob"])
+    job_file = tmp_path / "app" / "jobs" / "send_notification_job.py"
+    assert job_file.is_file()
+    assert "class SendNotificationJob(Job):" in job_file.read_text(encoding="utf-8")
+
+    # 5. Event
+    cli.run(["make:event", "UserRegistered"])
+    event_file = tmp_path / "app" / "events" / "user_registered.py"
+    assert event_file.is_file()
+    assert "class UserRegistered:" in event_file.read_text(encoding="utf-8")
+
+    # 6. Listener
+    cli.run(["make:listener", "SendWelcomeNotification"])
+    listener_file = tmp_path / "app" / "listeners" / "send_welcome_notification.py"
+    assert listener_file.is_file()
+    assert "class SendWelcomeNotification:" in listener_file.read_text(encoding="utf-8")
+
+    # 7. Provider
+    cli.run(["make:provider", "BillingServiceProvider"])
+    provider_file = tmp_path / "app" / "providers" / "billing_service_provider.py"
+    assert provider_file.is_file()
+    assert "class BillingServiceProvider(ServiceProvider):" in provider_file.read_text(encoding="utf-8")
+
+    # 8. Seeder
+    cli.run(["make:seeder", "UserSeeder"])
+    seeder_file = tmp_path / "database" / "seeders" / "user_seeder.py"
+    assert seeder_file.is_file()
+    assert "class UserSeeder(Seeder):" in seeder_file.read_text(encoding="utf-8")
+
 

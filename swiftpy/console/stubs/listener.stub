@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+class {class_name}:
+    """
+    Asynchronous event listener.
+    """
+
+    async def handle(self, event: Any) -> None:
+        """Handle the dispatched event."""
+        pass
+

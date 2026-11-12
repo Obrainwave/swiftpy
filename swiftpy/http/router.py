@@ -652,6 +652,7 @@ class Router:
         method: str,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         is_websocket: bool = False,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
@@ -667,6 +668,7 @@ class Router:
                 method,
                 path,
                 func,
+                middleware=middleware,
                 is_websocket=is_websocket,
                 max_body_size=max_body_size,
                 max_content_length=max_content_length,
@@ -681,6 +683,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -688,6 +691,7 @@ class Router:
         return self.route(
             "GET",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
@@ -697,6 +701,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -704,6 +709,7 @@ class Router:
         return self.route(
             "POST",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
@@ -713,6 +719,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -720,6 +727,7 @@ class Router:
         return self.route(
             "PUT",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
@@ -729,6 +737,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -736,6 +745,7 @@ class Router:
         return self.route(
             "PATCH",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
@@ -745,6 +755,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -752,6 +763,7 @@ class Router:
         return self.route(
             "DELETE",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
@@ -761,6 +773,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -768,6 +781,7 @@ class Router:
         return self.route(
             "HEAD",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
@@ -777,6 +791,7 @@ class Router:
         self,
         path: str,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
@@ -784,13 +799,24 @@ class Router:
         return self.route(
             "OPTIONS",
             path,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
 
-    def websocket(self, path: str) -> Callable[[F], F]:
-        return self.route("WEBSOCKET", path, is_websocket=True)
+    def websocket(
+        self,
+        path: str,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> Callable[[F], F]:
+        return self.route(
+            "WEBSOCKET",
+            path,
+            middleware=middleware,
+            is_websocket=True,
+        )
 
     @staticmethod
     def _coerce_matched_params(
@@ -919,3 +945,57 @@ class Router:
             return func
 
         return decorator
+
+    def include_router(
+        self,
+        router: Router,
+        prefix: str = "",
+        middleware: list[type[Any]] | None = None,
+    ) -> None:
+        """
+        Include routes from another router instance under an optional path prefix and middleware.
+        """
+        clean_prefix = prefix.strip()
+        if clean_prefix:
+            if any(ch.isspace() for ch in clean_prefix):
+                raise RouteRegistrationError(
+                    f"Router prefix must not contain whitespace: {prefix!r}"
+                )
+            if any(token in clean_prefix for token in ("{", "}")):
+                raise RouteRegistrationError(
+                    f"Router prefix must be a literal path, not a dynamic pattern: {prefix!r}"
+                )
+            if clean_prefix.startswith("//") or clean_prefix.endswith("//"):
+                raise RouteRegistrationError(
+                    f"Router prefix must not contain empty path segments: {prefix!r}"
+                )
+            clean_prefix = "/" + clean_prefix.strip("/") if clean_prefix.strip("/") else "/"
+        else:
+            clean_prefix = ""
+
+        parent_mw = list(middleware or [])
+
+        for child_route in router.routes:
+            if clean_prefix:
+                if child_route.path == "/":
+                    full_path = clean_prefix
+                elif child_route.path.endswith("/"):
+                    full_path = f"{clean_prefix}/{child_route.path.strip('/')}/"
+                else:
+                    full_path = f"{clean_prefix}/{child_route.path.strip('/')}"
+            else:
+                full_path = child_route.path
+
+            combined_middleware = parent_mw + list(child_route.middleware)
+
+            self.add_route(
+                method=child_route.method,
+                path=full_path,
+                handler=child_route.handler,
+                middleware=combined_middleware,
+                is_websocket=child_route.is_websocket,
+                max_body_size=child_route.max_body_size,
+                max_content_length=child_route.max_content_length,
+                max_json_depth=child_route.max_json_depth,
+                localns=child_route.localns,
+            )

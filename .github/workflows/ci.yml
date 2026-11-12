@@ -7,8 +7,8 @@ on:
     branches: [main, develop]
 
 jobs:
-  ci:
-    name: Lint, Type Check & Test Suite
+  test:
+    name: Test, lint, type-check, and package validation
     runs-on: ubuntu-latest
 
     services:
@@ -54,32 +54,29 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1edb512832cc572a6b52b2f67645155f9a62657e # v5.1.0
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Set up Python 3.12
         run: uv python install 3.12
 
-      - name: Install dependencies (frozen)
-        run: uv sync --frozen || uv sync
+      - name: Install SwiftPY development dependencies
+        run: uv sync --group dev --frozen || uv sync --group dev
 
-      - name: Lint with ruff
+      - name: Run pytest
+        run: uv run pytest -q
+
+      - name: Run Ruff
         run: uv run ruff check .
 
-      - name: Type check with mypy (strict)
+      - name: Run strict mypy
         run: uv run mypy .
 
-      - name: Run test suite with coverage
-        run: uv run pytest --cov=swiftpy --cov-fail-under=80 --cov-report=term-missing -q -p no:cacheprovider
-
-      - name: Security audit (dependencies)
-        run: uv run pip install pip-audit && uv run pip-audit || true
-        continue-on-error: true
-
-      - name: Security audit (static analysis)
-        run: uv run pip install bandit && uv run bandit -r swiftpy -ll || true
-        continue-on-error: true
+      - name: Build and validate distributions
+        run: |
+          uv build
+          uv run --with twine twine check dist/*

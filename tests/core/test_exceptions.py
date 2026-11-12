@@ -147,6 +147,19 @@ async def test_production_mode_exception_returns_safe_generic_message() -> None:
     assert "traceback" not in res_handler.json()
 
 
+def test_custom_exception_handler_requires_explicit_request_exception_order() -> None:
+    app = Application(auto_discover_providers=False)
+
+    class AmbiguousError(Exception):
+        pass
+
+    with pytest.raises(TypeError, match="Unsupported exception handler signature"):
+
+        @app.exception_handler_for(AmbiguousError)
+        def ambiguous_handler(a: Any, b: Any) -> Response:
+            return json_response({"ok": True})
+
+
 @pytest.mark.asyncio
 async def test_custom_exception_handler_registration() -> None:
     app = Application()
@@ -245,3 +258,90 @@ async def test_failing_custom_exception_handler_falls_back_safely() -> None:
     res = await client.get("/trigger-broken-handler")
     res.assert_status(500)
     assert res.json() == {"detail": "Internal Server Error"}
+
+
+class ParentDomainError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class ChildDomainError(ParentDomainError):
+    pass
+
+
+class UnhandledChildDomainError(ParentDomainError):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_custom_exception_handler_signatures_and_subclass_hierarchy() -> None:
+    """
+    Verify:
+    1. Decorator syntax @app.exception_handler(ExcClass)
+    2. (request, exc) parameter convention
+    3. (exc, request) parameter convention
+    4. Synchronous and asynchronous custom handlers
+    5. Subclass matching and MRO fallback behavior
+    6. Dict return auto-wrapping into json_response
+    """
+    from swiftpy.http.request import Request
+
+    app = Application(debug=False)
+    client = TestClient(app)
+
+    # 1. Async handler with (request, exc) signature
+    @app.exception_handler(ParentDomainError)
+    async def handle_parent(request: Request, exc: ParentDomainError) -> Response:
+        return json_response(
+            {"handler": "parent", "path": request.path, "error": exc.message},
+            status_code=400,
+        )
+
+    # 2. Sync handler with (exc, request) signature and dict return
+    @app.exception_handler(ChildDomainError)
+    def handle_child(exc: ChildDomainError, request: Request) -> dict[str, Any]:
+        return {
+            "handler": "child",
+            "path": request.path,
+            "error": exc.message,
+        }
+
+    @app.get("/trigger-child")
+    async def route_child() -> Response:
+        raise ChildDomainError("Child domain specific error")
+
+    @app.get("/trigger-unhandled-child")
+    async def route_unhandled_child() -> Response:
+        raise UnhandledChildDomainError("Falls back to parent domain handler")
+
+    @app.get("/trigger-parent")
+    async def route_parent() -> Response:
+        raise ParentDomainError("General parent domain error")
+
+    # Specific child handler matched
+    res_child = await client.get("/trigger-child")
+    assert res_child.status_code == 200  # Dict return defaults to 200 json response
+    assert res_child.json() == {
+        "handler": "child",
+        "path": "/trigger-child",
+        "error": "Child domain specific error",
+    }
+
+    # Subclass without explicit handler falls back to parent handler via MRO
+    res_fallback = await client.get("/trigger-unhandled-child")
+    assert res_fallback.status_code == 400
+    assert res_fallback.json() == {
+        "handler": "parent",
+        "path": "/trigger-unhandled-child",
+        "error": "Falls back to parent domain handler",
+    }
+
+    # Parent handler matched
+    res_parent = await client.get("/trigger-parent")
+    assert res_parent.status_code == 400
+    assert res_parent.json() == {
+        "handler": "parent",
+        "path": "/trigger-parent",
+        "error": "General parent domain error",
+    }

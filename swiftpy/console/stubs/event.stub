@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(slots=True, frozen=True)
+class {class_name}:
+    """
+    Domain event carrying immutable state.
+    """
+
+    payload: dict[str, Any]
+

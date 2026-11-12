@@ -41,6 +41,24 @@ async def test_dispatcher_sync_and_async_listeners() -> None:
     assert results == ["sync_result", "async_result"]
 
 
+async def test_dispatcher_uses_module_qualname_for_class_events() -> None:
+    disp = EventDispatcher()
+    seen: list[str] = []
+
+    first_model = type("Ping", (), {"__module__": "acme.alpha"})
+    second_model = type("Ping", (), {"__module__": "acme.beta"})
+
+    disp.listen(first_model, lambda payload: seen.append("alpha"))
+    disp.listen(second_model, lambda payload: seen.append("beta"))
+
+    assert disp.has_listeners(first_model) is True
+    assert disp.has_listeners(second_model) is True
+    await disp.dispatch(first_model, {"name": "first"})
+    await disp.dispatch(second_model, {"name": "second"})
+
+    assert seen == ["alpha", "beta"]
+
+
 async def test_dispatcher_execution_order() -> None:
     disp = EventDispatcher()
     execution_order: list[int] = []

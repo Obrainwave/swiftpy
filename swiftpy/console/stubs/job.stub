@@ -1,0 +1,22 @@
+from __future__ import annotations
+
+from typing import Any
+
+from swiftpy.queue.job import Job
+
+
+class {class_name}(Job):
+    """
+    Asynchronous queued background job.
+    """
+
+    tries: int = 3
+    backoff: int = 5
+
+    def __init__(self, **payload: Any) -> None:
+        self.payload = payload
+
+    async def handle(self) -> None:
+        """Execute the job's background logic."""
+        pass
+

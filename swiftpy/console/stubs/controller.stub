@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+from swiftpy.http.request import Request
+from swiftpy.http.response import Response, json_response
+
+
+class {class_name}:
+    """
+    HTTP Controller for handling request endpoints.
+    """
+
+    async def index(self, request: Request) -> Response:
+        return json_response({"message": "Hello from {class_name}"})
+

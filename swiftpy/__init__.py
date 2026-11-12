@@ -50,6 +50,12 @@ from swiftpy.core.exceptions import (
     ValidationError,
 )
 from swiftpy.core.providers.base import ServiceProvider
+from swiftpy.database import (
+    DatabaseError,
+    ModelNotFoundError,
+    RecordNotFoundError,
+    Seeder,
+)
 from swiftpy.database.orm import (
     BelongsTo,
     BelongsToMany,
@@ -91,6 +97,7 @@ from swiftpy.helpers.helper import (
     dispatcher,
     env,
     event,
+    mail,
     pluralize,
     queue,
     resolve,
@@ -115,7 +122,17 @@ from swiftpy.http.response import (
     json_response,
     unauthorized,
 )
-from swiftpy.http.router import RouteGroup
+from swiftpy.http.router import RouteGroup, Router
+from swiftpy.mail import (
+    Attachment,
+    Mail,
+    Mailable,
+    MailFake,
+    MailManager,
+    MailMessage,
+    MailSendResult,
+    MailTransport,
+)
 from swiftpy.queue import (
     Job,
     JobSerializationError,
@@ -188,6 +205,7 @@ __all__ = [
     "AgentTask",
     "ApiKeyGuard",
     "Application",
+    "Attachment",
     "AuthManager",
     "BadRequestError",
     "BaseAgent",
@@ -204,6 +222,7 @@ __all__ = [
     "Config",
     "Container",
     "CurrentUser",
+    "DatabaseError",
     "EmailRule",
     "EventDispatcher",
     "EventHandler",
@@ -227,6 +246,13 @@ __all__ = [
     "JobSerializationError",
     "LazyLoadingDisabledError",
     "LocalStorageDriver",
+    "Mail",
+    "MailFake",
+    "MailManager",
+    "MailMessage",
+    "MailSendResult",
+    "MailTransport",
+    "Mailable",
     "MaxRule",
     "MemoryDriver",
     "MethodNotAllowedError",
@@ -234,6 +260,7 @@ __all__ = [
     "MinRule",
     "Model",
     "ModelAdmin",
+    "ModelNotFoundError",
     "NotFoundError",
     "NotInRule",
     "NullableRule",
@@ -242,6 +269,7 @@ __all__ = [
     "PayloadTooLargeError",
     "QueueDispatcher",
     "QueueWorker",
+    "RecordNotFoundError",
     "RedisDriver",
     "RedisEventBus",
     "RegexRule",
@@ -252,9 +280,11 @@ __all__ = [
     "RequiredRule",
     "Response",
     "RouteGroup",
+    "Router",
     "S3StorageDriver",
     "SecurityHeaders",
     "SecurityHeadersMiddleware",
+    "Seeder",
     "ServiceProvider",
     "SimplePaginator",
     "Storage",
@@ -303,6 +333,7 @@ __all__ = [
     "in_",
     "int_",
     "json_response",
+    "mail",
     "max_",
     "min_",
     "not_in",

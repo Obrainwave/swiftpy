@@ -9,6 +9,7 @@ from swiftpy.core.container import get_container
 from swiftpy.core.container_exceptions import BindingNotFoundError, ResolutionError
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.filesystem.manager import FilesystemManager
+from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
 from swiftpy.support.strings import pluralize, snake_case
@@ -51,6 +52,22 @@ def storage(disk_name: str | None = None) -> Any:
 
     if disk_name is not None:
         return manager.disk(disk_name)
+    return manager
+
+
+def mail(mailer_name: str | None = None) -> Any:
+    """Retrieve the application MailManager or a specific MailTransport."""
+    try:
+        c_inst = get_container()
+        if c_inst.has(MailManager):
+            manager = c_inst.resolve(MailManager)
+        else:
+            manager = MailManager.get_instance()
+    except RuntimeError:
+        manager = MailManager.get_instance()
+
+    if mailer_name is not None:
+        return manager.mailer(mailer_name)
     return manager
 
 
@@ -158,6 +175,7 @@ __all__ = [
     "dispatcher",
     "env",
     "event",
+    "mail",
     "pluralize",
     "queue",
     "resolve",
