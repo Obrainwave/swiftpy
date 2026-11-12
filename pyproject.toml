@@ -99,5 +99,6 @@ package = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
