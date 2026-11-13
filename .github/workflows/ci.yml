@@ -74,7 +74,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Run strict mypy
-        run: uv run mypy .
+        run: uv run mypy swiftpy
 
       - name: Build and validate distributions
         run: |

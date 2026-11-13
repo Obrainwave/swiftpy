@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 
@@ -112,14 +113,29 @@ def _build_test_config() -> Config:
     cfg.set("ai.default", "openai")
     cfg.set("ai.providers.openai.api_key", "sk-mock-test")
     cfg.set("ai.providers.openai.model", "gpt-4o")
-    cfg.set("ai.redis.host", "redis")
-    cfg.set("ai.redis.port", 6379)
-    cfg.set("ai.redis.password", "secret")
-    cfg.set("database.connections.postgresql.host", "postgres")
-    cfg.set("database.connections.postgresql.port", 5432)
-    cfg.set("database.connections.postgresql.database", "swiftpy")
-    cfg.set("database.connections.postgresql.username", "postgres")
-    cfg.set("database.connections.postgresql.password", "secret")
+    cfg.set("ai.redis.host", os.environ.get("REDIS_HOST", "127.0.0.1"))
+    cfg.set("ai.redis.port", int(os.environ.get("REDIS_PORT", "6379")))
+    cfg.set("ai.redis.password", os.environ.get("REDIS_PASSWORD", ""))
+    cfg.set(
+        "database.connections.postgresql.host",
+        os.environ.get("DB_HOST", "127.0.0.1"),
+    )
+    cfg.set(
+        "database.connections.postgresql.port",
+        int(os.environ.get("DB_PORT", "5432")),
+    )
+    cfg.set(
+        "database.connections.postgresql.database",
+        os.environ.get("DB_DATABASE", "swiftpy"),
+    )
+    cfg.set(
+        "database.connections.postgresql.user",
+        os.environ.get("DB_USERNAME", "postgres"),
+    )
+    cfg.set(
+        "database.connections.postgresql.password",
+        os.environ.get("DB_PASSWORD", "secret"),
+    )
     return cfg
 
 

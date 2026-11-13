@@ -109,7 +109,11 @@ async def test_send_conversation_saves_both_user_and_assistant(
     conv.add_system("You are helpful.")
 
     ai_client = (
-        AIClient(config=Config(), http_pool=pool, default_provider="openai")
+        AIClient(
+            config=Config({"ai": {"providers": {"openai": {"api_key": "sk-test"}}}}),
+            http_pool=pool,
+            default_provider="openai",
+        )
         .conversation(conv)
         .user("New question from user")
     )
@@ -145,7 +149,11 @@ async def test_streaming_conversation_saves_assistant_response_after_completion(
     conv.add_system("You are helpful.")
 
     ai_client = (
-        AIClient(config=Config(), http_pool=pool, default_provider="openai")
+        AIClient(
+            config=Config({"ai": {"providers": {"openai": {"api_key": "sk-test"}}}}),
+            http_pool=pool,
+            default_provider="openai",
+        )
         .conversation(conv)
         .user("Stream question")
     )
@@ -188,7 +196,11 @@ async def test_streaming_conversation_does_not_save_partial_response(
     conv.add_system("You are helpful.")
 
     ai_client = (
-        AIClient(config=Config(), http_pool=pool, default_provider="openai")
+        AIClient(
+            config=Config({"ai": {"providers": {"openai": {"api_key": "sk-test"}}}}),
+            http_pool=pool,
+            default_provider="openai",
+        )
         .conversation(conv)
         .user("Aborted stream question")
     )
