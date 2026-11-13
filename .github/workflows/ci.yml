@@ -68,7 +68,7 @@ jobs:
         run: uv sync --group dev --frozen || uv sync --group dev
 
       - name: Run pytest
-        run: uv run pytest -q
+        run: uv run pytest -vv -ra --durations=30 --timeout=120
 
       - name: Run Ruff
         run: uv run ruff check .
