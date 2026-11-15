@@ -58,7 +58,7 @@ DOCKER_COMPOSE_CONTENT = """services:
         condition: service_healthy
 
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     ports:
       - "127.0.0.1:5432:5432"
     environment:
@@ -171,6 +171,10 @@ CACHE_DRIVER=redis
 CACHE_PREFIX=swiftpy_cache:
 CACHE_DEFAULT_TTL=3600
 
+# Events
+EVENTS_DRIVER=redis
+EVENTS_PREFIX=swiftpy_events:
+
 # Queue
 QUEUE_DRIVER=redis
 QUEUE_PREFIX=swiftpy_queue:
@@ -205,6 +209,7 @@ MAILGUN_DOMAIN=
 
 # Authentication & Security
 AUTH_GUARD=jwt
+AUTH_BLACKLIST_ENABLED=true
 JWT_SECRET=
 JWT_ALGORITHM=HS256
 JWT_ACCESS_TTL=900
@@ -234,9 +239,15 @@ MAIN_PY_CONTENT = """from __future__ import annotations
 
 from swiftpy.core.application import Application
 
+from app.http.handler.exceptions import register_exception_handlers
 from routes.api import router as api_router
 
 app = Application()
+register_exception_handlers(app)
+
+# Enable opt-in CORS middleware (configured in config/cors.py):
+# from swiftpy.http.middleware import CORSMiddleware
+# app.middleware([CORSMiddleware])
 
 # Mount default API routes under /api
 app.include_router(api_router, prefix="/api")
@@ -881,19 +892,19 @@ class DatabaseSeeder(Seeder):
 
 CONFIG_AI_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env, env_bool
 
 CONFIG = {
-    "enabled": os.getenv("AI_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "default": os.getenv("AI_DEFAULT_PROVIDER", "openai"),
+    "enabled": env_bool("AI_ENABLED", True),
+    "default": env("AI_DEFAULT_PROVIDER", "openai"),
     "providers": {
         "openai": {
-            "api_key": os.getenv("OPENAI_API_KEY", ""),
-            "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
+            "api_key": env("OPENAI_API_KEY", ""),
+            "model": env("OPENAI_MODEL", "gpt-4o"),
         },
         "anthropic": {
-            "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-            "model": os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+            "api_key": env("ANTHROPIC_API_KEY", ""),
+            "model": env("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
         },
     },
 }
@@ -901,59 +912,79 @@ CONFIG = {
 
 CONFIG_APP_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env, env_bool
 
 CONFIG = {
-    "name": os.getenv("APP_NAME", "SwiftPY"),
-    "env": os.getenv("APP_ENV", "local"),
-    "debug": os.getenv("APP_DEBUG", "false").strip().lower() in ("true", "1", "yes", "on"),
-    "enable_benchmarks": os.getenv("APP_ENABLE_BENCHMARKS", "false").strip().lower() in ("true", "1", "yes", "on"),
-    "key": os.getenv("APP_KEY", ""),
-    "url": os.getenv("APP_URL", "http://localhost:8000"),
+    "name": env("APP_NAME", "SwiftPY"),
+    "env": env("APP_ENV", "local"),
+    "debug": env_bool("APP_DEBUG", False),
+    "enable_benchmarks": env_bool("APP_ENABLE_BENCHMARKS", False),
+    "key": env("APP_KEY", ""),
+    "url": env("APP_URL", "http://localhost:8000"),
     "cipher": "AES-256-GCM",
 }
 """
 
 CONFIG_AUTH_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env, env_bool
 
 CONFIG = {
     "defaults": {
-        "guard": os.getenv("AUTH_GUARD", "jwt"),
+        "guard": env("AUTH_GUARD", "jwt"),
     },
+    "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
     "guards": {
         "jwt": {
-            "secret": os.getenv("JWT_SECRET", ""),
-            "algorithm": os.getenv("JWT_ALGORITHM", "HS256"),
-            "access_ttl": int(os.getenv("JWT_ACCESS_TTL", "900")),
-            "refresh_ttl": int(os.getenv("JWT_REFRESH_TTL", "604800")),
+            "secret": env("JWT_SECRET", ""),
+            "algorithm": env("JWT_ALGORITHM", "HS256"),
+            "access_token_ttl": int(env("JWT_ACCESS_TTL", "900") or "900"),
+            "refresh_token_ttl": int(env("JWT_REFRESH_TTL", "604800") or "604800"),
+            "leeway": int(env("JWT_LEEWAY", "0") or "0"),
+            "issuer": env("JWT_ISSUER") or None,
+            "audience": env("JWT_AUDIENCE") or None,
+            "private_key": env("JWT_PRIVATE_KEY") or None,
+            "public_key": env("JWT_PUBLIC_KEY") or None,
         },
         "api_key": {
-            "pepper": os.getenv("AUTH_KEY_PEPPER", ""),
+            "table": env("AUTH_API_KEYS_TABLE", "api_keys"),
+            "prefix_column": "prefix",
+            "hash_column": "key_hash",
+            "header": "X-API-Key",
+            "pepper": env("AUTH_KEY_PEPPER", ""),
         },
+    },
+    "redis": {
+        "host": env("REDIS_HOST", "127.0.0.1"),
+        "port": int(env("REDIS_PORT", "6379") or "6379"),
+        "password": env("REDIS_PASSWORD") or None,
+        "database": int(env("REDIS_AUTH_DB", env("REDIS_CACHE_DB", "0")) or "0"),
     },
 }
 """
 
 CONFIG_CACHE_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": os.getenv("CACHE_DRIVER", "redis"),
-    "prefix": os.getenv("CACHE_PREFIX", "swiftpy_cache:"),
-    "ttl": int(os.getenv("CACHE_DEFAULT_TTL", "3600")),
+    "default": env("CACHE_DRIVER", "redis"),
+    "prefix": env("CACHE_PREFIX", "swiftpy_cache:"),
+    "default_ttl": int(env("CACHE_DEFAULT_TTL", "3600") or "3600"),
     "stores": {
         "memory": {
             "driver": "memory",
+            "prefix": env("CACHE_PREFIX", "swiftpy_cache:"),
+            "ttl": int(env("CACHE_DEFAULT_TTL", "3600") or "3600"),
         },
         "redis": {
             "driver": "redis",
-            "host": os.getenv("REDIS_HOST", "127.0.0.1"),
-            "port": int(os.getenv("REDIS_PORT", "6379")),
-            "password": os.getenv("REDIS_PASSWORD") or None,
-            "db": int(os.getenv("REDIS_CACHE_DB", "0")),
+            "host": env("REDIS_HOST", "127.0.0.1"),
+            "port": int(env("REDIS_PORT", "6379") or "6379"),
+            "password": env("REDIS_PASSWORD") or None,
+            "database": int(env("REDIS_CACHE_DB", "0") or "0"),
+            "prefix": env("CACHE_PREFIX", "swiftpy_cache:"),
+            "ttl": int(env("CACHE_DEFAULT_TTL", "3600") or "3600"),
         },
     },
 }
@@ -961,97 +992,98 @@ CONFIG = {
 
 CONFIG_CORS_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env, env_bool
 
 CONFIG = {
     "allowed_origins": [
         origin.strip()
-        for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+        for origin in str(env("CORS_ALLOWED_ORIGINS", "") or "").split(",")
         if origin.strip()
     ],
     "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     "allowed_headers": ["Content-Type", "Authorization", "X-Request-ID"],
-    "allow_credentials": os.getenv("CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("true", "1", "yes", "on"),
-    "max_age": int(os.getenv("CORS_MAX_AGE", "600")),
+    "expose_headers": ["X-Request-ID"],
+    "allow_credentials": env_bool("CORS_ALLOW_CREDENTIALS", False),
+    "max_age": int(env("CORS_MAX_AGE", "600") or "600"),
 }
 """
 
 CONFIG_DATABASE_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": os.getenv("DB_CONNECTION", "postgresql"),
+    "default": env("DB_CONNECTION", "postgresql"),
     "connections": {
         "postgresql": {
-            "host": os.getenv("DB_HOST", "127.0.0.1"),
-            "port": int(os.getenv("DB_PORT", "5432")),
-            "database": os.getenv("DB_DATABASE", "swiftpy"),
-            "user": os.getenv("DB_USERNAME", "postgres"),
-            "password": os.getenv("DB_PASSWORD", "secret"),
-            "ssl": os.getenv("DB_SSL", "disable"),
-            "ssl_ca_file": os.getenv("DB_SSL_CA_FILE") or None,
+            "host": env("DB_HOST", "127.0.0.1"),
+            "port": int(env("DB_PORT", "5432") or "5432"),
+            "database": env("DB_DATABASE", "swiftpy"),
+            "user": env("DB_USERNAME", "postgres"),
+            "password": env("DB_PASSWORD", "secret"),
+            "ssl": env("DB_SSL", "disable"),
+            "ssl_ca_file": env("DB_SSL_CA_FILE") or None,
         },
     },
     "pool": {
-        "min_size": int(os.getenv("DB_POOL_MIN_SIZE", "5")),
-        "max_size": int(os.getenv("DB_POOL_MAX_SIZE", "20")),
-        "max_queries": int(os.getenv("DB_POOL_MAX_QUERIES", "50000")),
+        "min_size": int(env("DB_POOL_MIN_SIZE", "5") or "5"),
+        "max_size": int(env("DB_POOL_MAX_SIZE", "20") or "20"),
+        "max_queries": int(env("DB_POOL_MAX_QUERIES", "50000") or "50000"),
         "max_inactive_connection_lifetime": float(
-            os.getenv("DB_POOL_MAX_INACTIVE_LIFETIME", "300.0")
+            env("DB_POOL_MAX_INACTIVE_LIFETIME", "300.0") or "300.0"
         ),
-        "command_timeout": float(os.getenv("DB_COMMAND_TIMEOUT", "60.0")),
+        "command_timeout": float(env("DB_COMMAND_TIMEOUT", "60.0") or "60.0"),
     },
     "timeouts": {
-        "connect": float(os.getenv("DB_CONNECT_TIMEOUT", "10.0")),
-        "statement": float(os.getenv("DB_STATEMENT_TIMEOUT", "30.0")),
-        "transaction": float(os.getenv("DB_TRANSACTION_TIMEOUT", "60.0")),
+        "connect": float(env("DB_CONNECT_TIMEOUT", "10.0") or "10.0"),
+        "statement": float(env("DB_STATEMENT_TIMEOUT", "30.0") or "30.0"),
+        "transaction": float(env("DB_TRANSACTION_TIMEOUT", "60.0") or "60.0"),
     },
 }
 """
 
 CONFIG_EVENTS_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": "redis",
-    "connections": {
-        "redis": {
-            "host": os.getenv("REDIS_HOST", "127.0.0.1"),
-            "port": int(os.getenv("REDIS_PORT", "6379")),
-            "password": os.getenv("REDIS_PASSWORD") or None,
-            "db": int(os.getenv("REDIS_EVENTS_DB", "2")),
-        },
+    "default": env("EVENTS_DRIVER", "redis"),
+    "redis": {
+        "host": env("REDIS_HOST", "127.0.0.1"),
+        "port": int(env("REDIS_PORT", "6379") or "6379"),
+        "password": env("REDIS_PASSWORD") or None,
+        "database": int(env("REDIS_EVENTS_DB", "2") or "2"),
+        "prefix": env("EVENTS_PREFIX", "swiftpy_events:"),
     },
 }
 """
 
 CONFIG_FILESYSTEMS_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": os.getenv("FILESYSTEM_DISK", "local"),
+    "default": env("FILESYSTEM_DISK", "local"),
+    "signing_key": env("FILESYSTEM_SIGNING_KEY") or None,
     "disks": {
         "local": {
             "driver": "local",
-            "root": os.getenv("STORAGE_LOCAL_ROOT", "storage/app/private"),
+            "root": env("STORAGE_LOCAL_ROOT", "storage/app/private"),
             "visibility": "private",
         },
         "public": {
             "driver": "local",
-            "root": os.getenv("STORAGE_PUBLIC_ROOT", "storage/app/public"),
-            "url": os.getenv("STORAGE_PUBLIC_URL", "/storage"),
+            "root": env("STORAGE_PUBLIC_ROOT", "storage/app/public"),
+            "url": env("STORAGE_PUBLIC_URL", "/storage"),
             "visibility": "public",
         },
         "s3": {
             "driver": "s3",
-            "key": os.getenv("AWS_ACCESS_KEY_ID", ""),
-            "secret": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-            "region": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-            "bucket": os.getenv("AWS_BUCKET", ""),
-            "endpoint": os.getenv("AWS_ENDPOINT") or None,
+            "key": env("AWS_ACCESS_KEY_ID", ""),
+            "secret": env("AWS_SECRET_ACCESS_KEY", ""),
+            "region": env("AWS_DEFAULT_REGION", "us-east-1"),
+            "bucket": env("AWS_BUCKET", ""),
+            "endpoint": env("AWS_ENDPOINT") or None,
             "visibility": "private",
         },
     },
@@ -1060,11 +1092,11 @@ CONFIG = {
 
 CONFIG_LOGGING_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": os.getenv("LOG_CHANNEL", "stack"),
-    "level": os.getenv("LOG_LEVEL", "info"),
+    "default": env("LOG_CHANNEL", "stack"),
+    "level": env("LOG_LEVEL", "info"),
     "channels": {
         "stack": {
             "driver": "stack",
@@ -1073,12 +1105,12 @@ CONFIG = {
         "single": {
             "driver": "single",
             "path": "storage/logs/swiftpy.log",
-            "level": os.getenv("LOG_LEVEL", "info"),
+            "level": env("LOG_LEVEL", "info"),
         },
         "daily": {
             "driver": "daily",
             "path": "storage/logs/swiftpy.log",
-            "level": os.getenv("LOG_LEVEL", "info"),
+            "level": env("LOG_LEVEL", "info"),
             "days": 14,
         },
     },
@@ -1087,41 +1119,44 @@ CONFIG = {
 
 CONFIG_MAIL_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env, env_bool
 
 CONFIG = {
-    "default": os.getenv("MAIL_MAILER", "smtp"),
+    "default": env("MAIL_MAILER", "smtp"),
     "from": {
-        "address": os.getenv("MAIL_FROM_ADDRESS", "noreply@example.com"),
-        "name": os.getenv("MAIL_FROM_NAME", "SwiftPY"),
+        "address": env("MAIL_FROM_ADDRESS", "noreply@example.com"),
+        "name": env("MAIL_FROM_NAME", "SwiftPY"),
     },
     "mailers": {
         "smtp": {
             "transport": "smtp",
-            "host": os.getenv("MAIL_HOST", "127.0.0.1"),
-            "port": int(os.getenv("MAIL_PORT", "587")),
-            "username": os.getenv("MAIL_USERNAME") or None,
-            "password": os.getenv("MAIL_PASSWORD") or None,
-            "encryption": os.getenv("MAIL_ENCRYPTION", "starttls"),
-            "timeout": float(os.getenv("MAIL_TIMEOUT", "30.0")),
-            "validate_certs": os.getenv("MAIL_VALIDATE_CERTS", "true").lower() in ("true", "1", "yes"),
+            "host": env("MAIL_HOST", "127.0.0.1"),
+            "port": int(env("MAIL_PORT", "587") or "587"),
+            "username": env("MAIL_USERNAME") or None,
+            "password": env("MAIL_PASSWORD") or None,
+            "encryption": env("MAIL_ENCRYPTION", "starttls"),
+            "timeout": float(env("MAIL_TIMEOUT", "30.0") or "30.0"),
+            "validate_certs": env_bool("MAIL_VALIDATE_CERTS", True),
         },
         "resend": {
             "transport": "resend",
-            "api_key": os.getenv("RESEND_API_KEY", ""),
+            "api_key": env("RESEND_API_KEY", ""),
         },
         "sendgrid": {
             "transport": "sendgrid",
-            "api_key": os.getenv("SENDGRID_API_KEY", ""),
+            "api_key": env("SENDGRID_API_KEY", ""),
         },
         "mailgun": {
             "transport": "mailgun",
-            "api_key": os.getenv("MAILGUN_API_KEY", ""),
-            "domain": os.getenv("MAILGUN_DOMAIN", ""),
+            "api_key": env("MAILGUN_API_KEY", ""),
+            "domain": env("MAILGUN_DOMAIN", ""),
         },
         "sendmail": {
             "transport": "sendmail",
             "path": "/usr/sbin/sendmail",
+        },
+        "console": {
+            "transport": "console",
         },
         "fake": {
             "transport": "fake",
@@ -1132,19 +1167,19 @@ CONFIG = {
 
 CONFIG_QUEUE_CONTENT = """from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": os.getenv("QUEUE_DRIVER", "redis"),
+    "default": env("QUEUE_DRIVER", "redis"),
     "connections": {
         "redis": {
             "driver": "redis",
-            "host": os.getenv("REDIS_HOST", "127.0.0.1"),
-            "port": int(os.getenv("REDIS_PORT", "6379")),
-            "password": os.getenv("REDIS_PASSWORD") or None,
-            "db": int(os.getenv("REDIS_QUEUE_DB", "1")),
-            "queue": os.getenv("QUEUE_NAME", "default"),
-            "prefix": os.getenv("QUEUE_PREFIX", "swiftpy_queue:"),
+            "host": env("REDIS_HOST", "127.0.0.1"),
+            "port": int(env("REDIS_PORT", "6379") or "6379"),
+            "password": env("REDIS_PASSWORD") or None,
+            "database": int(env("REDIS_QUEUE_DB", "1") or "1"),
+            "queue": env("QUEUE_NAME", "default"),
+            "prefix": env("QUEUE_PREFIX", "swiftpy_queue:"),
         },
     },
 }
@@ -1459,7 +1494,11 @@ async def test_health_check_endpoint(client: TestClient) -> None:
 
 
 def _get_pyproject_toml(project_name: str) -> str:
-    return f"""[project]
+    return f"""[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "{project_name}"
 version = "0.1.0"
 description = "A SwiftPY web application"
@@ -1479,9 +1518,21 @@ dev = [
     "ruff>=0.16.4",
 ]
 
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["app*", "config*", "database*", "routes*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+explicit_package_bases = true
+follow_imports = "silent"
+ignore_missing_imports = true
 """
 
 
@@ -1493,12 +1544,17 @@ A high-performance Python ASGI backend powered by the [SwiftPY](https://github.c
 ## Prerequisites
 
 - Python >= 3.12
-- PostgreSQL 16
+- PostgreSQL 16 (with `pgvector` extension if using AI vector stores)
 - Redis 7
 
 ## Getting Started
 
-1. Set up your virtual environment:
+1. Install dependencies using `uv` (recommended) or `pip`:
+   ```bash
+   uv sync
+   source .venv/bin/activate
+   ```
+   Or with standard `venv` + `pip`:
    ```bash
    python -m venv .venv
    source .venv/bin/activate

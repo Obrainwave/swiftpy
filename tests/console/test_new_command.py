@@ -10,9 +10,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from swiftpy.auth.jwt_issuer import JWTIssuer
+from swiftpy.auth.token_blacklist import is_token_blacklist_enabled
+from swiftpy.cache.cache import Cache
 from swiftpy.console.cli import CLI
 from swiftpy.core.application import Application
 from swiftpy.database.pool import DatabasePool
+from swiftpy.support.redis_config import resolve_redis_params
 from swiftpy.testing.http_client import TestClient
 
 
@@ -311,3 +315,157 @@ def test_generated_project_passes_ruff_and_mypy(
         check=False,
     )
     assert mypy.returncode == 0, mypy.stdout + mypy.stderr
+
+
+def test_scaffolded_dotenv_overrides_and_framework_config_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated config/*.py must honor .env without os.environ mutation and match framework config keys."""
+    monkeypatch.chdir(tmp_path)
+    CLI().run(["new", "dotenv_app"])
+    app_dir = tmp_path / "dotenv_app"
+
+    for key in (
+        "APP_NAME",
+        "APP_DEBUG",
+        "JWT_SECRET",
+        "JWT_ACCESS_TTL",
+        "JWT_REFRESH_TTL",
+        "AUTH_BLACKLIST_ENABLED",
+        "CACHE_DEFAULT_TTL",
+        "EVENTS_PREFIX",
+        "REDIS_CACHE_DB",
+        "REDIS_QUEUE_DB",
+        "REDIS_EVENTS_DB",
+        "CORS_ALLOWED_ORIGINS",
+        "CORS_ALLOW_CREDENTIALS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    (app_dir / ".env").write_text(
+        "\n".join(
+            [
+                "APP_NAME=DotenvCustomApp",
+                "APP_DEBUG=true",
+                "APP_KEY=base64:" + base64.b64encode(b"k" * 32).decode("ascii"),
+                "JWT_SECRET=dotenv-jwt-secret-value-at-least-32-bytes",
+                "JWT_ACCESS_TTL=321",
+                "JWT_REFRESH_TTL=12345",
+                "AUTH_BLACKLIST_ENABLED=false",
+                "CACHE_DEFAULT_TTL=900",
+                "EVENTS_PREFIX=custom_events:",
+                "REDIS_CACHE_DB=4",
+                "REDIS_QUEUE_DB=5",
+                "REDIS_EVENTS_DB=6",
+                "CORS_ALLOWED_ORIGINS=https://app.example.com",
+                "CORS_ALLOW_CREDENTIALS=true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    app = Application(project_root=app_dir)
+
+    assert app.config.get("app.name") == "DotenvCustomApp"
+    assert app.config.get("app.debug") is True
+
+    issuer = JWTIssuer.from_config(app.config)
+    assert issuer.access_token_ttl == 321
+    assert issuer.refresh_token_ttl == 12345
+    assert is_token_blacklist_enabled(app.config) is False
+
+    assert app.config.get("cache.default_ttl") == 900
+    cache_mgr = Cache(config=app.config)
+    redis_store = app.config.get("cache.stores.redis")
+    assert isinstance(redis_store, dict)
+    assert cache_mgr._resolve_store_ttl(redis_store) == 900.0
+    assert resolve_redis_params(app.config, section="cache")["database"] == 4
+    assert resolve_redis_params(app.config, section="queue")["database"] == 5
+    events_redis = resolve_redis_params(app.config, section="events")
+    assert events_redis["database"] == 6
+    assert app.config.get("events.redis.prefix") == "custom_events:"
+
+    assert app.config.get("cors.allowed_origins") == ["https://app.example.com"]
+    assert app.config.get("cors.expose_headers") == ["X-Request-ID"]
+    assert app.config.get("cors.allow_credentials") is True
+
+
+def test_scaffolded_packaging_and_plain_mypy_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated pyproject.toml configures package discovery and strict mypy defaults."""
+    monkeypatch.chdir(tmp_path)
+    CLI().run(["new", "pkg_app"])
+    app_dir = tmp_path / "pkg_app"
+
+    pyproject = (app_dir / "pyproject.toml").read_text(encoding="utf-8")
+    assert "[build-system]" in pyproject
+    assert "[tool.setuptools.packages.find]" in pyproject
+    assert "[tool.mypy]" in pyproject
+
+    compose = (app_dir / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "image: pgvector/pgvector:pg16" in compose
+
+    readme = (app_dir / "README.md").read_text(encoding="utf-8")
+    assert "uv sync" in readme
+    assert "pip install -e ." in readme
+
+    repo_root = Path(__file__).resolve().parents[2]
+    mypy = subprocess.run(
+        [sys.executable, "-m", "mypy", "."],
+        cwd=app_dir,
+        env={**os.environ, "MYPYPATH": str(repo_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mypy.returncode == 0, mypy.stdout + mypy.stderr
+
+
+async def test_scaffolded_main_wires_exception_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generated main.py registers app.http.handler.exceptions onto Application."""
+    monkeypatch.chdir(tmp_path)
+    CLI().run(["new", "main_app"])
+    app_dir = tmp_path / "main_app"
+
+    monkeypatch.chdir(app_dir)
+    monkeypatch.syspath_prepend(str(app_dir))
+    monkeypatch.setenv("JWT_SECRET", "main-test-jwt-secret-at-least-32-bytes!!")
+
+    prefixes = ("main", "app", "routes")
+    saved_modules = {
+        name: mod
+        for name, mod in list(sys.modules.items())
+        if name in prefixes or name.startswith(("app.", "routes."))
+    }
+    for name in saved_modules:
+        sys.modules.pop(name, None)
+
+    try:
+        main_module = importlib.import_module("main")
+        exc_module = importlib.import_module("app.http.handler.exceptions")
+        loaded_app = main_module.app
+        assert isinstance(loaded_app, Application)
+        conflict_cls = exc_module.ResourceConflictException
+
+        @loaded_app.get("/conflict-test")
+        async def conflict_endpoint() -> dict[str, str]:
+            raise conflict_cls("duplicate entry")
+
+        if loaded_app.container.has(DatabasePool):
+            pool = loaded_app.container.resolve(DatabasePool)
+            monkeypatch.setattr(pool, "init", AsyncMock())
+            monkeypatch.setattr(pool, "close", AsyncMock())
+
+        async with TestClient(loaded_app) as client:
+            resp = await client.get("/conflict-test")
+            assert resp.status_code == 409
+            assert resp.json() == {"error": "conflict", "detail": "duplicate entry"}
+    finally:
+        for name in list(sys.modules):
+            if name in prefixes or name.startswith(("app.", "routes.")):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
