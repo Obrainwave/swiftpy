@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tomllib
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 from swiftpy.console.commands.cache import CacheCommand
 from swiftpy.console.commands.make import MakeCommand
@@ -11,6 +14,26 @@ from swiftpy.console.commands.queue import QueueCommand
 from swiftpy.console.commands.seed import SeedCommand
 from swiftpy.console.commands.start import StartCommand
 from swiftpy.console.commands.storage import StorageCommand
+
+
+def _get_framework_version() -> str:
+    """Return the installed SwiftPY version, falling back to pyproject.toml."""
+    try:
+        return version("swiftpy-framework")
+    except PackageNotFoundError:
+        pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if pyproject_path.is_file():
+            try:
+                with pyproject_path.open("rb") as handle:
+                    data = tomllib.load(handle)
+                project = data.get("project")
+                if isinstance(project, dict):
+                    pkg_version = project.get("version")
+                    if isinstance(pkg_version, str) and pkg_version:
+                        return pkg_version
+            except (OSError, tomllib.TOMLDecodeError):
+                pass
+        return "unknown"
 
 
 class CLI:
@@ -27,6 +50,12 @@ class CLI:
         self.parser = argparse.ArgumentParser(
             prog="swiftpy",
             description="SwiftPY Framework CLI",
+        )
+        self.parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=f"%(prog)s {_get_framework_version()}",
         )
 
         self.subparsers = self.parser.add_subparsers(

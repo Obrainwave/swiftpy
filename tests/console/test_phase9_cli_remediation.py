@@ -27,12 +27,15 @@ def test_new_command_templates_hardened(
     assert "pyproject.toml" in dockerfile
 
     pyproject = (app_dir / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"swiftpy-framework>=0.1.1"' in pyproject
+    assert '"swiftpy-framework>=0.1.2"' in pyproject
 
     compose = (app_dir / "docker-compose.yml").read_text(encoding="utf-8")
+    assert compose.startswith("name: sample_app\n")
     assert '"127.0.0.1:5432:5432"' in compose
     assert '"127.0.0.1:6379:6379"' in compose
     assert '"127.0.0.1:8000:8000"' in compose
+    assert "POSTGRES_PASSWORD: ${DB_PASSWORD}" in compose
+    assert ":-" not in compose
 
     assert not (app_dir / "public" / "storage" / ".gitkeep").exists()
     assert not (app_dir / "public" / "storage").exists()

@@ -4,6 +4,17 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-16
+
+### Added
+- **CLI (`swiftpy -v` / `swiftpy --version`):** Added `-v` and `--version` flags to `CLI` reporting the installed `swiftpy-framework` version (with `pyproject.toml` fallback).
+
+### Changed
+- **Scaffolding (`swiftpy new`):**
+  - Removed hardcoded fallback database names, users, and passwords from generated `docker-compose.yml` so `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `pg_isready` `healthcheck` directly reference `${DB_DATABASE}`, `${DB_USERNAME}`, and `${DB_PASSWORD}` from `.env`.
+  - Added top-level `name: <project_name>` to generated `docker-compose.yml` and initialized `DB_DATABASE=<project_name>` in generated `.env`, `.env.example`, and `config/database.py`.
+  - Updated generated `pyproject.toml` dependency floor to `swiftpy-framework>=0.1.2`.
+
 ## [0.1.1] - 2026-11-15
 
 ### Fixed

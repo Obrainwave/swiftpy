@@ -405,7 +405,20 @@ def test_scaffolded_packaging_and_plain_mypy_config(
     assert "[tool.mypy]" in pyproject
 
     compose = (app_dir / "docker-compose.yml").read_text(encoding="utf-8")
+    assert compose.startswith("name: pkg_app\n")
     assert "image: pgvector/pgvector:pg16" in compose
+    assert "POSTGRES_DB: ${DB_DATABASE}" in compose
+    assert "POSTGRES_USER: ${DB_USERNAME}" in compose
+    assert "POSTGRES_PASSWORD: ${DB_PASSWORD}" in compose
+    assert "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}" in compose
+    assert ":-" not in compose
+
+    env_active = (app_dir / ".env").read_text(encoding="utf-8")
+    assert "\nDB_DATABASE=pkg_app\n" in env_active
+    env_example = (app_dir / ".env.example").read_text(encoding="utf-8")
+    assert "\nDB_DATABASE=pkg_app\n" in env_example
+    db_cfg = (app_dir / "config" / "database.py").read_text(encoding="utf-8")
+    assert '"database": env("DB_DATABASE", "pkg_app")' in db_cfg
 
     readme = (app_dir / "README.md").read_text(encoding="utf-8")
     assert "uv sync" in readme
