@@ -561,11 +561,11 @@ async def test_shared_http_pool_used_across_both_providers(
     CRITICAL TEST: Verifies that multiple providers share the EXACT same
     underlying httpx.AsyncClient instance through AIHttpPool.
     """
-    requested_urls: list[str] = []
+    requested_hosts: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requested_urls.append(str(request.url))
-        if "openai" in str(request.url):
+        requested_hosts.append(request.url.host)
+        if request.url.host == "api.openai.com":
             return httpx.Response(200, json={"choices": [{"message": {"content": "OpenAI resp"}}]})
         return httpx.Response(200, json={"content": [{"type": "text", "text": "Anthropic resp"}]})
 
@@ -582,9 +582,7 @@ async def test_shared_http_pool_used_across_both_providers(
     await openai_provider.send(LLMRequest(messages=[Message(role="user", content="Ping OpenAI")]))
     await anthropic_provider.send(LLMRequest(messages=[Message(role="user", content="Ping Anthropic")]))
 
-    assert len(requested_urls) == 2
-    assert "openai.com" in requested_urls[0]
-    assert "anthropic.com" in requested_urls[1]
+    assert requested_hosts == ["api.openai.com", "api.anthropic.com"]
 
 
 async def test_closing_pool_closes_client() -> None:

@@ -116,7 +116,7 @@ uv run --with twine twine check dist/*
 ## Reporting Bugs & Security Vulnerabilities
 
 - **Bugs & feature requests**: Open an issue at <https://github.com/obrainwave/swiftpy/issues> with reproduction steps, expected vs. actual behavior, Python version, and relevant error output (redacting any secrets).
-- **Security vulnerabilities**: Do **not** publish exploit details or sensitive vulnerability reports in public issues. Report security concerns privately by sending a direct email to <akeem@swiftpy.net>.
+- **Security vulnerabilities**: Do **not** publish exploit details or sensitive vulnerability reports in public issues. Report security concerns privately by sending a direct email to <akeemsalau@swiftpy.net>.
 
 ---
 
