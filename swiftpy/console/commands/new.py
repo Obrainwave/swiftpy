@@ -62,13 +62,13 @@ DOCKER_COMPOSE_CONTENT = """services:
     ports:
       - "127.0.0.1:5432:5432"
     environment:
-      POSTGRES_DB: ${DB_DATABASE:-swiftpy}
-      POSTGRES_USER: ${DB_USERNAME:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-postgres} -d ${DB_DATABASE:-swiftpy}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -1493,6 +1493,29 @@ async def test_health_check_endpoint(client: TestClient) -> None:
 """
 
 
+def _get_docker_compose(project_name: str) -> str:
+    """Return generated docker-compose.yml content scoped to `project_name`."""
+    return f"name: {project_name}\n\n{DOCKER_COMPOSE_CONTENT}"
+
+
+def _get_env_example(project_name: str) -> str:
+    """Return .env.example content with `DB_DATABASE` set to `project_name`."""
+    return ENV_EXAMPLE_CONTENT.replace(
+        "\nDB_DATABASE=swiftpy\n",
+        f"\nDB_DATABASE={project_name}\n",
+        1,
+    )
+
+
+def _get_config_database(project_name: str) -> str:
+    """Return config/database.py content defaulting `database` to `project_name`."""
+    return CONFIG_DATABASE_CONTENT.replace(
+        '"database": env("DB_DATABASE", "swiftpy"),',
+        f'"database": env("DB_DATABASE", "{project_name}"),',
+        1,
+    )
+
+
 def _get_pyproject_toml(project_name: str) -> str:
     return f"""[build-system]
 requires = ["setuptools>=75.0"]
@@ -1504,7 +1527,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.1.1",
+    "swiftpy-framework>=0.1.2",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
@@ -1723,17 +1746,18 @@ class NewCommand:
             dir_path.mkdir(parents=True, exist_ok=True)
             _validate_safe_path(dir_path)
 
-        # Generate active .env with APP_KEY and JWT_SECRET
+        # Generate active .env with project DB_DATABASE, APP_KEY, and JWT_SECRET
+        env_example = _get_env_example(raw_name)
         jwt_secret = secrets.token_urlsafe(48)
-        env_content = ENV_EXAMPLE_CONTENT.replace("APP_KEY=", f"APP_KEY={app_key}")
+        env_content = env_example.replace("APP_KEY=", f"APP_KEY={app_key}")
         env_content = env_content.replace("JWT_SECRET=", f"JWT_SECRET={jwt_secret}")
 
         files: dict[str, str] = {
             ".dockerignore": DOCKERIGNORE_CONTENT,
-            ".env.example": ENV_EXAMPLE_CONTENT,
+            ".env.example": env_example,
             ".env": env_content,
             ".gitignore": GITIGNORE_CONTENT,
-            "docker-compose.yml": DOCKER_COMPOSE_CONTENT,
+            "docker-compose.yml": _get_docker_compose(raw_name),
             "Dockerfile": DOCKERFILE_CONTENT,
             "main.py": MAIN_PY_CONTENT,
             "pyproject.toml": _get_pyproject_toml(raw_name),
@@ -1765,7 +1789,7 @@ class NewCommand:
             "config/auth.py": CONFIG_AUTH_CONTENT,
             "config/cache.py": CONFIG_CACHE_CONTENT,
             "config/cors.py": CONFIG_CORS_CONTENT,
-            "config/database.py": CONFIG_DATABASE_CONTENT,
+            "config/database.py": _get_config_database(raw_name),
             "config/events.py": CONFIG_EVENTS_CONTENT,
             "config/filesystems.py": CONFIG_FILESYSTEMS_CONTENT,
             "config/logging.py": CONFIG_LOGGING_CONTENT,

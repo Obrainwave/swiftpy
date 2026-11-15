@@ -55,6 +55,7 @@ uv add swiftpy-framework
 Verify the CLI is available:
 
 ```bash
+swiftpy --version
 swiftpy --help
 ```
 
@@ -164,11 +165,11 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-The generated `pyproject.toml` already declares `"swiftpy-framework>=0.1.1"` along with `[build-system]` (`setuptools`), `[tool.setuptools.packages.find]`, and `[tool.mypy]`.
+The generated `pyproject.toml` already declares `"swiftpy-framework>=0.1.2"` along with `[build-system]` (`setuptools`), `[tool.setuptools.packages.find]`, and `[tool.mypy]`.
 
 ### Configure Environment & Backing Services
 
-`swiftpy new` initializes `.env` with freshly generated `APP_KEY` and `JWT_SECRET` values. Review `.env` and adjust PostgreSQL (`DB_*`) and Redis (`REDIS_*`) settings as needed.
+`swiftpy new` initializes `.env` with freshly generated `APP_KEY` and `JWT_SECRET` values, sets `DB_DATABASE` in `.env` and `.env.example` to your project name, and sets `name: <project_name>` in `docker-compose.yml` (referencing `${DB_DATABASE}`, `${DB_USERNAME}`, and `${DB_PASSWORD}` directly from `.env`). Review `.env` and adjust PostgreSQL (`DB_*`) and Redis (`REDIS_*`) settings as needed.
 
 > **Important:** All generated `config/*.py` files use `swiftpy.helpers.helper.env()` and `env_bool()`. When `Application` boots, `Config.load()` reads `.env` into SwiftPY's active env context without mutating `os.environ`.
 
