@@ -6,7 +6,8 @@ from typing import Any
 import pytest
 
 from swiftpy.core.application import Application
-from swiftpy.core.config import ConfigurationError
+from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.container import get_container, set_container
 from swiftpy.core.exceptions import (
     BadRequestError,
     ExceptionHandler,
@@ -90,15 +91,17 @@ async def test_global_middleware_sees_200_404_405_and_500_in_correct_order() -> 
     res_405.assert_header("X-Global-Middleware", "405")
     assert events == ["global:before:/api/ok", "global:after:405"]
 
-    # 4. 500 Internal Server Error: global middleware sees the 500 response produced by ExceptionHandler
+    # 4. 500 Internal Server Error: both group and global middleware see the 500 response produced by ExceptionHandler
     events.clear()
     res_500 = await client.get("/api/boom")
     res_500.assert_server_error()
     res_500.assert_header("X-Global-Middleware", "500")
+    res_500.assert_header("X-Group-Middleware", "1")
     assert events == [
         "global:before:/api/boom",
         "group:before",
         "handler:boom",
+        "group:after",
         "global:after:500",
     ]
 
@@ -317,3 +320,98 @@ async def test_builtin_security_headers_request_id_and_cors_middleware() -> None
     )
     res_get_ok.assert_header("Access-Control-Expose-Headers", "X-Request-ID")
     res_get_ok.assert_header("Vary", "Origin")
+
+
+@pytest.mark.asyncio
+async def test_cors_wildcard_with_credentials_rejected() -> None:
+    """Gate G-3 (HTTP-2): wildcard '*' with allow_credentials=True must fail closed."""
+    prev_instance = Config._instance
+    prev_container = get_container()
+    try:
+        app_bad = Application(
+            auto_discover_providers=False,
+            config={
+                "cors": {
+                    "allowed_origins": ["*"],
+                    "allow_credentials": True,
+                }
+            },
+        )
+        with pytest.raises(ConfigurationError, match="allowed_origins"):
+            CORS(app_bad.config)
+
+        # Also fail closed if config dict is mutated to wildcard+credentials after registration
+        app_mutated = Application(
+            auto_discover_providers=False,
+            config={
+                "cors": {
+                    "allowed_origins": ["https://app.example.com"],
+                    "allow_credentials": True,
+                }
+            },
+        )
+        app_mutated.middleware([CORS])
+
+        @app_mutated.get("/items")
+        async def items_mutated() -> Response:
+            return json_response({"items": []})
+
+        app_mutated.config["cors"] = {
+            "allowed_origins": "*",
+            "allow_credentials": True,
+        }
+        client = TestClient(app_mutated)
+        res = await client.get(
+            "/items",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        assert res.status_code == 500
+        assert "access-control-allow-origin" not in res.headers
+        assert "access-control-allow-credentials" not in res.headers
+    finally:
+        Config._instance = prev_instance
+        set_container(prev_container)
+
+
+@pytest.mark.asyncio
+async def test_cors_string_allowed_origins_not_split_into_characters() -> None:
+    """CORE-2 / INF-3: raw string CORS values must not split into chars or coerce 'false' to True."""
+    prev_instance = Config._instance
+    prev_container = get_container()
+    try:
+        app = Application(
+            auto_discover_providers=False,
+            config={
+                "cors": {
+                    "allowed_origins": "https://*.example.com, https://app.example.com",
+                    "allowed_methods": "GET, POST",
+                    "allowed_headers": "Authorization, Content-Type",
+                    "allow_credentials": "false",
+                }
+            },
+        )
+        app.middleware([CORS])
+
+        @app.get("/items")
+        async def items() -> Response:
+            return json_response({"items": []})
+
+        client = TestClient(app)
+
+        res_evil = await client.get(
+            "/items",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        res_evil.assert_ok()
+        assert "access-control-allow-origin" not in res_evil.headers
+
+        res_ok = await client.get(
+            "/items",
+            headers={"Origin": "https://app.example.com"},
+        )
+        res_ok.assert_ok()
+        res_ok.assert_header("Access-Control-Allow-Origin", "https://app.example.com")
+        assert "access-control-allow-credentials" not in res_ok.headers
+    finally:
+        Config._instance = prev_instance
+        set_container(prev_container)

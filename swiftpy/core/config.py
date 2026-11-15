@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+from collections.abc import Mapping
+from contextvars import ContextVar
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import Any
@@ -14,10 +16,72 @@ from swiftpy.core.container import get_container
 logger = logging.getLogger("swiftpy.core.config")
 
 _MISSING = object()
+_active_env_var: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "_swiftpy_active_env", default=None
+)
 
 
 class ConfigurationError(ValueError):
     """Raised when configuration values are malformed or invalid."""
+
+
+def _parse_dotenv(dotenv_path: Path) -> dict[str, str]:
+    """Parse a `.env` file into key-value pairs without mutating `os.environ`."""
+    if not dotenv_path.is_file():
+        return {}
+
+    parsed: dict[str, str] = {}
+    try:
+        content = dotenv_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to read .env file %s: %s", dotenv_path, exc)
+        return {}
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            quote = val[0]
+            inner = val[1:-1]
+            if quote == '"':
+                inner = (
+                    inner.replace('\\"', '"')
+                    .replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                )
+            val = inner
+        elif " #" in val:
+            val = val.split(" #", 1)[0].rstrip()
+        parsed[key] = val
+    return parsed
+
+
+def env(key: str, default: Any = None) -> Any:
+    """Retrieve environment variables from active config load context or `os.environ`."""
+    active_env = _active_env_var.get()
+    if active_env is not None:
+        return active_env.get(key, default)
+    return os.getenv(key, default)
+
+
+def env_bool(key: str, default: bool = False) -> bool:
+    """Retrieve an environment variable parsed strictly as a boolean."""
+    active_env = _active_env_var.get()
+    raw = active_env.get(key) if active_env is not None else os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
 
 
 class Config:
@@ -62,7 +126,10 @@ class Config:
         When `strict=True` (the default), broken or invalid config files raise `ConfigurationError`.
         When `strict=False`, broken config files log a warning and are skipped.
         """
-        cache_path = Path("bootstrap/cache/config.json")
+        config_path = Path(config_dir)
+        project_root = config_path.resolve().parent
+        cache_path = project_root / "bootstrap" / "cache" / "config.json"
+
         if not ignore_cache and env is None and cache_path.is_file():
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
@@ -74,42 +141,49 @@ class Config:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load cached config %s: %s", cache_path, exc)
 
+        if env is None:
+            dotenv_vars = _parse_dotenv(project_root / ".env")
+            env_vars: Mapping[str, str] = {**dotenv_vars, **os.environ}
+        else:
+            env_vars = env
+
         data: dict[str, Any] = {}
-        config_path = Path(config_dir)
-
-        if config_path.is_dir():
-            for file in sorted(config_path.glob("*.py")):
-                if file.name.startswith(("_", ".")):
-                    continue
-
-                spec = spec_from_file_location(file.stem, file)
-                if spec and spec.loader:
-                    module = module_from_spec(spec)
-                    try:
-                        spec.loader.exec_module(module)
-                    except Exception as exc:
-                        if strict:
-                            raise ConfigurationError(
-                                f"Failed to load configuration file '{file}': {exc}"
-                            ) from exc
-                        logger.warning(
-                            "Failed to load config file: %s",
-                            file,
-                            exc_info=True,
-                        )
+        token = _active_env_var.set(env_vars)
+        try:
+            if config_path.is_dir():
+                for file in sorted(config_path.glob("*.py")):
+                    if file.name.startswith(("_", ".")):
                         continue
 
-                    if hasattr(module, "CONFIG"):
-                        if isinstance(module.CONFIG, dict):
-                            data[file.stem] = copy.deepcopy(module.CONFIG)
-                        elif strict:
-                            raise ConfigurationError(
-                                f"Configuration file '{file}' must define CONFIG as a dict, "
-                                f"got {type(module.CONFIG).__name__}."
+                    spec = spec_from_file_location(file.stem, file)
+                    if spec and spec.loader:
+                        module = module_from_spec(spec)
+                        try:
+                            spec.loader.exec_module(module)
+                        except Exception as exc:
+                            if strict:
+                                raise ConfigurationError(
+                                    f"Failed to load configuration file '{file}': {exc}"
+                                ) from exc
+                            logger.warning(
+                                "Failed to load config file: %s",
+                                file,
+                                exc_info=True,
                             )
+                            continue
+
+                        if hasattr(module, "CONFIG"):
+                            if isinstance(module.CONFIG, dict):
+                                data[file.stem] = copy.deepcopy(module.CONFIG)
+                            elif strict:
+                                raise ConfigurationError(
+                                    f"Configuration file '{file}' must define CONFIG as a dict, "
+                                    f"got {type(module.CONFIG).__name__}."
+                                )
+        finally:
+            _active_env_var.reset(token)
 
         # Merge environment variables
-        env_vars = os.environ if env is None else env
         cls._merge_env_variables(data, env_vars)
 
         instance = cls(data)
@@ -120,7 +194,7 @@ class Config:
     def _merge_env_variables(
         cls,
         data: dict[str, Any],
-        env_vars: dict[str, str] | Any,
+        env_vars: Mapping[str, str],
     ) -> None:
         """
         Merge environment variables into the configuration dictionary.
@@ -230,6 +304,23 @@ class Config:
                     raise ConfigurationError(
                         f"Configuration key '{key}' expects a float, got '{val}'"
                     ) from exc
+            if isinstance(existing, list):
+                stripped = val.strip()
+                if not stripped:
+                    return []
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    try:
+                        parsed = json.loads(stripped)
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        raise ConfigurationError(
+                            f"Configuration key '{key}' contains malformed JSON: '{val}'"
+                        ) from exc
+                    if not isinstance(parsed, list):
+                        raise ConfigurationError(
+                            f"Configuration key '{key}' expects a list, got '{val}'"
+                        )
+                    return parsed
+                return [item.strip() for item in stripped.split(",") if item.strip()]
 
         # JSON arrays / objects
         if (val.startswith("{") and val.endswith("}")) or (
@@ -338,4 +429,4 @@ class Config:
         return False
 
 
-__all__ = ["Config", "ConfigurationError"]
+__all__ = ["Config", "ConfigurationError", "env", "env_bool"]

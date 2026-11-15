@@ -19,7 +19,7 @@ class WelcomeEmail(Mailable):
         return MailMessage(
             subject=f"Welcome to SwiftPY, {self.name}!",
             to=self.to_address,
-            template="views/mail/template.html",
+            template="mail/template.html",
             context={
                 "title": f"Welcome, {self.name}!",
                 "content": "Thank you for joining our platform. We are thrilled to have you here!",

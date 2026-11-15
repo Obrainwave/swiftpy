@@ -328,9 +328,9 @@ class JWTIssuer:
                 raise ValueError("expires_in must be a finite integer or timedelta")
         else:
             ttl_seconds = (
-                self.access_token_ttl
-                if token_type == "access"
-                else self.refresh_token_ttl
+                self.refresh_token_ttl
+                if token_type == "refresh"
+                else self.access_token_ttl
             )
 
         payload: dict[str, Any] = {
@@ -450,6 +450,7 @@ class JWTIssuer:
         token: str,
         *,
         verify_exp: bool = True,
+        verify_nbf: bool = True,
         expected_type: str | None = None,
         allowed_algorithms: list[str] | set[str] | None = None,
         leeway: int | None = None,
@@ -551,7 +552,7 @@ class JWTIssuer:
         if nbf is not None:
             if not _is_valid_timestamp(nbf):
                 raise InvalidTokenError("Claim 'nbf' must be a numeric timestamp")
-            if now + active_leeway < nbf:
+            if verify_nbf and now + active_leeway < nbf:
                 raise InvalidTokenError("Token is not active yet (nbf constraint)")
 
         # Issuer check

@@ -2,21 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import math
-import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from typing import Any
 
-try:
-    import httpx
-    _RERANK_HTTP_ERRORS: tuple[type[Exception], ...] = (
-        httpx.TimeoutException,
-        httpx.RequestError,
-    )
-except ImportError:
-    httpx = None
-    _RERANK_HTTP_ERRORS = (TimeoutError, OSError)
+import httpx
 
 from swiftpy.ai.exceptions import (
     AIAuthenticationError,
@@ -25,8 +16,14 @@ from swiftpy.ai.exceptions import (
     AIRateLimitError,
 )
 from swiftpy.ai.pool import AIHttpPool
+from swiftpy.ai.providers.base import parse_retry_after
 from swiftpy.ai.vectorstore.base import SearchResult, sanitize_error_message
 from swiftpy.core.config import Config
+
+_RERANK_HTTP_ERRORS: tuple[type[Exception], ...] = (
+    httpx.TimeoutException,
+    httpx.RequestError,
+)
 
 
 def _normalize_documents(
@@ -108,11 +105,11 @@ class CohereReranker(BaseReranker):
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "rerank-v3.5",
-        base_url: str = "https://api.cohere.com/v2/rerank",
+        model: str | None = None,
+        base_url: str | None = None,
         http_pool: AIHttpPool | None = None,
         config: Config | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         cfg = config
         if cfg is None:
@@ -121,19 +118,38 @@ class CohereReranker(BaseReranker):
             except RuntimeError:
                 cfg = Config()
 
-        self._api_key = (
-            api_key
-            or str(cfg.get("ai.rerankers.cohere.api_key", ""))
-            or (os.getenv("COHERE_API_KEY") or "")
-        ).strip()
+        if api_key is not None:
+            self._api_key = api_key.strip()
+        else:
+            self._api_key = str(cfg.get("ai.rerankers.cohere.api_key", "")).strip()
 
-        self._model = model or str(
-            cfg.get("ai.rerankers.cohere.model", "rerank-v3.5")
+        raw_model = (
+            model if model is not None else cfg.get("ai.rerankers.cohere.model", "rerank-v3.5")
         )
-        self._base_url = str(
-            cfg.get("ai.rerankers.cohere.base_url", base_url)
-        ).rstrip("/")
-        self._timeout = float(cfg.get("ai.rerankers.cohere.timeout", timeout))
+        self._model = str(raw_model).strip()
+        if not self._model:
+            raise ValueError("Cohere model must be a non-empty string.")
+
+        raw_base_url = (
+            base_url
+            if base_url is not None
+            else cfg.get("ai.rerankers.cohere.base_url", "https://api.cohere.com/v2/rerank")
+        )
+        self._base_url = str(raw_base_url).strip().rstrip("/")
+        if not self._base_url:
+            raise ValueError("Cohere base_url must be a non-empty URL.")
+
+        raw_timeout = timeout if timeout is not None else cfg.get("ai.rerankers.cohere.timeout", 30.0)
+        if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+            raise TypeError(
+                f"Cohere timeout must be a positive finite number, got {raw_timeout!r}"
+            )
+        parsed_timeout = float(raw_timeout)
+        if not math.isfinite(parsed_timeout) or parsed_timeout <= 0:
+            raise ValueError(
+                f"Cohere timeout must be a positive finite number, got {raw_timeout!r}"
+            )
+        self._timeout = parsed_timeout
         self._http_pool = http_pool or AIHttpPool.get_instance()
 
     @property
@@ -229,8 +245,7 @@ class CohereReranker(BaseReranker):
                 response_body=clean_text,
             )
         if response.status_code == 429:
-            retry_after_hdr = response.headers.get("Retry-After")
-            retry_after = float(retry_after_hdr) if retry_after_hdr else None
+            retry_after = parse_retry_after(response.headers.get("Retry-After"))
             raise AIRateLimitError(
                 f"Cohere rate limit exceeded (429): {clean_text}",
                 provider="cohere",
@@ -274,18 +289,34 @@ class CohereReranker(BaseReranker):
             if not isinstance(item, dict):
                 continue
             idx_val = item.get("index")
-            if not isinstance(idx_val, int) or idx_val < 0 or idx_val >= len(results):
+            if (
+                isinstance(idx_val, bool)
+                or not isinstance(idx_val, int)
+                or idx_val < 0
+                or idx_val >= len(results)
+            ):
                 continue
             if idx_val in seen_indices:
                 continue
             seen_indices.add(idx_val)
 
             score_val = item.get("relevance_score")
-            score = float(score_val) if isinstance(score_val, (int, float)) else 0.0
+            if isinstance(score_val, bool) or not isinstance(score_val, (int, float)):
+                raise AIProviderError(
+                    f"Cohere returned invalid relevance_score for index {idx_val}: {score_val!r}",
+                    provider="cohere",
+                )
+            score = float(score_val)
+            if not math.isfinite(score):
+                raise AIProviderError(
+                    f"Cohere returned non-finite relevance_score for index {idx_val}: {score_val!r}",
+                    provider="cohere",
+                )
             res = results[idx_val]
             res.score = score
             reranked_results.append(res)
 
+        reranked_results.sort(key=lambda r: r.score, reverse=True)
         return reranked_results[:effective_top_n]
 
 

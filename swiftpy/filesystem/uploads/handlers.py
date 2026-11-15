@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import posixpath
 import re
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 
 from swiftpy.filesystem.exceptions import (
@@ -12,9 +13,28 @@ from swiftpy.filesystem.exceptions import (
     MalformedMultipartError,
 )
 from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
+from swiftpy.http.exceptions import ClientDisconnect
 
 _HEADER_SPLIT = b"\r\n\r\n"
 _LINE_SPLIT = b"\r\n"
+
+
+def _open_part_spool(
+    memory_limit: int,
+    temp_dir: str | None,
+) -> tempfile.SpooledTemporaryFile[bytes]:
+    return tempfile.SpooledTemporaryFile(max_size=memory_limit, dir=temp_dir)
+
+
+def _sanitize_part_filename(raw_name: str) -> str:
+    """Normalize slashes, extract basename, and reject dot/control-char traversal."""
+    if "\x00" in raw_name or "\r" in raw_name or "\n" in raw_name:
+        raise MalformedMultipartError("Invalid control character in upload filename.")
+    normalized = raw_name.replace("\\", "/")
+    cleaned = posixpath.basename(normalized)
+    if cleaned in {"", ".", ".."}:
+        raise MalformedMultipartError("Invalid traversal segment in upload filename.")
+    return cleaned
 
 
 class FormData:
@@ -78,6 +98,8 @@ class MultipartParser:
         max_file_size: int = 100 * 1024 * 1024,
         max_request_size: int = 200 * 1024 * 1024,
         memory_limit: int = 1024 * 1024,
+        max_field_size: int | None = None,
+        temp_dir: str | Path | None = None,
     ) -> None:
         self.boundary = boundary
         self.delimiter = b"--" + boundary
@@ -85,6 +107,8 @@ class MultipartParser:
         self.max_file_size = max_file_size
         self.max_request_size = max_request_size
         self.memory_limit = memory_limit
+        self.max_field_size = max_field_size if max_field_size is not None else memory_limit
+        self.temp_dir = str(temp_dir) if temp_dir is not None else None
 
     @classmethod
     def extract_boundary(cls, content_type: str) -> bytes:
@@ -106,26 +130,35 @@ class MultipartParser:
         part_headers: dict[str, str] = {}
         part_name: str | None = None
         part_filename: str | None = None
+        part_is_empty_file = False
         part_content_type: str = "application/octet-stream"
         part_spool: tempfile.SpooledTemporaryFile[bytes] | None = None
         part_field_value: bytearray | None = None
         part_file_bytes = 0
+        stream_eof = False
 
         async def get_next_chunk() -> bytes | None:
-            nonlocal total_request_bytes
+            nonlocal total_request_bytes, stream_eof
+            if stream_eof:
+                return None
             chunk: bytes = b""
             if isinstance(stream, AsyncIterator):
                 try:
                     chunk = await anext(stream)
                 except StopAsyncIteration:
+                    stream_eof = True
                     return None
             else:
                 msg = await stream()
                 if msg.get("type") == "http.disconnect":
-                    return None
+                    raise ClientDisconnect("Client disconnected while reading multipart upload body.")
                 chunk = msg.get("body", b"")
                 if not chunk and not msg.get("more_body", False):
                     return None
+                if not msg.get("more_body", False):
+                    stream_eof = True
+                    if not chunk:
+                        return None
 
             if chunk:
                 total_request_bytes += len(chunk)
@@ -136,15 +169,32 @@ class MultipartParser:
             return chunk
 
         try:
-            # Read until initial delimiter
-            while self.delimiter not in buffer and self.close_delimiter not in buffer:
+            # Read until genuine initial delimiter (must be followed by CRLF or '--')
+            init_search_pos = 0
+            while True:
+                init_idx = buffer.find(self.delimiter, init_search_pos)
+                if init_idx != -1:
+                    valid_prefix = init_idx == 0 or buffer[init_idx - 1 : init_idx] == b"\n"
+                    after_init = init_idx + len(self.delimiter)
+                    while len(buffer) < after_init + 2:
+                        chunk = await get_next_chunk()
+                        if chunk is None:
+                            raise MalformedMultipartError(
+                                "Stream ended before initial multipart boundary was found."
+                            )
+                        buffer.extend(chunk)
+                    init_suffix = bytes(buffer[after_init : after_init + 2])
+                    if valid_prefix and init_suffix in (b"--", b"\r\n"):
+                        buffer = buffer[after_init:]
+                        break
+                    init_search_pos = init_idx + 2
+                    continue
                 chunk = await get_next_chunk()
                 if chunk is None:
-                    raise MalformedMultipartError("Stream ended before initial multipart boundary was found.")
+                    raise MalformedMultipartError(
+                        "Stream ended before initial multipart boundary was found."
+                    )
                 buffer.extend(chunk)
-
-            init_idx = buffer.find(self.delimiter)
-            buffer = buffer[init_idx + len(self.delimiter) :]
 
             if buffer.startswith(b"--"):
                 return form_data
@@ -154,6 +204,7 @@ class MultipartParser:
 
             boundary_marker = b"\r\n" + self.delimiter
             marker_len = len(boundary_marker)
+            guard_len = marker_len + 2
 
             while True:
                 # Read part headers
@@ -180,31 +231,59 @@ class MultipartParser:
                 cd = part_headers.get("content-disposition", "")
                 part_name = None
                 part_filename = None
+                part_is_empty_file = False
                 part_content_type = part_headers.get("content-type", "text/plain")
 
                 name_m = re.search(r'name="([^"]+)"', cd)
                 if name_m:
                     part_name = name_m.group(1)
 
-                filename_m = re.search(r'filename="([^"]+)"', cd)
-                if filename_m:
-                    part_filename = os.path.basename(filename_m.group(1))
-
-                if part_filename is not None:
-                    part_spool = tempfile.SpooledTemporaryFile(max_size=self.memory_limit)  # noqa: SIM115
-                    part_file_bytes = 0
+                filename_m = re.search(r'filename="([^"]*)"', cd)
+                if filename_m is not None:
+                    raw_fname = filename_m.group(1)
+                    if raw_fname == "":
+                        part_is_empty_file = True
+                        part_file_bytes = 0
+                    else:
+                        part_filename = _sanitize_part_filename(raw_fname)
+                        part_spool = _open_part_spool(self.memory_limit, self.temp_dir)
+                        part_file_bytes = 0
                 else:
                     part_field_value = bytearray()
 
-                # Read body of current part until boundary_marker
+                # Read body of current part until genuine boundary_marker followed by '--' or CRLF
+                search_pos = 0
                 while True:
-                    delim_idx = buffer.find(boundary_marker)
-                    if delim_idx != -1:
-                        # Found delimiter
-                        final_chunk = bytes(buffer[:delim_idx])
-                        buffer = buffer[delim_idx + marker_len :]
+                    matched_idx = -1
+                    while True:
+                        delim_idx = buffer.find(boundary_marker, search_pos)
+                        if delim_idx == -1:
+                            break
+                        after_idx = delim_idx + marker_len
+                        while len(buffer) < after_idx + 2:
+                            chunk = await get_next_chunk()
+                            if chunk is None:
+                                raise MalformedMultipartError(
+                                    "Unexpected end of stream: missing closing multipart boundary."
+                                )
+                            buffer.extend(chunk)
+                        suffix = bytes(buffer[after_idx : after_idx + 2])
+                        if suffix in (b"--", b"\r\n"):
+                            matched_idx = delim_idx
+                            break
+                        search_pos = delim_idx + 2
 
-                        if part_spool is not None:
+                    if matched_idx != -1:
+                        final_chunk = bytes(buffer[:matched_idx])
+                        buffer = buffer[matched_idx + marker_len :]
+
+                        if part_is_empty_file:
+                            part_file_bytes += len(final_chunk)
+                            if part_file_bytes > self.max_file_size:
+                                raise FileTooLargeError(
+                                    f"Uploaded file exceeds maximum allowed size of {self.max_file_size} bytes."
+                                )
+                        elif part_spool is not None:
                             part_file_bytes += len(final_chunk)
                             if part_file_bytes > self.max_file_size:
                                 raise FileTooLargeError(
@@ -222,6 +301,10 @@ class MultipartParser:
                                 form_data.add_file(part_name, up_file)
                             part_spool = None
                         elif part_field_value is not None:
+                            if len(part_field_value) + len(final_chunk) > self.max_field_size:
+                                raise FileTooLargeError(
+                                    f"Form field '{part_name or ''}' exceeds maximum allowed size of {self.max_field_size} bytes."
+                                )
                             part_field_value.extend(final_chunk)
                             val = part_field_value.decode("utf-8", errors="replace")
                             if part_name:
@@ -229,13 +312,19 @@ class MultipartParser:
                             part_field_value = None
                         break
                     else:
-                        # Flush safe portion to spool to keep memory bounded and enforce limits mid-stream
-                        if len(buffer) > marker_len:
-                            safe_len = len(buffer) - marker_len
+                        # Flush safe portion while retaining guard_len bytes to inspect future suffix
+                        if len(buffer) > guard_len:
+                            safe_len = len(buffer) - guard_len
                             safe_chunk = bytes(buffer[:safe_len])
                             buffer = buffer[safe_len:]
 
-                            if part_spool is not None:
+                            if part_is_empty_file:
+                                part_file_bytes += len(safe_chunk)
+                                if part_file_bytes > self.max_file_size:
+                                    raise FileTooLargeError(
+                                        f"Uploaded file exceeds maximum allowed size of {self.max_file_size} bytes."
+                                    )
+                            elif part_spool is not None:
                                 part_file_bytes += len(safe_chunk)
                                 if part_file_bytes > self.max_file_size:
                                     raise FileTooLargeError(
@@ -243,8 +332,13 @@ class MultipartParser:
                                     )
                                 await asyncio.to_thread(part_spool.write, safe_chunk)
                             elif part_field_value is not None:
+                                if len(part_field_value) + len(safe_chunk) > self.max_field_size:
+                                    raise FileTooLargeError(
+                                        f"Form field '{part_name or ''}' exceeds maximum allowed size of {self.max_field_size} bytes."
+                                    )
                                 part_field_value.extend(safe_chunk)
 
+                        search_pos = 0
                         chunk = await get_next_chunk()
                         if chunk is None:
                             raise MalformedMultipartError("Unexpected end of stream: missing closing multipart boundary.")
@@ -258,7 +352,7 @@ class MultipartParser:
                     buffer = buffer[2:]
 
             return form_data
-        except Exception:
+        except BaseException:
             await form_data.close()
             if part_spool is not None:
                 try:

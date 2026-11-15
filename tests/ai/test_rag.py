@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import json
 import time
-from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
+import httpx
 import pytest
 
+import swiftpy.ai as ai_pkg
 from swiftpy.ai.exceptions import (
     AIAuthenticationError,
     AIProviderError,
@@ -39,45 +39,6 @@ from swiftpy.ai.vectorstore.base import SearchResult, VectorRecord, VectorStore
 # ==============================================================================
 # HTTP Test Mocks
 # ==============================================================================
-
-
-class MockResponse:
-    """Mock HTTP response matching the httpx.Response interface used by AI adapters."""
-
-    def __init__(
-        self,
-        status_code: int = 200,
-        json_data: Any = None,
-        text: str = "",
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self._json_data = json_data
-        self.text = text or (json.dumps(json_data) if json_data is not None else "")
-        self.headers = headers or {}
-
-    def json(self) -> Any:
-        if self._json_data is not None:
-            return self._json_data
-        return json.loads(self.text)
-
-
-class MockHTTPClient:
-    """Mock HTTP client satisfying the AsyncClient contract."""
-
-    def __init__(self, handler: Callable[..., Any]) -> None:
-        self._handler = handler
-        self.is_closed = False
-
-    async def post(self, url: str, **kwargs: Any) -> MockResponse:
-        res = self._handler(url, **kwargs)
-        if asyncio.iscoroutine(res):
-            out = await res
-            return cast(MockResponse, out)
-        return cast(MockResponse, res)
-
-    async def aclose(self) -> None:
-        self.is_closed = True
 
 
 class MockSentenceTransformer:
@@ -123,7 +84,7 @@ async def test_retriever_validation() -> None:
 @pytest.mark.asyncio
 async def test_retriever_retrieve_and_filter() -> None:
     store = VectorStore.in_memory(collection="test_retriever_search", dimensions=1536)
-    retriever = Retriever(vectorstore=store, top_k=2)
+    retriever = Retriever(vectorstore=store, top_k=2, provider="deterministic")
 
     doc_ids = await retriever.add_documents(
         documents=[
@@ -158,7 +119,7 @@ async def test_retriever_retrieve_and_filter() -> None:
 @pytest.mark.asyncio
 async def test_retriever_min_score_filter() -> None:
     store = VectorStore.in_memory(collection="test_retriever_score", dimensions=1536)
-    retriever = Retriever(vectorstore=store, top_k=5, min_score=0.999)
+    retriever = Retriever(vectorstore=store, top_k=5, min_score=0.999, provider="deterministic")
 
     await retriever.add_documents(["Different content A", "Different content B"])
     results = await retriever.retrieve("Completely unrelated query about space travel")
@@ -195,21 +156,24 @@ async def test_retriever_mismatched_lengths() -> None:
 @pytest.mark.asyncio
 async def test_retriever_duplicate_ids_overwrite() -> None:
     store = VectorStore.in_memory(collection="test_retriever_dups", dimensions=1536)
-    retriever = Retriever(vectorstore=store)
+    retriever = Retriever(vectorstore=store, provider="deterministic")
 
     await retriever.add_documents(["Initial version"], ids=["doc_dup"])
-    assert (await store.get("doc_dup")) is not None
-    assert (await store.get("doc_dup")).content == "Initial version"  # type: ignore[union-attr]
+    initial_doc = await store.get("doc_dup")
+    assert initial_doc is not None
+    assert initial_doc.content == "Initial version"
 
     await retriever.add_documents(["Updated version"], ids=["doc_dup"])
     assert await store.count() == 1
-    assert (await store.get("doc_dup")).content == "Updated version"  # type: ignore[union-attr]
+    updated_doc = await store.get("doc_dup")
+    assert updated_doc is not None
+    assert updated_doc.content == "Updated version"
 
 
 @pytest.mark.asyncio
 async def test_retriever_batch_ingestion_and_concurrency() -> None:
     store = VectorStore.in_memory(collection="test_retriever_batch", dimensions=1536)
-    retriever = Retriever(vectorstore=store)
+    retriever = Retriever(vectorstore=store, provider="deterministic")
 
     docs = [f"Technical document number {i} with specific keywords." for i in range(25)]
     ids = [f"batch_doc_{i}" for i in range(25)]
@@ -235,7 +199,7 @@ async def test_retriever_batch_ingestion_and_concurrency() -> None:
 @pytest.mark.asyncio
 async def test_retriever_empty_collection() -> None:
     store = VectorStore.in_memory(collection="test_retriever_empty", dimensions=1536)
-    retriever = Retriever(vectorstore=store)
+    retriever = Retriever(vectorstore=store, provider="deterministic")
 
     results = await retriever.retrieve("Any query in empty store")
     assert results == []
@@ -471,13 +435,12 @@ async def test_cross_encoder_non_blocking_event_loop() -> None:
 
 @pytest.mark.asyncio
 async def test_cohere_reranker_mock_http() -> None:
-    def cohere_mock(url: str, **kwargs: Any) -> MockResponse:
-        assert url.endswith("/v2/rerank")
-        headers = kwargs.get("headers", {})
-        assert headers.get("Authorization") == "Bearer test_cohere_key"
-        return MockResponse(
+    def cohere_mock(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/v2/rerank")
+        assert request.headers.get("Authorization") == "Bearer test_cohere_key"
+        return httpx.Response(
             status_code=200,
-            json_data={
+            json={
                 "id": "cohere_123",
                 "results": [
                     {"index": 1, "relevance_score": 0.97},
@@ -486,7 +449,7 @@ async def test_cohere_reranker_mock_http() -> None:
             },
         )
 
-    mock_client: Any = MockHTTPClient(cohere_mock)
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(cohere_mock))
     http_pool = AIHttpPool(client=mock_client)
 
     reranker = CohereReranker(
@@ -530,8 +493,10 @@ async def test_cohere_reranker_http_error_mappings() -> None:
     ]
 
     for status_code, expected_exc in error_codes:
-        mock_client: Any = MockHTTPClient(
-            lambda url, sc=status_code, **kw: MockResponse(status_code=sc, text=f"Error {sc}")
+        mock_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request, sc=status_code: httpx.Response(status_code=sc, text=f"Error {sc}")
+            )
         )
         pool = AIHttpPool(client=mock_client)
         reranker = CohereReranker(api_key="valid_key", http_pool=pool)
@@ -543,19 +508,37 @@ async def test_cohere_reranker_http_error_mappings() -> None:
 @pytest.mark.asyncio
 async def test_cohere_reranker_malformed_responses() -> None:
     # 1. Non-JSON response
-    pool1 = AIHttpPool(client=MockHTTPClient(lambda u, **kw: MockResponse(status_code=200, text="<html>502 Bad Gateway</html>")))
+    pool1 = AIHttpPool(
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status_code=200, text="<html>502 Bad Gateway</html>")
+            )
+        )
+    )
     reranker1 = CohereReranker(api_key="valid_key", http_pool=pool1)
     with pytest.raises(AIProviderError, match="non-JSON response"):
         await reranker1.rerank("query", ["doc1"])
 
     # 2. Missing results field
-    pool2 = AIHttpPool(client=MockHTTPClient(lambda u, **kw: MockResponse(status_code=200, json_data={"id": "123"})))
+    pool2 = AIHttpPool(
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status_code=200, json={"id": "123"})
+            )
+        )
+    )
     reranker2 = CohereReranker(api_key="valid_key", http_pool=pool2)
     with pytest.raises(AIProviderError, match="missing 'results' list"):
         await reranker2.rerank("query", ["doc1"])
 
     # 3. Empty results list
-    pool3 = AIHttpPool(client=MockHTTPClient(lambda u, **kw: MockResponse(status_code=200, json_data={"results": []})))
+    pool3 = AIHttpPool(
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status_code=200, json={"results": []})
+            )
+        )
+    )
     reranker3 = CohereReranker(api_key="valid_key", http_pool=pool3)
     assert await reranker3.rerank("query", ["doc1"]) == []
 
@@ -568,7 +551,13 @@ async def test_cohere_reranker_malformed_responses() -> None:
             {"index": -5, "relevance_score": 0.80},  # Negative invalid index
         ]
     }
-    pool4 = AIHttpPool(client=MockHTTPClient(lambda u, **kw: MockResponse(status_code=200, json_data=mock_payload)))
+    pool4 = AIHttpPool(
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status_code=200, json=mock_payload)
+            )
+        )
+    )
     reranker4 = CohereReranker(api_key="valid_key", http_pool=pool4)
     reranked = await reranker4.rerank("query", ["doc0", "doc1"])
     assert len(reranked) == 1
@@ -579,10 +568,12 @@ async def test_cohere_reranker_malformed_responses() -> None:
 @pytest.mark.asyncio
 async def test_cohere_reranker_never_leaks_api_key() -> None:
     secret_key = "cohere_secret_super_private_token_xyz123"
-    client: Any = MockHTTPClient(
-        lambda u, **kw: MockResponse(
-            status_code=401,
-            text=f"Bearer {secret_key} is invalid",
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                status_code=401,
+                text=f"Bearer {secret_key} is invalid",
+            )
         )
     )
     pool = AIHttpPool(client=client)
@@ -710,7 +701,7 @@ async def test_pipeline_builder_concurrency_isolation() -> None:
     multiple tasks does not cause cross-request leakage of query, context, or results.
     """
     store = VectorStore.in_memory(collection="test_concurrent_p", dimensions=1536)
-    retriever = Retriever(vectorstore=store, top_k=2)
+    retriever = Retriever(vectorstore=store, top_k=2, provider="deterministic")
 
     await retriever.add_documents(
         documents=[
@@ -754,7 +745,7 @@ async def test_pipeline_builder_concurrency_isolation() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_builder_generator_varieties() -> None:
     store = VectorStore.in_memory(collection="test_gen_vars", dimensions=1536)
-    retriever = Retriever(vectorstore=store)
+    retriever = Retriever(vectorstore=store, provider="deterministic")
     await retriever.add_documents(["Reference doc text"], ids=["doc1"])
 
     pipeline = rag().retriever(retriever)
@@ -812,7 +803,7 @@ async def test_pipeline_builder_prompt_injection_defense() -> None:
     - XML formatting escapes adversarial injection tags.
     """
     store = VectorStore.in_memory(collection="test_injection", dimensions=1536)
-    retriever = Retriever(vectorstore=store)
+    retriever = Retriever(vectorstore=store, provider="deterministic")
 
     malicious_content = (
         "Normal documentation paragraph.\n"
@@ -851,7 +842,7 @@ async def test_pipeline_builder_prompt_injection_defense() -> None:
 @pytest.mark.asyncio
 async def test_pipeline_builder_empty_retrieval() -> None:
     store = VectorStore.in_memory(collection="test_empty_ret", dimensions=1536)
-    retriever = Retriever(vectorstore=store, min_score=0.999)
+    retriever = Retriever(vectorstore=store, min_score=0.999, provider="deterministic")
     await retriever.add_documents(["Irrelevant content"])
 
     async def fallback_generator(prompt: str, sources: list[SearchResult] | None = None, **kwargs: Any) -> str:
@@ -884,7 +875,7 @@ async def test_50_documents_10_questions_benchmark() -> None:
     - Tests each of the 3 context formatters independently under complete execution
     """
     store = VectorStore.in_memory(collection="rag_50_docs_bench", dimensions=1536)
-    retriever = Retriever(vectorstore=store, top_k=5)
+    retriever = Retriever(vectorstore=store, top_k=5, provider="deterministic")
 
     # 50 domain documents: 10 per domain
     domain_documents: list[dict[str, Any]] = [
@@ -1311,8 +1302,6 @@ async def test_50_documents_10_questions_benchmark() -> None:
 
 
 def test_package_exports() -> None:
-    import swiftpy.ai as ai_pkg
-
     expected_exports = [
         "RAGPipelineBuilder",
         "Retriever",

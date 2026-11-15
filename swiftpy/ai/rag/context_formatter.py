@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 import html
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any
 
 from swiftpy.ai.vectorstore.base import SearchResult
+
+_CONTEXT_BOUNDARY_RE = re.compile(
+    r"-{3,}\s*(BEGIN|END)\s+UNTRUSTED\s+REFERENCE\s+CONTEXT\s*-{3,}",
+    re.IGNORECASE,
+)
+_NONCE_BOUNDARY_RE = re.compile(
+    r"<<<\s*(?:END\s+)?CONTEXT_[A-Za-z0-9_-]*>>>",
+    re.IGNORECASE,
+)
+_XML_TAG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def escape_context_boundaries(text: str) -> str:
+    """Neutralize embedded context boundary delimiters in untrusted text."""
+    escaped = _CONTEXT_BOUNDARY_RE.sub(
+        lambda m: f"[escaped: {m.group(1).upper()} UNTRUSTED REFERENCE CONTEXT]",
+        text,
+    )
+    return _NONCE_BOUNDARY_RE.sub("[escaped: CONTEXT BOUNDARY]", escaped)
 
 
 def _extract_doc_content(
@@ -130,15 +150,18 @@ class NumberedListFormatter(ContextFormatter):
         blocks: list[str] = []
         for idx, doc in enumerate(documents, start=1):
             content, doc_id, metadata, _ = _extract_doc_content(doc, idx)
+            safe_content = escape_context_boundaries(content)
             header = f"[{idx}]"
             if self.include_metadata:
-                meta_parts = [f"id: {doc_id}"]
+                meta_parts = [f"id: {escape_context_boundaries(str(doc_id))}"]
                 source = metadata.get("source") or metadata.get("title")
                 if source:
-                    meta_parts.append(f"source: {source}")
+                    meta_parts.append(
+                        f"source: {escape_context_boundaries(str(source))}"
+                    )
                 header += f" ({', '.join(meta_parts)})"
 
-            blocks.append(f"{header} {content}")
+            blocks.append(f"{header} {safe_content}")
 
         return self.separator.join(blocks)
 
@@ -160,6 +183,14 @@ class XMLBlocksFormatter(ContextFormatter):
         include_attributes: bool = True,
         escape_content: bool = True,
     ) -> None:
+        if not isinstance(root_tag, str) or not _XML_TAG_NAME_RE.match(root_tag):
+            raise ValueError(
+                f"Invalid XML root_tag {root_tag!r}; expected match for {_XML_TAG_NAME_RE.pattern}"
+            )
+        if not isinstance(document_tag, str) or not _XML_TAG_NAME_RE.match(document_tag):
+            raise ValueError(
+                f"Invalid XML document_tag {document_tag!r}; expected match for {_XML_TAG_NAME_RE.pattern}"
+            )
         self.root_tag = root_tag
         self.document_tag = document_tag
         self.include_attributes = include_attributes
@@ -185,10 +216,15 @@ class XMLBlocksFormatter(ContextFormatter):
                     attrs += f' source="{safe_source}"'
 
             lines.append(f"  <{self.document_tag}{attrs}>")
-            # Indent each line of content for clean XML structure and escape untrusted markup
-            for content_line in content.splitlines():
+            # Indent each line of content (preserving trailing newlines) and escape untrusted markup
+            safe_content = (
+                content if self.escape_content else escape_context_boundaries(content)
+            )
+            for content_line in safe_content.split("\n"):
                 formatted_line = (
-                    html.escape(content_line) if self.escape_content else content_line
+                    html.escape(escape_context_boundaries(content_line))
+                    if self.escape_content
+                    else content_line
                 )
                 lines.append(f"    {formatted_line}")
             lines.append(f"  </{self.document_tag}>")
@@ -219,6 +255,9 @@ class PlainConcatenationFormatter(ContextFormatter):
         if not documents:
             return ""
 
-        chunks = [_extract_doc_content(doc, idx)[0] for idx, doc in enumerate(documents, start=1)]
+        chunks = [
+            escape_context_boundaries(_extract_doc_content(doc, idx)[0])
+            for idx, doc in enumerate(documents, start=1)
+        ]
         joined = self.separator.join(chunks)
         return f"{self.prefix}{joined}{self.suffix}"

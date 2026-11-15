@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import base64
-import email.utils
 from typing import Any
 
 import httpx
 
 from swiftpy.mail.exceptions import MailConfigurationError, MailValidationError
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.message import MailMessage, parse_mail_address
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.transports.api.base import ApiMailTransport
 
@@ -24,8 +23,16 @@ class SendGridTransport(ApiMailTransport):
         endpoint: str = "https://api.sendgrid.com/v3/mail/send",
         client: httpx.AsyncClient | None = None,
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> None:
-        super().__init__(timeout=timeout, client=client, default_from=default_from)
+        super().__init__(
+            timeout=timeout,
+            client=client,
+            default_from=default_from,
+            max_attachment_size_bytes=max_attachment_size_bytes,
+            max_message_size_bytes=max_message_size_bytes,
+        )
         self.api_key = api_key
         self.endpoint = endpoint
 
@@ -34,6 +41,8 @@ class SendGridTransport(ApiMailTransport):
         cls,
         config: dict[str, Any],
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> SendGridTransport:
         api_key = str(config.get("api_key", ""))
         timeout = float(config.get("timeout", 30.0))
@@ -43,11 +52,17 @@ class SendGridTransport(ApiMailTransport):
             timeout=timeout,
             endpoint=endpoint,
             default_from=default_from,
+            max_attachment_size_bytes=cls._resolve_size_limit(
+                max_attachment_size_bytes, config, "max_attachment_size_bytes"
+            ),
+            max_message_size_bytes=cls._resolve_size_limit(
+                max_message_size_bytes, config, "max_message_size_bytes"
+            ),
         )
 
     def _parse_recipient(self, formatted: str) -> dict[str, str]:
-        name, addr = email.utils.parseaddr(formatted)
-        rec = {"email": addr if addr else formatted}
+        name, addr = parse_mail_address(formatted, field_name="recipient")
+        rec = {"email": addr}
         if name:
             rec["name"] = name
         return rec
@@ -64,9 +79,17 @@ class SendGridTransport(ApiMailTransport):
         from_addr, from_name = self._resolve_from(
             message.from_address, message.from_name
         )
-        from_payload: dict[str, str] = {"email": from_addr}
-        if from_name:
-            from_payload["name"] = from_name
+        parsed_from_name, clean_from_addr = parse_mail_address(
+            from_addr, field_name="from"
+        )
+        from_payload: dict[str, str] = {"email": clean_from_addr}
+        resolved_from_name = (
+            from_name.strip()
+            if from_name is not None and from_name.strip()
+            else parsed_from_name
+        )
+        if resolved_from_name:
+            from_payload["name"] = resolved_from_name
 
         personalization: dict[str, Any] = {
             "to": [self._parse_recipient(r) for r in message.to]
@@ -94,10 +117,19 @@ class SendGridTransport(ApiMailTransport):
         if message.reply_to:
             payload["reply_to"] = self._parse_recipient(message.reply_to)
 
-        if message.attachments:
+        if message.headers:
+            payload["headers"] = {str(k): str(v) for k, v in message.headers.items()}
+        if message.tags:
+            payload["categories"] = [str(tag) for tag in message.tags]
+        if message.metadata:
+            payload["custom_args"] = {
+                str(k): str(v) for k, v in message.metadata.items()
+            }
+
+        loaded_attachments = await self._read_attachments_with_limits(message)
+        if loaded_attachments:
             att_payload: list[dict[str, str]] = []
-            for att in message.attachments:
-                data = await att.read_bytes()
+            for att, data in loaded_attachments:
                 encoded = base64.b64encode(data).decode("ascii")
                 item = {
                     "content": encoded,
@@ -128,7 +160,7 @@ class SendGridTransport(ApiMailTransport):
                 success=True,
                 message_id=msg_id,
                 provider="sendgrid",
-                accepted=list(message.to),
+                accepted=message.all_recipient_addresses(),
                 rejected=[],
                 raw_response={"status_code": response.status_code},
             )

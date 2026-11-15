@@ -1,12 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Callable
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.client import AIClient, ai
@@ -233,7 +230,7 @@ def test_empty_history_sequence_is_noop(mock_config: Config) -> None:
 def test_invalid_history_type_rejected(mock_config: Config) -> None:
     client = AIClient(config=mock_config)
     with pytest.raises(TypeError, match="Expected Message or dict in history"):
-        client.history(["not a valid message"])  # type: ignore[list-item]
+        client.history(json.loads('["not a valid message"]'))
 
 
 async def test_send_without_messages_rejected(mock_config: Config) -> None:

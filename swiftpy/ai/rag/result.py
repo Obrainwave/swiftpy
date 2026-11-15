@@ -4,8 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from swiftpy.ai.pricing import (
-    _CUSTOM_PRICING,
-    _PRICING_LOCK,
     DEFAULT_MODEL_PRICING,
     calculate_token_cost,
     register_model_pricing,
@@ -15,8 +13,6 @@ from swiftpy.ai.vectorstore.base import SearchResult
 
 __all__ = [
     "DEFAULT_MODEL_PRICING",
-    "_CUSTOM_PRICING",
-    "_PRICING_LOCK",
     "RAGResult",
     "calculate_token_cost",
     "register_model_pricing",

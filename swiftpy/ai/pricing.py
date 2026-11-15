@@ -14,6 +14,8 @@ DEFAULT_MODEL_PRICING: dict[str, tuple[float, float]] = {
     "o1-mini": (3.00, 12.00),
     "o3-mini": (1.10, 4.40),
     # Anthropic models
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4": (3.00, 15.00),
     "claude-3-5-sonnet": (3.00, 15.00),
     "claude-3-5-haiku": (0.80, 4.00),
     "claude-3-opus": (15.00, 75.00),
@@ -75,14 +77,16 @@ def calculate_token_cost(
     elif norm_model in DEFAULT_MODEL_PRICING:
         rates = DEFAULT_MODEL_PRICING[norm_model]
     else:
-        # 3. Custom prefix match
-        for key, val in custom_copy.items():
+        # 3. Custom prefix match (longest prefix first)
+        for key, val in sorted(custom_copy.items(), key=lambda kv: len(kv[0]), reverse=True):
             if norm_model.startswith(key):
                 rates = val
                 break
         if rates is None:
-            # 4. Default prefix match
-            for key, val in DEFAULT_MODEL_PRICING.items():
+            # 4. Default prefix match (longest prefix first)
+            for key, val in sorted(
+                DEFAULT_MODEL_PRICING.items(), key=lambda kv: len(kv[0]), reverse=True
+            ):
                 if norm_model.startswith(key):
                     rates = val
                     break

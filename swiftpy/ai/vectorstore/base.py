@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
+import ipaddress
 import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
+from urllib.parse import quote, urlparse
 
 from swiftpy.ai.exceptions import (
     AIAuthenticationError,
@@ -18,6 +21,126 @@ from swiftpy.core.config import Config
 from swiftpy.core.container import Container, get_container
 
 ALLOWED_METRICS: frozenset[str] = frozenset({"cosine", "l2", "inner_product"})
+ALLOWED_FILTER_OPERATORS: frozenset[str] = frozenset(
+    {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$and", "$or", "$exists"}
+)
+RESERVED_META_KEYS: frozenset[str] = frozenset({"_content", "_orig_id"})
+
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_PINECONE_ENV_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_PINECONE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$")
+
+
+def validate_collection_name(name: str) -> str:
+    """Validate collection/index names to block path traversal, query injection, and host injection."""
+    if not isinstance(name, str) or not _COLLECTION_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"Invalid collection name {name!r}. "
+            "Collection names must start with an alphanumeric character and contain only [A-Za-z0-9_-] (1-128 chars)."
+        )
+    return name
+
+
+def validate_record_id(record_id: str) -> str:
+    """Validate a record identifier is a non-empty string free of null bytes or ASCII control chars."""
+    if not isinstance(record_id, str) or not record_id or not record_id.strip():
+        raise ValueError("Record id must be a non-empty string.")
+    if "\x00" in record_id or any(ord(ch) < 32 for ch in record_id):
+        raise ValueError("Record id must not contain control characters.")
+    return record_id
+
+
+def encode_path_segment(value: str) -> str:
+    """Percent-encode a path segment for safe HTTP URL interpolation."""
+    return quote(value, safe="")
+
+
+def dedupe_preserve_order(ids: Sequence[str]) -> list[str]:
+    """Deduplicate non-empty string IDs while preserving caller order."""
+    return list(dict.fromkeys(ids))
+
+
+def validate_pinecone_environment(environment: str) -> str:
+    """Validate Pinecone environment identifier against strict DNS-label characters."""
+    if not isinstance(environment, str) or not _PINECONE_ENV_RE.fullmatch(environment):
+        raise ValueError(
+            f"Invalid Pinecone environment {environment!r}. Expected alphanumeric/hyphen/underscore token."
+        )
+    return environment
+
+
+def validate_pinecone_url(url: str, *, require_pinecone_host: bool = False) -> str:
+    """Validate a Pinecone endpoint URL, rejecting credentials, fragments, queries, and SSRF targets."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Pinecone URL must be a non-empty string.")
+    trimmed = url.strip().rstrip("/")
+    if any(ch in trimmed for ch in ("#", "?", "@")) or any(ch.isspace() for ch in trimmed):
+        raise ValueError(f"Invalid Pinecone URL {url!r}: contains disallowed characters.")
+    parsed = urlparse(trimmed)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError(f"Invalid Pinecone URL scheme in {url!r}.")
+    if require_pinecone_host and parsed.scheme != "https":
+        raise ValueError(f"Pinecone data-plane host URL must use https, got {url!r}.")
+    if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError(f"Invalid Pinecone URL components in {url!r}.")
+    host = parsed.hostname
+    if not host or not _PINECONE_HOST_RE.fullmatch(host):
+        raise ValueError(f"Invalid Pinecone hostname in {url!r}.")
+    # Block link-local / raw metadata IPs
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if ip_obj.is_link_local:
+            raise ValueError(f"Disallowed link-local Pinecone IP host in {url!r}.")
+    except ValueError as ip_err:
+        if "link-local" in str(ip_err):
+            raise
+    if require_pinecone_host and not host.endswith(".pinecone.io"):
+        raise ValueError(f"Untrusted Pinecone host {host!r}: expected *.pinecone.io suffix.")
+    return trimmed
+
+
+def validate_filter_operators(
+    flt: dict[str, Any],
+    *,
+    allowed_ops: frozenset[str] = ALLOWED_FILTER_OPERATORS,
+    nested_allowed: bool = False,
+) -> None:
+    """Validate metadata filter dictionary keys and dollar-prefixed query operators."""
+    if not isinstance(flt, dict):
+        raise TypeError(f"Filter must be a dict, got {type(flt).__name__}.")
+    for raw_key, value in flt.items():
+        if not isinstance(raw_key, str) or not raw_key or "\x00" in raw_key:
+            raise ValueError(f"Invalid filter key {raw_key!r}.")
+        if raw_key.startswith("$"):
+            if raw_key not in allowed_ops:
+                raise ValueError(f"Unsupported filter operator {raw_key!r}.")
+            if raw_key in ("$and", "$or"):
+                if not isinstance(value, Sequence) or isinstance(value, (str, bytes, dict)):
+                    raise ValueError(f"Operator {raw_key!r} expects a sequence of filter clauses.")
+                for clause in value:
+                    validate_filter_operators(clause, allowed_ops=allowed_ops, nested_allowed=nested_allowed)
+            elif raw_key in ("$in", "$nin"):
+                if not isinstance(value, Sequence) or isinstance(value, (str, bytes, dict)):
+                    raise ValueError(f"Operator {raw_key!r} expects a sequence of scalar values.")
+            elif raw_key == "$exists" and not isinstance(value, bool):
+                raise ValueError("Operator '$exists' expects a boolean.")
+            continue
+
+        if isinstance(value, dict):
+            if any(isinstance(k, str) and k.startswith("$") for k in value):
+                for op_key, op_val in value.items():
+                    if not isinstance(op_key, str) or not op_key.startswith("$") or op_key not in allowed_ops:
+                        raise ValueError(f"Unsupported filter operator {op_key!r} on field {raw_key!r}.")
+                    if op_key in ("$in", "$nin") and (
+                        not isinstance(op_val, Sequence) or isinstance(op_val, (str, bytes, dict))
+                    ):
+                        raise ValueError(f"Operator {op_key!r} expects a sequence of values.")
+            elif not nested_allowed:
+                raise ValueError(
+                    f"Nested dictionary filter on key {raw_key!r} is not supported by this adapter."
+                )
+            else:
+                validate_filter_operators(value, allowed_ops=allowed_ops, nested_allowed=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +190,8 @@ def validate_vector(
     vector: Sequence[float],
     dimensions: int | None = None,
     metric: str = "cosine",
+    *,
+    zero_norm_message: str | None = None,
 ) -> list[float]:
     """
     Validate that vector is a non-empty sequence of finite floats matching dimensions.
@@ -93,7 +218,9 @@ def validate_vector(
         norm_sq += fx * fx
 
     if metric == "cosine" and norm_sq <= 1e-12:
-        raise ValueError("Cannot calculate cosine similarity for a zero-magnitude vector.")
+        raise ValueError(
+            zero_norm_message or "Cannot calculate cosine similarity for a zero-magnitude vector."
+        )
 
     return parsed
 
@@ -107,25 +234,25 @@ def normalize_record(
     if isinstance(record, VectorRecord):
         rec_id = record.id
         rec_vec = record.vector
-        rec_meta = record.metadata
+        rec_meta = copy.deepcopy(dict(record.metadata)) if record.metadata else {}
         rec_content = record.content
     elif isinstance(record, dict):
         if "id" not in record or "vector" not in record:
             raise ValueError("Record dict must contain 'id' and 'vector' keys.")
         rec_id = str(record["id"])
         rec_vec = record["vector"]
-        rec_meta = dict(record.get("metadata") or {})
+        raw_meta = record.get("metadata")
+        rec_meta = copy.deepcopy(dict(raw_meta)) if raw_meta else {}
         rec_content = str(record.get("content", ""))
     elif isinstance(record, (list, tuple)) and len(record) >= 2:
         rec_id = str(record[0])
         rec_vec = record[1]
-        rec_meta = dict(record[2]) if len(record) > 2 and record[2] is not None else {}
+        rec_meta = copy.deepcopy(dict(record[2])) if len(record) > 2 and record[2] is not None else {}
         rec_content = str(record[3]) if len(record) > 3 and record[3] is not None else ""
     else:
         raise TypeError(f"Unsupported record format: {type(record).__name__}")
 
-    if not isinstance(rec_id, str) or not rec_id.strip():
-        raise ValueError("Record id must be a non-empty string.")
+    rec_id = validate_record_id(rec_id)
 
     parsed_vec = validate_vector(rec_vec, dimensions, metric)
     return VectorRecord(
@@ -239,7 +366,13 @@ class VectorStore(ABC):
                 f"Available adapters: {sorted(_ADAPTER_REGISTRY.keys())}"
             )
 
-        if container.has(adapter_cls):
+        has_explicit_override = (
+            collection != "default"
+            or dimensions != 1536
+            or metric != "cosine"
+            or bool(kwargs)
+        )
+        if container.has(adapter_cls) and not has_explicit_override:
             instance = container.resolve(adapter_cls)
             if isinstance(instance, VectorStore):
                 return instance

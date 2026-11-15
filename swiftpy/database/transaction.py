@@ -39,6 +39,7 @@ class TransactionConnection:
         self.closed: bool = False
         self._tx_depth: int = 0
         self._commit_callbacks: list[list[Callable[[], Any]]] = []
+        self._pending_callbacks: list[Callable[[], Any]] = []
 
     def on_commit(self, callback: Callable[[], Any]) -> None:
         """Register a callback to be executed after the outermost transaction successfully commits."""
@@ -47,7 +48,14 @@ class TransactionConnection:
             self._commit_callbacks.append([])
         self._commit_callbacks[-1].append(callback)
 
-    async def _run_commit_callbacks(self, callbacks: list[Callable[[], Any]]) -> None:
+    def drain_commit_callbacks(self) -> list[Callable[[], Any]]:
+        """Pop queued callbacks belonging to an already-committed outermost transaction."""
+        callbacks = list(self._pending_callbacks)
+        self._pending_callbacks.clear()
+        return callbacks
+
+    @staticmethod
+    async def run_commit_callbacks(callbacks: list[Callable[[], Any]]) -> None:
         for cb in callbacks:
             try:
                 res = cb()
@@ -55,6 +63,9 @@ class TransactionConnection:
                     await res
             except Exception:
                 logger.exception("Error executing on_commit callback %r", cb)
+
+    async def _run_commit_callbacks(self, callbacks: list[Callable[[], Any]]) -> None:
+        await self.run_commit_callbacks(callbacks)
 
     def _ensure_open(self) -> asyncpg.Connection:
         if self.closed or self._conn is None:
@@ -66,6 +77,16 @@ class TransactionConnection:
     def _close(self) -> None:
         self.closed = True
         self._conn = None
+
+    def close(self) -> None:
+        """Mark this transaction handle closed and release its underlying reference."""
+        self._close()
+
+    async def rollback_transaction(self, tx: Any) -> None:
+        """Acquire the serialized handle lock and roll back the given transaction."""
+        async with self._lock:
+            if self._conn is not None:
+                await tx.rollback()
 
     async def fetch(
         self, query: str, *args: Any, timeout: float | None = None
@@ -115,7 +136,7 @@ class TransactionConnection:
 
     @asynccontextmanager
     async def transaction(
-        self, **kwargs: Any
+        self, *, defer_callbacks: bool = False, **kwargs: Any
     ) -> AsyncGenerator[TransactionConnection, None]:
         self._ensure_open()
         async with self._lock:
@@ -144,13 +165,15 @@ class TransactionConnection:
                 if self._tx_depth > 0:
                     if self._commit_callbacks:
                         self._commit_callbacks[-1].extend(level_callbacks)
+                elif defer_callbacks:
+                    self._pending_callbacks.extend(level_callbacks)
                 else:
                     callbacks_to_run = level_callbacks
                 conn = self._ensure_open()
                 await tx.commit()
 
             if callbacks_to_run:
-                await self._run_commit_callbacks(callbacks_to_run)
+                await self.run_commit_callbacks(callbacks_to_run)
 
     def __getattr__(self, name: str) -> Any:
         conn = self._ensure_open()
@@ -224,16 +247,21 @@ class Database:
 
         pool = db_pool.get_pool()
 
+        committed_callbacks: list[Callable[[], Any]] = []
         async with pool.acquire() as conn:
             handle = TransactionConnection(conn)
             token = _active_connection.set(handle)
 
             try:
-                async with handle.transaction():
+                async with handle.transaction(defer_callbacks=True):
                     yield handle
+                committed_callbacks = handle.drain_commit_callbacks()
             finally:
-                handle._close()
+                handle.close()
                 _active_connection.reset(token)
+
+        if committed_callbacks:
+            await TransactionConnection.run_commit_callbacks(committed_callbacks)
 
 
 db = Database()

@@ -104,11 +104,18 @@ class FilesystemManager:
             root = str(disk_config.get("root", "storage/app/private"))
             url_prefix = str(disk_config.get("url", "/storage"))
             visibility = str(disk_config.get("visibility", "private"))
-            signing_key = str(
-                self.config.get(
-                    "filesystems.signing_key",
-                    self.config.get("app.key", "swiftpy-storage-secret"),
-                )
+            raw_signing_key = self.config.get("filesystems.signing_key")
+            if raw_signing_key is None or (
+                isinstance(raw_signing_key, str)
+                and (not raw_signing_key.strip() or raw_signing_key.strip().lower() == "none")
+            ):
+                raw_signing_key = self.config.get("app.key")
+            signing_key = (
+                str(raw_signing_key)
+                if isinstance(raw_signing_key, str)
+                and raw_signing_key.strip()
+                and raw_signing_key.strip().lower() != "none"
+                else None
             )
             permissions = disk_config.get("permissions")
             return LocalStorageDriver(

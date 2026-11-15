@@ -4,6 +4,8 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 import redis.asyncio as aioredis
@@ -24,7 +26,12 @@ class SimpleTestJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             await client.set(self.key, self.message)
         finally:
@@ -42,7 +49,12 @@ class StressCounterJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             pipe = client.pipeline()
             pipe.rpush(f"{self.key}:list", str(self.index))
@@ -77,7 +89,12 @@ class FlakyJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             curr = await client.incr(f"{self.key}:attempts")
             if curr <= self.fail_times:
@@ -105,7 +122,12 @@ class FailingJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             await client.incr(f"{self.key}:attempts")
         finally:
@@ -115,7 +137,12 @@ class FailingJob(Job):
     async def failed(self, exception: BaseException) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             await client.set(
                 f"{self.key}:failed_hook",
@@ -176,7 +203,12 @@ class TimestampedFlakyJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             curr = await client.incr(f"{self.key}:attempts")
             await client.rpush(f"{self.key}:timestamps", str(time.monotonic()))
@@ -197,7 +229,12 @@ class ZeroBackoffJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             curr = await client.incr(f"{self.key}:attempts")
             if curr < 2:
@@ -217,13 +254,54 @@ class CancellableJob(Job):
     async def handle(self) -> None:
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+            decode_responses=True,
+        )
         try:
             await client.set(f"{self.key}:started", "1")
             await asyncio.sleep(10.0)
             await client.set(f"{self.key}:completed", "1")
         finally:
             await client.aclose()
+
+
+@pytest.fixture(autouse=True)
+def allow_test_queue_jobs() -> Generator[None, None, None]:
+    prev_trusted = Job._trusted_classes.copy()
+    for job_cls in (
+        SimpleTestJob,
+        StressCounterJob,
+        FlakyJob,
+        FailingJob,
+        TimeoutJob,
+        FailingHookJob,
+        TimestampedFlakyJob,
+        ZeroBackoffJob,
+        CancellableJob,
+    ):
+        Job.allow_job_class(job_cls)
+    try:
+        yield
+    finally:
+        Job._trusted_classes = prev_trusted
+
+
+def _write_worker_boot_module(tmp_path: Path) -> Path:
+    boot_file = tmp_path / "worker_boot.py"
+    boot_file.write_text(
+        "from swiftpy.core.application import Application\n"
+        "from swiftpy.queue.job import Job\n"
+        "from tests.queue.test_queue import SimpleTestJob, StressCounterJob\n"
+        "\n"
+        "Job.allow_job_class(SimpleTestJob)\n"
+        "Job.allow_job_class(StressCounterJob)\n"
+        "app = Application(auto_discover_providers=False)\n",
+        encoding="utf-8",
+    )
+    return boot_file
 
 
 @pytest.fixture
@@ -265,28 +343,42 @@ def test_job_serialization_and_deserialization() -> None:
 def test_job_deserialization_errors() -> None:
     """Test deserialization error handling on malformed or non-job envelopes."""
     with pytest.raises(JobSerializationError, match="Failed to parse JSON"):
-        Job.deserialize("invalid-json{")
+        Job.deserialize("invalid-json{", allow_unsigned=True)
 
     with pytest.raises(JobSerializationError, match="Invalid job envelope"):
-        Job.deserialize(["not-a-dict"])  # type: ignore[arg-type]
+        Job.deserialize(json.loads('["not-a-dict"]'), allow_unsigned=True)
 
     with pytest.raises(JobSerializationError, match="missing valid 'job_class'"):
-        Job.deserialize({"job_id": "123"})
+        Job.deserialize({"job_id": "123"}, allow_unsigned=True)
 
     with pytest.raises(JobSerializationError, match="Invalid job class identifier"):
-        Job.deserialize({"job_class": "NoDelimiters"})
+        Job.deserialize({"job_class": "NoDelimiters"}, allow_unsigned=True)
 
     with pytest.raises(JobSerializationError, match="not in trusted namespaces"):
-        Job.deserialize({"job_class": "non_existent_module:SomeJob"})
+        Job.deserialize({"job_class": "non_existent_module:SomeJob"}, allow_unsigned=True)
 
-    with pytest.raises(JobSerializationError, match="Could not import module"):
-        Job.deserialize({"job_class": "tests.non_existent_module:SomeJob"})
+    prev_ns = Job._trusted_namespaces
+    try:
+        Job.set_trusted_namespaces(["app", "tests"])
+        with pytest.raises(JobSerializationError, match="Could not import module"):
+            Job.deserialize(
+                {"job_class": "tests.non_existent_module:SomeJob"},
+                allow_unsigned=True,
+            )
 
-    with pytest.raises(JobSerializationError, match="not found in module"):
-        Job.deserialize({"job_class": "test_queue:NonExistentJob"})
+        with pytest.raises(JobSerializationError, match="not found in module"):
+            Job.deserialize(
+                {"job_class": f"{__name__}:NonExistentJob"},
+                allow_unsigned=True,
+            )
 
-    with pytest.raises(JobSerializationError, match="not a subclass of Job"):
-        Job.deserialize({"job_class": "test_queue:test_job_deserialization_errors"})
+        with pytest.raises(JobSerializationError, match="not a subclass of Job"):
+            Job.deserialize(
+                {"job_class": f"{__name__}:test_job_deserialization_errors"},
+                allow_unsigned=True,
+            )
+    finally:
+        Job.set_trusted_namespaces(prev_ns)
 
 
 def test_backoff_delay_calculation() -> None:
@@ -369,7 +461,12 @@ async def test_worker_handles_job_successfully(
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "emails"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     result_key = f"result_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -406,7 +503,12 @@ async def test_worker_retry_with_backoff(redis_host: str, redis_port: int) -> No
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "retry_queue"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     key = f"flaky_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -449,7 +551,12 @@ async def test_worker_dead_letter_queue_on_exhaustion(
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "dead_letter_queue"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     key = f"failing_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -538,7 +645,12 @@ async def test_delayed_job_automatic_promotion(
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "scheduled_queue"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     key = f"delayed_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -597,7 +709,9 @@ async def test_worker_timeout_handling(redis_host: str, redis_port: int) -> None
         await dispatcher.close()
 
 
-async def test_concurrent_workers_500_jobs(redis_host: str, redis_port: int) -> None:
+async def test_concurrent_workers_500_jobs(
+    redis_host: str, redis_port: int, tmp_path: Path
+) -> None:
     """
     Stress & Concurrency Guarantee:
     Dispatch 500 jobs, run 3 worker processes concurrently, verify every job
@@ -608,7 +722,12 @@ async def test_concurrent_workers_500_jobs(redis_host: str, redis_port: int) -> 
     counter_key = f"counter_{uuid.uuid4().hex[:8]}"
 
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     worker_procs: list[asyncio.subprocess.Process] = []
 
     try:
@@ -628,11 +747,14 @@ async def test_concurrent_workers_500_jobs(redis_host: str, redis_port: int) -> 
         assert active_size == total_jobs
 
         # 2. Spawn 3 concurrent worker processes via CLI swiftpy queue:work
+        _write_worker_boot_module(tmp_path)
         env = os.environ.copy()
         test_dir = os.path.dirname(os.path.abspath(__file__))
         current_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (
-            f"{test_dir}:{current_pythonpath}" if current_pythonpath else test_dir
+            f"{tmp_path}:{test_dir}:{current_pythonpath}"
+            if current_pythonpath
+            else f"{tmp_path}:{test_dir}"
         )
         env["QUEUE_PREFIX"] = prefix
         env["REDIS_HOST"] = redis_host
@@ -643,6 +765,8 @@ async def test_concurrent_workers_500_jobs(redis_host: str, redis_port: int) -> 
             "-m",
             "swiftpy.console.cli",
             "queue:work",
+            "--app",
+            "worker_boot:app",
             "--queue",
             queue_name,
             "--prefix",
@@ -738,15 +862,17 @@ def test_deserialization_trusted_namespaces() -> None:
 
         # Untrusted module rejected BEFORE importlib.import_module
         with pytest.raises(JobSerializationError, match="not in trusted namespaces"):
-            Job.deserialize({"job_class": "os:system"})
+            Job.deserialize({"job_class": "os:system"}, allow_unsigned=True)
 
         with pytest.raises(JobSerializationError, match="not in trusted namespaces"):
-            Job.deserialize({"job_class": "subprocess:Popen"})
+            Job.deserialize({"job_class": "subprocess:Popen"}, allow_unsigned=True)
     finally:
         Job.set_trusted_namespaces(None)
 
 
-async def test_multi_worker_delayed_promotion(redis_host: str, redis_port: int) -> None:
+async def test_multi_worker_delayed_promotion(
+    redis_host: str, redis_port: int, tmp_path: Path
+) -> None:
     """
     Test: 60 delayed jobs scheduled (with identical and staggered timestamps).
     3 concurrent worker processes compete to promote and process them.
@@ -757,7 +883,12 @@ async def test_multi_worker_delayed_promotion(redis_host: str, redis_port: int) 
     counter_key = f"counter_delayed_{uuid.uuid4().hex[:8]}"
 
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     worker_procs: list[asyncio.subprocess.Process] = []
 
     try:
@@ -779,11 +910,14 @@ async def test_multi_worker_delayed_promotion(redis_host: str, redis_port: int) 
         assert await dispatcher.size(queue_name) == 0
 
         # Start 3 worker processes
+        _write_worker_boot_module(tmp_path)
         env = os.environ.copy()
         test_dir = os.path.dirname(os.path.abspath(__file__))
         current_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (
-            f"{test_dir}:{current_pythonpath}" if current_pythonpath else test_dir
+            f"{tmp_path}:{test_dir}:{current_pythonpath}"
+            if current_pythonpath
+            else f"{tmp_path}:{test_dir}"
         )
         env["QUEUE_PREFIX"] = prefix
         env["REDIS_HOST"] = redis_host
@@ -794,6 +928,8 @@ async def test_multi_worker_delayed_promotion(redis_host: str, redis_port: int) 
             "-m",
             "swiftpy.console.cli",
             "queue:work",
+            "--app",
+            "worker_boot:app",
             "--queue",
             queue_name,
             "--prefix",
@@ -858,7 +994,12 @@ async def test_worker_list_backoff_schedule(redis_host: str, redis_port: int) ->
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "list_backoff_queue"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     key = f"timestamps_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -899,7 +1040,12 @@ async def test_worker_immediate_retry_zero_delay(
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "zero_backoff_queue"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     key = f"zero_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -966,7 +1112,12 @@ async def test_worker_in_flight_cancellation_requeues_job(
     dispatcher = QueueDispatcher(host=redis_host, port=redis_port, prefix=prefix)
     queue_name = "cancellable_queue"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     key = f"cancel_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -1024,7 +1175,9 @@ async def test_worker_in_flight_cancellation_requeues_job(
         await dispatcher.close()
 
 
-async def test_worker_cli_max_jobs(redis_host: str, redis_port: int) -> None:
+async def test_worker_cli_max_jobs(
+    redis_host: str, redis_port: int, tmp_path: Path
+) -> None:
     """Test that --max-jobs stops the worker after processing the specified job count."""
     prefix = f"test_max_jobs_{uuid.uuid4().hex[:8]}:"
     queue_name = "max_jobs_queue"
@@ -1042,11 +1195,14 @@ async def test_worker_cli_max_jobs(redis_host: str, redis_port: int) -> None:
         assert await dispatcher.size(queue_name) == 10
 
         # Run worker with --max-jobs 4
+        _write_worker_boot_module(tmp_path)
         env = os.environ.copy()
         test_dir = os.path.dirname(os.path.abspath(__file__))
         current_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (
-            f"{test_dir}:{current_pythonpath}" if current_pythonpath else test_dir
+            f"{tmp_path}:{test_dir}:{current_pythonpath}"
+            if current_pythonpath
+            else f"{tmp_path}:{test_dir}"
         )
         env["QUEUE_PREFIX"] = prefix
         env["REDIS_HOST"] = redis_host
@@ -1057,6 +1213,8 @@ async def test_worker_cli_max_jobs(redis_host: str, redis_port: int) -> None:
             "-m",
             "swiftpy.console.cli",
             "queue:work",
+            "--app",
+            "worker_boot:app",
             "--queue",
             queue_name,
             "--prefix",

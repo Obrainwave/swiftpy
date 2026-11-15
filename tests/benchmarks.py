@@ -8,7 +8,9 @@ from swiftpy.ai.rag.retriever import Retriever
 from swiftpy.ai.vectorstore.base import VectorStore
 from swiftpy.auth.jwt_guard import require_jwt
 from swiftpy.auth.jwt_issuer import JWTIssuer
+from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
+from swiftpy.core.exceptions import HttpException
 from swiftpy.database.query_builder import Query
 from swiftpy.http.response import StreamingResponse
 
@@ -133,9 +135,43 @@ async def benchmark_rag(request: Request) -> Response:
     )
 
 
+def _benchmarks_enabled(config: Config | None, *, debug: bool | None) -> bool:
+    """Return True only in explicit non-production debug mode with benchmarks opted in."""
+    if debug is not True or config is None:
+        return False
+    app_env = str(
+        config.get("app.env") or config.get("env") or "production"
+    ).strip().lower()
+    if app_env in ("production", "prod"):
+        return False
+    flag = config.get("app.enable_benchmarks", False)
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, str):
+        return flag.strip().lower() in ("true", "1", "yes", "on")
+    return bool(flag)
+
+
 async def benchmark_token(request: Request) -> Response:
     """Helper Endpoint: issue a valid JWT token for benchmark test clients."""
     container = get_container()
+    app = container.resolve(Application) if container.has(Application) else None
+    config = (
+        app.config
+        if app is not None
+        else (container.resolve(Config) if container.has(Config) else None)
+    )
+    debug = (
+        app.debug
+        if app is not None
+        else bool(config.get("app.debug", False) if config is not None else False)
+    )
+    if not _benchmarks_enabled(config, debug=debug):
+        raise HttpException(
+            status_code=403,
+            message="Benchmark endpoints are disabled",
+        )
+
     issuer = container.resolve(JWTIssuer)
     token = issuer.issue_token(
         subject="benchmark_client_1",
@@ -146,7 +182,10 @@ async def benchmark_token(request: Request) -> Response:
 
 
 def register_benchmark_routes(app: Application) -> None:
-    """Mount all benchmark endpoints on the application."""
+    """Mount all benchmark endpoints on the application when explicitly enabled in debug mode."""
+    if not _benchmarks_enabled(app.config, debug=app.debug):
+        return
+
     app.get("/benchmarks/json")(benchmark_json)
     app.get("/benchmarks/auth")(benchmark_auth)
     app.get("/benchmarks/db")(benchmark_db)

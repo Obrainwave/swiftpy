@@ -4,11 +4,7 @@ import asyncio
 import json
 from collections.abc import Callable
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.exceptions import (
@@ -591,7 +587,6 @@ async def test_shared_http_pool_used_across_both_providers(
     assert "anthropic.com" in requested_urls[1]
 
 
-@pytest.mark.skipif(httpx is None, reason="httpx is required")
 async def test_closing_pool_closes_client() -> None:
     pool = AIHttpPool()
     client = pool.get_client()
@@ -601,7 +596,6 @@ async def test_closing_pool_closes_client() -> None:
     assert client.is_closed
 
 
-@pytest.mark.skipif(httpx is None, reason="httpx is required")
 async def test_closed_pool_reinitializes_fresh_client() -> None:
     pool = AIHttpPool()
     client1 = pool.get_client()
@@ -615,7 +609,6 @@ async def test_closed_pool_reinitializes_fresh_client() -> None:
     await pool.aclose()
 
 
-@pytest.mark.skipif(httpx is None, reason="httpx is required")
 async def test_pool_connection_limits_and_timeout_applied() -> None:
     config = Config(
         {

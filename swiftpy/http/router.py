@@ -158,6 +158,7 @@ class Route:
     param_specs: tuple[ParamSpec, ...] = field(default=(), init=False, repr=False)
     has_var_keyword: bool = field(default=False, init=False, repr=False)
     compiled_handler: RouteHandler | None = field(default=None, init=False, repr=False)
+    analysis_deferred: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.method = self.method.upper()
@@ -248,6 +249,43 @@ class Route:
         self.param_coercers = coercers
 
 
+def _normalize_route_prefix(prefix: str) -> str:
+    """Validate and normalize a router/group prefix (empty string for root `'/'`)."""
+    clean_prefix = prefix.strip()
+    if not clean_prefix or clean_prefix == "/":
+        return ""
+    if any(ch.isspace() for ch in clean_prefix):
+        raise RouteRegistrationError(
+            f"Router prefix must not contain whitespace: {prefix!r}"
+        )
+    if any(token in clean_prefix for token in ("{", "}")):
+        raise RouteRegistrationError(
+            f"Router prefix must be a literal path, not a dynamic pattern: {prefix!r}"
+        )
+    if "//" in clean_prefix:
+        raise RouteRegistrationError(
+            f"Router prefix must not contain empty path segments: {prefix!r}"
+        )
+    stripped = clean_prefix.strip("/")
+    return f"/{stripped}" if stripped else ""
+
+
+def _join_route_path(prefix: str, child_path: str) -> str:
+    """Join a normalized prefix with a child route path while preserving trailing slashes."""
+    clean_prefix = prefix.strip("/")
+    base = f"/{clean_prefix}" if clean_prefix else ""
+
+    if child_path in ("", "/"):
+        return base or "/"
+
+    stripped_child = child_path.strip("/")
+    if not stripped_child:
+        return base or "/"
+
+    suffix = f"{stripped_child}/" if child_path.endswith("/") else stripped_child
+    return f"{base}/{suffix}"
+
+
 class RouteGroup:
     def __init__(
         self,
@@ -255,7 +293,9 @@ class RouteGroup:
         router: Router,
         middleware: list[type[Any]] | None = None,
     ) -> None:
-        self.prefix = "/" + prefix.strip("/")
+        normalized = _normalize_route_prefix(prefix)
+        self.prefix = normalized or "/"
+        self._normalized_prefix = normalized
         self.router = router
         self.middleware = middleware or []
 
@@ -271,8 +311,7 @@ class RouteGroup:
         max_json_depth: int | None = None,
         localns: dict[str, Any] | None = None,
     ) -> None:
-        clean_path = "/" + path.strip("/") if path != "/" else ""
-        full_path = self.prefix + clean_path
+        full_path = _join_route_path(self._normalized_prefix, path)
         self.router.add_route(
             method=method,
             path=full_path,
@@ -453,9 +492,6 @@ class RouteGroup:
         return decorator
 
 
-_FALLBACK_CONTAINER = Container()
-
-
 class Router:
     """
     HTTP and WebSocket router with static-first precedence, precomputed handler
@@ -476,11 +512,22 @@ class Router:
         self._registered_keys: set[tuple[str, str]] = set()
         self._counter = 0
 
-    def _can_resolve_di(self, annotation: Any) -> bool:
-        target_container = self.container or _FALLBACK_CONTAINER
+    def _can_resolve_di(
+        self,
+        annotation: Any,
+        container: Container | None = None,
+    ) -> bool:
+        target_container = container if container is not None else self.container
+        if target_container is None:
+            return False
         return target_container.can_resolve(annotation)
 
-    def _analyze_handler(self, route: Route) -> tuple[ParamSpec, ...]:
+    def _analyze_handler(
+        self,
+        route: Route,
+        *,
+        container: Container | None = None,
+    ) -> tuple[ParamSpec, ...]:
         specs: list[ParamSpec] = []
         ws_assigned = False
 
@@ -510,7 +557,7 @@ class Router:
                     )
                 elif name in route.param_names:
                     specs.append(ParamSpec(name=name, kind="path", annotation=ann))
-                elif self._can_resolve_di(ann):
+                elif self._can_resolve_di(ann, container=container):
                     specs.append(ParamSpec(name=name, kind="di", annotation=ann))
                 elif param.default is not inspect.Parameter.empty:
                     specs.append(
@@ -543,7 +590,7 @@ class Router:
                 specs.append(ParamSpec(name=name, kind="path", annotation=ann))
             elif isinstance(ann, type) and issubclass(ann, FormRequest):
                 specs.append(ParamSpec(name=name, kind="form", annotation=ann))
-            elif self._can_resolve_di(ann):
+            elif self._can_resolve_di(ann, container=container):
                 specs.append(ParamSpec(name=name, kind="di", annotation=ann))
             elif param.default is not inspect.Parameter.empty:
                 specs.append(
@@ -563,6 +610,19 @@ class Router:
                 )
 
         return tuple(specs)
+
+    def ensure_route_analyzed(
+        self,
+        route: Route,
+        *,
+        container: Container | None = None,
+    ) -> tuple[ParamSpec, ...]:
+        """Resolve deferred handler parameter specs once a DI container is available."""
+        if route.analysis_deferred:
+            target = container or self.container or Container()
+            route.param_specs = self._analyze_handler(route, container=target)
+            route.analysis_deferred = False
+        return route.param_specs
 
     def add_compiled_route(self, route: Route) -> Route:
         """Register an already-compiled Route object into all routing indexes."""
@@ -643,7 +703,12 @@ class Router:
                 f"Duplicate route registered for {route.method} {path}"
             )
 
-        route.param_specs = self._analyze_handler(route)
+        if self.container is None:
+            # Standalone routers may declare app-bound DI dependencies before
+            # mounting onto an Application; defer strict DI checks until include_router().
+            route.analysis_deferred = True
+        else:
+            route.param_specs = self._analyze_handler(route)
         self._counter += 1
         return self.add_compiled_route(route)
 
@@ -885,13 +950,16 @@ class Router:
 
         # 3. Check if any HTTP methods match this path (for automatic OPTIONS or 405)
         matched_methods: set[str] = set()
+        matched_routes: list[Route] = []
         for meth, static_map in self._static_routes.items():
             if meth != "WEBSOCKET" and path in static_map:
                 matched_methods.add(meth)
+                matched_routes.append(static_map[path])
 
         for route in self._http_routes:
             if route.param_names and route.pattern.match(path) is not None:
                 matched_methods.add(route.method)
+                matched_routes.append(route)
 
         if matched_methods:
             if "GET" in matched_methods:
@@ -900,10 +968,13 @@ class Router:
             if norm_method == "OPTIONS":
                 options_methods = sorted(matched_methods | {"OPTIONS"})
                 allow_header = ", ".join(options_methods)
+                inherited_middleware = list(
+                    dict.fromkeys(
+                        mw for matched_route in matched_routes for mw in matched_route.middleware
+                    )
+                )
 
-                async def _options_handler(
-                    request: Request, *_args: Any, **_kwargs: Any
-                ) -> Response:
+                async def _options_handler(request: Request) -> Response:
                     return Response(
                         b"",
                         status_code=204,
@@ -912,11 +983,13 @@ class Router:
 
                 synthetic_route = Route(
                     method="OPTIONS",
-                    path=path,
+                    path="/",
                     handler=_options_handler,
-                    middleware=[],
+                    middleware=inherited_middleware,
                 )
-                synthetic_route.compiled_handler = _options_handler
+                synthetic_route.param_specs = self._analyze_handler(
+                    synthetic_route, container=self.container
+                )
                 return synthetic_route, {}
 
             unique_methods = sorted(matched_methods)
@@ -955,36 +1028,12 @@ class Router:
         """
         Include routes from another router instance under an optional path prefix and middleware.
         """
-        clean_prefix = prefix.strip()
-        if clean_prefix:
-            if any(ch.isspace() for ch in clean_prefix):
-                raise RouteRegistrationError(
-                    f"Router prefix must not contain whitespace: {prefix!r}"
-                )
-            if any(token in clean_prefix for token in ("{", "}")):
-                raise RouteRegistrationError(
-                    f"Router prefix must be a literal path, not a dynamic pattern: {prefix!r}"
-                )
-            if clean_prefix.startswith("//") or clean_prefix.endswith("//"):
-                raise RouteRegistrationError(
-                    f"Router prefix must not contain empty path segments: {prefix!r}"
-                )
-            clean_prefix = "/" + clean_prefix.strip("/") if clean_prefix.strip("/") else "/"
-        else:
-            clean_prefix = ""
+        clean_prefix = _normalize_route_prefix(prefix)
 
         parent_mw = list(middleware or [])
 
         for child_route in router.routes:
-            if clean_prefix:
-                if child_route.path == "/":
-                    full_path = clean_prefix
-                elif child_route.path.endswith("/"):
-                    full_path = f"{clean_prefix}/{child_route.path.strip('/')}/"
-                else:
-                    full_path = f"{clean_prefix}/{child_route.path.strip('/')}"
-            else:
-                full_path = child_route.path
+            full_path = _join_route_path(clean_prefix, child_route.path)
 
             combined_middleware = parent_mw + list(child_route.middleware)
 

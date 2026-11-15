@@ -3,14 +3,65 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Self
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 from swiftpy.http.response import ResponseHeaders
 from swiftpy.websockets.connection import WebSocketDisconnect
 
 logger = logging.getLogger("swiftpy.testing")
+
+
+def _merge_headers_case_insensitive(
+    base: Mapping[str, str],
+    updates: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Merge HTTP headers case-insensitively while preserving the latest key casing."""
+    merged: dict[str, str] = {}
+    key_by_lower: dict[str, str] = {}
+    for source in (base, updates or {}):
+        for key, value in source.items():
+            lowered = key.lower()
+            prev_key = key_by_lower.get(lowered)
+            if prev_key is not None and prev_key != key:
+                del merged[prev_key]
+            key_by_lower[lowered] = key
+            merged[key] = value
+    return merged
+
+
+def _build_path_and_query(
+    path: str,
+    query: Mapping[str, Any] | None = None,
+) -> tuple[str, bytes, bytes]:
+    """Parse URL path and inline query parameters, merging any explicit query mapping."""
+    if path.startswith(("http://", "https://", "ws://", "wss://")):
+        parts = urlsplit(path)
+        raw_path_part = parts.path or "/"
+        raw_qs_part = parts.query
+    else:
+        no_fragment = path.split("#", 1)[0]
+        raw_path_part, _, raw_qs_part = no_fragment.partition("?")
+        if not raw_path_part:
+            raw_path_part = "/"
+
+    decoded_path = unquote(raw_path_part)
+    encoded_raw_path = quote(raw_path_part, safe="/%:@!$&'()*+,;=-._~").encode("ascii")
+
+    query_pairs: list[tuple[str, Any]] = (
+        list(parse_qsl(raw_qs_part, keep_blank_values=True)) if raw_qs_part else []
+    )
+    if query:
+        query_pairs.extend(query.items())
+
+    query_string = (
+        urlencode(query_pairs, doseq=True, encoding="utf-8").encode("ascii")
+        if query_pairs
+        else b""
+    )
+    return decoded_path, encoded_raw_path, query_string
 
 
 class TestResponse:
@@ -138,14 +189,17 @@ class TestResponse:
     def assert_header(
         self, header: str, expected_val: str | None = None
     ) -> TestResponse:
-        """Assert header presence and optionally its exact value."""
-        norm_key = header.lower()
-        matched = {k.lower(): v for k, v in self.headers.items()}
-        if norm_key not in matched:
+        """Assert header presence and optionally its exact value across all values."""
+        values = self.headers.getlist(header)
+        if not values:
             raise AssertionError(f"Expected header '{header}' was not found.")
-        if expected_val is not None and matched[norm_key] != expected_val:
+        if expected_val is not None and expected_val not in values:
+            if len(values) == 1:
+                raise AssertionError(
+                    f"Expected header '{header}' to be '{expected_val}', got '{values[0]}'."
+                )
             raise AssertionError(
-                f"Expected header '{header}' to be '{expected_val}', got '{matched[norm_key]}'."
+                f"Expected header '{header}' to include '{expected_val}', got {values!r}."
             )
         return self
 
@@ -248,8 +302,7 @@ class TestClient:
 
     def with_headers(self, headers: dict[str, str]) -> TestClient:
         """Return a new TestClient with additional default headers."""
-        merged = dict(self._default_headers)
-        merged.update(headers)
+        merged = _merge_headers_case_insensitive(self._default_headers, headers)
         return TestClient(self.app, base_url=self.base_url, default_headers=merged)
 
     def with_token(self, token: str) -> TestClient:
@@ -266,55 +319,65 @@ class TestClient:
         path: str,
         *,
         json_data: Any = None,
-        data: bytes | str | None = None,
+        data: bytes | str | Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         query: dict[str, Any] | None = None,
     ) -> TestResponse:
         """Execute an in-process HTTP request against the ASGI application."""
-        req_headers: dict[str, str] = dict(self._default_headers)
-        if headers:
-            req_headers.update(headers)
+        req_headers = _merge_headers_case_insensitive(self._default_headers, headers)
+        lower_keys = {k.lower() for k in req_headers}
+
+        parsed_base = urlsplit(self.base_url)
+        if "host" not in lower_keys:
+            req_headers["host"] = parsed_base.netloc or "localhost"
+            lower_keys.add("host")
 
         # Prepare body
         body_bytes = b""
         if json_data is not None:
             body_bytes = json.dumps(json_data).encode("utf-8")
-            if "content-type" not in {k.lower() for k in req_headers}:
+            if "content-type" not in lower_keys:
                 req_headers["content-type"] = "application/json"
         elif isinstance(data, str):
             body_bytes = data.encode("utf-8")
         elif isinstance(data, bytes):
             body_bytes = data
+        elif isinstance(data, Mapping):
+            body_bytes = urlencode(
+                list(data.items()), doseq=True, encoding="utf-8"
+            ).encode("ascii")
+            if "content-type" not in lower_keys:
+                req_headers["content-type"] = "application/x-www-form-urlencoded"
+        elif data is not None:
+            raise TypeError(
+                f"Unsupported request data type: {type(data).__name__}. "
+                "Expected bytes, str, or Mapping."
+            )
 
         if body_bytes and "content-length" not in {k.lower() for k in req_headers}:
             req_headers["content-length"] = str(len(body_bytes))
 
-        # Query string
-        parsed_path = path
-        query_string = b""
-        if query:
-            query_string = urlencode(query, doseq=True).encode("ascii")
-        elif "?" in path:
-            parsed_path, raw_qs = path.split("?", 1)
-            query_string = raw_qs.encode("ascii")
+        decoded_path, raw_path_bytes, query_string = _build_path_and_query(path, query)
 
         raw_headers = [
             (k.lower().encode("latin-1"), v.encode("latin-1"))
             for k, v in req_headers.items()
         ]
 
+        scheme = parsed_base.scheme or "http"
+        default_port = 443 if scheme == "https" else 80
         scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
             "http_version": "1.1",
             "method": method.upper(),
-            "path": parsed_path,
-            "raw_path": parsed_path.encode("ascii"),
+            "path": decoded_path,
+            "raw_path": raw_path_bytes,
             "query_string": query_string,
             "headers": raw_headers,
-            "server": ("127.0.0.1", 80),
+            "server": (parsed_base.hostname or "127.0.0.1", parsed_base.port or default_port),
             "client": ("127.0.0.1", 50000),
-            "scheme": "http",
+            "scheme": scheme,
         }
 
         status_code = 0
@@ -366,7 +429,7 @@ class TestClient:
         path: str,
         *,
         json: Any = None,
-        data: bytes | str | None = None,
+        data: bytes | str | Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         query: dict[str, Any] | None = None,
     ) -> TestResponse:
@@ -384,7 +447,7 @@ class TestClient:
         path: str,
         *,
         json: Any = None,
-        data: bytes | str | None = None,
+        data: bytes | str | Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         query: dict[str, Any] | None = None,
     ) -> TestResponse:
@@ -397,7 +460,7 @@ class TestClient:
         path: str,
         *,
         json: Any = None,
-        data: bytes | str | None = None,
+        data: bytes | str | Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         query: dict[str, Any] | None = None,
     ) -> TestResponse:
@@ -414,10 +477,19 @@ class TestClient:
         self,
         path: str,
         *,
+        json: Any = None,
+        data: bytes | str | Mapping[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         query: dict[str, Any] | None = None,
     ) -> TestResponse:
-        return await self.request("DELETE", path, headers=headers, query=query)
+        return await self.request(
+            "DELETE",
+            path,
+            json_data=json,
+            data=data,
+            headers=headers,
+            query=query,
+        )
 
     async def head(
         self,
@@ -478,15 +550,9 @@ class WebSocketTestSession:
         headers: dict[str, str] | None = None,
         subprotocols: list[str] | None = None,
     ) -> None:
-        parsed_path = path
-        query_string = b""
-        if "?" in path:
-            parsed_path, raw_qs = path.split("?", 1)
-            query_string = raw_qs.encode("ascii")
+        decoded_path, raw_path_bytes, query_string = _build_path_and_query(path)
 
-        req_headers = dict(self.default_headers)
-        if headers:
-            req_headers.update(headers)
+        req_headers = _merge_headers_case_insensitive(self.default_headers, headers)
         if "host" not in {k.lower() for k in req_headers}:
             req_headers["host"] = "127.0.0.1:80"
 
@@ -500,8 +566,8 @@ class WebSocketTestSession:
             "asgi": {"version": "3.0"},
             "http_version": "1.1",
             "scheme": "ws",
-            "path": parsed_path,
-            "raw_path": parsed_path.encode("ascii"),
+            "path": decoded_path,
+            "raw_path": raw_path_bytes,
             "query_string": query_string,
             "headers": raw_headers,
             "subprotocols": subprotocols or [],

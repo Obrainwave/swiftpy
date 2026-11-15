@@ -4,11 +4,7 @@ import contextlib
 import os
 import uuid
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.exceptions import AIProviderError
@@ -18,8 +14,6 @@ from swiftpy.ai.vectorstore.lancedb_adapter import LanceDbAdapter
 
 
 async def _check_lancedb_live(url: str) -> bool:
-    if httpx is None:
-        return False
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.get(f"{url.rstrip('/')}/v1/table")

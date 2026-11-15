@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+from collections.abc import Generator
+from operator import methodcaller
 from typing import Any, ClassVar
 from urllib.parse import urlencode
 
@@ -10,6 +18,7 @@ from swiftpy.admin import (
     AdminAuthenticator,
     AdminSessionStore,
     AdminSite,
+    AdminUnauthorizedError,
     AdminUser,
     FieldMetadata,
     ModelAdmin,
@@ -19,10 +28,11 @@ from swiftpy.admin import (
     current_admin,
     get_admin_session_store,
     get_current_admin,
+    require_admin,
 )
 from swiftpy.core.application import Application
 from swiftpy.core.config import Config, ConfigurationError
-from swiftpy.core.container import get_container
+from swiftpy.core.container import get_container, set_container
 from swiftpy.database.orm.model import Model
 from swiftpy.database.orm.relationships import (
     BelongsTo,
@@ -140,7 +150,7 @@ def test_admin_duplicate_and_invalid_registration() -> None:
         pass
 
     with pytest.raises(TypeError) as err_type:
-        site.register(NotAModel)  # type: ignore[arg-type]
+        methodcaller("register", NotAModel)(site)
     assert "expects a Model subclass" in str(err_type.value)
 
 
@@ -425,7 +435,9 @@ async def test_multiple_admin_sites_with_different_prefixes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_full_database_backed_crud_workflow() -> None:
+async def test_admin_full_database_backed_crud_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     End-to-End Real PostgreSQL CRUD Integration Test:
     1. Initialize real PostgreSQL pool and create tables.
@@ -441,11 +453,11 @@ async def test_admin_full_database_backed_crud_workflow() -> None:
     11. Verify Book is deleted from PostgreSQL table while Author remains intact.
     """
     cfg = Config()
-    cfg.set("database.connections.postgresql.host", "postgres")
-    cfg.set("database.connections.postgresql.port", 5432)
-    cfg.set("database.connections.postgresql.database", "swiftpy")
-    cfg.set("database.connections.postgresql.username", "postgres")
-    cfg.set("database.connections.postgresql.password", "secret")
+    cfg.set("database.connections.postgresql.host", os.getenv("DB_HOST", "127.0.0.1"))
+    cfg.set("database.connections.postgresql.port", int(os.getenv("DB_PORT", "5432")))
+    cfg.set("database.connections.postgresql.database", os.getenv("DB_DATABASE", "swiftpy"))
+    cfg.set("database.connections.postgresql.username", os.getenv("DB_USERNAME", "postgres"))
+    cfg.set("database.connections.postgresql.password", os.getenv("DB_PASSWORD", "secret"))
     pool = DatabasePool(config=cfg)
     await pool.init()
     raw_pool = pool.get_pool()
@@ -469,7 +481,9 @@ async def test_admin_full_database_backed_crud_workflow() -> None:
         );
         """)
 
-    app = Application()
+    monkeypatch.setenv("APP_DEBUG", "true")
+    monkeypatch.setenv("APP_ENV", "local")
+    app = Application(debug=True)
     app.container.instance(DatabasePool, pool)
     get_container().instance(DatabasePool, pool)
 
@@ -589,3 +603,297 @@ async def test_admin_full_database_backed_crud_workflow() -> None:
         await conn.execute("DROP TABLE IF EXISTS admin_test_authors CASCADE;")
 
     await pool.close()
+
+
+# ==============================================================================
+# 5. Security Hardening, Search, Pagination & RBAC Tests (Phase 1 P1-S2..P1-S4)
+# ==============================================================================
+
+
+def test_admin_secret_and_credentials_fail_closed_and_no_static_secret() -> None:
+    """Verify Gate G-4: admin session secret & credentials fail closed without static secrets."""
+    for env_name, dbg in [("production", False), ("staging", False), ("local", False)]:
+        cfg = Config({"app": {"env": env_name, "debug": dbg}})
+        store = AdminSessionStore(config=cfg)
+        with pytest.raises(ConfigurationError):
+            store.get_secret_key()
+
+        auth = AdminAuthenticator(config=cfg)
+        with pytest.raises(ConfigurationError):
+            auth.authenticate("admin", "admin123")
+
+    # Even in local debug mode with no configured key, static secret MUST NOT be returned
+    local_cfg = Config({"app": {"env": "local", "debug": True}})
+    local_store = AdminSessionStore(config=local_cfg)
+    local_key = local_store.get_secret_key()
+    assert local_key != "swiftpy-admin-default-secret-change-in-production"
+    assert len(local_key) >= 32
+
+
+def test_admin_token_rejects_non_admin_and_missing_session_id() -> None:
+    """Verify AdminUser.from_dict defaults is_admin=False and verify_token rejects non-admin / empty session_id."""
+    user_default = AdminUser.from_dict({"username": "victim"})
+    assert user_default.is_admin is False
+
+    user_str = AdminUser.from_dict({"username": "victim", "is_admin": "true"})
+    assert user_str.is_admin is False
+
+    secret = "super-secret-signing-key-at-least-32b!"
+    store = AdminSessionStore(secret_key=secret)
+
+    def _sign_raw(user_dict: dict[str, Any]) -> str:
+        payload = {"user": user_dict, "exp": int(time.time()) + 3600, "iat": int(time.time())}
+        b = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        p_b64 = base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+        sig = hmac.new(secret.encode("utf-8"), p_b64.encode("ascii"), hashlib.sha256).digest()
+        s_b64 = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+        return f"{p_b64}.{s_b64}"
+
+    tok_non_admin = _sign_raw({"username": "bob", "is_admin": False, "session_id": "sid-1"})
+    assert store.verify_token(tok_non_admin) is None
+
+    tok_empty_sid = _sign_raw({"username": "bob", "is_admin": True, "session_id": ""})
+    assert store.verify_token(tok_empty_sid) is None
+
+    tok_missing_sid = _sign_raw({"username": "bob", "is_admin": True})
+    assert store.verify_token(tok_missing_sid) is None
+
+    # require_admin must also reject non-admin AdminUser even if manually attached
+    scope = {"type": "http", "method": "GET", "path": "/admin", "headers": []}
+
+    async def _recv() -> dict[str, Any]:
+        return {"type": "http.request", "body": b""}
+
+    req = Request(scope, _recv)
+    req.state["admin_user"] = AdminUser(username="bob", is_admin=False)
+    with pytest.raises(AdminUnauthorizedError):
+        require_admin(req)
+
+
+def test_admin_revoked_sessions_bounded_and_dynamic_cookie_path_secure() -> None:
+    """Verify revocation cache bounds/TTL pruning and dynamic cookie Path/Secure flags."""
+    store = AdminSessionStore(secret_key="x" * 40, max_revoked_sessions=3)
+    store.revoke_session("expired-sid", ttl=-5)
+    store.revoke_session("sid-1", ttl=3600)
+    store.revoke_session("sid-2", ttl=3600)
+    store.revoke_session("sid-3", ttl=3600)
+    store.revoke_session("sid-4", ttl=3600)
+    assert len(store._revoked_sessions) <= 3
+
+    resp = Response(content="ok")
+    user = AdminUser(username="admin_user")
+    create_admin_session(resp, user, prefix="/internal-admin", secure=True)
+    set_cookie = resp.headers.get("set-cookie") or ""
+    assert "Path=/internal-admin;" in set_cookie or "Path=/internal-admin " in set_cookie
+    assert "; Secure" in set_cookie
+
+
+@pytest.mark.asyncio
+async def test_admin_logout_requires_post_with_csrf_and_revokes_session() -> None:
+    """Verify GET logout is disabled and POST logout enforces CSRF + revokes session."""
+    site = AdminSite(title="Logout Test")
+    site.register(Author)
+    app = Application(
+        auto_discover_providers=False,
+        debug=True,
+        config={"app": {"env": "local", "debug": True}, "admin": {"secret_key": "k" * 40}},
+    )
+    site.mount(app, prefix="/admin")
+    client = TestClient(app)
+
+    store = get_admin_session_store()
+    user = AdminUser(username="admin")
+    login_resp = Response()
+    token = create_admin_session(login_resp, user)
+    csrf_tok = store.generate_csrf_token(user)
+    cookie_header = f"{ADMIN_COOKIE_NAME}={token}"
+
+    # 1. GET /admin/logout MUST be disabled (404/405) and must NOT revoke session
+    get_logout = await client.get("/admin/logout", headers={"Cookie": cookie_header})
+    assert get_logout.status_code in (404, 405)
+    assert store.verify_token(token) is not None
+
+    # 2. POST /admin/logout without CSRF MUST fail 403 and preserve session
+    bad_post = await client.post(
+        "/admin/logout",
+        data="",
+        headers={"Cookie": cookie_header, "content-type": "application/x-www-form-urlencoded"},
+    )
+    assert bad_post.status_code == 403
+    assert store.verify_token(token) is not None
+
+    # 3. POST /admin/logout with valid CSRF succeeds and revokes token
+    ok_post = await client.post(
+        "/admin/logout",
+        data=urlencode({"_csrf_token": csrf_tok}),
+        headers={"Cookie": cookie_header, "content-type": "application/x-www-form-urlencoded"},
+    )
+    assert ok_post.status_code in (200, 302)
+    assert store.verify_token(token) is None
+
+
+@pytest.mark.asyncio
+async def test_admin_rbac_permissions_enforced() -> None:
+    """Verify read-only AdminUser and ModelAdmin permission checks return 403 on unauthorized ops."""
+    site = AdminSite(title="RBAC Test")
+
+    @site.register(Book)
+    class BookAdmin(ModelAdmin):
+        required_delete_permission = "books:delete"
+
+    app = Application(
+        auto_discover_providers=False,
+        debug=True,
+        config={"app": {"env": "local", "debug": True}, "admin": {"secret_key": "k" * 40}},
+    )
+    site.mount(app, prefix="/admin")
+    client = TestClient(app)
+
+    store = get_admin_session_store()
+    reader = AdminUser(username="reader", is_admin=True, permissions=["models:read"])
+    reader_resp = Response()
+    reader_tok = create_admin_session(reader_resp, reader)
+    reader_csrf = store.generate_csrf_token(reader)
+
+    # Read-only admin can view dashboard & list
+    list_res = await client.get(
+        "/admin/admin_test_books",
+        headers={"Cookie": f"{ADMIN_COOKIE_NAME}={reader_tok}", "Accept": "application/json"},
+    )
+    assert list_res.status_code == 200
+
+    # Read-only admin CANNOT open create form or submit create/edit/delete
+    create_get_res = await client.get(
+        "/admin/admin_test_books/create",
+        headers={"Cookie": f"{ADMIN_COOKIE_NAME}={reader_tok}"},
+    )
+    assert create_get_res.status_code == 403
+
+    create_post_res = await client.post(
+        "/admin/admin_test_books/create",
+        data=urlencode({"title": "Hack", "_csrf_token": reader_csrf}),
+        headers={
+            "Cookie": f"{ADMIN_COOKIE_NAME}={reader_tok}",
+            "content-type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert create_post_res.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_search_or_escaping_pagination_delete_error_and_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify DB OR search with wildcard escaping, server pagination, HTML delete 500, and non-debug redaction."""
+    cfg = Config()
+    cfg.set("database.connections.postgresql.host", os.getenv("DB_HOST", "127.0.0.1"))
+    cfg.set("database.connections.postgresql.port", int(os.getenv("DB_PORT", "5432")))
+    cfg.set("database.connections.postgresql.database", os.getenv("DB_DATABASE", "swiftpy"))
+    cfg.set("database.connections.postgresql.username", os.getenv("DB_USERNAME", "postgres"))
+    cfg.set("database.connections.postgresql.password", os.getenv("DB_PASSWORD", "secret"))
+    pool = DatabasePool(config=cfg)
+    await pool.init()
+    raw_pool = pool.get_pool()
+
+    async with raw_pool.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS admin_test_books CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS admin_test_authors CASCADE;")
+        await conn.execute("""
+        CREATE TABLE admin_test_authors (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            bio TEXT
+        );
+        """)
+        await conn.execute("INSERT INTO admin_test_authors (name, bio) VALUES ($1, $2)", "Alice", "100% real author")
+        await conn.execute("INSERT INTO admin_test_authors (name, bio) VALUES ($1, $2)", "Bob", "Novelist")
+        await conn.execute("INSERT INTO admin_test_authors (name, bio) VALUES ($1, $2)", "Charlie", "Poet")
+
+    # Non-debug production app to test error redaction as well
+    app = Application(
+        auto_discover_providers=False,
+        debug=False,
+        config={"app": {"env": "production", "debug": False}, "admin": {"secret_key": "k" * 40}},
+    )
+    app.container.instance(DatabasePool, pool)
+    get_container().instance(DatabasePool, pool)
+
+    site = AdminSite(title="Search Paginate Admin")
+
+    @site.register(Author)
+    class AuthorSearchAdmin(ModelAdmin):
+        search_fields: ClassVar[list[str]] = ["name", "bio"]
+        ordering = "id ASC"
+        per_page = 2
+
+    site.mount(app, prefix="/admin")
+    client = TestClient(app)
+
+    store = get_admin_session_store()
+    admin_user = AdminUser(username="admin", is_admin=True, permissions=["all"])
+    login_resp = Response()
+    token = create_admin_session(login_resp, admin_user)
+    csrf_tok = store.generate_csrf_token(admin_user)
+    headers = {"Cookie": f"{ADMIN_COOKIE_NAME}={token}"}
+
+    try:
+        # 1. OR search: matches name='Bob' even though bio lacks 'Bob'
+        res_bob = await client.get("/admin/admin_test_authors?q=Bob&format=json", headers=headers)
+        assert res_bob.status_code == 200
+        assert len(res_bob.json()["data"]) == 1
+        assert res_bob.json()["data"][0]["name"] == "Bob"
+
+        # 2. Wildcard escaping: searching literal '100%' only matches '100% real author', not every record!
+        res_pct = await client.get("/admin/admin_test_authors?q=100%25&format=json", headers=headers)
+        assert res_pct.status_code == 200
+        assert len(res_pct.json()["data"]) == 1
+        assert res_pct.json()["data"][0]["name"] == "Alice"
+
+        # 3. Server pagination: page=2 with per_page=2 returns 1 record ('Charlie') and total=3
+        res_page2 = await client.get("/admin/admin_test_authors?page=2&per_page=2&format=json", headers=headers)
+        assert res_page2.status_code == 200
+        p2_body = res_page2.json()
+        assert p2_body["count"] == 1
+        assert p2_body["total"] == 3
+        assert p2_body["data"][0]["name"] == "Charlie"
+
+        # 4. Non-debug error redaction: database NOT NULL violation must NOT leak raw SQL error text
+        res_leak = await client.post(
+            "/admin/admin_test_authors/create?format=json",
+            data=urlencode({"bio": "missing required name", "_csrf_token": csrf_tok}),
+            headers={**headers, "content-type": "application/x-www-form-urlencoded"},
+        )
+        assert res_leak.status_code == 422
+        assert "admin_test_authors" not in res_leak.text
+        assert "null value in column" not in res_leak.text.lower()
+
+        # 5. HTML delete failure returns 500 instead of silently redirecting 302
+        async def _boom_delete(_self: Author) -> int:
+            raise RuntimeError("sensitive internal db fk trace")
+
+        monkeypatch.setattr(Author, "delete", _boom_delete)
+        del_err = await client.post(
+            "/admin/admin_test_authors/1/delete",
+            data=urlencode({"_csrf_token": csrf_tok}),
+            headers={**headers, "content-type": "application/x-www-form-urlencoded"},
+        )
+        assert del_err.status_code == 500
+        assert "sensitive internal db fk trace" not in del_err.text
+
+        # 6. XSS payload in list HTML actions (create_get / list_view escaping)
+        list_html = await client.get("/admin/admin_test_authors", headers=headers)
+        assert list_html.status_code == 200
+        assert "<script>" not in list_html.text
+    finally:
+        async with raw_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS admin_test_authors CASCADE;")
+        await pool.close()
+
+
+@pytest.fixture(autouse=True)
+def _restore_config_singleton() -> Generator[None, None, None]:
+    prev_cfg = Config._instance
+    prev_container = get_container()
+    yield
+    Config._instance = prev_cfg
+    set_container(prev_container)

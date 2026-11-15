@@ -5,7 +5,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import random
 import time
 import uuid
@@ -17,9 +16,15 @@ from uuid import UUID
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
-from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.config import ConfigurationError
 from swiftpy.core.container import get_container
 from swiftpy.events.dispatcher import EventDispatcher, EventHandler
+from swiftpy.support.keys import (
+    decode_signing_key,
+    resolve_configured_app_key,
+    resolve_configured_previous_keys,
+    validate_signing_key,
+)
 from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.events")
@@ -44,6 +49,17 @@ class RedisEventBus:
     _instance: ClassVar[RedisEventBus | None] = None
     _app_key: ClassVar[str | None] = None
     _previous_keys: ClassVar[list[str]] = []
+    _allow_unsigned: ClassVar[bool] = False
+
+    @classmethod
+    def set_allow_unsigned(cls, enabled: bool) -> None:
+        """Explicit opt-in to allow unsigned event bus messages in local tests."""
+        cls._allow_unsigned = bool(enabled)
+
+    @classmethod
+    def get_allow_unsigned(cls) -> bool:
+        """Return whether unsigned event bus messages are explicitly opted in."""
+        return cls._allow_unsigned
 
     @classmethod
     def set_app_key(cls, key: str | None) -> None:
@@ -55,14 +71,7 @@ class RedisEventBus:
         """Return the active application key for signing bus messages."""
         if cls._app_key is not None:
             return cls._app_key
-        try:
-            cfg = Config.get_instance()
-            val = cfg.get("app.key")
-            if val and isinstance(val, str):
-                return val
-        except ConfigurationError:
-            pass
-        return os.getenv("APP_KEY")
+        return resolve_configured_app_key()
 
     @classmethod
     def set_previous_keys(cls, keys: list[str]) -> None:
@@ -74,19 +83,7 @@ class RedisEventBus:
         """Return previous keys for key rotation verification."""
         if cls._previous_keys:
             return cls._previous_keys
-        try:
-            cfg = Config.get_instance()
-            val = cfg.get("app.previous_keys")
-            if isinstance(val, list):
-                return [str(k) for k in val]
-            if isinstance(val, str) and val.strip():
-                return [k.strip() for k in val.split(",") if k.strip()]
-        except ConfigurationError:
-            pass
-        env_prev = os.getenv("APP_PREVIOUS_KEYS")
-        if env_prev:
-            return [k.strip() for k in env_prev.split(",") if k.strip()]
-        return []
+        return resolve_configured_previous_keys()
 
     @classmethod
     def _compute_signature(cls, envelope: dict[str, Any], key: str) -> str:
@@ -98,8 +95,9 @@ class RedisEventBus:
             separators=(",", ":"),
             ensure_ascii=False,
         )
+        secret_bytes = decode_signing_key(key)
         return hmac.new(
-            key.encode("utf-8"),
+            secret_bytes,
             canonical_json.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -119,6 +117,7 @@ class RedisEventBus:
         max_connections: int | None = None,
         timeout: float = 30.0,
         max_concurrency: int = 50,
+        allow_unsigned: bool | None = None,
     ) -> None:
         self.bus_id: str = uuid.uuid4().hex
         self.dispatcher: EventDispatcher = (
@@ -136,6 +135,7 @@ class RedisEventBus:
         self.max_connections = max_connections or 20
         self.timeout = timeout
         self.max_concurrency = max_concurrency
+        self._allow_unsigned_override = allow_unsigned
         self._owns_client = redis_client is None
         self._owns_pool = connection_pool is None and redis_client is None
         self._client_lock = asyncio.Lock()
@@ -154,6 +154,14 @@ class RedisEventBus:
             container = get_container()
             if container.has(cls):
                 return container.resolve(cls)
+            disp = (
+                container.resolve(EventDispatcher)
+                if container.has(EventDispatcher)
+                else None
+            )
+            inst = cls(dispatcher=disp)
+            container.instance(cls, inst)
+            return inst
         except RuntimeError:
             pass
 
@@ -253,8 +261,12 @@ class RedisEventBus:
         seen.add(obj_id)
 
         try:
+            hidden = set(getattr(val, "__hidden__", ()) or ())
             if hasattr(val, "to_dict") and callable(val.to_dict):
-                return self._serialize_value(val.to_dict(), seen)
+                raw_dict = val.to_dict()
+                if hidden and isinstance(raw_dict, dict):
+                    raw_dict = {k: v for k, v in raw_dict.items() if k not in hidden}
+                return self._serialize_value(raw_dict, seen)
             if isinstance(val, (list, tuple)):
                 return [self._serialize_value(item, seen) for item in val]
             if isinstance(val, dict):
@@ -263,7 +275,7 @@ class RedisEventBus:
                 return {
                     k: self._serialize_value(v, seen)
                     for k, v in val.__dict__.items()
-                    if not k.startswith("_")
+                    if not k.startswith("_") and k not in hidden
                 }
         finally:
             seen.remove(obj_id)
@@ -271,6 +283,24 @@ class RedisEventBus:
         raise TypeError(
             f"Unsupported payload type for serialization: {type(val).__name__}"
         )
+
+    def _resolve_validated_key(self) -> str | None:
+        """Resolve and validate active signing key, failing closed unless explicitly opted into unsigned mode."""
+        key = self.get_app_key()
+        unsigned_allowed = (
+            self._allow_unsigned_override
+            if self._allow_unsigned_override is not None
+            else self.get_allow_unsigned()
+        )
+        if key is None or not str(key).strip():
+            if not unsigned_allowed:
+                raise ConfigurationError(
+                    "APP_KEY (>=32 bytes) is required for RedisEventBus HMAC signing. "
+                    "Configure APP_KEY or pass allow_unsigned=True for local tests."
+                )
+            return None
+        validate_signing_key(str(key), purpose="RedisEventBus APP_KEY")
+        return str(key)
 
     async def publish(
         self, event: str, payload: Any = None, *, local: bool = False
@@ -280,6 +310,7 @@ class RedisEventBus:
         Optionally dispatches locally in the current process if local=True.
         Returns the number of subscribers that received the message.
         """
+        key = self._resolve_validated_key()
         serialized_payload = self._serialize_value(payload)
         envelope: dict[str, Any] = {
             "event": event,
@@ -288,7 +319,6 @@ class RedisEventBus:
             "timestamp": time.time(),
         }
 
-        key = self.get_app_key()
         if key:
             envelope["signature"] = self._compute_signature(envelope, key)
 
@@ -310,6 +340,8 @@ class RedisEventBus:
         """
         if self._listener_task is not None and not self._listener_task.done():
             return self._listener_task
+
+        self._resolve_validated_key()
 
         self._running = True
         self._ready_event.clear()
@@ -400,8 +432,17 @@ class RedisEventBus:
         if not isinstance(envelope, dict):
             return
 
-        # HMAC signature verification if APP_KEY is configured
-        key = self.get_app_key()
+        # HMAC signature verification (fail closed unless allow_unsigned is explicitly opted in)
+        try:
+            key = self._resolve_validated_key()
+        except ConfigurationError as exc:
+            logger.error(
+                "Dropping Redis bus message for event '%s' due to invalid APP_KEY config: %s",
+                envelope.get("event"),
+                exc,
+            )
+            return
+
         if key:
             sig = envelope.get("signature")
             if not sig or not isinstance(sig, str):
@@ -434,17 +475,25 @@ class RedisEventBus:
         payload = envelope.get("payload")
 
         if isinstance(event, str):
-            async def _dispatch_task(evt: str, pay: Any) -> None:
-                async with self._dispatch_semaphore:
-                    try:
-                        await self.dispatcher.dispatch(evt, pay)
-                    except Exception:
-                        logger.exception(
-                            "Error executing listener for cross-process event '%s'",
-                            evt,
-                        )
+            await self._dispatch_semaphore.acquire()
 
-            task = asyncio.create_task(_dispatch_task(event, payload))
+            async def _dispatch_task(evt: str, pay: Any) -> None:
+                try:
+                    await self.dispatcher.dispatch(evt, pay)
+                except Exception:
+                    logger.exception(
+                        "Error executing listener for cross-process event '%s'",
+                        evt,
+                    )
+                finally:
+                    self._dispatch_semaphore.release()
+
+            try:
+                task = asyncio.create_task(_dispatch_task(event, payload))
+            except BaseException:
+                self._dispatch_semaphore.release()
+                raise
+
             self._active_dispatch_tasks.add(task)
 
             def _on_task_done(t: asyncio.Task[Any]) -> None:

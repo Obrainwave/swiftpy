@@ -9,17 +9,85 @@ import uuid
 from typing import Any, ClassVar, Self
 
 import redis.asyncio as aioredis
+from redis.exceptions import NoScriptError, RedisError
 
 from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import get_container
 from swiftpy.queue.job import Job, set_dispatch_handler
+from swiftpy.support.keys import validate_signing_key
 from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.queue")
 
 _POP_AND_LEASE_LUA = """
-local job = redis.call('lmove', KEYS[1], KEYS[2], 'LEFT', 'RIGHT')
+local function sanitize_utf8(s)
+    local n = #s
+    local has_non_ascii = false
+    for k = 1, n do
+        if string.byte(s, k) >= 128 then
+            has_non_ascii = true
+            break
+        end
+    end
+    if not has_non_ascii then
+        return s
+    end
+    local i = 1
+    local out = nil
+    local last = 1
+    local repl = string.char(239, 191, 189)
+    while i <= n do
+        local b1 = string.byte(s, i)
+        local seq_len = 0
+        if b1 < 128 then
+            seq_len = 1
+        elseif b1 >= 194 and b1 <= 223 and i + 1 <= n then
+            local b2 = string.byte(s, i + 1)
+            if b2 >= 128 and b2 <= 191 then
+                seq_len = 2
+            end
+        elseif b1 >= 224 and b1 <= 239 and i + 2 <= n then
+            local b2, b3 = string.byte(s, i + 1, i + 2)
+            if b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 then
+                if not (b1 == 224 and b2 < 160) and not (b1 == 237 and b2 > 159) then
+                    seq_len = 3
+                end
+            end
+        elseif b1 >= 240 and b1 <= 244 and i + 3 <= n then
+            local b2, b3, b4 = string.byte(s, i + 1, i + 3)
+            if b2 >= 128 and b2 <= 191 and b3 >= 128 and b3 <= 191 and b4 >= 128 and b4 <= 191 then
+                if not (b1 == 240 and b2 < 144) and not (b1 == 244 and b2 > 143) then
+                    seq_len = 4
+                end
+            end
+        end
+        if seq_len > 0 then
+            i = i + seq_len
+        else
+            if not out then
+                out = {}
+            end
+            if i > last then
+                out[#out + 1] = string.sub(s, last, i - 1)
+            end
+            out[#out + 1] = repl
+            i = i + 1
+            last = i
+        end
+    end
+    if not out then
+        return s
+    end
+    if last <= n then
+        out[#out + 1] = string.sub(s, last)
+    end
+    return table.concat(out)
+end
+
+local job = redis.call('lpop', KEYS[1])
 if job then
+    job = sanitize_utf8(job)
+    redis.call('rpush', KEYS[2], job)
     local member = ARGV[1] .. string.char(31) .. job
     redis.call('zadd', KEYS[3], ARGV[2], member)
     return job
@@ -30,31 +98,17 @@ return nil
 _ACK_JOB_LUA = """
 local removed = redis.call('lrem', KEYS[1], 1, ARGV[1])
 local zremoved = redis.call('zrem', KEYS[2], ARGV[2])
-if removed == 0 or zremoved == 0 then
-    local items = redis.call('lrange', KEYS[1], 0, -1)
-    for _, it in ipairs(items) do
-        if #items == 1 or #it == #ARGV[1] then
-            redis.call('lrem', KEYS[1], 1, it)
-            redis.call('zrem', KEYS[2], ARGV[3] .. string.char(31) .. it)
-            break
-        end
-    end
+if removed > 0 or zremoved > 0 then
+    return 1
 end
-return 1
+return 0
 """
 
 _RELEASE_JOB_LUA = """
 local removed = redis.call('lrem', KEYS[1], 1, ARGV[1])
 local zremoved = redis.call('zrem', KEYS[2], ARGV[2])
-if removed == 0 or zremoved == 0 then
-    local items = redis.call('lrange', KEYS[1], 0, -1)
-    for _, it in ipairs(items) do
-        if #items == 1 or #it == #ARGV[1] then
-            redis.call('lrem', KEYS[1], 1, it)
-            redis.call('zrem', KEYS[2], ARGV[6] .. string.char(31) .. it)
-            break
-        end
-    end
+if removed == 0 and zremoved == 0 then
+    return 0
 end
 local delay = tonumber(ARGV[4]) or 0
 if delay > 0 then
@@ -67,7 +121,94 @@ return 1
 """
 
 _REAP_LEASES_LUA = """
+local function update_top_attempts(raw_json, new_attempts)
+    local n = #raw_json
+    local i = 1
+    local depth = 0
+    local in_str = false
+    local escaped = false
+    while i <= n do
+        local b = string.byte(raw_json, i)
+        if in_str then
+            if escaped then
+                escaped = false
+            elseif b == 92 then
+                escaped = true
+            elseif b == 34 then
+                in_str = false
+            end
+            i = i + 1
+        else
+            if b == 34 then
+                local j = i + 1
+                local esc = false
+                while j <= n do
+                    local c = string.byte(raw_json, j)
+                    if esc then
+                        esc = false
+                    elseif c == 92 then
+                        esc = true
+                    elseif c == 34 then
+                        break
+                    end
+                    j = j + 1
+                end
+                local key_name = string.sub(raw_json, i + 1, j - 1)
+                local k = j + 1
+                while k <= n do
+                    local ws = string.byte(raw_json, k)
+                    if ws == 32 or ws == 9 or ws == 10 or ws == 13 then
+                        k = k + 1
+                    else
+                        break
+                    end
+                end
+                if depth == 1 and key_name == 'attempts' and string.byte(raw_json, k) == 58 then
+                    local v_start = k + 1
+                    while v_start <= n do
+                        local ws = string.byte(raw_json, v_start)
+                        if ws == 32 or ws == 9 or ws == 10 or ws == 13 then
+                            v_start = v_start + 1
+                        else
+                            break
+                        end
+                    end
+                    local v_end = v_start
+                    while v_end <= n do
+                        local vc = string.byte(raw_json, v_end)
+                        if vc == 44 or vc == 125 or vc == 32 or vc == 9 or vc == 10 or vc == 13 then
+                            break
+                        end
+                        v_end = v_end + 1
+                    end
+                    return string.sub(raw_json, 1, v_start - 1) .. tostring(new_attempts) .. string.sub(raw_json, v_end)
+                end
+                i = j + 1
+            else
+                if b == 123 or b == 91 then
+                    depth = depth + 1
+                elseif b == 125 or b == 93 then
+                    depth = depth - 1
+                end
+                i = i + 1
+            end
+        end
+    end
+    local rev = string.reverse(raw_json)
+    local pos = string.find(rev, '}')
+    if pos then
+        local close_idx = n - pos + 1
+        local inner = string.sub(raw_json, 1, close_idx - 1)
+        if string.match(inner, '^{%s*$') then
+            return inner .. '"attempts":' .. tostring(new_attempts) .. string.sub(raw_json, close_idx)
+        end
+        return inner .. ',"attempts":' .. tostring(new_attempts) .. string.sub(raw_json, close_idx)
+    end
+    return raw_json
+end
+
 local expired = redis.call('zrangebyscore', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]) or 50)
+local max_failed = tonumber(ARGV[4]) or 0
 local count = 0
 for i, member in ipairs(expired) do
     redis.call('zrem', KEYS[1], member)
@@ -81,26 +222,24 @@ for i, member in ipairs(expired) do
         local ok, data = pcall(cjson.decode, raw_payload)
         if ok and type(data) == 'table' then
             local attempts = (tonumber(data['attempts']) or 0) + 1
-            data['attempts'] = attempts
             local tries = tonumber(data['tries']) or 3
+            local updated_raw = update_top_attempts(raw_payload, attempts)
             if attempts >= tries then
-                local record = {
-                    job_id = data['job_id'] or 'unknown',
-                    job_class = data['job_class'] or 'unknown',
-                    queue = data['queue'] or 'default',
-                    payload = data,
-                    exception = {
-                        type = 'LeaseExpiredError',
-                        message = 'Job lease expired and max retry attempts (' .. tries .. ') reached',
-                        traceback = ''
-                    },
-                    failed_at = tonumber(ARGV[1]),
-                    attempts = attempts,
-                    tries = tries
-                }
-                redis.call('rpush', KEYS[3], cjson.encode(record))
+                local record_json = '{"job_id":' .. cjson.encode(tostring(data['job_id'] or 'unknown'))
+                    .. ',"job_class":' .. cjson.encode(tostring(data['job_class'] or 'unknown'))
+                    .. ',"queue":' .. cjson.encode(tostring(data['queue'] or 'default'))
+                    .. ',"payload":' .. updated_raw
+                    .. ',"exception":{"type":"LeaseExpiredError","message":'
+                    .. cjson.encode('Job lease expired and max retry attempts (' .. tries .. ') reached')
+                    .. ',"traceback":""},"failed_at":' .. ARGV[1]
+                    .. ',"attempts":' .. attempts
+                    .. ',"tries":' .. tries .. '}'
+                redis.call('rpush', KEYS[3], record_json)
+                if max_failed > 0 then
+                    redis.call('ltrim', KEYS[3], -max_failed, -1)
+                end
             else
-                redis.call('lpush', KEYS[2], cjson.encode(data))
+                redis.call('lpush', KEYS[2], updated_raw)
             end
         else
             redis.call('lpush', KEYS[2], raw_payload)
@@ -139,7 +278,7 @@ class QueueDispatcher:
         host: str | None = None,
         port: int | None = None,
         password: str | None = None,
-        database: int = 0,
+        database: int | None = None,
         prefix: str | None = None,
         max_connections: int | None = None,
         timeout: float = 30.0,
@@ -151,7 +290,8 @@ class QueueDispatcher:
         self.host = host
         self.port = port
         self.password = password
-        self.database = database
+        self._explicit_database = database
+        self.database = database if database is not None else 0
         self.prefix = prefix if prefix is not None else _default_queue_prefix()
         self.max_connections = max_connections or 50
         self.timeout = timeout
@@ -159,6 +299,7 @@ class QueueDispatcher:
         self._owns_client = redis_client is None
         self._owns_pool = connection_pool is None and redis_client is None
         self._client_lock = asyncio.Lock()
+        self._script_shas: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls) -> QueueDispatcher:
@@ -167,6 +308,9 @@ class QueueDispatcher:
             container = get_container()
             if container.has(cls):
                 return container.resolve(cls)
+            inst = cls()
+            container.instance(cls, inst)
+            return inst
         except RuntimeError:
             pass
 
@@ -208,7 +352,7 @@ class QueueDispatcher:
                         host=self.host,
                         port=self.port,
                         password=self.password,
-                        database=self.database if self.database != 0 else None,
+                        database=self._explicit_database,
                     )
 
                     self._pool = aioredis.BlockingConnectionPool(
@@ -247,6 +391,32 @@ class QueueDispatcher:
     def _processing_prefix(self, queue: str) -> str:
         return f"{self.prefix}{queue}:processing:"
 
+    async def _eval_lua(
+        self,
+        client: aioredis.Redis,
+        script: str,
+        numkeys: int,
+        *keys_and_args: str | float,
+    ) -> Any:
+        """Execute a Lua script with cached EVALSHA and transparent NoScriptError reload."""
+        sha = self._script_shas.get(script)
+        if sha is None and hasattr(client, "script_load"):
+            try:
+                sha = await client.script_load(script)
+                self._script_shas[script] = sha
+            except (RedisError, ConnectionError, OSError):
+                sha = None
+
+        if sha is not None and hasattr(client, "evalsha"):
+            try:
+                return await client.evalsha(sha, numkeys, *keys_and_args)
+            except NoScriptError:
+                sha = await client.script_load(script)
+                self._script_shas[script] = sha
+                return await client.evalsha(sha, numkeys, *keys_and_args)
+
+        return await client.eval(script, numkeys, *keys_and_args)
+
     async def pop_and_lease(
         self,
         queue: str,
@@ -259,7 +429,8 @@ class QueueDispatcher:
         """
         client = await self.get_client()
         deadline = time.time() + float(lease_duration)
-        res = await client.eval(
+        res = await self._eval_lua(
+            client,
             _POP_AND_LEASE_LUA,
             3,
             self._queue_key(queue),
@@ -284,14 +455,14 @@ class QueueDispatcher:
         """
         client = await self.get_client()
         member = f"{worker_id}\x1f{raw_payload}"
-        res = await client.eval(
+        res = await self._eval_lua(
+            client,
             _ACK_JOB_LUA,
             2,
             self._processing_key(queue, worker_id),
             self._leases_key(queue),
             raw_payload,
             member,
-            worker_id,
         )
         return bool(res)
 
@@ -313,7 +484,8 @@ class QueueDispatcher:
             self._delayed_key(queue) if delay > 0 else self._queue_key(queue)
         )
         member = f"{worker_id}\x1f{raw_payload}"
-        res = await client.eval(
+        res = await self._eval_lua(
+            client,
             _RELEASE_JOB_LUA,
             3,
             self._processing_key(queue, worker_id),
@@ -324,7 +496,6 @@ class QueueDispatcher:
             payload_to_store,
             str(delay),
             str(time.time()),
-            worker_id,
         )
         return bool(res)
 
@@ -339,7 +510,8 @@ class QueueDispatcher:
         or re-queue at the head of the ready queue.
         """
         client = await self.get_client()
-        res = await client.eval(
+        res = await self._eval_lua(
+            client,
             _REAP_LEASES_LUA,
             3,
             self._leases_key(queue),
@@ -348,6 +520,7 @@ class QueueDispatcher:
             str(time.time()),
             str(batch_size),
             self._processing_prefix(queue),
+            str(self.failed_max_size),
         )
         return int(res) if res is not None else 0
 
@@ -540,8 +713,31 @@ class QueueDispatcher:
             rec_id = record.get("job_id")
             if job_id in (None, "all") or rec_id == job_id:
                 payload = record.get("payload")
+                parsed_payload: dict[str, Any] | None = None
                 if isinstance(payload, dict):
-                    requeue_str = json.dumps(payload, ensure_ascii=False)
+                    parsed_payload = dict(payload)
+                elif isinstance(payload, str):
+                    try:
+                        maybe_dict = json.loads(payload)
+                        if isinstance(maybe_dict, dict):
+                            parsed_payload = maybe_dict
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_payload = None
+
+                if parsed_payload is not None:
+                    parsed_payload["attempts"] = 0
+                    if "job_class" in parsed_payload:
+                        key = Job.get_app_key()
+                        if key is not None and str(key).strip():
+                            validate_signing_key(str(key), purpose="APP_KEY")
+                            parsed_payload["signature"] = Job._compute_signature(
+                                parsed_payload, str(key)
+                            )
+                        elif not Job.get_allow_unsigned():
+                            raise ConfigurationError(
+                                "APP_KEY (>=32 bytes) is required to re-sign retried queue jobs."
+                            )
+                    requeue_str = json.dumps(parsed_payload, ensure_ascii=False)
                 elif isinstance(payload, str):
                     requeue_str = payload
                 else:

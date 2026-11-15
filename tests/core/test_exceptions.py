@@ -13,8 +13,10 @@ from swiftpy.core.exceptions import (
     UnauthorizedError,
     ValidationError,
 )
+from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
 from swiftpy.testing.http_client import TestClient
+from swiftpy.validation.exceptions import ValidationException
 
 
 @pytest.mark.asyncio
@@ -223,8 +225,6 @@ async def test_unknown_route_returns_404_not_found() -> None:
 @pytest.mark.asyncio
 async def test_validation_exception_mapping() -> None:
     """Verify that ValidationException (from validation subsystem) maps to 422 with structured errors."""
-    from swiftpy.validation.exceptions import ValidationException
-
     app = Application()
     client = TestClient(app)
 
@@ -285,8 +285,6 @@ async def test_custom_exception_handler_signatures_and_subclass_hierarchy() -> N
     5. Subclass matching and MRO fallback behavior
     6. Dict return auto-wrapping into json_response
     """
-    from swiftpy.http.request import Request
-
     app = Application(debug=False)
     client = TestClient(app)
 

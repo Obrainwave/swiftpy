@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from swiftpy.mail.exceptions import MailConfigurationError, MailValidationError
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.message import MailMessage, format_mail_address
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.transports.api.base import ApiMailTransport
 
@@ -23,8 +23,16 @@ class ResendTransport(ApiMailTransport):
         endpoint: str = "https://api.resend.com/emails",
         client: httpx.AsyncClient | None = None,
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> None:
-        super().__init__(timeout=timeout, client=client, default_from=default_from)
+        super().__init__(
+            timeout=timeout,
+            client=client,
+            default_from=default_from,
+            max_attachment_size_bytes=max_attachment_size_bytes,
+            max_message_size_bytes=max_message_size_bytes,
+        )
         self.api_key = api_key
         self.endpoint = endpoint
 
@@ -33,6 +41,8 @@ class ResendTransport(ApiMailTransport):
         cls,
         config: dict[str, Any],
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> ResendTransport:
         api_key = str(config.get("api_key", ""))
         timeout = float(config.get("timeout", 30.0))
@@ -42,6 +52,12 @@ class ResendTransport(ApiMailTransport):
             timeout=timeout,
             endpoint=endpoint,
             default_from=default_from,
+            max_attachment_size_bytes=cls._resolve_size_limit(
+                max_attachment_size_bytes, config, "max_attachment_size_bytes"
+            ),
+            max_message_size_bytes=cls._resolve_size_limit(
+                max_message_size_bytes, config, "max_message_size_bytes"
+            ),
         )
 
     async def send(self, message: MailMessage) -> MailSendResult:
@@ -56,20 +72,26 @@ class ResendTransport(ApiMailTransport):
         from_addr, from_name = self._resolve_from(
             message.from_address, message.from_name
         )
-        formatted_from = f"{from_name} <{from_addr}>" if from_name else from_addr
+        formatted_from = format_mail_address(from_addr, from_name, field_name="from")
 
         payload: dict[str, Any] = {
             "from": formatted_from,
-            "to": message.to,
+            "to": [format_mail_address(r, field_name="to") for r in message.to],
             "subject": message.subject,
         }
 
         if message.cc:
-            payload["cc"] = message.cc
+            payload["cc"] = [
+                format_mail_address(r, field_name="cc") for r in message.cc
+            ]
         if message.bcc:
-            payload["bcc"] = message.bcc
+            payload["bcc"] = [
+                format_mail_address(r, field_name="bcc") for r in message.bcc
+            ]
         if message.reply_to:
-            payload["reply_to"] = message.reply_to
+            payload["reply_to"] = format_mail_address(
+                message.reply_to, field_name="reply_to"
+            )
 
         if message.html_body:
             payload["html"] = message.html_body
@@ -78,10 +100,13 @@ class ResendTransport(ApiMailTransport):
         if not message.html_body and not message.text_body:
             payload["text"] = ""
 
-        if message.attachments:
+        if message.headers:
+            payload["headers"] = {str(k): str(v) for k, v in message.headers.items()}
+
+        loaded_attachments = await self._read_attachments_with_limits(message)
+        if loaded_attachments:
             att_payload: list[dict[str, str]] = []
-            for att in message.attachments:
-                data = await att.read_bytes()
+            for att, data in loaded_attachments:
                 encoded = base64.b64encode(data).decode("ascii")
                 att_payload.append(
                     {
@@ -91,8 +116,13 @@ class ResendTransport(ApiMailTransport):
                 )
             payload["attachments"] = att_payload
 
-        if message.tags:
-            payload["tags"] = [{"name": tag, "value": "true"} for tag in message.tags]
+        resend_tags: list[dict[str, str]] = [
+            {"name": tag, "value": "true"} for tag in message.tags
+        ]
+        for meta_key, meta_val in message.metadata.items():
+            resend_tags.append({"name": str(meta_key), "value": str(meta_val)})
+        if resend_tags:
+            payload["tags"] = resend_tags
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -114,7 +144,7 @@ class ResendTransport(ApiMailTransport):
                 success=True,
                 message_id=msg_id,
                 provider="resend",
-                accepted=list(message.to),
+                accepted=message.all_recipient_addresses(),
                 rejected=[],
                 raw_response=res_json,
             )

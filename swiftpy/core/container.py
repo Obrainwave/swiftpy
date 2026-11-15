@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -163,6 +163,16 @@ def get_container() -> Container:
     if container is None:
         raise RuntimeError("Application container not bootstrapped")
     return container
+
+
+@contextmanager
+def bind_container(container: Container) -> Iterator[None]:
+    """Bind `container` to the current asyncio context without mutating global fallback."""
+    token = _container_var.set(container)
+    try:
+        yield
+    finally:
+        _container_var.reset(token)
 
 
 class Scope(StrEnum):
@@ -461,7 +471,30 @@ class Container:
 
     @asynccontextmanager
     async def scope(self) -> AsyncIterator[Container]:
-        """Async context manager that disposes task-scoped dependencies on exit."""
+        """Async context manager that isolates and disposes task-scoped dependencies on exit."""
+        cur_task = _current_task_or_none()
+        raw_list = Context.get(_DI_SCOPED_INSTANCES_KEY)
+        saved_owned: list[tuple[asyncio.Task[Any] | None, str, Any]] = []
+        saved_keys: dict[str, Any] = {}
+        if isinstance(raw_list, list) and raw_list:
+            other_entries: list[Any] = []
+            for entry in raw_list:
+                if (
+                    isinstance(entry, tuple)
+                    and len(entry) == 3
+                    and entry[0] is cur_task
+                ):
+                    saved_owned.append(entry)
+                    ctx_key = entry[1]
+                    if ctx_key not in saved_keys:
+                        saved_keys[ctx_key] = Context.get(ctx_key)
+                else:
+                    other_entries.append(entry)
+            if saved_owned:
+                Context.set(_DI_SCOPED_INSTANCES_KEY, other_entries)
+                for ctx_key in saved_keys:
+                    Context.set(ctx_key, None)
+
         exc_info: tuple[
             type[BaseException] | None,
             BaseException | None,
@@ -474,6 +507,12 @@ class Container:
             raise
         finally:
             await self.aclose_scoped(*exc_info)
+            if saved_owned:
+                remaining = Context.get(_DI_SCOPED_INSTANCES_KEY)
+                restored = list(remaining) if isinstance(remaining, list) else []
+                Context.set(_DI_SCOPED_INSTANCES_KEY, [*restored, *saved_owned])
+                for ctx_key, saved_val in saved_keys.items():
+                    Context.set(ctx_key, saved_val)
 
     def call(
         self,

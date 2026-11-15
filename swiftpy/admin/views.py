@@ -3,7 +3,9 @@ from __future__ import annotations
 import html
 import logging
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, urlencode
+
+import asyncpg
 
 from swiftpy.admin.auth import (
     AdminUser,
@@ -16,10 +18,15 @@ from swiftpy.admin.auth import (
 from swiftpy.admin.registry import (
     AdminSite,
     ModelAdmin,
+    humanize_name,
     set_admin_route_compiler,
 )
 from swiftpy.ai.observability.observer import get_observability
-from swiftpy.database.orm.model import Model
+from swiftpy.core.config import Config
+from swiftpy.core.container import get_container
+from swiftpy.database.exceptions import DatabaseError
+from swiftpy.database.orm.model import Model, ModelQueryBuilder
+from swiftpy.database.pagination.paginator import Paginator
 from swiftpy.http.request import Request
 from swiftpy.http.response import (
     Response,
@@ -33,6 +40,86 @@ if TYPE_CHECKING:
     from swiftpy.core.application import Application
 
 logger = logging.getLogger("swiftpy.admin.views")
+
+_ADMIN_DB_ERRORS = (
+    DatabaseError,
+    asyncpg.PostgresError,
+    ValueError,
+    TypeError,
+    RuntimeError,
+    LookupError,
+    OSError,
+)
+
+
+def _admin_url(clean_prefix: str, *segments: Any, query: dict[str, Any] | None = None) -> str:
+    """Build a URL under the admin prefix with percent-encoded path segments."""
+    base = "" if clean_prefix == "/" else clean_prefix
+    encoded = "/".join(quote(str(seg), safe="") for seg in segments)
+    url = f"{base}/{encoded}" if encoded else clean_prefix
+    if query:
+        filtered = {k: v for k, v in query.items() if v is not None and v != ""}
+        if filtered:
+            url = f"{url}?{urlencode(filtered)}"
+    return url
+
+
+def _is_admin_debug_mode(explicit_debug: bool | None = None) -> bool:
+    """Determine whether admin error responses may expose detailed exception text."""
+    if explicit_debug is not None:
+        return bool(explicit_debug)
+    cfg: Config | None = None
+    try:
+        container = get_container()
+        if container.has(Config):
+            cfg = container.resolve(Config)
+    except RuntimeError:
+        cfg = None
+    if cfg is None:
+        try:
+            cfg = Config.get_instance()
+        except (RuntimeError, ValueError):
+            cfg = None
+    if cfg is None:
+        return False
+    app_env = str(cfg.get("app.env") or cfg.get("APP_ENV") or cfg.get("env") or "").strip().lower()
+    if app_env in ("production", "prod", "staging"):
+        return False
+    raw_debug = cfg.get("app.debug")
+    if isinstance(raw_debug, bool):
+        return raw_debug
+    if isinstance(raw_debug, str):
+        return raw_debug.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
+def _format_admin_error(exc: Exception, *, generic: str, debug: bool) -> str:
+    """Return full exception details only in debug mode; redact in production."""
+    if debug:
+        return f"{generic}: {exc}"
+    return generic
+
+
+def _forbidden_response(
+    request: Request,
+    site: AdminSite,
+    admin_user: AdminUser,
+    clean_prefix: str,
+    message: str = "Forbidden: insufficient administrator permissions.",
+) -> Response:
+    """Return consistent JSON or HTML 403 Forbidden response."""
+    if _wants_json(request):
+        return json_response({"detail": message}, status_code=403)
+    return _html_response(
+        _render_base_layout(
+            site,
+            "Forbidden",
+            f'<div class="alert alert-error">{html.escape(message)}</div>',
+            admin_user=admin_user,
+            prefix=clean_prefix,
+        ),
+        status_code=403,
+    )
 
 
 def _redirect(url: str, status_code: int = 302) -> Response:
@@ -109,17 +196,20 @@ def _render_base_layout(
     """Render the master HTML shell with navbar, sidebar, and responsive styling."""
     models = site.all_registered()
     sidebar_items_html = []
+    esc_prefix = html.escape(_admin_url(prefix), quote=True)
     dash_active = 'class="active"' if active_slug is None else ""
-    sidebar_items_html.append(f'<li><a href="{prefix}/" {dash_active}>📊 Dashboard</a></li>')
+    sidebar_items_html.append(f'<li><a href="{esc_prefix}/" {dash_active}>📊 Dashboard</a></li>')
 
     for m_admin in models:
         is_active = 'class="active"' if active_slug == m_admin.slug else ""
+        model_href = html.escape(_admin_url(prefix, m_admin.slug), quote=True)
         sidebar_items_html.append(
-            f'<li><a href="{prefix}/{m_admin.slug}" {is_active}>📁 {html.escape(m_admin.plural_title)}</a></li>'
+            f'<li><a href="{model_href}" {is_active}>📁 {html.escape(m_admin.plural_title)}</a></li>'
         )
 
     ai_active = 'class="active"' if active_slug == "ai-usage" else ""
-    sidebar_items_html.append(f'<li><a href="{prefix}/ai-usage" {ai_active}>🤖 AI Usage</a></li>')
+    ai_href = html.escape(_admin_url(prefix, "ai-usage"), quote=True)
+    sidebar_items_html.append(f'<li><a href="{ai_href}" {ai_active}>🤖 AI Usage</a></li>')
 
     sidebar_html = "\n".join(sidebar_items_html)
 
@@ -132,10 +222,11 @@ def _render_base_layout(
     user_info_html = ""
     if admin_user:
         csrf_tok = get_admin_session_store().generate_csrf_token(admin_user)
+        logout_action = html.escape(_admin_url(prefix, "logout"), quote=True)
         user_info_html = f"""
         <div class="user-profile">
             <span>👤 <strong>{html.escape(admin_user.username)}</strong></span>
-            <form action="{prefix}/logout" method="POST" style="display:inline; margin-left:12px;">
+            <form action="{logout_action}" method="POST" style="display:inline; margin-left:12px;">
                 <input type="hidden" name="_csrf_token" value="{html.escape(csrf_tok, quote=True)}">
                 <button type="submit" class="btn btn-sm btn-outline">Sign Out</button>
             </form>
@@ -439,7 +530,7 @@ def _render_login_page(
         <div class="brand">⚡ {html.escape(site.title)}</div>
         <div class="subtitle">Secure session-based administrative access</div>
         {error_html}
-        <form action="{prefix}/login" method="POST">
+        <form action="{html.escape(_admin_url(prefix, "login"), quote=True)}" method="POST">
             <div class="form-group">
                 <label for="username">Username</label>
                 <input type="text" id="username" name="username" required autofocus placeholder="admin">
@@ -464,7 +555,12 @@ def _html_response(content: str, status_code: int = 200) -> Response:
     )
 
 
-def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
+def create_admin_router(
+    site: AdminSite,
+    prefix: str = "/admin",
+    *,
+    debug: bool | None = None,
+) -> Router:
     """Construct a complete Router containing all CRUD and authentication endpoints for AdminSite."""
     clean_prefix = "/" + prefix.strip("/")
     router = Router()
@@ -476,12 +572,12 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
     async def login_get(request: Request) -> Response:
         admin_user = get_current_admin(request)
         if admin_user:
-            return _redirect(f"{clean_prefix}/")
+            return _redirect(_admin_url(clean_prefix))
         return _html_response(_render_login_page(site, prefix=clean_prefix))
 
     async def login_post(request: Request) -> Response:
         payload = await _extract_payload(request)
-        username = str(payload.get("username", "")).strip()
+        username = str(payload.get("username") or payload.get("email") or "").strip()
         password = str(payload.get("password", ""))
 
         authenticator = get_admin_authenticator()
@@ -499,15 +595,33 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         else:
             resp = _redirect(f"{clean_prefix}/")
 
-        create_admin_session(resp, user)
+        create_admin_session(resp, user, prefix=clean_prefix, request=request)
         return resp
 
     async def logout_handler(request: Request) -> Response:
+        admin_user = get_current_admin(request)
+        if not admin_user:
+            if _wants_json(request):
+                return json_response({"detail": "Admin authentication required."}, status_code=401)
+            return _redirect(_admin_url(clean_prefix, "login"))
+
+        payload = await _extract_payload(request)
+        session_store = get_admin_session_store()
+        csrf_tok = payload.get("_csrf_token") or request.headers.get("x-csrf-token")
+        if not session_store.verify_csrf_token(csrf_tok, admin_user):
+            return _forbidden_response(
+                request,
+                site,
+                admin_user,
+                clean_prefix,
+                "CSRF verification failed: missing or invalid CSRF token.",
+            )
+
         if _wants_json(request):
             resp = json_response({"message": "Logged out successfully."})
         else:
-            resp = _redirect(f"{clean_prefix}/login")
-        clear_admin_session(resp)
+            resp = _redirect(_admin_url(clean_prefix, "login"))
+        clear_admin_session(resp, request, prefix=clean_prefix)
         return resp
 
     async def dashboard_get(request: Request) -> Response:
@@ -551,11 +665,19 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         """
 
         for m_admin in registered:
+            if not m_admin.has_view_permission(request, admin_user):
+                continue
             try:
                 count = await m_admin.model.query().count()
             except (RuntimeError, OSError, ValueError):
                 count = 0
             stats[m_admin.slug] = {"title": m_admin.plural_title, "count": count}
+
+            browse_href = html.escape(_admin_url(clean_prefix, m_admin.slug), quote=True)
+            add_btn_html = ""
+            if m_admin.has_create_permission(request, admin_user):
+                create_href = html.escape(_admin_url(clean_prefix, m_admin.slug, "create"), quote=True)
+                add_btn_html = f'<a href="{create_href}" class="btn btn-outline btn-sm">+ Add New</a>'
 
             cards_html.append(f"""
             <div class="card" style="padding: 24px; margin-bottom: 20px;">
@@ -567,8 +689,8 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                         <span class="badge">{count} records</span>
                     </div>
                     <div>
-                        <a href="{clean_prefix}/{m_admin.slug}" class="btn btn-primary btn-sm">Browse Records</a>
-                        <a href="{clean_prefix}/{m_admin.slug}/create" class="btn btn-outline btn-sm">+ Add New</a>
+                        <a href="{browse_href}" class="btn btn-primary btn-sm">Browse Records</a>
+                        {add_btn_html}
                     </div>
                 </div>
             </div>
@@ -789,7 +911,6 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
 
     router.add_route("GET", f"{clean_prefix}/login", login_get)
     router.add_route("POST", f"{clean_prefix}/login", login_post)
-    router.add_route("GET", f"{clean_prefix}/logout", logout_handler)
     router.add_route("POST", f"{clean_prefix}/logout", logout_handler)
     router.add_route("GET", f"{clean_prefix}/", dashboard_get)
     router.add_route("GET", f"{clean_prefix}", dashboard_get)
@@ -804,36 +925,75 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         if not admin_user:
             if _wants_json(request):
                 return json_response({"detail": "Admin authentication required."}, status_code=401)
-            return _redirect(f"{clean_prefix}/login")
+            return _redirect(_admin_url(clean_prefix, "login"))
 
         item = site.get_by_slug(slug)
         if not item:
             return not_found(f"Model '{slug}' not found.")
         model_cls, m_admin = item
 
-        # Query records with eager loaded BelongsTo relations
+        if not m_admin.has_view_permission(request, admin_user):
+            return _forbidden_response(request, site, admin_user, clean_prefix)
+
+        page = 1
+        default_per_page = max(1, int(getattr(m_admin, "per_page", 25) or 25))
+        per_page = default_per_page
+        try:
+            raw_page = request.query_params.get("page")
+            if raw_page is not None:
+                page = max(1, int(raw_page))
+        except (ValueError, TypeError):
+            page = 1
+        try:
+            raw_per_page = request.query_params.get("per_page")
+            if raw_per_page is not None:
+                per_page = max(1, min(200, int(raw_per_page)))
+        except (ValueError, TypeError):
+            per_page = default_per_page
+
+        # Query records with eager loaded BelongsTo relations and safe OR search + pagination
         query = m_admin.get_queryset()
-        search_query = request.query_params.get("q")
+        search_query = str(request.query_params.get("q") or "").strip()
         if search_query and m_admin.search_fields:
-            for field in m_admin.search_fields:
-                query.where_ilike(field, f"%{search_query}%")
+            search_fields = list(m_admin.search_fields)
+
+            def _apply_search(q: ModelQueryBuilder[Any]) -> None:
+                q.where_ilike(search_fields[0], search_query)
+                for field in search_fields[1:]:
+                    q.or_where_ilike(field, search_query)
+
+            query.where_group(_apply_search)
 
         try:
-            records = await query.get()
-        except Exception:
+            paginator = await query.paginate(per_page=per_page, page=page)
+        except _ADMIN_DB_ERRORS:
             logger.exception("Error querying records for admin list")
-            records = []
+            paginator = Paginator(items=[], total=0, per_page=per_page, current_page=page)
+
+        records = paginator.items
+        total_records = paginator.total
+        last_page = paginator.last_page
 
         if _wants_json(request):
             data = [
                 r.to_dict() if hasattr(r, "to_dict") else getattr(r, "_attributes", {})
                 for r in records
             ]
-            return json_response({"model": m_admin.title, "count": len(records), "data": data})
+            return json_response(
+                {
+                    "model": m_admin.title,
+                    "count": len(records),
+                    "total": total_records,
+                    "page": paginator.current_page,
+                    "per_page": paginator.per_page,
+                    "last_page": last_page,
+                    "data": data,
+                }
+            )
 
         # Build table headers
         list_display = m_admin.get_list_display()
-        th_cells = [f"<th>{html.escape(_humanize_header(col))}</th>" for col in list_display]
+        th_cells = [f"<th>{html.escape(humanize_name(col))}</th>" for col in list_display]
         th_cells.append('<th style="text-align:right;">Actions</th>')
         thead_html = f"<tr>{''.join(th_cells)}</tr>"
 
@@ -845,6 +1005,9 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
             for meta in relationships.values()
             if meta.relation_type == "BelongsTo" and meta.foreign_key
         }
+        can_create = m_admin.has_create_permission(request, admin_user)
+        can_edit = m_admin.has_edit_permission(request, admin_user)
+        can_delete = m_admin.has_delete_permission(request, admin_user)
 
         tbody_rows = []
         for rec in records:
@@ -865,16 +1028,20 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
 
                 td_cells.append(f"<td>{display_val}</td>")
 
-            csrf_tok = get_admin_session_store().generate_csrf_token(admin_user)
-            actions_html = f"""
-            <td style="text-align:right;">
-                <a href="{clean_prefix}/{slug}/{pk_val}/edit" class="btn btn-sm btn-outline">Edit</a>
-                <form action="{clean_prefix}/{slug}/{pk_val}/delete" method="POST" style="display:inline; margin-left:6px;" onsubmit="return confirm('Delete this record?');">
-                    <input type="hidden" name="_csrf_token" value="{html.escape(csrf_tok, quote=True)}">
-                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
-                </form>
-            </td>
-            """
+            action_parts = []
+            if can_edit:
+                edit_href = html.escape(_admin_url(clean_prefix, slug, pk_val, "edit"), quote=True)
+                action_parts.append(f'<a href="{edit_href}" class="btn btn-sm btn-outline">Edit</a>')
+            if can_delete:
+                csrf_tok = get_admin_session_store().generate_csrf_token(admin_user)
+                delete_action = html.escape(_admin_url(clean_prefix, slug, pk_val, "delete"), quote=True)
+                action_parts.append(
+                    f"""<form action="{delete_action}" method="POST" style="display:inline; margin-left:6px;" onsubmit="return confirm('Delete this record?');">
+                        <input type="hidden" name="_csrf_token" value="{html.escape(csrf_tok, quote=True)}">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>"""
+                )
+            actions_html = f'<td style="text-align:right;">{"".join(action_parts)}</td>'
             td_cells.append(actions_html)
             tbody_rows.append(f"<tr>{''.join(td_cells)}</tr>")
 
@@ -884,21 +1051,70 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
             else f'<tr><td colspan="{len(list_display) + 1}" style="text-align:center; color:var(--text-muted); padding:30px;">No records found.</td></tr>'
         )
 
+        list_action_href = html.escape(_admin_url(clean_prefix, slug), quote=True)
+        add_btn_html = ""
+        if can_create:
+            create_href = html.escape(_admin_url(clean_prefix, slug, "create"), quote=True)
+            add_btn_html = f'<a href="{create_href}" class="btn btn-primary">+ Add {html.escape(m_admin.title)}</a>'
+
+        search_form_html = ""
+        if m_admin.search_fields:
+            search_form_html = f"""
+            <form action="{list_action_href}" method="GET" style="display:flex; gap:8px; margin-bottom:16px;">
+                <input type="text" name="q" value="{html.escape(search_query, quote=True)}" placeholder="Search..." class="form-control" style="max-width:300px;">
+                <button type="submit" class="btn btn-outline btn-sm">Search</button>
+            </form>
+            """
+
+        prev_link_html = ""
+        if paginator.has_previous_page:
+            prev_href = html.escape(
+                _admin_url(
+                    clean_prefix,
+                    slug,
+                    query={"page": paginator.current_page - 1, "per_page": paginator.per_page, "q": search_query},
+                ),
+                quote=True,
+            )
+            prev_link_html = f'<a href="{prev_href}" class="btn btn-outline btn-sm">&laquo; Prev</a>'
+
+        next_link_html = ""
+        if paginator.has_more_pages:
+            next_href = html.escape(
+                _admin_url(
+                    clean_prefix,
+                    slug,
+                    query={"page": paginator.current_page + 1, "per_page": paginator.per_page, "q": search_query},
+                ),
+                quote=True,
+            )
+            next_link_html = f'<a href="{next_href}" class="btn btn-outline btn-sm" style="margin-left:8px;">Next &raquo;</a>'
+
         body = f"""
         <div class="page-header">
             <div>
                 <h1>{html.escape(m_admin.plural_title)}</h1>
-                <p style="color:var(--text-muted); font-size:0.9rem;">{len(records)} total records</p>
+                <p style="color:var(--text-muted); font-size:0.9rem;">{total_records} total records</p>
             </div>
             <div>
-                <a href="{clean_prefix}/{slug}/create" class="btn btn-primary">+ Add {html.escape(m_admin.title)}</a>
+                {add_btn_html}
             </div>
         </div>
+        {search_form_html}
         <div class="card">
             <table class="data-table">
                 <thead>{thead_html}</thead>
                 <tbody>{tbody_html}</tbody>
             </table>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:16px;">
+            <div style="color:var(--text-muted); font-size:0.9rem;">
+                Page {paginator.current_page} of {last_page} &bull; Showing {len(records)} of {total_records} records
+            </div>
+            <div>
+                {prev_link_html}
+                {next_link_html}
+            </div>
         </div>
         """
         html_str = _render_base_layout(
@@ -914,26 +1130,31 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
     async def create_get(request: Request, slug: str) -> Response:
         admin_user = get_current_admin(request)
         if not admin_user:
-            return _redirect(f"{clean_prefix}/login")
+            return _redirect(_admin_url(clean_prefix, "login"))
 
         item = site.get_by_slug(slug)
         if not item:
             return not_found(f"Model '{slug}' not found.")
         _, m_admin = item
 
+        if not m_admin.has_create_permission(request, admin_user):
+            return _forbidden_response(request, site, admin_user, clean_prefix)
+
         csrf_tok = get_admin_session_store().generate_csrf_token(admin_user)
         form_fields_html = await _build_form_inputs(m_admin, csrf_token=csrf_tok)
+        list_href = html.escape(_admin_url(clean_prefix, slug), quote=True)
+        create_action = html.escape(_admin_url(clean_prefix, slug, "create"), quote=True)
         body = f"""
         <div class="page-header">
             <h1>Create {html.escape(m_admin.title)}</h1>
-            <a href="{clean_prefix}/{slug}" class="btn btn-outline btn-sm">← Back to List</a>
+            <a href="{list_href}" class="btn btn-outline btn-sm">← Back to List</a>
         </div>
         <div class="card" style="padding: 28px; max-width: 650px;">
-            <form action="{clean_prefix}/{slug}/create" method="POST">
+            <form action="{create_action}" method="POST">
                 {form_fields_html}
                 <div style="margin-top:24px; display:flex; gap:10px;">
                     <button type="submit" class="btn btn-primary">Save {html.escape(m_admin.title)}</button>
-                    <a href="{clean_prefix}/{slug}" class="btn btn-outline">Cancel</a>
+                    <a href="{list_href}" class="btn btn-outline">Cancel</a>
                 </div>
             </form>
         </div>
@@ -953,30 +1174,30 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         if not admin_user:
             if _wants_json(request):
                 return json_response({"detail": "Admin authentication required."}, status_code=401)
-            return _redirect(f"{clean_prefix}/login")
+            return _redirect(_admin_url(clean_prefix, "login"))
 
         item = site.get_by_slug(slug)
         if not item:
             return not_found(f"Model '{slug}' not found.")
         model_cls, m_admin = item
 
+        if not m_admin.has_create_permission(request, admin_user):
+            return _forbidden_response(request, site, admin_user, clean_prefix)
+
         payload = await _extract_payload(request)
         session_store = get_admin_session_store()
         csrf_tok = payload.get("_csrf_token") or request.headers.get("x-csrf-token")
         if not session_store.verify_csrf_token(csrf_tok, admin_user):
-            if _wants_json(request):
-                return json_response({"detail": "CSRF verification failed: missing or invalid CSRF token."}, status_code=403)
-            return _html_response(
-                _render_base_layout(
-                    site,
-                    "Forbidden",
-                    '<div class="alert alert-error">CSRF verification failed: missing or invalid CSRF token.</div>',
-                    admin_user=admin_user,
-                    prefix=clean_prefix,
-                ),
-                status_code=403,
+            return _forbidden_response(
+                request,
+                site,
+                admin_user,
+                clean_prefix,
+                "CSRF verification failed: missing or invalid CSRF token.",
             )
 
+        is_debug = _is_admin_debug_mode(debug)
+        create_action = html.escape(_admin_url(clean_prefix, slug, "create"), quote=True)
         fields = m_admin.get_form_fields()
         data: dict[str, Any] = {}
         protected_fields = {m_admin.primary_key, "created_at", "updated_at"}
@@ -986,8 +1207,9 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                 try:
                     data[f.name] = f.coerce_value(payload[f.name])
                 except ValueError as err:
+                    err_msg = _format_admin_error(err, generic="Invalid field value submitted.", debug=is_debug)
                     if _wants_json(request):
-                        return json_response({"error": str(err)}, status_code=422)
+                        return json_response({"error": err_msg}, status_code=422)
                     csrf_t = session_store.generate_csrf_token(admin_user)
                     form_fields_html = await _build_form_inputs(m_admin, values=payload, csrf_token=csrf_t)
                     body = f"""
@@ -995,7 +1217,7 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                         <h1>Create {html.escape(m_admin.title)}</h1>
                     </div>
                     <div class="card" style="padding: 28px; max-width: 650px;">
-                        <form action="{clean_prefix}/{slug}/create" method="POST">
+                        <form action="{create_action}" method="POST">
                             {form_fields_html}
                             <div style="margin-top:24px; display:flex; gap:10px;">
                                 <button type="submit" class="btn btn-primary">Save {html.escape(m_admin.title)}</button>
@@ -1010,17 +1232,18 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                         admin_user=admin_user,
                         prefix=clean_prefix,
                         active_slug=slug,
-                        flash_error=f"Validation error: {err}",
+                        flash_error=f"Validation error: {err_msg}" if is_debug else err_msg,
                     )
                     return _html_response(html_str, status_code=422)
 
         try:
             instance = model_cls(**data)
             await instance.save()
-        except Exception as exc:
+        except _ADMIN_DB_ERRORS as exc:
             logger.exception("Failed to create record for %s", slug)
+            err_msg = _format_admin_error(exc, generic="Failed to save record.", debug=is_debug)
             if _wants_json(request):
-                return json_response({"error": str(exc)}, status_code=422)
+                return json_response({"error": err_msg}, status_code=422)
             csrf_t = session_store.generate_csrf_token(admin_user)
             form_fields_html = await _build_form_inputs(m_admin, values=payload, csrf_token=csrf_t)
             body = f"""
@@ -1028,7 +1251,7 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                 <h1>Create {html.escape(m_admin.title)}</h1>
             </div>
             <div class="card" style="padding: 28px; max-width: 650px;">
-                <form action="{clean_prefix}/{slug}/create" method="POST">
+                <form action="{create_action}" method="POST">
                     {form_fields_html}
                     <div style="margin-top:24px; display:flex; gap:10px;">
                         <button type="submit" class="btn btn-primary">Save {html.escape(m_admin.title)}</button>
@@ -1043,7 +1266,7 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                 admin_user=admin_user,
                 prefix=clean_prefix,
                 active_slug=slug,
-                flash_error=f"Error saving record: {exc}",
+                flash_error=err_msg,
             )
             return _html_response(html_str, status_code=422)
 
@@ -1052,17 +1275,20 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                 instance.to_dict() if hasattr(instance, "to_dict") else getattr(instance, "_attributes", {}),
                 status_code=201,
             )
-        return _redirect(f"{clean_prefix}/{slug}")
+        return _redirect(_admin_url(clean_prefix, slug))
 
     async def edit_get(request: Request, slug: str, id: str) -> Response:
         admin_user = get_current_admin(request)
         if not admin_user:
-            return _redirect(f"{clean_prefix}/login")
+            return _redirect(_admin_url(clean_prefix, "login"))
 
         item = site.get_by_slug(slug)
         if not item:
             return not_found(f"Model '{slug}' not found.")
         model_cls, m_admin = item
+
+        if not m_admin.has_edit_permission(request, admin_user):
+            return _forbidden_response(request, site, admin_user, clean_prefix)
 
         pk_col = getattr(model_cls, "__primary_key__", "id")
         pk_val = _coerce_pk(m_admin, id)
@@ -1078,17 +1304,19 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         csrf_tok = get_admin_session_store().generate_csrf_token(admin_user)
         form_fields_html = await _build_form_inputs(m_admin, values=current_values, csrf_token=csrf_tok)
 
+        list_href = html.escape(_admin_url(clean_prefix, slug), quote=True)
+        edit_action = html.escape(_admin_url(clean_prefix, slug, id, "edit"), quote=True)
         body = f"""
         <div class="page-header">
-            <h1>Edit {html.escape(m_admin.title)} #{html.escape(id)}</h1>
-            <a href="{clean_prefix}/{slug}" class="btn btn-outline btn-sm">← Back to List</a>
+            <h1>Edit {html.escape(m_admin.title)} #{html.escape(str(id))}</h1>
+            <a href="{list_href}" class="btn btn-outline btn-sm">← Back to List</a>
         </div>
         <div class="card" style="padding: 28px; max-width: 650px;">
-            <form action="{clean_prefix}/{slug}/{id}/edit" method="POST">
+            <form action="{edit_action}" method="POST">
                 {form_fields_html}
                 <div style="margin-top:24px; display:flex; gap:10px;">
                     <button type="submit" class="btn btn-primary">Update {html.escape(m_admin.title)}</button>
-                    <a href="{clean_prefix}/{slug}" class="btn btn-outline">Cancel</a>
+                    <a href="{list_href}" class="btn btn-outline">Cancel</a>
                 </div>
             </form>
         </div>
@@ -1108,12 +1336,15 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         if not admin_user:
             if _wants_json(request):
                 return json_response({"detail": "Admin authentication required."}, status_code=401)
-            return _redirect(f"{clean_prefix}/login")
+            return _redirect(_admin_url(clean_prefix, "login"))
 
         item = site.get_by_slug(slug)
         if not item:
             return not_found(f"Model '{slug}' not found.")
         model_cls, m_admin = item
+
+        if not m_admin.has_edit_permission(request, admin_user):
+            return _forbidden_response(request, site, admin_user, clean_prefix)
 
         pk_col = getattr(model_cls, "__primary_key__", "id")
         pk_val = _coerce_pk(m_admin, id)
@@ -1125,19 +1356,16 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         session_store = get_admin_session_store()
         csrf_tok = payload.get("_csrf_token") or request.headers.get("x-csrf-token")
         if not session_store.verify_csrf_token(csrf_tok, admin_user):
-            if _wants_json(request):
-                return json_response({"detail": "CSRF verification failed: missing or invalid CSRF token."}, status_code=403)
-            return _html_response(
-                _render_base_layout(
-                    site,
-                    "Forbidden",
-                    '<div class="alert alert-error">CSRF verification failed: missing or invalid CSRF token.</div>',
-                    admin_user=admin_user,
-                    prefix=clean_prefix,
-                ),
-                status_code=403,
+            return _forbidden_response(
+                request,
+                site,
+                admin_user,
+                clean_prefix,
+                "CSRF verification failed: missing or invalid CSRF token.",
             )
 
+        is_debug = _is_admin_debug_mode(debug)
+        edit_action = html.escape(_admin_url(clean_prefix, slug, id, "edit"), quote=True)
         fields = m_admin.get_form_fields()
         protected_fields = {m_admin.primary_key, "created_at", "updated_at"}
 
@@ -1146,13 +1374,14 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                 try:
                     setattr(record, f.name, f.coerce_value(payload[f.name]))
                 except ValueError as err:
+                    err_msg = _format_admin_error(err, generic="Invalid field value submitted.", debug=is_debug)
                     if _wants_json(request):
-                        return json_response({"error": str(err)}, status_code=422)
+                        return json_response({"error": err_msg}, status_code=422)
                     csrf_t = session_store.generate_csrf_token(admin_user)
                     form_fields_html = await _build_form_inputs(m_admin, values=payload, csrf_token=csrf_t)
                     body = f"""
                     <div class="card" style="padding: 28px; max-width: 650px;">
-                        <form action="{clean_prefix}/{slug}/{id}/edit" method="POST">
+                        <form action="{edit_action}" method="POST">
                             {form_fields_html}
                             <button type="submit" class="btn btn-primary">Update {html.escape(m_admin.title)}</button>
                         </form>
@@ -1165,21 +1394,22 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                         admin_user=admin_user,
                         prefix=clean_prefix,
                         active_slug=slug,
-                        flash_error=f"Validation error: {err}",
+                        flash_error=f"Validation error: {err_msg}" if is_debug else err_msg,
                     )
                     return _html_response(html_str, status_code=422)
 
         try:
             await record.save()
-        except Exception as exc:
+        except _ADMIN_DB_ERRORS as exc:
             logger.exception("Failed to update record #%s for %s", id, slug)
+            err_msg = _format_admin_error(exc, generic="Failed to update record.", debug=is_debug)
             if _wants_json(request):
-                return json_response({"error": str(exc)}, status_code=422)
+                return json_response({"error": err_msg}, status_code=422)
             csrf_t = session_store.generate_csrf_token(admin_user)
             form_fields_html = await _build_form_inputs(m_admin, values=payload, csrf_token=csrf_t)
             body = f"""
             <div class="card" style="padding: 28px; max-width: 650px;">
-                <form action="{clean_prefix}/{slug}/{id}/edit" method="POST">
+                <form action="{edit_action}" method="POST">
                     {form_fields_html}
                     <button type="submit" class="btn btn-primary">Update {html.escape(m_admin.title)}</button>
                 </form>
@@ -1192,7 +1422,7 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
                 admin_user=admin_user,
                 prefix=clean_prefix,
                 active_slug=slug,
-                flash_error=f"Error updating record: {exc}",
+                flash_error=err_msg,
             )
             return _html_response(html_str, status_code=422)
 
@@ -1200,35 +1430,33 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
             return json_response(
                 record.to_dict() if hasattr(record, "to_dict") else getattr(record, "_attributes", {})
             )
-        return _redirect(f"{clean_prefix}/{slug}")
+        return _redirect(_admin_url(clean_prefix, slug))
 
     async def delete_handler(request: Request, slug: str, id: str) -> Response:
         admin_user = get_current_admin(request)
         if not admin_user:
             if _wants_json(request):
                 return json_response({"detail": "Admin authentication required."}, status_code=401)
-            return _redirect(f"{clean_prefix}/login")
+            return _redirect(_admin_url(clean_prefix, "login"))
 
         item = site.get_by_slug(slug)
         if not item:
             return not_found(f"Model '{slug}' not found.")
         model_cls, m_admin = item
 
+        if not m_admin.has_delete_permission(request, admin_user):
+            return _forbidden_response(request, site, admin_user, clean_prefix)
+
         payload = await _extract_payload(request)
         session_store = get_admin_session_store()
         csrf_tok = payload.get("_csrf_token") or request.headers.get("x-csrf-token")
         if not session_store.verify_csrf_token(csrf_tok, admin_user):
-            if _wants_json(request):
-                return json_response({"detail": "CSRF verification failed: missing or invalid CSRF token."}, status_code=403)
-            return _html_response(
-                _render_base_layout(
-                    site,
-                    "Forbidden",
-                    '<div class="alert alert-error">CSRF verification failed: missing or invalid CSRF token.</div>',
-                    admin_user=admin_user,
-                    prefix=clean_prefix,
-                ),
-                status_code=403,
+            return _forbidden_response(
+                request,
+                site,
+                admin_user,
+                clean_prefix,
+                "CSRF verification failed: missing or invalid CSRF token.",
             )
 
         pk_col = getattr(model_cls, "__primary_key__", "id")
@@ -1237,16 +1465,29 @@ def create_admin_router(site: AdminSite, prefix: str = "/admin") -> Router:
         if not record:
             return not_found(f"Record with ID {id} not found.")
 
+        is_debug = _is_admin_debug_mode(debug)
         try:
             await record.delete()
-        except Exception as exc:
+        except _ADMIN_DB_ERRORS as exc:
             logger.exception("Failed to delete record #%s for %s", id, slug)
+            err_msg = _format_admin_error(exc, generic="Failed to delete record.", debug=is_debug)
             if _wants_json(request):
-                return json_response({"error": str(exc)}, status_code=500)
+                return json_response({"error": err_msg}, status_code=500)
+            list_href = html.escape(_admin_url(clean_prefix, slug), quote=True)
+            html_str = _render_base_layout(
+                site,
+                f"Delete {m_admin.title} Failed",
+                f'<div class="card" style="padding:24px;"><p>Unable to delete the requested record.</p><a href="{list_href}" class="btn btn-outline btn-sm">← Back to List</a></div>',
+                admin_user=admin_user,
+                prefix=clean_prefix,
+                active_slug=slug,
+                flash_error=err_msg,
+            )
+            return _html_response(html_str, status_code=500)
 
         if _wants_json(request):
             return json_response({"message": f"Record #{id} deleted successfully."})
-        return _redirect(f"{clean_prefix}/{slug}")
+        return _redirect(_admin_url(clean_prefix, slug))
 
     # Register CRUD routes
     router.add_route("GET", f"{clean_prefix}/{{slug}}", list_view)
@@ -1325,16 +1566,9 @@ async def _build_form_inputs(
     return "\n".join(html_parts)
 
 
-def _humanize_header(col: str) -> str:
-    if col.lower() == "id":
-        return "ID"
-    clean = col.removesuffix("_id") if col.endswith("_id") and len(col) > 3 else col
-    return clean.replace("_", " ").title()
-
-
 def compile_admin_routes(site: AdminSite, app: Application, prefix: str = "/admin") -> None:
     """Mount the compiled admin router directly onto a SwiftPY Application."""
-    router = create_admin_router(site, prefix=prefix)
+    router = create_admin_router(site, prefix=prefix, debug=app.debug)
     # Merge admin routes into application's router
     for route in router.routes:
         app.router.add_compiled_route(route)

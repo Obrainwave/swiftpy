@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 import uuid
 
+import asyncpg
 import pytest
 
 from swiftpy.ai.vectorstore.pgvector_adapter import PgVectorAdapter
@@ -11,9 +13,13 @@ from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import db
 
 
+async def _build_pgvector_config() -> Config:
+    return Config.load(ignore_cache=True)
+
+
 async def _check_pgvector_connection() -> bool:
     try:
-        config = Config()
+        config = await _build_pgvector_config()
         pool = DatabasePool(config)
         await pool.init()
         raw_pool = pool.get_pool()
@@ -24,7 +30,7 @@ async def _check_pgvector_connection() -> bool:
         finally:
             await raw_pool.release(conn)
             await pool.close()
-    except (OSError, RuntimeError, TimeoutError):
+    except (OSError, RuntimeError, TimeoutError, asyncpg.PostgresError):
         return False
 
 
@@ -37,7 +43,7 @@ async def test_pgvector_live_database_crud_and_search() -> None:
     if not await _check_pgvector_connection():
         pytest.skip("PostgreSQL with pgvector is not available in the local execution environment.")
 
-    config = Config()
+    config = await _build_pgvector_config()
     pool = DatabasePool(config)
     await pool.init()
 
@@ -101,7 +107,7 @@ async def test_pgvector_transaction_rollback_and_commit() -> None:
     if not await _check_pgvector_connection():
         pytest.skip("PostgreSQL with pgvector is not available in the local execution environment.")
 
-    config = Config()
+    config = await _build_pgvector_config()
     pool = DatabasePool(config)
     await pool.init()
     container = get_container()
@@ -136,3 +142,40 @@ async def test_pgvector_transaction_rollback_and_commit() -> None:
     finally:
         await adapter.drop_collection(coll_name)
         await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_check_pgvector_connection_returns_false_on_postgres_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing pgvector extension raises asyncpg.PostgresError and must return False so tests skip."""
+    pool_closed = False
+
+    class _FakeConn:
+        async def execute(self, _sql: str) -> None:
+            raise asyncpg.FeatureNotSupportedError('extension "vector" is not available')
+
+    class _FakeRawPool:
+        async def acquire(self) -> _FakeConn:
+            return _FakeConn()
+
+        async def release(self, _conn: _FakeConn) -> None:
+            return None
+
+    class _FakePool:
+        def __init__(self, _config: Config) -> None:
+            pass
+
+        async def init(self) -> None:
+            return None
+
+        def get_pool(self) -> _FakeRawPool:
+            return _FakeRawPool()
+
+        async def close(self) -> None:
+            nonlocal pool_closed
+            pool_closed = True
+
+    monkeypatch.setattr(sys.modules[__name__], "DatabasePool", _FakePool)
+    assert await _check_pgvector_connection() is False
+    assert pool_closed is True

@@ -4,7 +4,7 @@ from swiftpy.helpers.helper import env
 
 CONFIG: dict[str, object] = {
     "default": env("FILESYSTEM_DISK", "local"),
-    "signing_key": env("FILESYSTEM_SIGNING_KEY", env("APP_KEY", "swiftpy-secret-signing-key")),
+    "signing_key": env("FILESYSTEM_SIGNING_KEY", env("APP_KEY", "")),
     "disks": {
         "local": {
             "driver": "local",

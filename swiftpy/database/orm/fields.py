@@ -36,7 +36,7 @@ class VectorFieldInfo(FieldInfo):
         primary_key: bool = False,
         nullable: bool = True,
     ) -> None:
-        if not isinstance(dimensions, int) or dimensions <= 0:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(f"Vector dimensions must be a positive integer, got {dimensions}")
         allowed_metrics = {"cosine", "l2", "inner_product"}
         if metric not in allowed_metrics:

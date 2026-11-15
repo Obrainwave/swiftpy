@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from swiftpy.core.application import Application
@@ -210,8 +212,6 @@ async def test_test_client_json_serialization_and_raw_body_handling() -> None:
 @pytest.mark.asyncio
 async def test_test_client_independent_headers_across_concurrent_requests() -> None:
     """Verify that concurrent requests using distinct client configurations retain header isolation."""
-    import asyncio
-
     app = Application()
 
     @app.get("/echo-headers")

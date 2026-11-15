@@ -211,7 +211,12 @@ async def test_redis_bus_caller_client_ownership(
     Test: When an external Redis client is passed to RedisEventBus, closing the bus
     does NOT close the caller's client (_owns_client=False).
     """
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     try:
         bus = RedisEventBus(redis_client=client)
         assert bus._owns_client is False
@@ -300,7 +305,12 @@ async def test_redis_bus_resilience_to_malformed_messages_and_handler_errors(
     and exceptions thrown by subscriber handlers without crashing or stopping.
     """
     prefix = f"resilience_{uuid.uuid4().hex[:8]}:"
-    raw_client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    raw_client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     bus = RedisEventBus(host=redis_host, port=redis_port, channel_prefix=prefix)
     sender_bus = RedisEventBus(host=redis_host, port=redis_port, channel_prefix=prefix)
 
@@ -354,7 +364,12 @@ async def test_cross_process_event_delivery_via_redis_bus(
     ready_key = f"{prefix}worker_b_ready"
     result_key = f"{prefix}worker_b_result"
 
-    client = aioredis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    client = aioredis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     await client.delete(ready_key, result_key)
 
     worker_script = f"""
@@ -371,7 +386,12 @@ async def main():
     ready_key = "{ready_key}"
     result_key = "{result_key}"
 
-    client = aioredis.Redis(host=host, port=port, decode_responses=True)
+    client = aioredis.Redis(
+        host=host,
+        port=port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     bus = RedisEventBus(redis_client=client, channel_prefix=prefix)
 
     async def on_event(payload):

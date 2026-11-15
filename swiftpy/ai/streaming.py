@@ -1,10 +1,43 @@
 from __future__ import annotations
 
+import codecs
 import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 from swiftpy.ai.exceptions import AIProviderError
+
+
+async def _iter_sse_lines(lines: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Expand chunks containing embedded newlines into individual SSE lines."""
+    async for chunk in lines:
+        if not chunk:
+            yield ""
+            continue
+        for line in chunk.splitlines():
+            yield line
+
+
+def _parse_sse_event_payload(full_data: str, current_event: str) -> dict[str, Any]:
+    """Parse buffered SSE event data and raise AIProviderError on active provider errors."""
+    try:
+        parsed_json = json.loads(full_data)
+    except (json.JSONDecodeError, ValueError):
+        return {"event": current_event, "data": full_data}
+
+    if isinstance(parsed_json, dict):
+        err_obj = parsed_json.get("error")
+        if parsed_json.get("type") == "error" or (
+            err_obj is not None and err_obj is not False
+        ):
+            payload_err = err_obj if err_obj is not None else parsed_json
+            err_msg = (
+                payload_err.get("message")
+                if isinstance(payload_err, dict)
+                else str(payload_err)
+            )
+            raise AIProviderError(f"Stream error: {err_msg}")
+    return {"event": current_event, "data": parsed_json}
 
 
 async def parse_sse_events(
@@ -24,7 +57,7 @@ async def parse_sse_events(
     current_event = "message"
     data_buffer: list[str] = []
 
-    async for raw_line in lines:
+    async for raw_line in _iter_sse_lines(lines):
         line = raw_line.rstrip("\r\n")
 
         if not line:
@@ -34,23 +67,7 @@ async def parse_sse_events(
                 data_buffer.clear()
                 if full_data == "[DONE]":
                     break
-
-                try:
-                    parsed_json = json.loads(full_data)
-                    # Check for provider stream error payload
-                    if isinstance(parsed_json, dict) and (
-                        parsed_json.get("type") == "error" or "error" in parsed_json
-                    ):
-                        err_obj = parsed_json.get("error", parsed_json)
-                        err_msg = (
-                            err_obj.get("message")
-                            if isinstance(err_obj, dict)
-                            else str(err_obj)
-                        )
-                        raise AIProviderError(f"Stream error: {err_msg}")
-                    yield {"event": current_event, "data": parsed_json}
-                except (json.JSONDecodeError, ValueError):
-                    yield {"event": current_event, "data": full_data}
+                yield _parse_sse_event_payload(full_data, current_event)
                 current_event = "message"
             continue
 
@@ -70,21 +87,7 @@ async def parse_sse_events(
     if data_buffer:
         full_data = "\n".join(data_buffer)
         if full_data != "[DONE]":
-            try:
-                parsed_json = json.loads(full_data)
-                if isinstance(parsed_json, dict) and (
-                    parsed_json.get("type") == "error" or "error" in parsed_json
-                ):
-                    err_obj = parsed_json.get("error", parsed_json)
-                    err_msg = (
-                        err_obj.get("message")
-                        if isinstance(err_obj, dict)
-                        else str(err_obj)
-                    )
-                    raise AIProviderError(f"Stream error: {err_msg}")
-                yield {"event": current_event, "data": parsed_json}
-            except (json.JSONDecodeError, ValueError):
-                yield {"event": current_event, "data": full_data}
+            yield _parse_sse_event_payload(full_data, current_event)
 
 
 async def split_chunk_lines(
@@ -92,14 +95,21 @@ async def split_chunk_lines(
 ) -> AsyncIterator[str]:
     """
     Split arbitrary incoming network chunks into individual lines, buffering
-    partial lines that cross chunk boundaries.
+    partial lines and multi-byte UTF-8 sequences across chunk boundaries.
     """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buffer = ""
     async for chunk in chunks:
-        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
+        if isinstance(chunk, (bytes, bytearray)):
+            text = decoder.decode(chunk, final=False)
+        else:
+            text = chunk
         buffer += text
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             yield line
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        buffer += tail
     if buffer:
         yield buffer

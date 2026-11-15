@@ -14,7 +14,7 @@ from swiftpy.auth.exceptions import (
     TokenRevokedError,
 )
 from swiftpy.auth.jwt_issuer import JWTIssuer
-from swiftpy.auth.token_blacklist import TokenBlacklist
+from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
 from swiftpy.core.context import Context
@@ -121,12 +121,13 @@ async def require_jwt(
     if active_issuer is None:
         active_issuer = JWTIssuer.from_config()
 
-    # 4. Resolve TokenBlacklist from parameters, container, or default
+    # 4. Resolve TokenBlacklist from parameters or container unless disabled in config
     active_blacklist = blacklist
     if active_blacklist is None:
         try:
             container = get_container()
-            if container.has(TokenBlacklist):
+            cfg = container.resolve(Config) if container.has(Config) else None
+            if is_token_blacklist_enabled(cfg) and container.has(TokenBlacklist):
                 active_blacklist = container.resolve(TokenBlacklist)
         except RuntimeError:
             pass

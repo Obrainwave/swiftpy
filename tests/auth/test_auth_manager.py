@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
@@ -70,7 +71,12 @@ async def test_auth_manager_default_builtin_jwt_guard_authenticate() -> None:
             "auth": {
                 "defaults": {"guard": "jwt"},
                 "jwt": {"secret": secret, "algorithm": "HS256"},
-            }
+            },
+            "redis": {
+                "host": os.getenv("REDIS_HOST", "127.0.0.1"),
+                "port": int(os.getenv("REDIS_PORT", "6379")),
+                "password": os.getenv("REDIS_PASSWORD") or None,
+            },
         },
         auto_discover_providers=False,
     )

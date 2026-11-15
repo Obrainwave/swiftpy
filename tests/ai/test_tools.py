@@ -5,14 +5,10 @@ import datetime
 import enum
 import json
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from typing import Any, ClassVar, Literal, Optional, Union
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.client import AIClient
@@ -38,31 +34,8 @@ from swiftpy.ai.tools.first_party import (
 from swiftpy.core.config import Config
 
 # ==============================================================================
-# Test Fixtures & Scoped Mock Provider & Mock HTTP Client
+# Test Fixtures & Scoped Mock Provider
 # ==============================================================================
-
-
-class MockHttpResponse:
-    def __init__(self, status_code: int, data: dict[str, Any], text: str = "") -> None:
-        self.status_code = status_code
-        self._data = data
-        self.text = text or json.dumps(data)
-        self.headers: dict[str, str] = {}
-
-    def json(self) -> dict[str, Any]:
-        return self._data
-
-
-class MockHttpClient:
-    def __init__(self, handler: Callable[..., MockHttpResponse]) -> None:
-        self._handler = handler
-        self.is_closed = False
-
-    async def post(self, url: str, **kwargs: Any) -> MockHttpResponse:
-        return self._handler(url=url, **kwargs)
-
-    async def aclose(self) -> None:
-        self.is_closed = True
 
 
 @pytest.fixture
@@ -291,7 +264,7 @@ async def test_calculator_tool_security_and_ast_rejections() -> None:
 
     # 8. Type validation: passing non-string
     with pytest.raises(TypeError, match="expression must be a string"):
-        await calc.handle(expression=123)  # type: ignore[arg-type]
+        await calc.handle(expression=json.loads("123"))
 
 
 # ==============================================================================
@@ -320,7 +293,7 @@ async def test_date_time_tool_timezone_precision_and_fallback() -> None:
 
     # Type validation
     with pytest.raises(TypeError, match="timezone must be a string"):
-        await dt.handle(timezone=123)  # type: ignore[arg-type]
+        await dt.handle(timezone=json.loads("123"))
 
 
 @pytest.mark.asyncio
@@ -366,12 +339,12 @@ async def test_openai_raw_wire_payload_and_multi_tool_calls() -> None:
     """
     captured_payloads: list[dict[str, Any]] = []
 
-    def handler(url: str, **kwargs: Any) -> MockHttpResponse:
-        if "json" in kwargs:
-            captured_payloads.append(kwargs["json"])
-        return MockHttpResponse(
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.content:
+            captured_payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
             200,
-            {
+            json={
                 "id": "chatcmpl-tool-test",
                 "object": "chat.completion",
                 "created": 1700000000,
@@ -408,7 +381,7 @@ async def test_openai_raw_wire_payload_and_multi_tool_calls() -> None:
             },
         )
 
-    mock_client = MockHttpClient(handler)
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     pool = AIHttpPool(client=mock_client)
     provider = OpenAIProvider(config={"api_key": "sk-mock-key"}, http_pool=pool)
 
@@ -477,12 +450,12 @@ async def test_anthropic_raw_wire_payload_and_multi_tool_results() -> None:
     """
     captured_payloads: list[dict[str, Any]] = []
 
-    def handler(url: str, **kwargs: Any) -> MockHttpResponse:
-        if "json" in kwargs:
-            captured_payloads.append(kwargs["json"])
-        return MockHttpResponse(
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.content:
+            captured_payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
             200,
-            {
+            json={
                 "id": "msg_tool_test",
                 "type": "message",
                 "role": "assistant",
@@ -507,7 +480,7 @@ async def test_anthropic_raw_wire_payload_and_multi_tool_results() -> None:
             },
         )
 
-    mock_client = MockHttpClient(handler)
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     pool = AIHttpPool(client=mock_client)
     provider = AnthropicProvider(config={"api_key": "ant-mock-key"}, http_pool=pool)
 
@@ -908,13 +881,22 @@ async def test_autonomous_tool_loop_three_step_chain(mock_config: Config) -> Non
     ScopedMockProvider.set_responses(responses)
     AIClient.register_provider("mock_tools_provider", ScopedMockProvider)
 
+    def mock_tokyo_search(query: str, max_results: int = 5) -> list[dict[str, str]]:
+        return [
+            {
+                "title": "Tokyo Population Facts",
+                "snippet": "The population of Tokyo is approximately 14,000,000.",
+                "url": "https://example.org/tokyo",
+            }
+        ][:max_results]
+
     client = (
         AIClient(config=mock_config, default_provider="mock_tools_provider")
         .user(
             "Find the population of Tokyo, calculate what 15% of that population is, "
             "and give me the current time in Asia/Tokyo for the report."
         )
-        .tools([WebSearchTool(), CalculatorTool(), DateTimeTool()])
+        .tools([WebSearchTool(search_fn=mock_tokyo_search), CalculatorTool(), DateTimeTool()])
         .auto_execute_tools(enable=True, max_iterations=10)
     )
 

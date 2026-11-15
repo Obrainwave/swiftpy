@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import math
 from collections.abc import Sequence
 from typing import Any
 
 from swiftpy.ai.vectorstore.base import (
+    ALLOWED_METRICS,
     SearchResult,
     VectorRecord,
     VectorStore,
     VectorStoreCapabilities,
+    dedupe_preserve_order,
+    normalize_record,
+    validate_collection_name,
+    validate_record_id,
+    validate_vector,
 )
-
-ALLOWED_METRICS: frozenset[str] = frozenset({"cosine", "l2", "inner_product"})
 
 
 def _matches_jsonb_containment(target: Any, filter_val: Any) -> bool:
@@ -22,10 +27,10 @@ def _matches_jsonb_containment(target: Any, filter_val: Any) -> bool:
       k must be in target and target[k] must contain v.
     - If filter_val is a list, target must be a list and every element in filter_val
       must match an element in target.
-    - Otherwise, scalar equality target == filter_val.
+    - Otherwise, scalar equality target == filter_val (including None without bool/int confusion).
     """
     if filter_val is None:
-        return True
+        return target is None
     if isinstance(filter_val, dict):
         if not isinstance(target, dict):
             return False
@@ -42,25 +47,9 @@ def _matches_jsonb_containment(target: Any, filter_val: Any) -> bool:
             if not any(_matches_jsonb_containment(target_elem, item) for target_elem in target):
                 return False
         return True
+    if isinstance(target, bool) != isinstance(filter_val, bool):
+        return False
     return bool(target == filter_val)
-
-
-def _validate_vector_numeric(vector: Sequence[float], dimensions: int | None = None) -> list[float]:
-    """Validate that vector is a non-empty sequence of finite numbers matching dimensions."""
-    if not isinstance(vector, (list, tuple)) or not vector:
-        raise ValueError("Vector must be a non-empty sequence of floats.")
-    if dimensions is not None and len(vector) != dimensions:
-        raise ValueError(f"Vector dimension {len(vector)} does not match collection dimension {dimensions}")
-
-    parsed: list[float] = []
-    for idx, x in enumerate(vector):
-        if not isinstance(x, (int, float)) or isinstance(x, bool):
-            raise TypeError(f"Vector element at index {idx} must be a float, got {type(x).__name__}")
-        fx = float(x)
-        if math.isnan(fx) or math.isinf(fx):
-            raise ValueError(f"Vector element at index {idx} is NaN or Infinite.")
-        parsed.append(fx)
-    return parsed
 
 
 class InMemoryVectorStore(VectorStore):
@@ -77,19 +66,25 @@ class InMemoryVectorStore(VectorStore):
         collection_name: str = "default",
         dimensions: int | None = None,
         metric: str = "cosine",
+        *,
+        max_records: int | None = 100_000,
     ) -> None:
+        validate_collection_name(collection_name)
         norm_metric = metric.lower().strip()
         if norm_metric not in ALLOWED_METRICS:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(ALLOWED_METRICS)}")
+        if max_records is not None and (isinstance(max_records, bool) or not isinstance(max_records, int) or max_records <= 0):
+            raise ValueError(f"max_records must be a positive integer or None, got {max_records!r}")
 
         self._current_collection = collection_name
         self._collections: dict[str, dict[str, dict[str, Any]]] = {}
         self._dimensions: dict[str, int] = {}
         self._metrics: dict[str, str] = {collection_name: norm_metric}
+        self._max_records = max_records
         self._lock = asyncio.Lock()
 
         if dimensions is not None:
-            if dimensions <= 0:
+            if isinstance(dimensions, bool) or dimensions <= 0:
                 raise ValueError(f"Dimensions must be a positive integer, got {dimensions}")
             self._dimensions[collection_name] = dimensions
             self._collections[collection_name] = {}
@@ -101,10 +96,28 @@ class InMemoryVectorStore(VectorStore):
             metadata_filtering=True,
             nested_metadata_filtering=True,
             namespaces=False,
-            pagination=True,
+            pagination=False,
             batch_upsert=True,
             native_distance_metrics=("cosine", "l2", "inner_product"),
         )
+
+    def _put_record_locked(
+        self,
+        coll: dict[str, dict[str, Any]],
+        record: VectorRecord,
+    ) -> None:
+        # Refresh insertion order on overwrite so FIFO/LRU eviction behaves predictably.
+        coll.pop(record.id, None)
+        coll[record.id] = {
+            "id": record.id,
+            "vector": list(record.vector),
+            "metadata": copy.deepcopy(record.metadata),
+            "content": record.content,
+        }
+        if self._max_records is not None:
+            while len(coll) > self._max_records:
+                oldest_key = next(iter(coll))
+                del coll[oldest_key]
 
     async def create_collection(
         self,
@@ -113,9 +126,8 @@ class InMemoryVectorStore(VectorStore):
         metric: str = "cosine",
     ) -> None:
         """Create or initialize a named collection with specified dimensions and metric."""
-        if not name or not name.strip():
-            raise ValueError("Collection name must be a non-empty string.")
-        if dimensions <= 0:
+        validate_collection_name(name)
+        if isinstance(dimensions, bool) or dimensions <= 0:
             raise ValueError(f"Dimensions must be a positive integer, got {dimensions}")
         norm_metric = metric.lower().strip()
         if norm_metric not in ALLOWED_METRICS:
@@ -143,26 +155,26 @@ class InMemoryVectorStore(VectorStore):
         content: str = "",
     ) -> None:
         """Insert or update a single vector record."""
-        if not isinstance(id, str) or not id.strip():
-            raise ValueError("Record id must be a non-empty string.")
-
-        expected_dim = self._dimensions.get(self._current_collection)
-        parsed_vec = _validate_vector_numeric(vector, expected_dim)
-
-        active_metric = self._metrics.get(self._current_collection, "cosine")
-        if active_metric == "cosine":
-            norm = math.sqrt(sum(x * x for x in parsed_vec))
-            if norm == 0.0:
-                raise ValueError("Zero vector cannot be indexed with cosine distance metric.")
-
+        rec_id = validate_record_id(id)
         async with self._lock:
+            expected_dim = self._dimensions.get(self._current_collection)
+            active_metric = self._metrics.get(self._current_collection, "cosine")
+            parsed_vec = validate_vector(
+                vector,
+                expected_dim,
+                active_metric,
+                zero_norm_message="Zero vector cannot be indexed with cosine distance metric.",
+            )
+            if expected_dim is None:
+                self._dimensions[self._current_collection] = len(parsed_vec)
             coll = self._collections.setdefault(self._current_collection, {})
-            coll[id] = {
-                "id": id,
-                "vector": parsed_vec,
-                "metadata": dict(metadata) if metadata else {},
-                "content": content,
-            }
+            norm_rec = VectorRecord(
+                id=rec_id,
+                vector=parsed_vec,
+                metadata=copy.deepcopy(dict(metadata)) if metadata else {},
+                content=content,
+            )
+            self._put_record_locked(coll, norm_rec)
 
     async def upsert_batch(
         self,
@@ -173,35 +185,26 @@ class InMemoryVectorStore(VectorStore):
             | tuple[str, list[float], dict[str, Any] | None, str]
         ],
     ) -> None:
-        """Insert or update multiple vector records in batch."""
-        for rec in records:
-            if isinstance(rec, VectorRecord):
-                await self.upsert(
-                    id=rec.id,
-                    vector=rec.vector,
-                    metadata=rec.metadata,
-                    content=rec.content,
-                )
-            elif isinstance(rec, tuple):
-                rec_id = rec[0]
-                rec_vec = rec[1]
-                rec_meta = rec[2] if len(rec) > 2 else None
-                rec_content = rec[3] if len(rec) > 3 and isinstance(rec[3], str) else ""
-                await self.upsert(
-                    id=rec_id,
-                    vector=rec_vec,
-                    metadata=rec_meta,
-                    content=rec_content,
-                )
-            elif isinstance(rec, dict):
-                await self.upsert(
-                    id=rec["id"],
-                    vector=rec["vector"],
-                    metadata=rec.get("metadata"),
-                    content=rec.get("content", ""),
-                )
-            else:
-                raise TypeError(f"Unsupported record format: {type(rec).__name__}")
+        """Insert or update multiple vector records atomically in batch."""
+        if not records:
+            return
+        async with self._lock:
+            expected_dim = self._dimensions.get(self._current_collection)
+            active_metric = self._metrics.get(self._current_collection, "cosine")
+            normalized: list[VectorRecord] = []
+            batch_dim = expected_dim
+            for rec in records:
+                parsed = normalize_record(rec, batch_dim, active_metric)
+                if batch_dim is None:
+                    batch_dim = len(parsed.vector)
+                normalized.append(parsed)
+
+            if expected_dim is None and batch_dim is not None:
+                self._dimensions[self._current_collection] = batch_dim
+
+            coll = self._collections.setdefault(self._current_collection, {})
+            for item in normalized:
+                self._put_record_locked(coll, item)
 
     async def search(
         self,
@@ -213,18 +216,18 @@ class InMemoryVectorStore(VectorStore):
         if limit <= 0:
             raise ValueError(f"Limit must be a positive integer, got {limit}")
 
-        expected_dim = self._dimensions.get(self._current_collection)
-        query_vec = _validate_vector_numeric(vector, expected_dim)
-
-        active_metric = self._metrics.get(self._current_collection, "cosine")
-        if active_metric == "cosine":
-            norm_q = math.sqrt(sum(x * x for x in query_vec))
-            if norm_q == 0.0:
-                raise ValueError("Zero vector cannot be used as query with cosine distance metric.")
-        else:
-            norm_q = 1.0
-
         async with self._lock:
+            expected_dim = self._dimensions.get(self._current_collection)
+            active_metric = self._metrics.get(self._current_collection, "cosine")
+            query_vec = validate_vector(
+                vector,
+                expected_dim,
+                active_metric,
+                zero_norm_message="Zero vector cannot be used as query with cosine distance metric.",
+            )
+            norm_q_sq = sum(x * x for x in query_vec)
+            norm_q = math.sqrt(norm_q_sq) if active_metric == "cosine" else 1.0
+
             coll = self._collections.get(self._current_collection, {})
             if not coll:
                 return []
@@ -238,8 +241,11 @@ class InMemoryVectorStore(VectorStore):
                 rec_vec: list[float] = record["vector"]
                 if active_metric == "cosine":
                     dot = sum(a * b for a, b in zip(query_vec, rec_vec, strict=True))
-                    norm_r = math.sqrt(sum(b * b for b in rec_vec))
-                    score = dot / (norm_q * norm_r) if (norm_q > 0 and norm_r > 0) else 0.0
+                    norm_r_sq = sum(b * b for b in rec_vec)
+                    if norm_q_sq > 1e-12 and norm_r_sq > 1e-12:
+                        score = dot / (norm_q * math.sqrt(norm_r_sq))
+                    else:
+                        score = 0.0
                     score = max(-1.0, min(1.0, score))
                 elif active_metric == "l2":
                     dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vec, rec_vec, strict=True)))
@@ -254,7 +260,7 @@ class InMemoryVectorStore(VectorStore):
                     SearchResult(
                         id=record["id"],
                         score=score,
-                        metadata=dict(meta),
+                        metadata=copy.deepcopy(meta),
                         content=record["content"],
                         vector=list(rec_vec),
                     )
@@ -274,12 +280,12 @@ class InMemoryVectorStore(VectorStore):
             return False
 
     async def delete_batch(self, ids: Sequence[str]) -> int:
-        """Delete multiple vector records by ids. Return count of deleted items."""
+        """Delete multiple deduplicated vector records by ids. Return count of deleted items."""
         deleted_count = 0
         async with self._lock:
             coll = self._collections.get(self._current_collection)
             if coll is not None:
-                for target_id in ids:
+                for target_id in dedupe_preserve_order(ids):
                     if target_id in coll:
                         del coll[target_id]
                         deleted_count += 1
@@ -295,7 +301,7 @@ class InMemoryVectorStore(VectorStore):
             return SearchResult(
                 id=data["id"],
                 score=1.0,
-                metadata=dict(data["metadata"]),
+                metadata=copy.deepcopy(data["metadata"]),
                 content=data["content"],
                 vector=list(data["vector"]),
             )
@@ -308,6 +314,7 @@ class InMemoryVectorStore(VectorStore):
 
     async def drop_collection(self, name: str) -> None:
         """Drop a collection and remove its records."""
+        validate_collection_name(name)
         async with self._lock:
             self._collections.pop(name, None)
             self._dimensions.pop(name, None)

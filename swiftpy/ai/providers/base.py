@@ -1,13 +1,82 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import math
+import random
 import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from typing import Any, TypeVar
 
+from swiftpy.ai.exceptions import AIConnectionError, AIProviderError, AIRateLimitError
 from swiftpy.ai.pool import AIHttpPool
+
+INTERNAL_ATTRIBUTION_KEYS: frozenset[str] = frozenset({"user_id", "tenant_id", "user", "tenant"})
+
+_T = TypeVar("_T")
+_SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{12,}")
+_BEARER_TOKEN_RE = re.compile(r"Bearer\s+[A-Za-z0-9._\-+/=]{8,}", re.IGNORECASE)
+
+
+def redact_sensitive_text(message: str, api_key: str = "") -> str:
+    """Redact API keys, Bearer tokens, and sk-* credentials from text."""
+    result = message
+    if api_key and len(api_key) > 6:
+        result = result.replace(api_key, "[REDACTED]")
+    result = _SK_TOKEN_RE.sub("[REDACTED]", result)
+    result = _BEARER_TOKEN_RE.sub("Bearer [REDACTED]", result)
+    return result
+
+
+def parse_retry_after(header_value: str | None) -> float | None:
+    """Parse Retry-After header supporting both numeric seconds and HTTP-date."""
+    if not header_value:
+        return None
+    raw = str(header_value).strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+        if math.isfinite(seconds):
+            return max(0.0, seconds)
+        return None
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    delta = (dt - datetime.now(UTC)).total_seconds()
+    return max(0.0, round(delta, 2))
+
+
+def extract_error_message(data: Any, fallback: str) -> str:
+    """Safely extract provider error message from parsed JSON without assuming dict shape."""
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if msg:
+                return str(msg)
+        elif isinstance(err, str) and err:
+            return err
+        msg_top = data.get("message")
+        if msg_top:
+            return str(msg_top)
+    return fallback
+
+
+def strip_internal_extra(extra: dict[str, Any]) -> dict[str, Any]:
+    """Return copy of extra parameters with framework attribution keys removed."""
+    return {k: v for k, v in extra.items() if k not in INTERNAL_ATTRIBUTION_KEYS}
 
 VALID_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool"})
 
@@ -103,6 +172,7 @@ class LLMRequest:
     stop: list[str] | None = None
     tools: list[dict[str, Any]] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -161,9 +231,43 @@ class ProviderInterface(ABC):
 
     def sanitize_error(self, message: str) -> str:
         """Sanitize error messages to avoid leaking API credentials in logs/exceptions."""
-        api_key = str(self.config.get("api_key", ""))
-        if api_key and len(api_key) > 6:
-            message = message.replace(api_key, "[REDACTED]")
-        # General pattern redaction for sk- style tokens
-        message = re.sub(r"sk-[A-Za-z0-9_-]{20,}", "[REDACTED]", message)
-        return message
+        return redact_sensitive_text(
+            message,
+            api_key=str(self.config.get("api_key", "")),
+        )
+
+    def _max_retries(self) -> int:
+        raw = self.config.get("max_retries", 0)
+        if isinstance(raw, bool):
+            return 0
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    async def _call_with_retries(self, fn: Callable[[], Awaitable[_T]]) -> _T:
+        """Execute an async provider operation honoring configured max_retries."""
+        max_retries = self._max_retries()
+        base_delay = float(self.config.get("retry_delay", 0.05))
+        max_delay = float(self.config.get("max_retry_delay", 2.0))
+
+        attempt = 0
+        while True:
+            try:
+                return await fn()
+            except (AIConnectionError, AIRateLimitError, AIProviderError) as exc:
+                retryable = isinstance(exc, (AIConnectionError, AIRateLimitError)) or (
+                    exc.status_code is not None and exc.status_code >= 500
+                )
+                if attempt >= max_retries or not retryable:
+                    raise
+
+                if isinstance(exc, AIRateLimitError) and exc.retry_after is not None:
+                    delay = min(max(0.0, float(exc.retry_after)), max_delay)
+                else:
+                    delay = min(base_delay * (2**attempt), max_delay) + random.uniform(
+                        0.0, min(0.02, base_delay)
+                    )
+                attempt += 1
+                if delay > 0:
+                    await asyncio.sleep(delay)

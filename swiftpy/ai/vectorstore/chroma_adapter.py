@@ -4,12 +4,7 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
-try:
-    import httpx
-    _HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
-except ImportError:
-    httpx = None
-    _HTTP_ERRORS = (TimeoutError, OSError)
+import httpx
 
 from swiftpy.ai.exceptions import (
     AIConnectionError,
@@ -22,11 +17,17 @@ from swiftpy.ai.vectorstore.base import (
     VectorRecord,
     VectorStore,
     VectorStoreCapabilities,
+    dedupe_preserve_order,
+    encode_path_segment,
     handle_adapter_http_error,
     normalize_record,
+    validate_collection_name,
+    validate_filter_operators,
     validate_vector,
 )
 from swiftpy.core.config import Config
+
+_HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
 
 _CHROMA_METRIC_MAP = {
     "cosine": "cosine",
@@ -54,6 +55,7 @@ class ChromaAdapter(VectorStore):
         http_pool: AIHttpPool | None = None,
         **kwargs: Any,
     ) -> None:
+        validate_collection_name(collection_name)
         self._config = config or Config()
         if not self._config.get("ai.enabled", True):
             raise AIModuleDisabledError("AI module is disabled in configuration (ai.enabled is false).")
@@ -89,7 +91,7 @@ class ChromaAdapter(VectorStore):
             metadata_filtering=True,
             nested_metadata_filtering=False,
             namespaces=False,
-            pagination=True,
+            pagination=False,
             batch_upsert=True,
             native_distance_metrics=("cosine", "l2", "inner_product"),
         )
@@ -101,26 +103,31 @@ class ChromaAdapter(VectorStore):
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
-    async def _get_or_create_collection_id(self, name: str | None = None) -> str:
-        coll_name = name or self._collection
-        if self._collection_id and not name:
+    async def _get_or_create_collection_id(
+        self,
+        name: str | None = None,
+        metric: str | None = None,
+    ) -> str:
+        coll_name = self._collection if name is None else validate_collection_name(name)
+        if self._collection_id and name is None:
             return self._collection_id
 
         client = self._http_pool.get_client()
-        url = f"{self._base_url}/collections/{coll_name}"
+        url = f"{self._base_url}/collections/{encode_path_segment(coll_name)}"
         params = {"tenant": self._tenant, "database": self._database}
 
         try:
             resp = await client.get(url, params=params, headers=self._get_headers(), timeout=self._timeout)
             if resp.status_code == 200:
                 coll_id = str(resp.json().get("id"))
-                if not name or name == self._collection:
+                if name is None or name == self._collection:
                     self._collection_id = coll_id
                 return coll_id
             if resp.status_code == 404:
                 # Create collection
                 create_url = f"{self._base_url}/collections"
-                chroma_metric = _CHROMA_METRIC_MAP.get(self._metric, "cosine")
+                active_metric = metric or self._metric
+                chroma_metric = _CHROMA_METRIC_MAP.get(active_metric, "cosine")
                 create_body = {
                     "name": coll_name,
                     "metadata": {"hnsw:space": chroma_metric},
@@ -134,7 +141,7 @@ class ChromaAdapter(VectorStore):
                 )
                 if c_resp.status_code in (200, 201):
                     coll_id = str(c_resp.json().get("id"))
-                    if not name or name == self._collection:
+                    if name is None or name == self._collection:
                         self._collection_id = coll_id
                     return coll_id
                 handle_adapter_http_error(c_resp.status_code, c_resp.text, "chroma")
@@ -151,17 +158,18 @@ class ChromaAdapter(VectorStore):
         dimensions: int,
         metric: str = "cosine",
     ) -> None:
+        validate_collection_name(name)
         norm_metric = metric.lower().strip()
         if norm_metric not in ALLOWED_METRICS:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(ALLOWED_METRICS)}")
-        if dimensions <= 0:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(f"Dimensions must be positive, got {dimensions}")
 
+        coll_id = await self._get_or_create_collection_id(name, metric=norm_metric)
         self._collection = name
         self._dimensions = dimensions
         self._metric = norm_metric
-        self._collection_id = None
-        await self._get_or_create_collection_id(name)
+        self._collection_id = coll_id
 
     async def upsert(
         self,
@@ -190,7 +198,7 @@ class ChromaAdapter(VectorStore):
         ]
 
         coll_id = await self._get_or_create_collection_id()
-        url = f"{self._base_url}/collections/{coll_id}/upsert"
+        url = f"{self._base_url}/collections/{encode_path_segment(coll_id)}/upsert"
 
         payload = {
             "ids": [r.id for r in norm_records],
@@ -222,8 +230,11 @@ class ChromaAdapter(VectorStore):
             raise ValueError(f"Limit must be a positive integer, got {limit}")
 
         parsed_vec = validate_vector(vector, self._dimensions, self._metric)
+        if filter is not None:
+            validate_filter_operators(filter, nested_allowed=False)
+
         coll_id = await self._get_or_create_collection_id()
-        url = f"{self._base_url}/collections/{coll_id}/query"
+        url = f"{self._base_url}/collections/{encode_path_segment(coll_id)}/query"
 
         body: dict[str, Any] = {
             "query_embeddings": [parsed_vec],
@@ -291,7 +302,7 @@ class ChromaAdapter(VectorStore):
             return None
 
         coll_id = await self._get_or_create_collection_id()
-        url = f"{self._base_url}/collections/{coll_id}/get"
+        url = f"{self._base_url}/collections/{encode_path_segment(coll_id)}/get"
         body = {"ids": [id], "include": ["metadatas", "documents", "embeddings"]}
 
         client = self._http_pool.get_client()
@@ -331,7 +342,7 @@ class ChromaAdapter(VectorStore):
             return False
 
         coll_id = await self._get_or_create_collection_id()
-        url = f"{self._base_url}/collections/{coll_id}/delete"
+        url = f"{self._base_url}/collections/{encode_path_segment(coll_id)}/delete"
         client = self._http_pool.get_client()
         try:
             resp = await client.post(
@@ -347,36 +358,50 @@ class ChromaAdapter(VectorStore):
             raise AIConnectionError(f"[chroma] Connection error: {err}") from err
 
     async def delete_batch(self, ids: Sequence[str]) -> int:
-        if not ids:
-            return 0
-
-        existing_count = 0
-        for item_id in ids:
-            if await self.get(item_id) is not None:
-                existing_count += 1
-
-        if existing_count == 0:
+        unique_ids = dedupe_preserve_order(ids)
+        if not unique_ids:
             return 0
 
         coll_id = await self._get_or_create_collection_id()
-        url = f"{self._base_url}/collections/{coll_id}/delete"
+        encoded_coll_id = encode_path_segment(coll_id)
         client = self._http_pool.get_client()
+
+        get_url = f"{self._base_url}/collections/{encoded_coll_id}/get"
+        try:
+            get_resp = await client.post(
+                get_url,
+                json={"ids": unique_ids, "include": []},
+                headers=self._get_headers(),
+                timeout=self._timeout,
+            )
+            if get_resp.status_code == 404:
+                return 0
+            if get_resp.status_code != 200:
+                handle_adapter_http_error(get_resp.status_code, get_resp.text, "chroma")
+            found_ids = dedupe_preserve_order([str(item_id) for item_id in get_resp.json().get("ids", [])])
+        except _HTTP_ERRORS as err:
+            raise AIConnectionError(f"[chroma] Connection error: {err}") from err
+
+        if not found_ids:
+            return 0
+
+        url = f"{self._base_url}/collections/{encoded_coll_id}/delete"
         try:
             resp = await client.post(
                 url,
-                json={"ids": list(ids)},
+                json={"ids": found_ids},
                 headers=self._get_headers(),
                 timeout=self._timeout,
             )
             if resp.status_code not in (200, 204):
                 handle_adapter_http_error(resp.status_code, resp.text, "chroma")
-            return existing_count
+            return len(found_ids)
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[chroma] Connection error: {err}") from err
 
     async def count(self) -> int:
         coll_id = await self._get_or_create_collection_id()
-        url = f"{self._base_url}/collections/{coll_id}/count"
+        url = f"{self._base_url}/collections/{encode_path_segment(coll_id)}/count"
         client = self._http_pool.get_client()
         try:
             resp = await client.get(
@@ -391,7 +416,8 @@ class ChromaAdapter(VectorStore):
             raise AIConnectionError(f"[chroma] Connection error: {err}") from err
 
     async def drop_collection(self, name: str) -> None:
-        url = f"{self._base_url}/collections/{name}"
+        validated = validate_collection_name(name)
+        url = f"{self._base_url}/collections/{encode_path_segment(validated)}"
         params = {"tenant": self._tenant, "database": self._database}
         client = self._http_pool.get_client()
         try:

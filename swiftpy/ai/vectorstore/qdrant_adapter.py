@@ -1,15 +1,11 @@
 from __future__ import annotations
 
+import copy
 import uuid
 from collections.abc import Sequence
 from typing import Any
 
-try:
-    import httpx
-    _HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
-except ImportError:
-    httpx = None
-    _HTTP_ERRORS = (TimeoutError, OSError)
+import httpx
 
 from swiftpy.ai.exceptions import (
     AIConnectionError,
@@ -18,15 +14,21 @@ from swiftpy.ai.exceptions import (
 from swiftpy.ai.pool import AIHttpPool
 from swiftpy.ai.vectorstore.base import (
     ALLOWED_METRICS,
+    RESERVED_META_KEYS,
     SearchResult,
     VectorRecord,
     VectorStore,
     VectorStoreCapabilities,
+    dedupe_preserve_order,
+    encode_path_segment,
     handle_adapter_http_error,
     normalize_record,
+    validate_collection_name,
     validate_vector,
 )
 from swiftpy.core.config import Config
+
+_HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
 
 _METRIC_MAP = {
     "cosine": "Cosine",
@@ -42,6 +44,30 @@ def _to_qdrant_id(orig_id: str) -> str:
         return orig_id
     except (ValueError, AttributeError):
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, orig_id))
+
+
+def _flatten_qdrant_must(flt: dict[str, Any], prefix: str = "") -> list[dict[str, Any]]:
+    """Flatten nested metadata filter dicts into Qdrant dot-path must conditions."""
+    if not isinstance(flt, dict):
+        raise TypeError(f"Filter must be a dict, got {type(flt).__name__}.")
+    clauses: list[dict[str, Any]] = []
+    for k, v in flt.items():
+        if not isinstance(k, str) or not k or "\x00" in k:
+            raise ValueError(f"Invalid filter key {k!r}.")
+        if k.startswith("$"):
+            raise ValueError(f"Qdrant metadata filters do not support Mongo-style operator {k!r}.")
+        full_key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            if any(isinstance(sub_k, str) and sub_k.startswith("$") for sub_k in v):
+                raise ValueError(f"Qdrant metadata filters do not support operator dicts on {full_key!r}.")
+            if not v:
+                raise ValueError(f"Empty nested filter dict on key {full_key!r} is not supported.")
+            clauses.extend(_flatten_qdrant_must(v, prefix=full_key))
+        elif v is None:
+            clauses.append({"is_null": {"key": full_key}})
+        else:
+            clauses.append({"key": full_key, "match": {"value": v}})
+    return clauses
 
 
 class QdrantAdapter(VectorStore):
@@ -61,6 +87,7 @@ class QdrantAdapter(VectorStore):
         http_pool: AIHttpPool | None = None,
         **kwargs: Any,
     ) -> None:
+        validate_collection_name(collection_name)
         self._config = config or Config()
         if not self._config.get("ai.enabled", True):
             raise AIModuleDisabledError("AI module is disabled in configuration (ai.enabled is false).")
@@ -88,7 +115,7 @@ class QdrantAdapter(VectorStore):
             metadata_filtering=True,
             nested_metadata_filtering=True,
             namespaces=False,
-            pagination=True,
+            pagination=False,
             batch_upsert=True,
             native_distance_metrics=("cosine", "l2", "inner_product"),
         )
@@ -99,24 +126,25 @@ class QdrantAdapter(VectorStore):
             headers["api-key"] = self._api_key
         return headers
 
+    def _collection_url(self, name: str | None = None, suffix: str = "") -> str:
+        coll = self._collection if name is None else validate_collection_name(name)
+        return f"{self._base_url}/collections/{encode_path_segment(coll)}{suffix}"
+
     async def create_collection(
         self,
         name: str,
         dimensions: int,
         metric: str = "cosine",
     ) -> None:
+        validate_collection_name(name)
         norm_metric = metric.lower().strip()
         if norm_metric not in ALLOWED_METRICS:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(ALLOWED_METRICS)}")
-        if dimensions <= 0:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(f"Dimensions must be positive, got {dimensions}")
 
-        self._collection = name
-        self._dimensions = dimensions
-        self._metric = norm_metric
-
         qdrant_metric = _METRIC_MAP[norm_metric]
-        url = f"{self._base_url}/collections/{name}"
+        url = self._collection_url(name)
         payload = {
             "vectors": {
                 "size": dimensions,
@@ -136,6 +164,10 @@ class QdrantAdapter(VectorStore):
                 handle_adapter_http_error(resp.status_code, resp.text, "qdrant")
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[qdrant] Connection error: {err}") from err
+
+        self._collection = name
+        self._dimensions = dimensions
+        self._metric = norm_metric
 
     async def upsert(
         self,
@@ -166,10 +198,15 @@ class QdrantAdapter(VectorStore):
         points: list[dict[str, Any]] = []
         for r in norm_records:
             qid = _to_qdrant_id(r.id)
+            user_meta = {
+                k: copy.deepcopy(v)
+                for k, v in r.metadata.items()
+                if k not in RESERVED_META_KEYS
+            }
             payload = {
+                **user_meta,
                 "_orig_id": r.id,
                 "_content": r.content,
-                **r.metadata,
             }
             points.append({
                 "id": qid,
@@ -177,7 +214,7 @@ class QdrantAdapter(VectorStore):
                 "payload": payload,
             })
 
-        url = f"{self._base_url}/collections/{self._collection}/points?wait=true"
+        url = self._collection_url(suffix="/points?wait=true")
         client = self._http_pool.get_client()
         try:
             resp = await client.put(
@@ -201,7 +238,7 @@ class QdrantAdapter(VectorStore):
             raise ValueError(f"Limit must be a positive integer, got {limit}")
 
         parsed_vec = validate_vector(vector, self._dimensions, self._metric)
-        url = f"{self._base_url}/collections/{self._collection}/points/search"
+        url = self._collection_url(suffix="/points/search")
 
         body: dict[str, Any] = {
             "vector": parsed_vec,
@@ -210,11 +247,10 @@ class QdrantAdapter(VectorStore):
             "with_vector": True,
         }
 
-        if filter:
-            must_clauses: list[dict[str, Any]] = []
-            for k, v in filter.items():
-                must_clauses.append({"key": k, "match": {"value": v}})
-            body["filter"] = {"must": must_clauses}
+        if filter is not None:
+            must_clauses = _flatten_qdrant_must(filter)
+            if must_clauses:
+                body["filter"] = {"must": must_clauses}
 
         client = self._http_pool.get_client()
         try:
@@ -235,7 +271,7 @@ class QdrantAdapter(VectorStore):
             payload = item.get("payload") or {}
             orig_id = str(payload.get("_orig_id", item.get("id", "")))
             content = str(payload.get("_content", ""))
-            meta = {k: v for k, v in payload.items() if k not in ("_orig_id", "_content")}
+            meta = {k: v for k, v in payload.items() if k not in RESERVED_META_KEYS}
             raw_score = float(item.get("score", 0.0))
             score = -abs(raw_score) if self._metric == "l2" else raw_score
             vec = item.get("vector")
@@ -255,7 +291,7 @@ class QdrantAdapter(VectorStore):
             return None
 
         qid = _to_qdrant_id(id)
-        url = f"{self._base_url}/collections/{self._collection}/points"
+        url = self._collection_url(suffix="/points")
         client = self._http_pool.get_client()
         try:
             resp = await client.post(
@@ -275,7 +311,7 @@ class QdrantAdapter(VectorStore):
             payload = item.get("payload") or {}
             orig_id = str(payload.get("_orig_id", item.get("id", "")))
             content = str(payload.get("_content", ""))
-            meta = {k: v for k, v in payload.items() if k not in ("_orig_id", "_content")}
+            meta = {k: v for k, v in payload.items() if k not in RESERVED_META_KEYS}
             vec = item.get("vector")
             return SearchResult(
                 id=orig_id,
@@ -293,7 +329,7 @@ class QdrantAdapter(VectorStore):
             return False
 
         qid = _to_qdrant_id(id)
-        url = f"{self._base_url}/collections/{self._collection}/points/delete?wait=true"
+        url = self._collection_url(suffix="/points/delete?wait=true")
         client = self._http_pool.get_client()
         try:
             resp = await client.post(
@@ -309,36 +345,50 @@ class QdrantAdapter(VectorStore):
             raise AIConnectionError(f"[qdrant] Connection error: {err}") from err
 
     async def delete_batch(self, ids: Sequence[str]) -> int:
-        if not ids:
+        unique_ids = dedupe_preserve_order(ids)
+        if not unique_ids:
             return 0
 
-        # Check existing count to accurately return number of deleted items
-        existing_count = 0
-        for item_id in ids:
-            if await self.get(item_id) is not None:
-                existing_count += 1
-
-        if existing_count == 0:
-            return 0
-
-        qids = [_to_qdrant_id(i) for i in ids]
-        url = f"{self._base_url}/collections/{self._collection}/points/delete?wait=true"
+        candidate_qids = [_to_qdrant_id(item_id) for item_id in unique_ids]
+        lookup_url = self._collection_url(suffix="/points")
         client = self._http_pool.get_client()
+        try:
+            lookup_resp = await client.post(
+                lookup_url,
+                json={"ids": candidate_qids, "with_payload": False, "with_vector": False},
+                headers=self._get_headers(),
+                timeout=self._timeout,
+            )
+            if lookup_resp.status_code == 404:
+                return 0
+            if lookup_resp.status_code != 200:
+                handle_adapter_http_error(lookup_resp.status_code, lookup_resp.text, "qdrant")
+            found_items = lookup_resp.json().get("result", [])
+        except _HTTP_ERRORS as err:
+            raise AIConnectionError(f"[qdrant] Connection error: {err}") from err
+
+        found_qids = dedupe_preserve_order(
+            [str(item["id"]) for item in found_items if isinstance(item, dict) and item.get("id") is not None]
+        )
+        if not found_qids:
+            return 0
+
+        url = self._collection_url(suffix="/points/delete?wait=true")
         try:
             resp = await client.post(
                 url,
-                json={"points": qids},
+                json={"points": found_qids},
                 headers=self._get_headers(),
                 timeout=self._timeout,
             )
             if resp.status_code != 200:
                 handle_adapter_http_error(resp.status_code, resp.text, "qdrant")
-            return existing_count
+            return len(found_qids)
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[qdrant] Connection error: {err}") from err
 
     async def count(self) -> int:
-        url = f"{self._base_url}/collections/{self._collection}/points/count"
+        url = self._collection_url(suffix="/points/count")
         client = self._http_pool.get_client()
         try:
             resp = await client.post(
@@ -354,7 +404,7 @@ class QdrantAdapter(VectorStore):
             raise AIConnectionError(f"[qdrant] Connection error: {err}") from err
 
     async def drop_collection(self, name: str) -> None:
-        url = f"{self._base_url}/collections/{name}"
+        url = self._collection_url(name)
         client = self._http_pool.get_client()
         try:
             resp = await client.delete(

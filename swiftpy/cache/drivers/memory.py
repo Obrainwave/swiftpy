@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import itertools
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -31,18 +32,31 @@ class MemoryDriver(CacheDriver):
         self.max_items = max_items
         self._storage: OrderedDict[str, tuple[Any, float | None]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._sweep_cursor: int = 0
 
     def _sweep_expired(self, max_keys: int = 20) -> None:
-        """Lazily sweep up to max_keys expired entries."""
+        """Lazily sweep up to max_keys expired entries using a rolling cursor."""
+        total = len(self._storage)
+        if total == 0 or max_keys <= 0:
+            if total == 0:
+                self._sweep_cursor = 0
+            return
+
+        start = self._sweep_cursor % total
+        batch = list(itertools.islice(self._storage.items(), start, start + max_keys))
         now = self._clock()
-        to_del: list[str] = []
-        for checked, (k, (_, exp)) in enumerate(self._storage.items()):
+        deleted = 0
+        for k, (_, exp) in batch:
             if exp is not None and now >= exp:
-                to_del.append(k)
-            if checked + 1 >= max_keys:
-                break
-        for k in to_del:
-            self._storage.pop(k, None)
+                self._storage.pop(k, None)
+                deleted += 1
+
+        new_total = len(self._storage)
+        if new_total == 0:
+            self._sweep_cursor = 0
+        else:
+            scanned_surviving = len(batch) - deleted
+            self._sweep_cursor = (start + scanned_surviving) % new_total
 
     def _prefixed_key(self, key: str) -> str:
         return f"{self.prefix}{key}"
@@ -103,10 +117,13 @@ class MemoryDriver(CacheDriver):
         async with self._lock:
             if not self.prefix:
                 self._storage.clear()
+                self._sweep_cursor = 0
             else:
                 keys_to_delete = [k for k in self._storage if k.startswith(self.prefix)]
                 for k in keys_to_delete:
                     del self._storage[k]
+                if not self._storage:
+                    self._sweep_cursor = 0
             return True
 
     async def add(
@@ -179,3 +196,4 @@ class MemoryDriver(CacheDriver):
     async def close(self) -> None:
         async with self._lock:
             self._storage.clear()
+            self._sweep_cursor = 0

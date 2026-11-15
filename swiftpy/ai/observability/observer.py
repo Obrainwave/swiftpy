@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
-import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
@@ -126,10 +124,8 @@ class AIObservabilityManager:
         """Initialize driver(s) based on configuration."""
         driver_cfg = str(self._config.get("ai.observability.driver", "")).lower().strip()
         if not driver_cfg:
-            app_env = str(
-                self._config.get("app.env", os.environ.get("APP_ENV", "local"))
-            ).lower().strip()
-            if app_env in ("testing", "test") or "pytest" in sys.modules:
+            app_env = str(self._config.get("app.env", "local")).lower().strip()
+            if app_env in ("testing", "test"):
                 driver_cfg = "memory"
             else:
                 driver_cfg = "database"

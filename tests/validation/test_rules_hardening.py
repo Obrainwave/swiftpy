@@ -188,9 +188,9 @@ def test_regex_rule_escaped_pipe_and_re_error() -> None:
     assert rules_list[1].validate("field", "b", {})
     assert not rules_list[1].validate("field", "c", {})
 
-    # Invalid regex pattern does not crash with 500, returns False
-    invalid_regex = RegexRule("[unclosed")
-    assert not invalid_regex.validate("field", "anything", {})
+    # Invalid regex pattern fails eagerly at rule construction with ConfigurationError (G-9)
+    with pytest.raises(ConfigurationError):
+        RegexRule("[unclosed")
 
 
 def test_between_rule_missing_arg_raises_configuration_error() -> None:

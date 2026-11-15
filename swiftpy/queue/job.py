@@ -6,14 +6,20 @@ import importlib
 import inspect
 import json
 import logging
-import os
+import math
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from typing import Any, ClassVar
 
-from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.config import ConfigurationError
 from swiftpy.database.transaction import get_active_connection
+from swiftpy.support.keys import (
+    decode_signing_key,
+    resolve_configured_app_key,
+    resolve_configured_previous_keys,
+    validate_signing_key,
+)
 
 logger = logging.getLogger("swiftpy.queue")
 
@@ -32,6 +38,84 @@ class JobSerializationError(Exception):
     """Raised when a job payload cannot be serialized or deserialized."""
 
 
+_SIGNATURE_EXCLUDED_FIELDS: frozenset[str] = frozenset({"signature", "attempts"})
+
+
+def _parse_optional_timeout(
+    raw_timeout: Any, *, exc_cls: type[Exception] = JobSerializationError
+) -> float | None:
+    """Validate optional job execution timeout as a positive finite float."""
+    if raw_timeout is None:
+        return None
+    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+        raise exc_cls(
+            f"Invalid 'timeout' in job envelope: expected positive number, got {type(raw_timeout).__name__}"
+        )
+    value = float(raw_timeout)
+    if not math.isfinite(value) or value <= 0:
+        raise exc_cls(
+            f"Invalid 'timeout' in job envelope: must be a finite positive number, got {raw_timeout!r}"
+        )
+    return value
+
+
+def _parse_int_field(
+    raw_value: Any, *, field_name: str, minimum: int
+) -> int:
+    """Validate integer envelope metadata fields while rejecting booleans."""
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        raise JobSerializationError(
+            f"Invalid '{field_name}' in job envelope: expected int, got {type(raw_value).__name__}"
+        )
+    if raw_value < minimum:
+        raise JobSerializationError(
+            f"Invalid '{field_name}' in job envelope: must be >= {minimum}"
+        )
+    return raw_value
+
+
+def parse_class_path(
+    class_path: str, *, exc_cls: type[Exception] = JobSerializationError
+) -> tuple[str, str]:
+    """Parse ``module:ClassName`` or ``module.ClassName`` into ``(module, class)``."""
+    if ":" in class_path:
+        module_name, class_name = class_path.split(":", 1)
+    elif "." in class_path:
+        module_name, class_name = class_path.rsplit(".", 1)
+    else:
+        raise exc_cls(f"Invalid job class identifier format: {class_path}")
+
+    if not module_name or not class_name:
+        raise exc_cls(f"Invalid job class identifier format: {class_path}")
+    return module_name, class_name
+
+
+def is_trusted_class_path(
+    class_path: str,
+    module_name: str,
+    *,
+    trusted_namespaces: Sequence[str] | None,
+    trusted_classes: set[str] | frozenset[str] = frozenset(),
+    class_name: str | None = None,
+) -> bool:
+    """Return True if a class path belongs to a trusted namespace or explicit allowlist."""
+    if trusted_namespaces is None:
+        return True
+    resolved_cls = (
+        class_name if class_name is not None else parse_class_path(class_path)[1]
+    )
+    candidates = {
+        class_path,
+        f"{module_name}:{resolved_cls}",
+        f"{module_name}.{resolved_cls}",
+    }
+    return any(
+        module_name == ns.rstrip(".")
+        or module_name.startswith(f"{ns.rstrip('.')}.")
+        for ns in trusted_namespaces
+    ) or bool(candidates & set(trusted_classes))
+
+
 class Job(ABC):
     """
     Abstract base class for all SwiftPY queued jobs.
@@ -48,6 +132,17 @@ class Job(ABC):
     _previous_keys: ClassVar[list[str]] = []
     _trusted_namespaces: ClassVar[list[str] | None] = None
     _trusted_classes: ClassVar[set[str]] = set()
+    _allow_unsigned: ClassVar[bool] = False
+
+    @classmethod
+    def set_allow_unsigned(cls, enabled: bool) -> None:
+        """Explicit opt-in to allow unsigned job serialization/deserialization in local tests."""
+        cls._allow_unsigned = bool(enabled)
+
+    @classmethod
+    def get_allow_unsigned(cls) -> bool:
+        """Return whether unsigned job payloads are explicitly opted in."""
+        return cls._allow_unsigned
 
     @classmethod
     def set_app_key(cls, key: str | None) -> None:
@@ -58,20 +153,13 @@ class Job(ABC):
     def get_app_key(cls, strict: bool = False) -> str | None:
         """
         Retrieve the active application key.
-        Checks explicit Job._app_key, then Config 'app.key' / 'key', then os.getenv('APP_KEY').
+        Checks explicit Job._app_key, then Config 'app.key' / 'key', then env('APP_KEY').
         """
         if cls._app_key is not None:
             return cls._app_key
-        try:
-            cfg = Config.get_instance()
-            key = cfg.get("app.key") or cfg.get("key")
-            if key and isinstance(key, str):
-                return key
-        except (ConfigurationError, RuntimeError):
-            logger.debug("Config not yet available for queue APP_KEY", exc_info=True)
-        env_key = os.getenv("APP_KEY")
-        if env_key:
-            return env_key
+        resolved = resolve_configured_app_key()
+        if resolved is not None:
+            return resolved
         if strict:
             raise ConfigurationError(
                 "APP_KEY is required and must be configured for queue signing."
@@ -88,22 +176,15 @@ class Job(ABC):
         """Retrieve previous keys configured for key rotation."""
         if cls._previous_keys:
             return list(cls._previous_keys)
-        try:
-            cfg = Config.get_instance()
-            prev = cfg.get("app.previous_keys")
-            if isinstance(prev, (list, tuple)):
-                return [str(k) for k in prev]
-        except (ConfigurationError, RuntimeError):
-            logger.debug("Config not yet available for previous_keys", exc_info=True)
-        return []
+        return resolve_configured_previous_keys()
 
     @classmethod
     def set_trusted_namespaces(cls, namespaces: list[str] | None) -> None:
         """
-        Configure allowed module namespace prefixes (e.g. ['app.', 'tests.']).
+        Configure allowed module namespace prefixes (e.g. ['app.', 'swiftpy.']).
         If configured, deserialization of jobs from non-whitelisted modules is rejected
         before importlib.import_module() is called.
-        Pass None to use default trusted namespaces ('app', 'swiftpy', 'tests').
+        Pass None to use default trusted namespaces ('app', 'swiftpy').
         """
         cls._trusted_namespaces = namespaces
 
@@ -112,20 +193,25 @@ class Job(ABC):
         """Return configured or default trusted namespaces."""
         if cls._trusted_namespaces is not None:
             return cls._trusted_namespaces
-        return ["app", "swiftpy", "tests", "test"]
+        return ["app", "swiftpy"]
 
     @classmethod
     def _compute_signature(cls, envelope: dict[str, Any], key: str) -> str:
-        """Compute an HMAC-SHA256 signature over the canonical representation of the envelope."""
-        canonical_fields = {k: v for k, v in envelope.items() if k != "signature"}
+        """Compute an HMAC-SHA256 signature over immutable canonical fields."""
+        canonical_fields = {
+            k: v
+            for k, v in envelope.items()
+            if k not in _SIGNATURE_EXCLUDED_FIELDS
+        }
         canonical_json = json.dumps(
             canonical_fields,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
         )
+        secret_bytes = decode_signing_key(key)
         return hmac.new(
-            key.encode("utf-8"),
+            secret_bytes,
             canonical_json.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -144,7 +230,10 @@ class Job(ABC):
         self.tries = kwargs.pop("tries", getattr(self, "tries", 3))
         self.attempts: int = kwargs.pop("attempts", 0)
         self.backoff = kwargs.pop("backoff", getattr(self, "backoff", 0))
-        self.timeout = kwargs.pop("timeout", getattr(self, "timeout", None))
+        self.timeout: float | None = _parse_optional_timeout(
+            kwargs.pop("timeout", getattr(self, "timeout", None)),
+            exc_cls=ValueError,
+        )
         self.pushed_at: float | None = kwargs.pop("pushed_at", None)
         self.args: tuple[Any, ...] = args
         self.kwargs: dict[str, Any] = kwargs
@@ -177,10 +266,15 @@ class Job(ABC):
             return max(0.0, float(self.backoff[idx]))
         return 0.0
 
-    def serialize(self, app_key: str | None = None) -> dict[str, Any]:
+    def serialize(
+        self,
+        app_key: str | None = None,
+        *,
+        allow_unsigned: bool | None = None,
+    ) -> dict[str, Any]:
         """
         Serialize job metadata and payload into a JSON-compatible dictionary.
-        Signs the envelope with HMAC-SHA256 if an app key is configured.
+        Signs the envelope with HMAC-SHA256 using APP_KEY unless unsigned mode is explicitly opted in.
         """
         qualname = f"{self.__class__.__module__}:{self.__class__.__qualname__}"
         envelope: dict[str, Any] = {
@@ -197,8 +291,17 @@ class Job(ABC):
             "data": self.data,
         }
         key = app_key if app_key is not None else self.get_app_key()
-        if key:
-            envelope["signature"] = self._compute_signature(envelope, key)
+        unsigned_ok = self.get_allow_unsigned() if allow_unsigned is None else allow_unsigned
+        if key is None or not str(key).strip():
+            if not unsigned_ok:
+                raise ConfigurationError(
+                    "APP_KEY (>=32 bytes) is required for queue job signing. "
+                    "Configure APP_KEY or pass allow_unsigned=True for local tests."
+                )
+            return envelope
+
+        validate_signing_key(str(key), purpose="APP_KEY")
+        envelope["signature"] = self._compute_signature(envelope, str(key))
         return envelope
 
     @classmethod
@@ -206,11 +309,25 @@ class Job(ABC):
         cls,
         payload: dict[str, Any] | str,
         app_key: str | None = None,
+        *,
+        allow_unsigned: bool | None = None,
     ) -> Job:
         """
         Reconstruct a Job instance from a serialized dictionary or JSON string.
         Verifies HMAC signature and trusted namespace before module import.
         """
+        key = app_key if app_key is not None else cls.get_app_key()
+        unsigned_ok = cls.get_allow_unsigned() if allow_unsigned is None else allow_unsigned
+
+        if key is None or not str(key).strip():
+            if not unsigned_ok:
+                raise ConfigurationError(
+                    "APP_KEY (>=32 bytes) is required for queue job deserialization. "
+                    "Configure APP_KEY or pass allow_unsigned=True for local tests."
+                )
+        else:
+            validate_signing_key(str(key), purpose="APP_KEY")
+
         if isinstance(payload, str):
             try:
                 data: dict[str, Any] = json.loads(payload)
@@ -227,61 +344,50 @@ class Job(ABC):
             )
 
         # 1. Verify signature BEFORE importing module
-        key = app_key if app_key is not None else cls.get_app_key()
-        signature = data.get("signature")
-        if key is not None:
-            if not signature or not isinstance(signature, str):
+        if key is not None and str(key).strip():
+            signature = data.get("signature")
+            if signature is None or signature == "":
+                if not unsigned_ok:
+                    raise JobSerializationError(
+                        "Job envelope is missing a signature or signature is invalid"
+                    )
+            elif not isinstance(signature, str):
                 raise JobSerializationError(
                     "Job envelope is missing a signature or signature is invalid"
                 )
-            expected_sig = cls._compute_signature(data, key)
-            if not hmac.compare_digest(signature, expected_sig):
-                # Try previous keys for key rotation
-                matched_prev = False
-                for prev_key in cls.get_previous_keys():
-                    if hmac.compare_digest(
-                        signature, cls._compute_signature(data, prev_key)
-                    ):
-                        matched_prev = True
-                        break
-                if not matched_prev:
-                    raise JobSerializationError(
-                        "Job envelope signature verification failed: tampered or untrusted payload"
-                    )
+            else:
+                expected_sig = cls._compute_signature(data, str(key))
+                if not hmac.compare_digest(signature, expected_sig):
+                    matched_prev = False
+                    for prev_key in cls.get_previous_keys():
+                        if hmac.compare_digest(
+                            signature, cls._compute_signature(data, prev_key)
+                        ):
+                            matched_prev = True
+                            break
+                    if not matched_prev:
+                        raise JobSerializationError(
+                            "Job envelope signature verification failed: tampered or untrusted payload"
+                        )
 
         job_class_str = data.get("job_class")
         if not job_class_str or not isinstance(job_class_str, str):
             raise JobSerializationError("Job envelope missing valid 'job_class'")
 
         # Resolve module and class name (support module:ClassName or module.ClassName)
-        if ":" in job_class_str:
-            module_name, class_name = job_class_str.split(":", 1)
-        elif "." in job_class_str:
-            module_name, class_name = job_class_str.rsplit(".", 1)
-        else:
-            raise JobSerializationError(
-                f"Invalid job class identifier format: {job_class_str}"
-            )
+        module_name, class_name = parse_class_path(job_class_str)
 
         # 2. Check namespace allowlist before importing module
-        trusted_namespaces = cls.get_trusted_namespaces()
-        if trusted_namespaces is not None:
-            is_trusted = (
-                any(
-                    module_name == ns.rstrip(".")
-                    or module_name.startswith(f"{ns.rstrip('.')}.")
-                    or (
-                        ns.rstrip(".") in ("tests", "test")
-                        and module_name.startswith("test")
-                    )
-                    for ns in trusted_namespaces
-                )
-                or job_class_str in cls._trusted_classes
+        if not is_trusted_class_path(
+            job_class_str,
+            module_name,
+            trusted_namespaces=cls.get_trusted_namespaces(),
+            trusted_classes=cls._trusted_classes,
+            class_name=class_name,
+        ):
+            raise JobSerializationError(
+                f"Job class '{job_class_str}' from module '{module_name}' is not in trusted namespaces"
             )
-            if not is_trusted:
-                raise JobSerializationError(
-                    f"Job class '{job_class_str}' from module '{module_name}' is not in trusted namespaces"
-                )
 
         try:
             module = importlib.import_module(module_name)
@@ -320,26 +426,32 @@ class Job(ABC):
             kwargs = {}
 
         if "tries" in data and data["tries"] is not None:
-            try:
-                parsed_tries = int(data["tries"])
-                if parsed_tries < 1:
-                    raise ValueError("tries must be >= 1")
-                data["tries"] = parsed_tries
-            except (ValueError, TypeError) as exc:
-                raise JobSerializationError(
-                    f"Invalid 'tries' in job envelope: {exc}"
-                ) from exc
+            data["tries"] = _parse_int_field(
+                data["tries"], field_name="tries", minimum=1
+            )
 
         if "attempts" in data and data["attempts"] is not None:
-            try:
-                parsed_attempts = int(data["attempts"])
-                if parsed_attempts < 0:
-                    raise ValueError("attempts must be >= 0")
-                data["attempts"] = parsed_attempts
-            except (ValueError, TypeError) as exc:
+            data["attempts"] = _parse_int_field(
+                data["attempts"], field_name="attempts", minimum=0
+            )
+
+        parsed_timeout: float | None = None
+        if "timeout" in data and data["timeout"] is not None:
+            parsed_timeout = _parse_optional_timeout(
+                data["timeout"], exc_cls=JobSerializationError
+            )
+            data["timeout"] = parsed_timeout
+
+        if "pushed_at" in data and data["pushed_at"] is not None:
+            raw_pushed = data["pushed_at"]
+            if (
+                isinstance(raw_pushed, bool)
+                or not isinstance(raw_pushed, (int, float))
+                or not math.isfinite(float(raw_pushed))
+            ):
                 raise JobSerializationError(
-                    f"Invalid 'attempts' in job envelope: {exc}"
-                ) from exc
+                    "Invalid 'pushed_at' in job envelope: expected finite timestamp"
+                )
 
         if "data" in data and data["data"] is not None and not isinstance(data["data"], dict):
             raise JobSerializationError("Envelope field 'data' must be a dict")
@@ -356,6 +468,7 @@ class Job(ABC):
                 "attempts",
                 "backoff",
                 "timeout",
+                "pushed_at",
                 "data",
             ):
                 if (

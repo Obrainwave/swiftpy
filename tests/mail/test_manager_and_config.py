@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from swiftpy.core.config import Config
@@ -38,7 +40,7 @@ def test_mail_config_from_dict() -> None:
 
 def test_mail_config_invalid_dict() -> None:
     with pytest.raises(MailConfigurationError):
-        MailConfig.from_dict("not-a-dict")  # type: ignore[arg-type]
+        MailConfig.from_dict(json.loads('"not-a-dict"'))
 
 
 @pytest.mark.asyncio
@@ -126,7 +128,14 @@ async def test_mail_manager_send_applies_default_from() -> None:
     result = await manager.send(msg)
 
     assert result.success is True
-    assert msg.from_address == "global@example.com"
-    assert msg.from_name == "Global Sender"
+    assert msg.from_address is None
+    assert msg.from_name is None
+
+    transport = manager.mailer("console")
+    assert isinstance(transport, ConsoleTransport)
+    assert len(transport.sent_messages) == 1
+    sent_msg = transport.sent_messages[0]
+    assert sent_msg.from_address == "global@example.com"
+    assert sent_msg.from_name == "Global Sender"
 
     await manager.close()

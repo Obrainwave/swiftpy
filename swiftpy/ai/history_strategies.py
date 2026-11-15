@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 
 from swiftpy.ai.conversation import Conversation
 from swiftpy.ai.providers.base import Message
+
+
+def _trim_orphaned_leading_turns(
+    dialogue: list[Message],
+    *,
+    min_remaining: int = 0,
+) -> list[Message]:
+    """Remove leading orphaned assistant/tool messages so dialogue starts cleanly with user."""
+    while len(dialogue) > min_remaining and dialogue[0].role in ("assistant", "tool"):
+        dialogue.pop(0)
+    return dialogue
 
 
 def default_token_estimator(text: str) -> int:
@@ -53,9 +65,8 @@ class SlidingWindowStrategy(HistoryStrategy):
         allowed_dialogue = max(0, self.max_messages - len(system_msgs))
         trimmed_dialogue = dialogue_msgs[-allowed_dialogue:] if allowed_dialogue > 0 else []
 
-        # Turn integrity: do not start dialogue with an orphaned assistant message
-        while trimmed_dialogue and trimmed_dialogue[0].role == "assistant":
-            trimmed_dialogue.pop(0)
+        # Turn integrity: do not start dialogue with orphaned assistant or tool messages
+        trimmed_dialogue = _trim_orphaned_leading_turns(trimmed_dialogue, min_remaining=0)
 
         retained: list[Message] = []
         retained.extend(system_msgs)
@@ -89,7 +100,10 @@ class TokenBudgetStrategy(HistoryStrategy):
 
     def estimate_message(self, message: Message) -> int:
         """Estimate token consumption of a single message including framing overhead."""
-        return self.estimator(message.content) + 4
+        base = self.estimator(message.content) + 4
+        if message.tool_calls:
+            base += self.estimator(json.dumps([tc.to_dict() for tc in message.tool_calls]))
+        return base
 
     def estimate_conversation(self, conversation: Conversation) -> int:
         """Calculate total estimated token consumption of a conversation."""
@@ -131,9 +145,8 @@ class TokenBudgetStrategy(HistoryStrategy):
 
         retained_dialogue = list(reversed(retained_dialogue_reversed))
 
-        # Turn integrity: ensure dialogue begins with user turn
-        while len(retained_dialogue) > 1 and retained_dialogue[0].role == "assistant":
-            retained_dialogue.pop(0)
+        # Turn integrity: ensure dialogue begins cleanly with user turn (drop orphaned assistant/tool)
+        retained_dialogue = _trim_orphaned_leading_turns(retained_dialogue, min_remaining=1)
 
         retained: list[Message] = []
         retained.extend(system_msgs)

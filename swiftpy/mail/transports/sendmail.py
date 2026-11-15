@@ -11,7 +11,7 @@ from swiftpy.mail.exceptions import (
     MailTimeoutError,
     MailTransportError,
 )
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.message import MailMessage, parse_mail_address
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.transports.base import MailTransport
 
@@ -30,30 +30,55 @@ class SendmailTransport(MailTransport):
         path: str = "/usr/sbin/sendmail",
         timeout: float = 30.0,
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> None:
         self.path = path
         self.timeout = timeout
         self.default_from = default_from
+        self.max_attachment_size_bytes = max_attachment_size_bytes
+        self.max_message_size_bytes = max_message_size_bytes
 
     @classmethod
     def from_config(
         cls,
         config: dict[str, Any],
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> SendmailTransport:
         path = str(config.get("path", "/usr/sbin/sendmail"))
         timeout = float(config.get("timeout", 30.0))
-        return cls(path=path, timeout=timeout, default_from=default_from)
+        raw_att = config.get("max_attachment_size_bytes", max_attachment_size_bytes)
+        raw_msg = config.get("max_message_size_bytes", max_message_size_bytes)
+        return cls(
+            path=path,
+            timeout=timeout,
+            default_from=default_from,
+            max_attachment_size_bytes=int(raw_att) if raw_att is not None else None,
+            max_message_size_bytes=int(raw_msg) if raw_msg is not None else None,
+        )
 
     async def send(self, message: MailMessage) -> MailSendResult:
         if not Path(self.path).exists():
             raise MailConfigurationError(f"Sendmail binary not found at '{self.path}'")
 
-        email_msg = await Envelope.build(message, default_from=self.default_from)
+        email_msg = await Envelope.build(
+            message,
+            default_from=self.default_from,
+            max_message_size_bytes=self.max_message_size_bytes,
+            max_attachment_size_bytes=self.max_attachment_size_bytes,
+        )
         raw_bytes = email_msg.as_bytes()
 
-        all_recipients = message.all_recipient_addresses()
-        cmd = [self.path, "-t", "-i"]
+        _, sender_addr = parse_mail_address(
+            str(email_msg["From"]), field_name="from_address"
+        )
+        all_recipients = [
+            parse_mail_address(r, field_name="recipient")[1]
+            for r in message.to + message.cc + message.bcc
+        ]
+        cmd = [self.path, "-i", "-f", sender_addr, "--", *all_recipients]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

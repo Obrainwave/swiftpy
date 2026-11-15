@@ -6,7 +6,7 @@ CONFIG: dict[str, object] = {
         "host": env("REDIS_HOST", "127.0.0.1"),
         "port": int(env("REDIS_PORT", "6379")),
         "password": env("REDIS_PASSWORD", None),
-        "database": int(env("REDIS_EVENTS_DB", "0")),
+        "database": int(env("REDIS_EVENTS_DB", "2")),
         "prefix": env("EVENTS_PREFIX", "swiftpy_events:"),
     },
 }

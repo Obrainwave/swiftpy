@@ -6,7 +6,15 @@ from typing import Any
 
 import uvicorn
 
-from swiftpy.core.config import Config
+from swiftpy.core.config import Config, ConfigurationError
+
+
+def _first_configured(*values: Any) -> Any:
+    """Return the first explicitly configured value, preserving integer 0 and boolean False."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
 
 
 class StartCommand:
@@ -87,7 +95,7 @@ class StartCommand:
     def handle(args: argparse.Namespace) -> None:
         try:
             config = Config.load()
-        except Exception:  # noqa: BLE001
+        except (ConfigurationError, OSError, ValueError, RuntimeError, SyntaxError):
             config = Config()
 
         target = (
@@ -102,15 +110,30 @@ class StartCommand:
             or config.get("app.host")
             or "127.0.0.1"
         )
-        raw_port = (
-            args.port
-            or config.get("server.port")
-            or config.get("app.port")
-            or 8000
+        raw_port = _first_configured(
+            args.port,
+            config.get("server.port"),
+            config.get("app.port"),
+            8000,
         )
         port = int(raw_port)
-        raw_workers = args.workers or config.get("server.workers") or 1
+        if port < 0 or port > 65535:
+            sys.stderr.write(
+                f"Error: invalid port {port} (must be between 0 and 65535).\n"
+            )
+            raise SystemExit(1)
+
+        raw_workers = _first_configured(
+            args.workers,
+            config.get("server.workers"),
+            1,
+        )
         workers = int(raw_workers)
+        if workers < 1:
+            sys.stderr.write(
+                f"Error: invalid worker count {workers} (must be >= 1).\n"
+            )
+            raise SystemExit(1)
         reload = bool(args.reload)
         env_file = args.env_file or config.get("server.env_file")
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from swiftpy.auth.auth_manager import AuthManager
+from swiftpy.core.container import get_container
+from swiftpy.core.context import Context
 from swiftpy.core.exceptions import HttpException
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
@@ -10,31 +13,27 @@ class AuthMiddleware(Middleware):
     """
     Authentication ASGI middleware for SwiftPY.
 
-    Extracts Bearer tokens from the Authorization header, validates the credential
-    against the application's authentication guard, and binds the authenticated
-    user entity to both `request.state["user"]` and task-isolated `Context.set("auth.user", user)`.
-    Raises HTTP 401 Unauthorized if the token is missing or invalid.
+    Validates incoming credentials through the application's AuthManager guard,
+    binds the authenticated user entity to `request.state["user"]` and
+    task-isolated `Context`, and raises HTTP 401 when authentication fails.
     """
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
-        auth_header = request.headers.get("authorization") or request.headers.get(
-            "Authorization"
+        container = get_container()
+        auth_manager = (
+            container.resolve(AuthManager)
+            if container.has(AuthManager)
+            else AuthManager(container)
         )
-        if not auth_header or not auth_header.startswith("Bearer "):
+        user = await auth_manager.authenticate(request)
+        if user is None:
             raise HttpException(
                 status_code=401,
-                message="Unauthenticated: Missing or invalid Bearer token",
+                message="Unauthenticated: Missing or invalid credentials",
             )
 
-        token = auth_header[7:].strip()
-        if not token:
-            raise HttpException(
-                status_code=401, message="Unauthenticated: Empty Bearer token"
-            )
-
-        # In production applications, decode JWT or resolve API key via Auth guard:
-        # user = await Auth.guard().user_from_token(token)
-        # Context.set("auth.user", user)
-        # request.state["user"] = user
+        Context.set("auth.user", user)
+        Context.set("__swiftpy_current_user__", user)
+        request.state["user"] = user
 
         return await next_handler(request)

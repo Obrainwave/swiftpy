@@ -4,6 +4,7 @@ from swiftpy.validation.exceptions import ValidationException
 from swiftpy.validation.form_request import FormRequest
 from swiftpy.validation.protocols import ValidatorRule
 from swiftpy.validation.rules import (
+    BailRule,
     BetweenRule,
     BoolRule,
     EmailRule,
@@ -21,6 +22,7 @@ from swiftpy.validation.rules import (
     StrRule,
     UniqueRule,
     UrlRule,
+    bail,
     between,
     bool_,
     boolean,
@@ -46,6 +48,7 @@ from swiftpy.validation.rules import (
 from swiftpy.validation.validator import ValidationResult, Validator, validate
 
 __all__ = [
+    "BailRule",
     "BetweenRule",
     "BoolRule",
     "EmailRule",
@@ -68,6 +71,7 @@ __all__ = [
     "ValidationResult",
     "Validator",
     "ValidatorRule",
+    "bail",
     "between",
     "bool_",
     "boolean",

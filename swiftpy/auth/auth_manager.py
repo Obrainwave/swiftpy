@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import weakref
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -20,21 +21,42 @@ class CurrentUser(dict[str, Any]):
     Task-scoped authenticated user context resolvable through the DI container.
 
     Resolves lazily from `Context` at access time when constructed without explicit
-    payload data, and is never cached in the container scope while unauthenticated.
+    payload data, stays synchronized with context updates so C-level readers like
+    `dict(user)` and `json.dumps(user)` see live data, and is never cached in
+    the container scope while unauthenticated.
     """
 
     def __init__(self, data: dict[str, Any] | None = None) -> None:
         self._lazy = data is None
+        self._last_synced: dict[str, Any] = {}
         if data is None:
             ctx_user = Context.get("__swiftpy_current_user__")
-            data = ctx_user if isinstance(ctx_user, dict) else {}
-        super().__init__(data)
+            initial = dict(ctx_user) if isinstance(ctx_user, dict) else {}
+            super().__init__(initial)
+            self._last_synced = dict(initial)
+            Context.watch(
+                "__swiftpy_current_user__",
+                weakref.WeakMethod(self._apply_context_payload),
+            )
+        else:
+            super().__init__(data)
+
+    def _apply_context_payload(self, payload: Any) -> None:
+        if not self._lazy:
+            return
+        target = dict(payload) if isinstance(payload, dict) else {}
+        if target != self._last_synced or dict.keys(self) != target.keys():
+            super().clear()
+            super().update(target)
+            self._last_synced = target
 
     def _sync(self) -> None:
-        if self._lazy and not super().__len__():
-            ctx_user = Context.get("__swiftpy_current_user__")
-            if isinstance(ctx_user, dict) and ctx_user:
-                super().update(ctx_user)
+        if not self._lazy:
+            return
+        ctx_user = Context.get("__swiftpy_current_user__")
+        target = ctx_user if isinstance(ctx_user, dict) else {}
+        if target != self._last_synced:
+            self._apply_context_payload(target)
 
     @property
     def _cache_in_scope(self) -> bool:
@@ -76,6 +98,26 @@ class CurrentUser(dict[str, Any]):
     def items(self) -> Any:
         self._sync()
         return super().items()
+
+    def copy(self) -> dict[str, Any]:
+        self._sync()
+        return super().copy()
+
+    def to_dict(self) -> dict[str, Any]:
+        self._sync()
+        return super().copy()
+
+    def __repr__(self) -> str:
+        self._sync()
+        return super().__repr__()
+
+    def __eq__(self, other: object) -> bool:
+        self._sync()
+        return super().__eq__(other)
+
+    def __ne__(self, other: object) -> bool:
+        self._sync()
+        return super().__ne__(other)
 
     @property
     def id(self) -> Any:

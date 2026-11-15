@@ -4,13 +4,60 @@ import argparse
 import asyncio
 import concurrent.futures
 import logging
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from swiftpy.console.loader import load_application
+from swiftpy.core.config import ConfigurationError
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.worker import QueueWorker
 
+if TYPE_CHECKING:
+    from swiftpy.core.application import Application
+
 logger = logging.getLogger("swiftpy.console")
+
+
+def _load_optional_app(app_target: str | None) -> Application | None:
+    """Load the optional `module:attribute` application target or exit on failure."""
+    if not app_target:
+        return None
+    try:
+        return load_application(app_target)
+    except (
+        ImportError,
+        AttributeError,
+        TypeError,
+        ConfigurationError,
+        OSError,
+        ValueError,
+        RuntimeError,
+        SyntaxError,
+    ) as exc:
+        logger.error("Could not boot application target '%s': %s", app_target, exc)
+        raise SystemExit(1) from exc
+
+
+def _run_queue_action(
+    action: Callable[[], Awaitable[None]],
+    *,
+    app: Application | None = None,
+    temporary_dispatcher: QueueDispatcher | None = None,
+) -> None:
+    """Execute an async queue CLI action within optional app lifespan and dispatcher cleanup."""
+
+    async def _execute() -> None:
+        if app is not None:
+            await app.startup()
+        try:
+            await action()
+        finally:
+            if temporary_dispatcher is not None:
+                await temporary_dispatcher.close()
+            if app is not None:
+                await app.shutdown()
+
+    _run_coroutine(_execute())
 
 
 def _run_coroutine(coro: Any) -> Any:
@@ -105,6 +152,11 @@ class QueueCommand:
             default=None,
             help="The Redis key prefix for queues",
         )
+        failed_parser.add_argument(
+            "--app",
+            default=None,
+            help="Application target (module:attribute) to boot before running command",
+        )
         failed_parser.set_defaults(
             _handler=QueueCommand.handle_failed,
         )
@@ -128,6 +180,11 @@ class QueueCommand:
             default=None,
             help="The Redis key prefix for queues",
         )
+        retry_parser.add_argument(
+            "--app",
+            default=None,
+            help="Application target (module:attribute) to boot before running command",
+        )
         retry_parser.set_defaults(
             _handler=QueueCommand.handle_retry,
         )
@@ -147,6 +204,11 @@ class QueueCommand:
             default=None,
             help="The Redis key prefix for queues",
         )
+        flush_parser.add_argument(
+            "--app",
+            default=None,
+            help="Application target (module:attribute) to boot before running command",
+        )
         flush_parser.set_defaults(
             _handler=QueueCommand.handle_flush,
         )
@@ -154,31 +216,34 @@ class QueueCommand:
     @staticmethod
     def handle_work(args: argparse.Namespace) -> None:
         """Run the queue worker process."""
-        if args.app:
-            try:
-                load_application(args.app)
-            except Exception as exc:
-                logger.error(
-                    "Could not boot application target '%s': %s", args.app, exc
-                )
-                raise SystemExit(1) from exc
-
-        dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
+        app = _load_optional_app(getattr(args, "app", None))
+        temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
         worker = QueueWorker(
             queues=args.queue,
-            dispatcher=dispatcher,
+            dispatcher=temporary_dispatcher,
             sleep=args.sleep,
             max_jobs=args.max_jobs,
             stop_when_empty=args.stop_when_empty,
             timeout=args.timeout,
             concurrency=getattr(args, "concurrency", 1),
         )
-        _run_coroutine(worker.work())
+        _run_queue_action(
+            worker.work,
+            app=app,
+            temporary_dispatcher=temporary_dispatcher,
+        )
 
     @staticmethod
     def handle_failed(args: argparse.Namespace) -> None:
         """List failed jobs from the Dead Letter Queue."""
-        dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else QueueDispatcher.get_instance()
+        if args.limit < 1 or args.limit > 1000:
+            raise SystemExit(
+                f"Invalid --limit {args.limit}: must be between 1 and 1000."
+            )
+
+        app = _load_optional_app(getattr(args, "app", None))
+        temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
+        dispatcher = temporary_dispatcher or QueueDispatcher.get_instance()
 
         async def _list() -> None:
             records = await dispatcher.get_failed_jobs(
@@ -197,12 +262,18 @@ class QueueCommand:
                 failed_at = rec.get("failed_at", 0)
                 print(f"  [{job_id}] {job_class} - {exc_msg} (failed at {failed_at})")
 
-        _run_coroutine(_list())
+        _run_queue_action(
+            _list,
+            app=app,
+            temporary_dispatcher=temporary_dispatcher,
+        )
 
     @staticmethod
     def handle_retry(args: argparse.Namespace) -> None:
         """Retry one or all failed jobs."""
-        dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else QueueDispatcher.get_instance()
+        app = _load_optional_app(getattr(args, "app", None))
+        temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
+        dispatcher = temporary_dispatcher or QueueDispatcher.get_instance()
 
         async def _retry() -> None:
             target_id = None if args.id == "all" else args.id
@@ -211,15 +282,25 @@ class QueueCommand:
             )
             print(f"Retried {retried} failed job(s) on queue '{args.queue}'.")
 
-        _run_coroutine(_retry())
+        _run_queue_action(
+            _retry,
+            app=app,
+            temporary_dispatcher=temporary_dispatcher,
+        )
 
     @staticmethod
     def handle_flush(args: argparse.Namespace) -> None:
         """Flush failed jobs from the Dead Letter Queue."""
-        dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else QueueDispatcher.get_instance()
+        app = _load_optional_app(getattr(args, "app", None))
+        temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
+        dispatcher = temporary_dispatcher or QueueDispatcher.get_instance()
 
         async def _flush() -> None:
             cleared = await dispatcher.flush_failed(queue=args.queue)
             print(f"Flushed {cleared} failed job(s) from queue '{args.queue}'.")
 
-        _run_coroutine(_flush())
+        _run_queue_action(
+            _flush,
+            app=app,
+            temporary_dispatcher=temporary_dispatcher,
+        )

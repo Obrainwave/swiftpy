@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+from swiftpy.core.config import Config
+from swiftpy.core.container import Container, get_container, set_container
 from swiftpy.queue.job import Job, JobSerializationError
 
 
@@ -22,16 +24,22 @@ def reset_job_keys_and_namespaces() -> Generator[None, None, None]:
     original_key = Job.get_app_key()
     original_prev = Job.get_previous_keys()
     original_namespaces = Job._trusted_namespaces
+    original_trusted = Job._trusted_classes.copy()
+    original_allow_unsigned = Job.get_allow_unsigned()
 
     Job.set_app_key(None)
     Job.set_previous_keys([])
     Job.set_trusted_namespaces(None)
+    Job.set_allow_unsigned(False)
+    Job.allow_job_class(DummySignedJob)
 
     yield
 
     Job.set_app_key(original_key)
     Job.set_previous_keys(original_prev)
     Job.set_trusted_namespaces(original_namespaces)
+    Job._trusted_classes = original_trusted
+    Job.set_allow_unsigned(original_allow_unsigned)
 
 
 def test_unsigned_payload_is_rejected_and_never_imports_module() -> None:
@@ -40,7 +48,7 @@ def test_unsigned_payload_is_rejected_and_never_imports_module() -> None:
     Job.set_app_key(secret_key)
 
     job = DummySignedJob(message="secret")
-    payload = job.serialize(app_key=None)  # Unsigned payload
+    payload = job.serialize(app_key=None, allow_unsigned=True)  # Unsigned payload
     payload.pop("signature", None)
 
     with patch("importlib.import_module") as mock_import:
@@ -98,31 +106,59 @@ def test_key_rotation_accepts_previous_key() -> None:
     assert deserialized.message == "key-rotation"
 
 
-def test_untrusted_namespace_is_rejected_before_import() -> None:
+def test_untrusted_namespace_is_rejected_before_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When signing is off, default trusted namespaces block arbitrary modules from importing."""
-    Job.set_app_key(None)
+    prev_cfg = Config._instance
+    prev_container = get_container()
+    try:
+        monkeypatch.delenv("APP_KEY", raising=False)
+        empty_cfg = Config({"app": {"key": ""}})
+        c = Container()
+        c.instance(Config, empty_cfg)
+        set_container(c)
+        Config._instance = empty_cfg
+        Job.set_app_key(None)
 
-    untrusted_payload = {
-        "job_class": "os.system",
-        "args": ["echo evil"],
-    }
+        untrusted_payload = {
+            "job_class": "os.system",
+            "args": ["echo evil"],
+        }
 
-    with patch("importlib.import_module") as mock_import:
-        with pytest.raises(JobSerializationError, match="trusted namespaces"):
-            Job.deserialize(untrusted_payload)
-        mock_import.assert_not_called()
+        with patch("importlib.import_module") as mock_import:
+            with pytest.raises(JobSerializationError, match="trusted namespaces"):
+                Job.deserialize(untrusted_payload, allow_unsigned=True)
+            mock_import.assert_not_called()
+    finally:
+        Config._instance = prev_cfg
+        set_container(prev_container)
 
 
-def test_target_class_not_job_subclass_is_rejected() -> None:
+def test_target_class_not_job_subclass_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Even if module is within trusted namespaces, non-Job classes are rejected."""
-    Job.set_app_key(None)
-    Job.set_trusted_namespaces(["tests.", "test_signing"])
+    prev_cfg = Config._instance
+    prev_container = get_container()
+    try:
+        monkeypatch.delenv("APP_KEY", raising=False)
+        empty_cfg = Config({"app": {"key": ""}})
+        c = Container()
+        c.instance(Config, empty_cfg)
+        set_container(c)
+        Config._instance = empty_cfg
+        Job.set_app_key(None)
+        Job.set_trusted_namespaces(["tests.", "test_signing"])
 
-    # tests.queue.test_signing has non-Job functions/classes
-    payload = {
-        "job_class": f"{reset_job_keys_and_namespaces.__module__}:{reset_job_keys_and_namespaces.__name__}",
-        "args": [],
-    }
+        # tests.queue.test_signing has non-Job functions/classes
+        payload = {
+            "job_class": f"{reset_job_keys_and_namespaces.__module__}:{reset_job_keys_and_namespaces.__name__}",
+            "args": [],
+        }
 
-    with pytest.raises(JobSerializationError, match="not a subclass of Job"):
-        Job.deserialize(payload)
+        with pytest.raises(JobSerializationError, match="not a subclass of Job"):
+            Job.deserialize(payload, allow_unsigned=True)
+    finally:
+        Config._instance = prev_cfg
+        set_container(prev_container)

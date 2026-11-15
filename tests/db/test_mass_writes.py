@@ -94,7 +94,7 @@ async def test_in_and_not_in_empty_and_non_list_validation() -> None:
     assert bindings_not_in == []
     assert len(await q_not_in_empty.get()) == 3
 
-    # 3. Non-empty NOT IN works with bindings
+    # 3. Non-empty NOT IN works with list and tuple bindings
     q_not_in = Query.table("test_mass_write_items").where("views", "NOT IN", [10, 30])
     sql_ni, bindings_ni = q_not_in.to_sql()
     assert '"views" NOT IN ($1, $2)' in sql_ni
@@ -103,8 +103,14 @@ async def test_in_and_not_in_empty_and_non_list_validation() -> None:
     assert len(rows) == 1
     assert rows[0]["views"] == 20
 
-    # 4. Non-list raises QueryError
-    for bad_value in ("not-a-list", 123, {"a": 1}, (1, 2), {1, 2}):
+    q_tuple_in = Query.table("test_mass_write_items").where("views", "IN", (10, 30))
+    sql_ti, bindings_ti = q_tuple_in.to_sql()
+    assert '"views" IN ($1, $2)' in sql_ti
+    assert bindings_ti == [10, 30]
+    assert len(await q_tuple_in.get()) == 2
+
+    # 4. Non-sequence raises QueryError
+    for bad_value in ("not-a-list", 123, {"a": 1}, {1, 2}):
         with pytest.raises(QueryError, match=r"(?i)list"):
             Query.table("test_mass_write_items").where("id", "IN", bad_value)
         with pytest.raises(QueryError, match=r"(?i)list"):

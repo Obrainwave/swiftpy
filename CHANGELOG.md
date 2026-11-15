@@ -4,6 +4,30 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+### Audit Remediation & Approved Breaking Changes (`G-1`–`G-16`)
+- **Packaging, Core, & HTTP (`G-1`, `G-2`, `G-16`):**
+  - **Policy Update (`G-1`):** `swiftpy/ai` (LLM clients, embeddings, vector stores, RAG pipelines, agents, tools, prompts, and observability) is fully implemented and included in the main `swiftpy-framework` v0.1.0 wheel (superseding the earlier `P10-L7` wheel exclusion); `swiftpy/__init__.py` uses PEP 562 lazy exports so lightweight imports do not pull heavy optional submodules eagerly, and `swiftpy.testing` remains documented as a dev-only test utility.
+  - **Breaking (`G-2`):** `config/app.py` defaults `app.debug` (`APP_DEBUG`) to `False`, and explicit `Application(**kwargs)` overrides always take precedence over environment/cache defaults.
+  - **Breaking (`G-16`):** Removed dead unbootstrapped `RouteCache` (`swiftpy cache:build` precompiles `config.json` and `prompts.json`), enabled automatic JSON serialization when route handlers return `dict` or `list` values, and preserved `.gitignore` exclusion of `/docs/` and `AGENTS.md`.
+- **Security, Starter App, Admin, & WebSockets (`G-3`, `G-4`, `P1-S1`–`P1-S5`, `P2-*`, `P3-A1`):**
+  - Removed unauthenticated `/benchmarks/token`, gated benchmark routes behind `APP_ENABLE_BENCHMARKS` (`app/http/benchmarks.py` relocated to `tests/benchmarks.py`), and hardened starter app auth/token handling.
+  - **Breaking (`G-3`):** `CORSMiddleware` fails closed when combining wildcard `"*"` with `allow_credentials=True` (`ConfigurationError`), `CORS_ALLOW_CREDENTIALS` uses strict boolean parsing, and Redis DB defaults align with `.env.example`.
+  - **Breaking (`G-4`):** Production `AdminAuthenticator` rejects default `"admin123"` credentials and missing/short secrets, enforces `is_admin` and non-empty `session_id`, requires `POST` + CSRF validation on logout, bounds revoked sessions, and escapes `OR` search filters.
+  - Isolated nested `Container.scope()` and `CurrentUser`, ensured `StreamingResponse` closes inside request context and stops on `HEAD`, prevented `OPTIONS` 500 on braced paths, and hardened WebSocket `urlsplit` origin parsing and distributed broadcast error handling.
+- **Database, ORM, & Migrations (`G-6`, `P4-*`):**
+  - Hardened `having()`, `where_null()`, and `select_raw()` against invalid/injected SQL identifiers, fixed `on_commit` ordering after transaction close, fixed ORM `create()` defaults, JSON list persistence, custom `__primary_key__`, dirty-hook updates, and `BelongsToMany` transaction propagation.
+- **Queue, Cache, & Events (`G-5`, `P5-*`):**
+  - **Breaking (`G-5`):** Queue and `RedisEventBus` HMAC signing require explicit `>= 32`-byte `APP_KEY` and reject `"tests"` / `test*` job namespaces by default (use explicit `Job.allow_job_class(...)` or configured trusted namespaces).
+  - Fixed `_REAP_LEASES_LUA` signature & empty `args=[]` preservation, DLQ list capping (`failed_max_size`), worker concurrency/cancellation/shutdown cleanup, `MemoryDriver` bounded LRU sweeping, single-flight `RedisDriver.remember`, and `EventDispatcher` `**kwargs` + `forget()`.
+- **Filesystem, Mail, & Validation (`G-7`, `G-8`, `G-9`, `P6-*`):**
+  - **Breaking (`G-7`):** Enforced upload `Sequence` & magic-byte validation, raised on S3 listing HTTP failures, required signing keys for local temporary URLs, and enforced symlink containment.
+  - **Breaking (`G-8`):** Propagated `SendQueuedMailableJob` exceptions to worker DLQ handling, enforced mailable allowlists, and standardized sandboxed Jinja2 mail templates on the `views/` root (`MailTemplateRenderer(template_dir="views")`).
+  - **Breaking (`G-9`):** Hardened `FormRequest` dynamic `rules()` / `messages()` / multipart / `SAVEPOINT` / `regex:` handling with strict schema failure reporting and canonical coercion ordering.
+- **AI, Vector Stores, RAG, Agents, Tools, & Prompts (`G-10`–`G-15`, `P7-*`, `P8-*`):**
+  - **Breaking (`G-10`–`G-15`):** Enforced fail-closed missing `OPENAI_API_KEY` in `EmbeddingsClient`, longest-prefix model pricing, split UTF-8 SSE decoding, LanceDB merge/append upsert and safe delete filters, Pinecone SSRF validation, `AI.vectorstore("pgvector")`, `<= 63`-byte PostgreSQL HNSW index names, per-item RAG ingest validation + reranker ordering, strict `BaseAgent` tool/budget enforcement, session locks, strict `BaseTool` nested schema / `WebSearchTool` checks, and `base_dir`-scoped `PromptLoader` compiled caches.
+- **Testing, CLI, CI/CD, & Hygiene (`P9-*`, `P10-*`):**
+  - Aligned `TestClient` query/non-ASCII/`Set-Cookie`/lifespan parity; updated `swiftpy new` scaffolding (`Dockerfile`, `storage:link`, `WelcomeEmail`) and `swiftpy queue:failed`/`retry`/`flush` (`--app`, resource cleanup, bounded limits); added `--timeout-method=thread` reliability, SHA-pinned CI/publish GitHub Actions, isolated clean-venv wheel smoke gate, `${VAR:?}` Docker Compose secrets, `pip-audit`, zero `# type: ignore` comments & zero inline imports across `swiftpy/` and `tests/`, and updated `README.md` + `tests/docs/test_readme_examples.py`.
+
 ### Phase 1 – Shared Foundations
 - **P1-F1 (Security / Database):** Consolidated SQL identifier validation into `swiftpy.database.identifiers` (`validate_identifier`, `validate_column_identifier`, `quote_identifier`) using `re.fullmatch` and enforcing PostgreSQL's 63-character limit (`MAX_IDENTIFIER_LENGTH = 63`). Rejected trailing newlines (`"users\n"`), whitespace, and wildcards (`"*"`) in `WHERE`, `JOIN`, `ORDER BY`, `INSERT`, and `UPDATE` column identifiers across `QueryBuilder`, migrations (`Blueprint`, `Schema`, `Migrator`), validation rules (`UniqueRule`, `ExistsRule`), and `ApiKeyGuard`.
 - **P1-F2 (Support / ORM):** Extracted `snake_case` and `pluralize` into `swiftpy.support.strings` (re-exported from `swiftpy.helpers` and `swiftpy.helpers.helper` for backward compatibility) to eliminate circular import coupling with the ORM.
@@ -240,10 +264,8 @@ All notable changes to SwiftPY will be documented in this file.
   - Untracked previously committed `.coverage` and `*.pyc` files from the git index (`git rm --cached`).
   - Updated `.gitignore` to explicitly ignore `*.pyc`, `*.pyo`, `*.pyd`, `.coverage`, `.coverage.*`, and `htmlcov/`.
   - Confirmed `docs/`, `AGENTS.md`, and `DEVLOG.md` untracked status in git per Decision `D-12`.
-- **P10-L7 (Repo Hygiene – Placeholder API Deprecation & Wheel Exclusion):**
-  - Added `"""Not implemented."""` docstrings across all 29 placeholder files in `swiftpy/ai/**`, plus empty helper modules (`params.py`, `route_cache.py`, `route_group.py`, `commands/ai.py`, `config/ai.py`, `config/logging.py`) per Decision `D-11`.
-  - Configured `[tool.hatch.build.targets.wheel]` in `pyproject.toml` to exclude `swiftpy/ai` from distributed wheels.
-  - Added CLI snapshot test in `tests/console/test_start.py` ensuring `swiftpy --help` exposes no unimplemented placeholder commands.
+- **P10-L7 (Repo Hygiene – Placeholder API Deprecation & Wheel Exclusion, Superseded by `G-1`):**
+  - Earlier placeholder annotations and `[tool.hatch.build.targets.wheel]` `swiftpy/ai` exclusion were subsequently superseded by full `swiftpy/ai` implementation (Phases 11–13) and Decision `G-1` (shipping `swiftpy/ai` inside the main v0.1.0 `swiftpy-framework` wheel).
 - **P10-D1 (Documentation – Readme Examples Test Suite & Migration Guide):**
   - Overhauled `README.md` to reflect completion of all 10 architectural phases and 600+ passing tests.
   - Aligned all code examples with actual SwiftPY APIs (`app.middleware`, `app.group`, `JWTGuard`, `CurrentUser`, `Blueprint`, `Job`).

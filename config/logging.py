@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
+from swiftpy.helpers.helper import env
 
 CONFIG = {
-    "default": os.getenv("LOG_CHANNEL", "stack"),
-    "level": os.getenv("LOG_LEVEL", "info"),
+    "default": env("LOG_CHANNEL", "stack"),
+    "level": env("LOG_LEVEL", "info"),
     "channels": {
         "stack": {
             "driver": "stack",
@@ -13,12 +13,12 @@ CONFIG = {
         "single": {
             "driver": "single",
             "path": "storage/logs/swiftpy.log",
-            "level": os.getenv("LOG_LEVEL", "info"),
+            "level": env("LOG_LEVEL", "info"),
         },
         "daily": {
             "driver": "daily",
             "path": "storage/logs/swiftpy.log",
-            "level": os.getenv("LOG_LEVEL", "info"),
+            "level": env("LOG_LEVEL", "info"),
             "days": 14,
         },
     },

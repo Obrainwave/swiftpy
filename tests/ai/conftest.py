@@ -3,11 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 import swiftpy.ai.vectorstore  # noqa: F401
@@ -40,9 +36,6 @@ async def mock_client_factory() -> AsyncGenerator[Callable[[Callable[[Any], Any]
     Factory creating an httpx.AsyncClient with MockTransport that is registered
     for automatic asynchronous cleanup.
     """
-    if httpx is None:
-        pytest.skip("httpx is not installed in the local environment.")
-
     clients: list[httpx.AsyncClient] = []
 
     def _factory(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:

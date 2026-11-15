@@ -4,9 +4,10 @@ import hashlib
 import importlib.util
 import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -18,7 +19,7 @@ from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.migrations.lock import MigrationLock
 from swiftpy.database.migrations.migration import Migration, MigrationProtocol
 from swiftpy.database.pool import DatabasePool
-from swiftpy.database.transaction import _active_connection
+from swiftpy.database.transaction import TransactionConnection, _active_connection
 
 
 @dataclass(frozen=True)
@@ -251,29 +252,25 @@ class Migrator:
             next_batch = (await self.get_last_batch(conn)) + 1
             applied: list[str] = []
 
-            # Bind connection to context so Schema operations reuse this exact transaction
-            token = _active_connection.set(conn)
-            try:
-                for file in pending:
-                    started = time.perf_counter()
-                    checksum = self.compute_checksum(file)
-                    instance = self.resolve_migration_instance(file)
+            for file in pending:
+                started = time.perf_counter()
+                checksum = self.compute_checksum(file)
+                instance = self.resolve_migration_instance(file)
 
-                    async with conn.transaction():
-                        await instance.up()
-                        await conn.execute(
-                            f'INSERT INTO "{self.table_name}" ("migration", "batch", "checksum") '
-                            f"VALUES ($1, $2, $3);",
-                            file.name,
-                            next_batch,
-                            checksum,
-                        )
-                    duration_ms = (time.perf_counter() - started) * 1000
-                    applied.append(file.name)
-                    if on_applied is not None:
-                        on_applied(file.name, duration_ms)
-            finally:
-                _active_connection.reset(token)
+                await self._execute_in_transaction(
+                    conn,
+                    partial(
+                        self._apply_migration_tx,
+                        instance=instance,
+                        migration_name=file.name,
+                        batch=next_batch,
+                        checksum=checksum,
+                    ),
+                )
+                duration_ms = (time.perf_counter() - started) * 1000
+                applied.append(file.name)
+                if on_applied is not None:
+                    on_applied(file.name, duration_ms)
 
             return applied
 
@@ -326,28 +323,77 @@ class Migrator:
 
             rolled_back: list[str] = []
 
-            token = _active_connection.set(conn)
-            try:
-                for row in rows:
-                    name = str(row["migration"])
-                    file = files_by_name[name]
-                    started = time.perf_counter()
-                    instance = self.resolve_migration_instance(file)
+            for row in rows:
+                name = str(row["migration"])
+                file = files_by_name[name]
+                started = time.perf_counter()
+                instance = self.resolve_migration_instance(file)
 
-                    async with conn.transaction():
-                        await instance.down()
-                        await conn.execute(
-                            f'DELETE FROM "{self.table_name}" WHERE "migration" = $1;',
-                            name,
-                        )
-                    duration_ms = (time.perf_counter() - started) * 1000
-                    rolled_back.append(name)
-                    if on_rolled_back is not None:
-                        on_rolled_back(name, duration_ms)
-            finally:
-                _active_connection.reset(token)
+                await self._execute_in_transaction(
+                    conn,
+                    partial(
+                        self._rollback_migration_tx,
+                        instance=instance,
+                        migration_name=name,
+                    ),
+                )
+                duration_ms = (time.perf_counter() - started) * 1000
+                rolled_back.append(name)
+                if on_rolled_back is not None:
+                    on_rolled_back(name, duration_ms)
 
             return rolled_back
+
+    async def _apply_migration_tx(
+        self,
+        tx_handle: TransactionConnection,
+        *,
+        instance: MigrationProtocol,
+        migration_name: str,
+        batch: int,
+        checksum: str,
+    ) -> None:
+        await instance.up()
+        await tx_handle.execute(
+            f'INSERT INTO "{self.table_name}" ("migration", "batch", "checksum") '
+            f"VALUES ($1, $2, $3);",
+            migration_name,
+            batch,
+            checksum,
+        )
+
+    async def _rollback_migration_tx(
+        self,
+        tx_handle: TransactionConnection,
+        *,
+        instance: MigrationProtocol,
+        migration_name: str,
+    ) -> None:
+        await instance.down()
+        await tx_handle.execute(
+            f'DELETE FROM "{self.table_name}" WHERE "migration" = $1;',
+            migration_name,
+        )
+
+    @staticmethod
+    async def _execute_in_transaction(
+        conn: asyncpg.Connection,
+        operation: Callable[[TransactionConnection], Awaitable[None]],
+    ) -> None:
+        """Bind a TransactionConnection handle per migration step and flush on_commit after closing."""
+        tx_handle = TransactionConnection(conn)
+        token = _active_connection.set(tx_handle)
+        committed_callbacks: list[Callable[[], Any]] = []
+        try:
+            async with tx_handle.transaction(defer_callbacks=True):
+                await operation(tx_handle)
+            committed_callbacks = tx_handle.drain_commit_callbacks()
+        finally:
+            tx_handle._close()
+            _active_connection.reset(token)
+
+        if committed_callbacks:
+            await TransactionConnection.run_commit_callbacks(committed_callbacks)
 
     async def reset(self) -> list[str]:
         """Roll back all migrations in reverse chronological order."""
@@ -380,41 +426,42 @@ class Migrator:
 
             rolled_back: list[str] = []
 
-            token = _active_connection.set(conn)
-            try:
-                for row in rows:
-                    name = str(row["migration"])
-                    file = files_by_name[name]
-                    instance = self.resolve_migration_instance(file)
+            for row in rows:
+                name = str(row["migration"])
+                file = files_by_name[name]
+                instance = self.resolve_migration_instance(file)
 
-                    async with conn.transaction():
-                        await instance.down()
-                        await conn.execute(
-                            f'DELETE FROM "{self.table_name}" WHERE "migration" = $1;',
-                            name,
-                        )
-                    rolled_back.append(name)
-            finally:
-                _active_connection.reset(token)
+                await self._execute_in_transaction(
+                    conn,
+                    partial(
+                        self._rollback_migration_tx,
+                        instance=instance,
+                        migration_name=name,
+                    ),
+                )
+                rolled_back.append(name)
 
             return rolled_back
 
     async def status(self) -> list[dict[str, Any]]:
-        """Return the execution status of all discovered migration files."""
+        """Return the execution status of all discovered migration files and applied records."""
         raw_pool = self.pool.get_pool()
 
         async with raw_pool.acquire() as conn:
             await self.ensure_repository(conn)
 
             rows = await conn.fetch(
-                f'SELECT "migration", "batch", "checksum", "applied_at" FROM "{self.table_name}";'
+                f'SELECT "migration", "batch", "checksum", "applied_at" '
+                f'FROM "{self.table_name}" ORDER BY "id" ASC;'
             )
             records = {str(r["migration"]): r for r in rows}
 
             files = self.get_migration_files()
+            seen_files: set[str] = set()
             statuses: list[dict[str, Any]] = []
 
             for f in files:
+                seen_files.add(f.name)
                 rec = records.get(f.name)
                 current_checksum = self.compute_checksum(f)
                 recorded_checksum = (
@@ -434,6 +481,26 @@ class Migrator:
                             if recorded_checksum is None
                             else recorded_checksum == current_checksum
                         ),
+                        "missing_file": False,
+                    }
+                )
+
+            for name, rec in records.items():
+                if name in seen_files:
+                    continue
+                statuses.append(
+                    {
+                        "migration": name,
+                        "ran": True,
+                        "batch": rec["batch"],
+                        "applied_at": rec["applied_at"],
+                        "checksum": (
+                            str(rec["checksum"])
+                            if rec["checksum"] is not None
+                            else None
+                        ),
+                        "checksum_valid": False,
+                        "missing_file": True,
                     }
                 )
 

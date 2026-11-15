@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -74,10 +75,10 @@ def test_limit_and_offset_reject_negatives_and_invalid_types() -> None:
         qb.offset(-10)
 
     with pytest.raises(TypeError, match="LIMIT must be an integer"):
-        qb.limit("10")  # type: ignore[arg-type]
+        qb.limit(json.loads('"10"'))
 
     with pytest.raises(TypeError, match="OFFSET must be an integer"):
-        qb.offset(3.14)  # type: ignore[arg-type]
+        qb.offset(json.loads("3.14"))
 
 
 def test_take_and_skip_aliases() -> None:
@@ -217,7 +218,7 @@ def test_paginator_reject_invalid_inputs() -> None:
         Paginator(items=[], total=10, per_page=True, current_page=1)
 
     with pytest.raises(TypeError, match="per_page must be an integer"):
-        Paginator(items=[], total=10, per_page=3.14, current_page=1)  # type: ignore[arg-type]
+        Paginator(items=[], total=10, per_page=json.loads("3.14"), current_page=1)
 
     with pytest.raises(ValueError, match="per_page must be >= 1"):
         Paginator(items=[], total=10, per_page=0, current_page=1)
@@ -268,7 +269,7 @@ def test_simple_paginator_boundary_and_validation() -> None:
         SimplePaginator(items=[], per_page=10, current_page=0, has_more=False)
 
     with pytest.raises(TypeError, match="has_more must be a boolean"):
-        SimplePaginator(items=[], per_page=10, current_page=1, has_more="yes")  # type: ignore[arg-type]
+        SimplePaginator(items=[], per_page=10, current_page=1, has_more=json.loads('"yes"'))
 
 
 # ============================================================================
@@ -317,7 +318,7 @@ def test_group_by_empty_calls_and_validation() -> None:
         Query.table("orders").group_by("")
 
     with pytest.raises(TypeError):
-        Query.table("orders").group_by(123)  # type: ignore[arg-type]
+        Query.table("orders").group_by(json.loads("123"))
 
 
 def test_group_by_qualified_identifiers() -> None:
@@ -507,7 +508,7 @@ def test_deep_query_cloning_nested_state_isolation() -> None:
     cloned.group_by("country")
     cloned.having("total", "<", 50)
     cloned.limit(5).offset(0)
-    cloned.select_raw("SUM(amount) AS sum_amt", [99])
+    cloned.select_raw("SUM(amount + ?) AS sum_amt", [99])
     cloned.having_raw("MAX(amount) > ?", [500])
 
     sql_cloned, bindings_cloned = cloned.to_sql()

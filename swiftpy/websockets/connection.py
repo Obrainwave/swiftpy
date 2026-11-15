@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 from urllib.parse import parse_qs
 
+from swiftpy.http.response import encode_json
+
 
 class WebSocketState(enum.Enum):
     CONNECTING = 0
@@ -51,6 +53,9 @@ class WebSocketConnection:
         self.close_code: int | None = None
         self.close_reason: str = ""
         self.state: dict[str, Any] = {}
+        self._headers: dict[str, str] | None = None
+        self._query_param_list: dict[str, list[str]] | None = None
+        self._query_params: dict[str, str] | None = None
 
     @property
     def origin(self) -> str | None:
@@ -64,32 +69,44 @@ class WebSocketConnection:
 
     @property
     def headers(self) -> dict[str, str]:
-        """Parsed request headers mapping lowercase header names to values."""
-        result: dict[str, str] = {}
-        for k, v in self.scope.get("headers", []):
-            key = k.decode("latin-1").lower() if isinstance(k, bytes) else str(k).lower()
-            val = v.decode("latin-1") if isinstance(v, bytes) else str(v)
-            result[key] = val
-        return result
-
-    @property
-    def query_params(self) -> dict[str, str]:
-        """Parsed dictionary of URL query string parameters (first value for each key)."""
-        raw_qs = self.scope.get("query_string", b"")
-        if not raw_qs:
-            return {}
-        qs_str = raw_qs.decode("latin-1") if isinstance(raw_qs, bytes) else str(raw_qs)
-        parsed = parse_qs(qs_str, keep_blank_values=True)
-        return {k: v[0] for k, v in parsed.items()}
+        """Parsed request headers mapping lowercase header names to values (cached per connection)."""
+        cached = getattr(self, "_headers", None)
+        if cached is None:
+            result: dict[str, str] = {}
+            for k, v in self.scope.get("headers", []):
+                key = k.decode("latin-1").lower() if isinstance(k, bytes) else str(k).lower()
+                val = v.decode("latin-1") if isinstance(v, bytes) else str(v)
+                result[key] = val
+            cached = result
+            self._headers = cached
+        return cached
 
     @property
     def query_param_list(self) -> dict[str, list[str]]:
-        """Parsed dictionary of URL query string parameters with all values as lists."""
-        raw_qs = self.scope.get("query_string", b"")
-        if not raw_qs:
-            return {}
-        qs_str = raw_qs.decode("latin-1") if isinstance(raw_qs, bytes) else str(raw_qs)
-        return parse_qs(qs_str, keep_blank_values=True)
+        """Parsed dictionary of UTF-8 URL query parameters with all values as lists (cached)."""
+        cached = getattr(self, "_query_param_list", None)
+        if cached is None:
+            raw_qs = self.scope.get("query_string", b"")
+            if not raw_qs:
+                cached = {}
+            else:
+                qs_str = (
+                    raw_qs.decode("utf-8", errors="replace")
+                    if isinstance(raw_qs, bytes)
+                    else str(raw_qs)
+                )
+                cached = parse_qs(qs_str, keep_blank_values=True)
+            self._query_param_list = cached
+        return cached
+
+    @property
+    def query_params(self) -> dict[str, str]:
+        """Parsed dictionary of UTF-8 URL query string parameters (first value per key, cached)."""
+        cached = getattr(self, "_query_params", None)
+        if cached is None:
+            cached = {k: v[0] for k, v in self.query_param_list.items() if v}
+            self._query_params = cached
+        return cached
 
     @property
     def client(self) -> tuple[str, int] | None:
@@ -268,10 +285,15 @@ class WebSocketConnection:
         await self._send({"type": "websocket.send", "bytes": data})
 
     async def send_json(self, data: Any) -> None:
-        """Serialize data to JSON and send as a text frame to the WebSocket client."""
+        """Serialize data to JSON using SwiftPY's strict encoder and send as a text frame."""
         if self.client_state != WebSocketState.CONNECTED:
             raise WebSocketException("Cannot send message: WebSocket is not connected")
-        await self._send({"type": "websocket.send", "text": json.dumps(data)})
+        await self._send(
+            {
+                "type": "websocket.send",
+                "text": encode_json(data).decode("utf-8"),
+            }
+        )
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         """Close the WebSocket connection."""

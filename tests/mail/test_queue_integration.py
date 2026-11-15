@@ -23,6 +23,7 @@ from swiftpy.mail.message import MailMessage
 from swiftpy.mail.queue.job import SendQueuedMailableJob
 from swiftpy.mail.transports.base import MailTransport
 from swiftpy.mail.transports.console import ConsoleTransport
+from swiftpy.queue import job as queue_job
 from swiftpy.queue.job import Job, set_dispatch_handler
 
 
@@ -109,14 +110,17 @@ async def test_queued_mailable_job_execution() -> None:
 
     # Test full deserialize & handle cycle from serialized dictionary
     payload = job.serialize()
-    restored_job = Job.deserialize(payload)
-    assert isinstance(restored_job, SendQueuedMailableJob)
-    await restored_job.handle()
+    allowed_path = SendQueuedMailableJob.allow_mailable_class(SampleMailable)
+    try:
+        restored_job = Job.deserialize(payload)
+        assert isinstance(restored_job, SendQueuedMailableJob)
+        await restored_job.handle()
+    finally:
+        SendQueuedMailableJob._trusted_mailable_classes.discard(allowed_path)
+        MailManager._instance = None
 
     assert len(transport.sent_messages) == 2
     assert transport.sent_messages[1].to == ["exec@domain.com"]
-
-    MailManager._instance = None
 
 
 @pytest.mark.asyncio
@@ -127,6 +131,7 @@ async def test_queue_transaction_commit_safety() -> None:
         dispatched_jobs.append(job)
         return job.job_id
 
+    prev_handler = queue_job._dispatch_handler
     set_dispatch_handler(mock_dispatch)
 
     mock_conn = MockTxConnection()
@@ -149,7 +154,7 @@ async def test_queue_transaction_commit_safety() -> None:
         assert isinstance(dispatched_jobs[0], SendQueuedMailableJob)
     finally:
         _active_connection.reset(token)
-        set_dispatch_handler(None)
+        set_dispatch_handler(prev_handler)
 
 
 @pytest.mark.asyncio
@@ -160,6 +165,7 @@ async def test_queue_transaction_rollback_safety() -> None:
         dispatched_jobs.append(job)
         return job.job_id
 
+    prev_handler = queue_job._dispatch_handler
     set_dispatch_handler(mock_dispatch)
 
     mock_conn = MockTxConnection()
@@ -179,7 +185,7 @@ async def test_queue_transaction_rollback_safety() -> None:
         assert len(dispatched_jobs) == 0
     finally:
         _active_connection.reset(token)
-        set_dispatch_handler(None)
+        set_dispatch_handler(prev_handler)
 
 
 @pytest.mark.asyncio
@@ -190,6 +196,7 @@ async def test_queue_after_commit_outside_transaction() -> None:
         dispatched_jobs.append(job)
         return job.job_id
 
+    prev_handler = queue_job._dispatch_handler
     set_dispatch_handler(mock_dispatch)
 
     # Ensure no active database transaction
@@ -202,7 +209,7 @@ async def test_queue_after_commit_outside_transaction() -> None:
         # Dispatches immediately when outside an active transaction
         assert len(dispatched_jobs) == 1
     finally:
-        set_dispatch_handler(None)
+        set_dispatch_handler(prev_handler)
 
 
 @pytest.mark.asyncio
@@ -230,10 +237,11 @@ async def test_queue_transient_errors_trigger_retry(
     job = SendQueuedMailableJob(mailable=mailable)
 
     # Transient error MUST be re-raised to allow the queue worker to schedule a retry
-    with pytest.raises(type(transient_exc)):
-        await job.handle()
-
-    MailManager._instance = None
+    try:
+        with pytest.raises(type(transient_exc)):
+            await job.handle()
+    finally:
+        MailManager._instance = None
 
 
 @pytest.mark.asyncio
@@ -259,10 +267,11 @@ async def test_queue_permanent_errors_fail_fast(
     mailable.mailer_name = "mock"
 
     job = SendQueuedMailableJob(mailable=mailable)
-    job.failed = AsyncMock()  # type: ignore[method-assign]
 
-    # Permanent error MUST NOT be re-raised; it calls failed() and fails fast
-    await job.handle()
-    job.failed.assert_awaited_once_with(permanent_exc)
-
-    MailManager._instance = None
+    # Permanent error exhausts retries and propagates so QueueWorker routes the job to DLQ
+    try:
+        with pytest.raises(type(permanent_exc)):
+            await job.handle()
+        assert job.attempts >= job.tries
+    finally:
+        MailManager._instance = None

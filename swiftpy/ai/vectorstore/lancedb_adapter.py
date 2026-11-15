@@ -1,14 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 from collections.abc import Sequence
 from typing import Any
 
-try:
-    import httpx
-    _HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
-except ImportError:
-    httpx = None
-    _HTTP_ERRORS = (TimeoutError, OSError)
+import httpx
 
 from swiftpy.ai.exceptions import (
     AIConnectionError,
@@ -21,11 +18,23 @@ from swiftpy.ai.vectorstore.base import (
     VectorRecord,
     VectorStore,
     VectorStoreCapabilities,
+    dedupe_preserve_order,
+    encode_path_segment,
     handle_adapter_http_error,
     normalize_record,
+    validate_collection_name,
+    validate_filter_operators,
     validate_vector,
 )
 from swiftpy.core.config import Config
+
+_HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
+
+_METRIC_MAP: dict[str, str] = {
+    "cosine": "cosine",
+    "l2": "l2",
+    "inner_product": "dot",
+}
 
 
 class LanceDbAdapter(VectorStore):
@@ -45,6 +54,7 @@ class LanceDbAdapter(VectorStore):
         http_pool: AIHttpPool | None = None,
         **kwargs: Any,
     ) -> None:
+        validate_collection_name(collection_name)
         self._config = config or Config()
         if not self._config.get("ai.enabled", True):
             raise AIModuleDisabledError("AI module is disabled in configuration (ai.enabled is false).")
@@ -72,7 +82,7 @@ class LanceDbAdapter(VectorStore):
             metadata_filtering=True,
             nested_metadata_filtering=True,
             namespaces=False,
-            pagination=True,
+            pagination=False,
             batch_upsert=True,
             native_distance_metrics=("cosine", "l2", "inner_product"),
         )
@@ -84,26 +94,28 @@ class LanceDbAdapter(VectorStore):
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
+    def _table_url(self, name: str | None = None, suffix: str = "") -> str:
+        coll = self._collection if name is None else validate_collection_name(name)
+        seg = encode_path_segment(coll)
+        return f"{self._base_url}/v1/table/{seg}{suffix}"
+
     async def create_collection(
         self,
         name: str,
         dimensions: int,
         metric: str = "cosine",
     ) -> None:
+        validate_collection_name(name)
         norm_metric = metric.lower().strip()
         if norm_metric not in ALLOWED_METRICS:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(ALLOWED_METRICS)}")
-        if dimensions <= 0:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(f"Dimensions must be positive, got {dimensions}")
 
-        self._collection = name
-        self._dimensions = dimensions
-        self._metric = norm_metric
-
-        url = f"{self._base_url}/v1/table/{name}/create"
+        url = self._table_url(name, "/create")
         payload = {
             "dimensions": dimensions,
-            "metric": norm_metric,
+            "metric": _METRIC_MAP[norm_metric],
         }
 
         client = self._http_pool.get_client()
@@ -118,6 +130,10 @@ class LanceDbAdapter(VectorStore):
                 handle_adapter_http_error(resp.status_code, resp.text, "lancedb")
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[lancedb] Connection error: {err}") from err
+
+        self._collection = name
+        self._dimensions = dimensions
+        self._metric = norm_metric
 
     async def upsert(
         self,
@@ -145,19 +161,19 @@ class LanceDbAdapter(VectorStore):
             normalize_record(r, self._dimensions, self._metric) for r in records
         ]
 
-        url = f"{self._base_url}/v1/table/{self._collection}/insert"
+        url = self._table_url(suffix="/insert")
         rows: list[dict[str, Any]] = []
         for r in norm_records:
             rows.append({
                 "id": r.id,
                 "vector": r.vector,
                 "content": r.content,
-                "metadata": r.metadata,
+                "metadata": copy.deepcopy(r.metadata),
             })
 
         body = {
             "data": rows,
-            "mode": "overwrite",
+            "mode": "merge",
         }
 
         client = self._http_pool.get_client()
@@ -183,16 +199,18 @@ class LanceDbAdapter(VectorStore):
             raise ValueError(f"Limit must be a positive integer, got {limit}")
 
         parsed_vec = validate_vector(vector, self._dimensions, self._metric)
-        url = f"{self._base_url}/v1/table/{self._collection}/query"
+        url = self._table_url(suffix="/query")
 
         body: dict[str, Any] = {
             "vector": parsed_vec,
             "k": limit,
-            "metric": self._metric,
+            "metric": _METRIC_MAP[self._metric],
         }
 
-        if filter:
-            body["filter"] = filter
+        if filter is not None:
+            validate_filter_operators(filter, nested_allowed=True)
+            if filter:
+                body["filter"] = filter
 
         client = self._http_pool.get_client()
         try:
@@ -215,7 +233,7 @@ class LanceDbAdapter(VectorStore):
                 score = 1.0 - dist
             elif self._metric == "l2":
                 score = -dist
-            else:  # inner_product
+            else:  # inner_product ("dot")
                 score = 1.0 - dist
 
             results.append(
@@ -235,7 +253,7 @@ class LanceDbAdapter(VectorStore):
         if not id or not isinstance(id, str):
             return None
 
-        url = f"{self._base_url}/v1/table/{self._collection}/query"
+        url = self._table_url(suffix="/query")
         body = {"filter": {"id": id}, "k": 1}
 
         client = self._http_pool.get_client()
@@ -272,8 +290,8 @@ class LanceDbAdapter(VectorStore):
         if existing is None:
             return False
 
-        url = f"{self._base_url}/v1/table/{self._collection}/delete"
-        body = {"predicate": f"id = '{id}'"}
+        url = self._table_url(suffix="/delete")
+        body = {"ids": [id]}
 
         client = self._http_pool.get_client()
         try:
@@ -290,19 +308,23 @@ class LanceDbAdapter(VectorStore):
             raise AIConnectionError(f"[lancedb] Connection error: {err}") from err
 
     async def delete_batch(self, ids: Sequence[str]) -> int:
-        if not ids:
+        unique_ids = dedupe_preserve_order(ids)
+        if not unique_ids:
             return 0
 
-        existing_count = 0
-        for item_id in ids:
-            if await self.get(item_id) is not None:
-                existing_count += 1
+        semaphore = asyncio.Semaphore(8)
 
-        if existing_count == 0:
+        async def _exists(item_id: str) -> bool:
+            async with semaphore:
+                return await self.get(item_id) is not None
+
+        exists_flags = await asyncio.gather(*(_exists(item_id) for item_id in unique_ids))
+        existing_ids = [item_id for item_id, found in zip(unique_ids, exists_flags, strict=True) if found]
+        if not existing_ids:
             return 0
 
-        url = f"{self._base_url}/v1/table/{self._collection}/delete"
-        body = {"ids": list(ids)}
+        url = self._table_url(suffix="/delete")
+        body = {"ids": existing_ids}
 
         client = self._http_pool.get_client()
         try:
@@ -314,12 +336,12 @@ class LanceDbAdapter(VectorStore):
             )
             if resp.status_code not in (200, 204):
                 handle_adapter_http_error(resp.status_code, resp.text, "lancedb")
-            return existing_count
+            return len(existing_ids)
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[lancedb] Connection error: {err}") from err
 
     async def count(self) -> int:
-        url = f"{self._base_url}/v1/table/{self._collection}/count"
+        url = self._table_url(suffix="/count")
         client = self._http_pool.get_client()
         try:
             resp = await client.get(
@@ -334,7 +356,7 @@ class LanceDbAdapter(VectorStore):
             raise AIConnectionError(f"[lancedb] Connection error: {err}") from err
 
     async def drop_collection(self, name: str) -> None:
-        url = f"{self._base_url}/v1/table/{name}"
+        url = self._table_url(name)
         client = self._http_pool.get_client()
         try:
             resp = await client.delete(

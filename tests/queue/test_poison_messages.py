@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from collections.abc import Generator
+from typing import TypedDict
 
 import pytest
 import redis.asyncio as aioredis
@@ -10,6 +12,7 @@ import redis.asyncio as aioredis
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job, JobSerializationError
 from swiftpy.queue.worker import QueueWorker
+from swiftpy.support.redis_config import resolve_redis_params
 
 
 class GoodJob(Job):
@@ -21,20 +24,46 @@ class GoodJob(Job):
         self.value = value
 
     async def handle(self) -> None:
-        host = os.getenv("REDIS_HOST", "127.0.0.1")
-        port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        params = resolve_redis_params(section="queue")
+        host = os.getenv("REDIS_HOST", str(params["host"]))
+        port = int(os.getenv("REDIS_PORT", str(params["port"])))
+        db = int(params["database"])
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=os.getenv("REDIS_PASSWORD") or params["password"],
+            decode_responses=True,
+        )
         try:
             await client.rpush(self.key, self.value)
         finally:
             await client.aclose()
 
 
+@pytest.fixture(autouse=True)
+def allow_good_job() -> Generator[None, None, None]:
+    prev_trusted = Job._trusted_classes.copy()
+    Job.allow_job_class(GoodJob)
+    try:
+        yield
+    finally:
+        Job._trusted_classes = prev_trusted
+
+
+class _RedisParams(TypedDict):
+    host: str
+    port: int
+    password: str | None
+    prefix: str
+
+
 @pytest.fixture
-def redis_params() -> dict[str, object]:
+def redis_params() -> _RedisParams:
     return {
         "host": os.getenv("REDIS_HOST", "127.0.0.1"),
         "port": int(os.getenv("REDIS_PORT", "6379")),
+        "password": os.getenv("REDIS_PASSWORD") or None,
         "prefix": f"test_poison_{uuid.uuid4().hex[:6]}:",
     }
 
@@ -45,28 +74,28 @@ def test_job_deserialize_validates_envelope_types_and_raises_serialization_error
 
     # 1. kwargs is not a dict (e.g. kwargs=5)
     with pytest.raises(JobSerializationError, match="kwargs"):
-        Job.deserialize({"job_class": qualname, "kwargs": 5})
+        Job.deserialize({"job_class": qualname, "kwargs": 5}, allow_unsigned=True)
 
     # 2. tries is not an int (e.g. tries="abc")
     with pytest.raises(JobSerializationError, match="tries"):
-        Job.deserialize({"job_class": qualname, "tries": "abc"})
+        Job.deserialize({"job_class": qualname, "tries": "abc"}, allow_unsigned=True)
 
     # 3. attempts is not an int (e.g. attempts={})
     with pytest.raises(JobSerializationError, match="attempts"):
-        Job.deserialize({"job_class": qualname, "attempts": {}})
+        Job.deserialize({"job_class": qualname, "attempts": {}}, allow_unsigned=True)
 
     # 4. args is not a list/tuple
     with pytest.raises(JobSerializationError, match="args"):
-        Job.deserialize({"job_class": qualname, "args": 12345})
+        Job.deserialize({"job_class": qualname, "args": 12345}, allow_unsigned=True)
 
     # 5. data is not a dict
     with pytest.raises(JobSerializationError, match="data"):
-        Job.deserialize({"job_class": qualname, "data": "not_a_dict"})
+        Job.deserialize({"job_class": qualname, "data": "not_a_dict"}, allow_unsigned=True)
 
 
 @pytest.mark.asyncio
 async def test_worker_survives_poison_messages_and_subsequent_good_job_runs(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """
     Worker processes poison payloads (kwargs=5, tries="abc", attempts={}, truncated JSON,
@@ -74,7 +103,7 @@ async def test_worker_survives_poison_messages_and_subsequent_good_job_runs(
     """
     q_name = f"q_{uuid.uuid4().hex[:6]}"
     res_key = f"res_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         qualname = f"{GoodJob.__module__}:{GoodJob.__qualname__}"

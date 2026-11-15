@@ -58,4 +58,12 @@ CONFIG: dict[str, object] = {
             "timeout": float(env("PGVECTOR_TIMEOUT", "30.0")),
         },
     },
+    "rerankers": {
+        "cohere": {
+            "api_key": env("COHERE_API_KEY", ""),
+            "model": env("COHERE_MODEL", "rerank-v3.5"),
+            "base_url": env("COHERE_BASE_URL", "https://api.cohere.com/v2/rerank"),
+            "timeout": float(env("COHERE_TIMEOUT", "30.0")),
+        },
+    },
 }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from swiftpy.filesystem.exceptions import (
@@ -40,6 +40,16 @@ MAGIC_BYTE_SIGNATURES: dict[str, list[bytes]] = {
     "application/x-zip-compressed": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
 }
 
+_EXTENSION_MIME_MAP: dict[str, tuple[str, ...]] = {
+    "jpg": ("image/jpeg", "image/jpg"),
+    "jpeg": ("image/jpeg", "image/jpg"),
+    "png": ("image/png",),
+    "gif": ("image/gif",),
+    "webp": ("image/webp",),
+    "pdf": ("application/pdf",),
+    "zip": ("application/zip", "application/x-zip-compressed"),
+}
+
 
 def parse_size_to_bytes(size: int | str) -> int:
     """Parse integer or string size (e.g. '5MB', '500KB') into integer bytes."""
@@ -57,29 +67,61 @@ def parse_size_to_bytes(size: int | str) -> int:
 
 
 def verify_magic_bytes(header: bytes, expected_mime: str) -> bool:
-    """Verify if header bytes match known magic signatures for expected_mime."""
-    mime = expected_mime.lower()
+    """
+    Verify if header bytes match known magic signatures for expected_mime.
+    Fails closed (returns False) when expected_mime has no known signature.
+    """
+    mime = expected_mime.split(";", 1)[0].strip().lower()
+    if not header:
+        return False
+
     if mime == "image/webp":
         return len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP"
 
     signatures = MAGIC_BYTE_SIGNATURES.get(mime)
     if not signatures:
-        return True  # If no signature known for MIME, pass through
-
-    if not header:
         return False
 
-    for sig in signatures:
-        if header.startswith(sig):
-            return True
-    return False
+    return any(header.startswith(sig) for sig in signatures)
 
 
 class FileValidator:
     """Upload validation engine enforcing size, extension, MIME, and magic byte constraints."""
 
-    def __init__(self, rules: dict[str, Any] | Sequence[Any]) -> None:
-        self.rules: dict[str, Any] = dict(rules) if isinstance(rules, dict) else {}
+    def __init__(self, rules: Mapping[str, Any]) -> None:
+        if not isinstance(rules, Mapping):
+            raise TypeError(
+                f"FileValidator rules must be a mapping, got {type(rules).__name__}."
+            )
+        self.rules: dict[str, Any] = dict(rules)
+
+    def _resolve_magic_byte_candidates(
+        self,
+        file: UploadedFile,
+        allowed_extensions: list[str] | None,
+        allowed_mimes: list[str] | None,
+    ) -> list[str]:
+        """Resolve authoritative MIME signature candidates derived from server policy."""
+        file_ext = file.extension.lower()
+        declared_mime = file.content_type.split(";", 1)[0].strip().lower()
+        ext_mimes = list(_EXTENSION_MIME_MAP.get(file_ext, ()))
+
+        if allowed_extensions is not None and allowed_mimes is not None:
+            if not ext_mimes:
+                return []
+            return [m for m in ext_mimes if m in allowed_mimes]
+
+        if allowed_extensions is not None:
+            return ext_mimes
+
+        if allowed_mimes is not None:
+            if ext_mimes:
+                return [m for m in ext_mimes if m in allowed_mimes]
+            return allowed_mimes
+
+        if ext_mimes:
+            return ext_mimes
+        return [declared_mime]
 
     async def validate(self, file: UploadedFile, field_name: str = "file") -> None:
         errors: list[str] = []
@@ -100,6 +142,7 @@ class FileValidator:
                 errors.append(f"The {field_name} must not be less than {min_size_raw}.")
 
         extensions = self.rules.get("extensions")
+        ext_list: list[str] | None = None
         if extensions is not None:
             ext_list = [str(e).lstrip(".").lower() for e in extensions]
             if file.extension.lower() not in ext_list:
@@ -107,9 +150,11 @@ class FileValidator:
                 errors.append(f"The {field_name} must be a file of type: {allowed_str}.")
 
         mimes = self.rules.get("mimes")
+        mime_list: list[str] | None = None
         if mimes is not None:
-            mime_list = [str(m).lower() for m in mimes]
-            if file.content_type.lower() not in mime_list:
+            mime_list = [str(m).split(";", 1)[0].strip().lower() for m in mimes]
+            declared_mime = file.content_type.split(";", 1)[0].strip().lower()
+            if declared_mime not in mime_list:
                 allowed_str = ", ".join(mime_list)
                 errors.append(f"The {field_name} must have a MIME type of: {allowed_str}.")
 
@@ -118,14 +163,24 @@ class FileValidator:
             await file.seek(0)
             header = await file.read(32)
             await file.seek(0)
-            if not verify_magic_bytes(header, file.content_type):
-                errors.append(f"The {field_name} content does not match its declared type '{file.content_type}'.")
+            candidates = self._resolve_magic_byte_candidates(file, ext_list, mime_list)
+            declared_mime = file.content_type.split(";", 1)[0].strip().lower()
+            matched_policy = bool(candidates) and any(
+                verify_magic_bytes(header, mime) for mime in candidates
+            )
+            if ext_list is None and mime_list is None:
+                matched_policy = matched_policy and verify_magic_bytes(header, declared_mime)
+            if not matched_policy:
+                errors.append(
+                    f"The {field_name} content does not match an expected file signature."
+                )
 
         if errors:
+            error_map = {field_name: errors}
             if any("greater than" in e for e in errors):
                 raise FileTooLargeError(errors[0])
             if any("file of type" in e for e in errors):
-                raise InvalidFileExtensionError(errors[0])
+                raise InvalidFileExtensionError(error_map, message=errors[0])
             if any("MIME type" in e for e in errors):
-                raise InvalidMimeTypeError(errors[0])
-            raise FileValidationError(errors={field_name: errors}, message=errors[0])
+                raise InvalidMimeTypeError(error_map, message=errors[0])
+            raise FileValidationError(errors=error_map, message=errors[0])

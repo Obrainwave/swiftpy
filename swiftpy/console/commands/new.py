@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 
 COPY pyproject.toml .
 RUN pip install --no-cache-dir --upgrade pip && \\
-    pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r <(pip compile pyproject.toml 2>/dev/null || echo "swiftpy")
+    python -c 'import tomllib, subprocess, sys; subprocess.check_call([sys.executable, "-m", "pip", "wheel", "--no-cache-dir", "--wheel-dir", "/app/wheels", *tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]])'
 
 FROM python:3.12-slim-bookworm
 
@@ -46,7 +46,7 @@ DOCKER_COMPOSE_CONTENT = """services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     volumes:
@@ -60,7 +60,7 @@ DOCKER_COMPOSE_CONTENT = """services:
   postgres:
     image: postgres:16-alpine
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_DB: ${DB_DATABASE:-swiftpy}
       POSTGRES_USER: ${DB_USERNAME:-postgres}
@@ -76,7 +76,7 @@ DOCKER_COMPOSE_CONTENT = """services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -130,7 +130,8 @@ ENV_EXAMPLE_CONTENT = """# Application Configuration
 APP_NAME=SwiftPY
 APP_ENV=local
 APP_KEY=
-APP_DEBUG=true
+# Keep APP_DEBUG=false in staging/production; enable only for local debugging.
+APP_DEBUG=false
 APP_URL=http://localhost:8000
 
 # Server (Uvicorn)
@@ -210,9 +211,10 @@ JWT_ACCESS_TTL=900
 JWT_REFRESH_TTL=604800
 AUTH_KEY_PEPPER=
 
-# CORS
-CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8000
-CORS_ALLOW_CREDENTIALS=true
+# CORS (opt-in explicit comma-separated origins, e.g. http://localhost:3000,http://localhost:8000)
+# Never pair '*' with CORS_ALLOW_CREDENTIALS=true
+CORS_ALLOWED_ORIGINS=
+CORS_ALLOW_CREDENTIALS=false
 CORS_MAX_AGE=600
 
 # Logging
@@ -471,7 +473,7 @@ class WelcomeEmail(Mailable):
         return MailMessage(
             subject=f"Welcome to SwiftPY, {self.name}!",
             to=self.to_address,
-            template="views/mail/template.html",
+            template="mail/template",
             context={
                 "title": f"Welcome, {self.name}!",
                 "content": "Thank you for joining our platform. We are thrilled to have you here!",
@@ -509,6 +511,9 @@ def register_exception_handlers(app: Application) -> None:
 
 AUTH_MIDDLEWARE_CONTENT = """from __future__ import annotations
 
+from swiftpy.auth.auth_manager import AuthManager
+from swiftpy.core.container import get_container
+from swiftpy.core.context import Context
 from swiftpy.core.exceptions import HttpException
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
@@ -519,37 +524,35 @@ class AuthMiddleware(Middleware):
     \"\"\"
     Authentication ASGI middleware for SwiftPY.
 
-    Extracts Bearer tokens from the Authorization header, validates the credential
-    against the application's authentication guard, and binds the authenticated
-    user entity to both `request.state["user"]` and task-isolated `Context.set("auth.user", user)`.
-    Raises HTTP 401 Unauthorized if the token is missing or invalid.
+    Validates incoming credentials through the application's AuthManager guard,
+    binds the authenticated user entity to `request.state["user"]` and
+    task-isolated `Context`, and raises HTTP 401 when authentication fails.
     \"\"\"
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
-        auth_header = request.headers.get("authorization") or request.headers.get(
-            "Authorization"
+        container = get_container()
+        auth_manager = (
+            container.resolve(AuthManager)
+            if container.has(AuthManager)
+            else AuthManager(container)
         )
-        if not auth_header or not auth_header.startswith("Bearer "):
+        user = await auth_manager.authenticate(request)
+        if user is None:
             raise HttpException(
                 status_code=401,
-                message="Unauthenticated: Missing or invalid Bearer token",
+                message="Unauthenticated: Missing or invalid credentials",
             )
 
-        token = auth_header[7:].strip()
-        if not token:
-            raise HttpException(
-                status_code=401, message="Unauthenticated: Empty Bearer token"
-            )
-
-        # In production applications, decode JWT or resolve API key via Auth guard:
-        # user = await Auth.guard().user_from_token(token)
-        # Context.set("auth.user", user)
-        # request.state["user"] = user
+        Context.set("auth.user", user)
+        Context.set("__swiftpy_current_user__", user)
+        request.state["user"] = user
 
         return await next_handler(request)
 """
 
 ADMIN_MIDDLEWARE_CONTENT = """from __future__ import annotations
+
+from collections.abc import Mapping
 
 from swiftpy.core.context import Context
 from swiftpy.core.exceptions import HttpException
@@ -563,19 +566,27 @@ class AdminMiddleware(Middleware):
     Authorization ASGI middleware for administrative access control.
 
     Retrieves the authenticated user from task-isolated `Context` or `request.state`.
-    Verifies that the user exists and has administrative privileges (`user.is_admin` is True).
-    Raises HTTP 401 Unauthorized if unauthenticated, or HTTP 403 Forbidden if not an administrator.
+    Verifies that the user exists and carries boolean `is_admin is True`, raising
+    HTTP 401 Unauthorized if unauthenticated, or HTTP 403 Forbidden if not an administrator.
     \"\"\"
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
-        user = Context.get("auth.user") or request.state.get("user")
-        if not user:
+        user = Context.get("auth.user")
+        if user is None:
+            user = Context.get("__swiftpy_current_user__")
+        if user is None:
+            user = request.state.get("user")
+        if user is None:
             raise HttpException(
                 status_code=401,
                 message="Unauthenticated: Please authenticate first",
             )
 
-        is_admin = getattr(user, "is_admin", False)
+        is_admin = (
+            user.get("is_admin") is True
+            if isinstance(user, Mapping)
+            else getattr(user, "is_admin", None) is True
+        )
         if not is_admin:
             raise HttpException(
                 status_code=403,
@@ -804,6 +815,32 @@ class QueueServiceProvider(ServiceProvider):
         pass
 """
 
+MAIL_SERVICE_PROVIDER_CONTENT = """from __future__ import annotations
+
+from swiftpy.core.config import Config
+from swiftpy.core.providers.base import ServiceProvider
+from swiftpy.mail.manager import MailManager
+
+
+class MailServiceProvider(ServiceProvider):
+    \"\"\"
+    Register the MailManager singleton into the application DI container.
+    \"\"\"
+
+    def register(self) -> None:
+        self.container.singleton(
+            MailManager,
+            lambda c: MailManager(
+                config=c.resolve(Config) if c.has(Config) else None
+            ),
+        )
+
+    async def shutdown(self) -> None:
+        manager = self.container.get_singleton(MailManager)
+        if isinstance(manager, MailManager):
+            await manager.close()
+"""
+
 CREATE_USERS_MIGRATION_CONTENT = """from __future__ import annotations
 
 from swiftpy.database.migrations import Blueprint, Migration, Schema
@@ -848,15 +885,15 @@ import os
 
 CONFIG = {
     "enabled": os.getenv("AI_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "default_provider": os.getenv("AI_DEFAULT_PROVIDER", "openai"),
+    "default": os.getenv("AI_DEFAULT_PROVIDER", "openai"),
     "providers": {
         "openai": {
             "api_key": os.getenv("OPENAI_API_KEY", ""),
-            "default_model": os.getenv("OPENAI_MODEL", "gpt-4o"),
+            "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
         },
         "anthropic": {
             "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-            "default_model": os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+            "model": os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
         },
     },
 }
@@ -869,7 +906,8 @@ import os
 CONFIG = {
     "name": os.getenv("APP_NAME", "SwiftPY"),
     "env": os.getenv("APP_ENV", "local"),
-    "debug": os.getenv("APP_DEBUG", "true").lower() in ("true", "1", "yes"),
+    "debug": os.getenv("APP_DEBUG", "false").strip().lower() in ("true", "1", "yes", "on"),
+    "enable_benchmarks": os.getenv("APP_ENABLE_BENCHMARKS", "false").strip().lower() in ("true", "1", "yes", "on"),
     "key": os.getenv("APP_KEY", ""),
     "url": os.getenv("APP_URL", "http://localhost:8000"),
     "cipher": "AES-256-GCM",
@@ -928,12 +966,12 @@ import os
 CONFIG = {
     "allowed_origins": [
         origin.strip()
-        for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+        for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
         if origin.strip()
     ],
     "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     "allowed_headers": ["Content-Type", "Authorization", "X-Request-ID"],
-    "allow_credentials": os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() in ("true", "1", "yes"),
+    "allow_credentials": os.getenv("CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("true", "1", "yes", "on"),
     "max_age": int(os.getenv("CORS_MAX_AGE", "600")),
 }
 """
@@ -1258,8 +1296,8 @@ VIEWS_ADMIN_LOGIN_CONTENT = """<!DOCTYPE html>
         <h1>SwiftPY Admin</h1>
         <form method="POST" action="/admin/login">
             <div class="form-group">
-                <label for="email">Email</label>
-                <input type="email" id="email" name="email" required autocomplete="email">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autocomplete="username">
             </div>
             <div class="form-group">
                 <label for="password">Password</label>
@@ -1366,10 +1404,6 @@ VIEWS_ADMIN_DASHBOARD_CONTENT = """<!DOCTYPE html>
                 <div class="value">Operational</div>
             </div>
             <div class="card">
-                <h3>Environment</h3>
-                <div class="value">Production</div>
-            </div>
-            <div class="card">
                 <h3>Version</h3>
                 <div class="value">1.0.0</div>
             </div>
@@ -1431,7 +1465,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy",
+    "swiftpy-framework>=0.1.0",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
@@ -1550,6 +1584,10 @@ class NewCommand:
             )
 
         target_dir = Path.cwd() / raw_name
+        if target_dir.is_symlink():
+            raise SystemExit(
+                f"Refusing to scaffold into symlinked project directory at {target_dir}"
+            )
         resolved_base = Path.cwd().resolve()
         resolved_target = target_dir.resolve()
 
@@ -1571,6 +1609,10 @@ class NewCommand:
             )
 
         target_dir.mkdir(parents=True, exist_ok=True)
+        if target_dir.is_symlink() or target_dir.resolve() != resolved_target:
+            raise SystemExit(
+                f"Invalid project path {raw_name!r}: project root resolves through a symlink or escapes base directory."
+            )
 
         # Generate cryptographically secure 32-byte APP_KEY encoded in base64
         raw_key = secrets.token_bytes(32)
@@ -1593,7 +1635,7 @@ class NewCommand:
             "config",
             "database/migrations",
             "database/seeders",
-            "public/storage",
+            "public",
             "routes",
             "storage/app/private",
             "storage/app/public",
@@ -1604,11 +1646,31 @@ class NewCommand:
             "tests",
         ]
 
-        for d in dirs_to_create:
-            (target_dir / d).mkdir(parents=True, exist_ok=True)
+        def _validate_safe_path(candidate: Path) -> None:
+            current = candidate
+            while True:
+                if current.is_symlink():
+                    raise SystemExit(f"Refusing to traverse symlink at {current}")
+                if current == target_dir:
+                    break
+                if current.parent == current:
+                    break
+                current = current.parent
+            if not candidate.resolve().is_relative_to(resolved_target):
+                raise SystemExit(
+                    f"Destination path escapes project directory: {candidate}"
+                )
 
-        # Generate active .env with APP_KEY
+        for d in dirs_to_create:
+            dir_path = target_dir / d
+            _validate_safe_path(dir_path)
+            dir_path.mkdir(parents=True, exist_ok=True)
+            _validate_safe_path(dir_path)
+
+        # Generate active .env with APP_KEY and JWT_SECRET
+        jwt_secret = secrets.token_urlsafe(48)
         env_content = ENV_EXAMPLE_CONTENT.replace("APP_KEY=", f"APP_KEY={app_key}")
+        env_content = env_content.replace("JWT_SECRET=", f"JWT_SECRET={jwt_secret}")
 
         files: dict[str, str] = {
             ".dockerignore": DOCKERIGNORE_CONTENT,
@@ -1640,6 +1702,7 @@ class NewCommand:
             "app/providers/database_service_provider.py": DATABASE_SERVICE_PROVIDER_CONTENT,
             "app/providers/event_service_provider.py": EVENT_SERVICE_PROVIDER_CONTENT,
             "app/providers/filesystem_service_provider.py": FILESYSTEM_SERVICE_PROVIDER_CONTENT,
+            "app/providers/mail_service_provider.py": MAIL_SERVICE_PROVIDER_CONTENT,
             "app/providers/queue_service_provider.py": QUEUE_SERVICE_PROVIDER_CONTENT,
             "config/ai.py": CONFIG_AI_CONTENT,
             "config/app.py": CONFIG_APP_CONTENT,
@@ -1659,7 +1722,6 @@ class NewCommand:
             "views/mail/template.html": VIEWS_MAIL_TEMPLATE_CONTENT,
             "tests/conftest.py": TESTS_CONFTEST_CONTENT,
             "tests/test_api.py": TESTS_TEST_API_CONTENT,
-            "public/storage/.gitkeep": "",
             "storage/app/private/.gitkeep": "",
             "storage/app/public/.gitkeep": "",
             "storage/framework/.gitkeep": "",
@@ -1667,7 +1729,6 @@ class NewCommand:
         }
 
         existing_env = (target_dir / ".env").exists()
-        resolved_target = target_dir.resolve()
 
         for rel_path, content in files.items():
             dest = target_dir / rel_path
@@ -1675,13 +1736,9 @@ class NewCommand:
             if rel_path == ".env" and existing_env:
                 continue
 
-            if dest.is_symlink():
-                raise SystemExit(f"Refusing to write to symlink at {dest}")
-
+            _validate_safe_path(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            resolved_dest = dest.resolve()
-            if not resolved_dest.is_relative_to(resolved_target) and dest.exists():
-                raise SystemExit(f"Destination path escapes project directory: {dest}")
+            _validate_safe_path(dest)
 
             dest.write_text(content, encoding="utf-8")
 

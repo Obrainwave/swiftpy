@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from app.http.benchmarks import register_benchmark_routes
 from app.http.middleware.test_middleware import TestMiddleware
 from routes.api import router as api_router
 from swiftpy import Application, Request, Response, RouteGroup, json_response
@@ -13,9 +12,6 @@ app.include_router(api_router, prefix="/api")
 
 # Mount admin panel
 admin.mount(app, prefix="/admin")
-
-# Mount benchmark suite endpoints
-register_benchmark_routes(app)
 
 
 @app.get("/")

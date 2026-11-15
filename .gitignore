@@ -21,6 +21,9 @@ bootstrap/cache/*.json
 .coverage
 .coverage.*
 htmlcov/
+dist/
+build/
+*.egg-info/
 
 COMMANDS.md
 PROMPTS.md

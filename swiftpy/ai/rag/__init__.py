@@ -22,7 +22,7 @@ from swiftpy.ai.rag.result import (
     calculate_token_cost,
     register_model_pricing,
 )
-from swiftpy.ai.rag.retriever import Retriever
+from swiftpy.ai.rag.retriever import Retriever, chunk_text, truncate_to_token_budget
 
 
 def rag() -> RAGPipelineBuilder:
@@ -45,7 +45,9 @@ __all__ = [
     "Retriever",
     "XMLBlocksFormatter",
     "calculate_token_cost",
+    "chunk_text",
     "rag",
     "register_model_pricing",
+    "truncate_to_token_budget",
 ]
 

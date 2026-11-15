@@ -1,6 +1,7 @@
-from swiftpy.helpers.helper import env
+from swiftpy.helpers.helper import env, env_bool
 
 CONFIG: dict[str, object] = {
+    "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
     "defaults": {
         "guard": env("AUTH_GUARD", "jwt"),
     },

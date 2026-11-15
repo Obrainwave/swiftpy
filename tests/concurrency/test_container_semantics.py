@@ -233,3 +233,39 @@ async def test_http_request_disposes_scoped_dependencies_after_handler_and_on_er
     assert len(created) == 2
     assert created[1].closed is True
     assert created[0] is not created[1]
+
+
+@pytest.mark.asyncio
+async def test_nested_container_scope_isolation() -> None:
+    """CORE-4: Nested container.scope() isolates inner instances and leaves outer active."""
+    container = Container()
+    container.scoped(AsyncClosableResource)
+
+    async with container.scope():
+        outer_svc = container.resolve(AsyncClosableResource)
+        assert outer_svc.closed is False
+        assert container.resolve(AsyncClosableResource) is outer_svc
+
+        async with container.scope():
+            inner_svc = container.resolve(AsyncClosableResource)
+            assert inner_svc is not outer_svc
+            assert inner_svc.closed is False
+            assert container.resolve(AsyncClosableResource) is inner_svc
+
+        # Exiting inner scope must dispose ONLY inner_svc and preserve outer_svc
+        assert inner_svc.closed is True
+        assert outer_svc.closed is False
+        assert container.resolve(AsyncClosableResource) is outer_svc
+
+        # Inner exception still disposes inner scope cleanly and keeps outer intact
+        inner_exc_svc: AsyncClosableResource | None = None
+        with pytest.raises(RuntimeError, match="inner failure"):
+            async with container.scope():
+                inner_exc_svc = container.resolve(AsyncClosableResource)
+                assert inner_exc_svc is not outer_svc
+                raise RuntimeError("inner failure")
+        assert inner_exc_svc is not None and inner_exc_svc.closed is True
+        assert outer_svc.closed is False
+        assert container.resolve(AsyncClosableResource) is outer_svc
+
+    assert outer_svc.closed is True

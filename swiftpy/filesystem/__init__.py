@@ -182,6 +182,16 @@ class Storage:
         return await cls.disk().temporary_url(path, expires_in=expires_in)
 
     @classmethod
+    def verify_temporary_url(
+        cls,
+        signed_url: str,
+        *,
+        method: str = "GET",
+        now: float | None = None,
+    ) -> str:
+        return cls.disk().verify_temporary_url(signed_url, method=method, now=now)
+
+    @classmethod
     async def get_visibility(cls, path: str) -> Visibility:
         return await cls.disk().get_visibility(path)
 

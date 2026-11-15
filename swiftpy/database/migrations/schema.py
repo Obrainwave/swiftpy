@@ -242,7 +242,12 @@ class SchemaGrammar:
         elif t == "timestamptz":
             parts.append("TIMESTAMPTZ")
         elif t == "vector":
-            dim = getattr(col, "dimensions", None) or 1536
+            raw_dim = getattr(col, "dimensions", None)
+            dim = 1536 if raw_dim is None else raw_dim
+            if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
+                raise ValueError(
+                    f"Vector dimensions must be a positive integer, got {raw_dim!r}"
+                )
             parts.append(f"vector({dim})")
 
         # Primary key

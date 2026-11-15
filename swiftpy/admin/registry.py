@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast, get_args, get_origin
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, get_args, get_origin
 
 from swiftpy.database.orm.model import Model
 from swiftpy.database.orm.relationships import (
@@ -14,20 +14,25 @@ from swiftpy.database.orm.relationships import (
 from swiftpy.support.strings import pluralize, snake_case
 
 if TYPE_CHECKING:
+    from swiftpy.admin.auth import AdminUser
     from swiftpy.core.application import Application
     from swiftpy.database.orm.model import ModelQueryBuilder
+    from swiftpy.http.request import Request
     from swiftpy.http.router import Router
 
 T = TypeVar("T", bound=Model)
 A = TypeVar("A", bound="ModelAdmin")
 
 
-def _humanize_name(name: str) -> str:
+def humanize_name(name: str) -> str:
     """Convert snake_case column or identifier to title case label."""
     if name.lower() == "id":
         return "ID"
     clean = name.removesuffix("_id") if name.endswith("_id") and len(name) > 3 else name
     return clean.replace("_", " ").title()
+
+
+_humanize_name = humanize_name
 
 
 def _infer_type_name(hint: Any) -> str:
@@ -102,7 +107,7 @@ class FieldMetadata:
         self.is_foreign_key = is_foreign_key
         self.foreign_relation_name = foreign_relation_name
         self.foreign_model_name = foreign_model_name
-        self.label = _humanize_name(name)
+        self.label = humanize_name(name)
 
     @property
     def input_type(self) -> str:
@@ -160,14 +165,22 @@ class RelationshipMetadata:
     def __init__(
         self,
         name: str,
-        relation_obj: Relation,
+        relation_obj: Relation[Any],
         owner_cls: type[Model],
     ) -> None:
         self.name = name
         self.relation_obj = relation_obj
         self.owner_cls = owner_cls
         self.foreign_key = relation_obj.foreign_key or f"{snake_case(owner_cls.__name__)}_id"
-        self.local_key = relation_obj.local_key
+        if isinstance(relation_obj, BelongsTo):
+            target = self.get_target_model() if relation_obj.local_key is None else None
+            self.local_key = (
+                relation_obj.local_key
+                or getattr(target, "__primary_key__", None)
+                or getattr(owner_cls, "__primary_key__", "id")
+            )
+        else:
+            self.local_key = relation_obj.local_key or getattr(owner_cls, "__primary_key__", "id")
 
         if isinstance(relation_obj, BelongsTo):
             self.relation_type = "BelongsTo"
@@ -186,7 +199,7 @@ class RelationshipMetadata:
             self.pivot_table = None
 
         self.target_model_name = relation_obj.related_model_name
-        self.label = _humanize_name(name)
+        self.label = humanize_name(name)
 
     def get_target_model(self) -> type[Model] | None:
         """Resolve the target Model class, or return None if unresolved."""
@@ -199,7 +212,7 @@ class RelationshipMetadata:
 class ModelAdmin:
     """
     Administrative configuration for a registered Model.
-    Controls list display columns, search fields, ordering, and CRUD form behaviors.
+    Controls list display columns, search fields, ordering, RBAC permissions, and CRUD form behaviors.
     """
 
     model: type[Model]
@@ -209,6 +222,13 @@ class ModelAdmin:
     readonly_fields: ClassVar[list[str]] = []
     exclude: ClassVar[list[str]] = []
     per_page: ClassVar[int] = 25
+    can_create: ClassVar[bool] = True
+    can_edit: ClassVar[bool] = True
+    can_delete: ClassVar[bool] = True
+    required_view_permission: ClassVar[str | None] = None
+    required_create_permission: ClassVar[str | None] = None
+    required_edit_permission: ClassVar[str | None] = None
+    required_delete_permission: ClassVar[str | None] = None
 
     def __init__(self, model: type[Model], site: AdminSite | None = None) -> None:
         self.model = model
@@ -244,7 +264,7 @@ class ModelAdmin:
     @property
     def title(self) -> str:
         """Singular humanized display name."""
-        return _humanize_name(snake_case(self.model.__name__))
+        return humanize_name(snake_case(self.model.__name__))
 
     @property
     def plural_title(self) -> str:
@@ -339,6 +359,55 @@ class ModelAdmin:
             if not f.is_primary_key and f.name != pk and f.name not in excluded
         ]
 
+    def _has_action_permission(
+        self,
+        user: AdminUser,
+        explicit_perm: str | None,
+        default_perms: tuple[str, ...],
+        *,
+        action_enabled: bool = True,
+    ) -> bool:
+        if not action_enabled or user.is_admin is not True:
+            return False
+        if explicit_perm is not None:
+            return user.has_permission(explicit_perm)
+        return any(user.has_permission(p) for p in default_perms)
+
+    def has_view_permission(self, request: Request, user: AdminUser) -> bool:
+        """Return whether `user` is permitted to view records for this model."""
+        return self._has_action_permission(
+            user,
+            self.required_view_permission,
+            ("all", "models:read", f"{self.slug}:read"),
+        )
+
+    def has_create_permission(self, request: Request, user: AdminUser) -> bool:
+        """Return whether `user` is permitted to create records for this model."""
+        return self._has_action_permission(
+            user,
+            self.required_create_permission,
+            ("all", "models:write", f"{self.slug}:create"),
+            action_enabled=self.can_create,
+        )
+
+    def has_edit_permission(self, request: Request, user: AdminUser) -> bool:
+        """Return whether `user` is permitted to edit records for this model."""
+        return self._has_action_permission(
+            user,
+            self.required_edit_permission,
+            ("all", "models:write", f"{self.slug}:edit"),
+            action_enabled=self.can_edit,
+        )
+
+    def has_delete_permission(self, request: Request, user: AdminUser) -> bool:
+        """Return whether `user` is permitted to delete records for this model."""
+        return self._has_action_permission(
+            user,
+            self.required_delete_permission,
+            ("all", "models:write", "models:delete", f"{self.slug}:delete"),
+            action_enabled=self.can_delete,
+        )
+
     def get_queryset(self) -> ModelQueryBuilder[Any]:
         """
         Produce a base ModelQueryBuilder for list views.
@@ -354,17 +423,25 @@ class ModelAdmin:
         if eager_rels:
             builder.with_(*eager_rels)
         if self.ordering:
-            builder.order_by(self.ordering)
+            raw_order = self.ordering.strip()
+            if raw_order.startswith("-") and len(raw_order) > 1:
+                builder.order_by(raw_order[1:].strip(), "DESC")
+            else:
+                parts = raw_order.split()
+                if len(parts) == 2 and parts[1].upper() in ("ASC", "DESC"):
+                    builder.order_by(parts[0], parts[1].upper())
+                else:
+                    builder.order_by(raw_order, "ASC")
         return builder
 
 
-_ROUTE_COMPILER: Callable[[AdminSite, Any, str], None] | None = None
-_ROUTER_FACTORY: Callable[[AdminSite, str], Any] | None = None
+_ROUTE_COMPILER: Callable[[AdminSite, Application, str], None] | None = None
+_ROUTER_FACTORY: Callable[[AdminSite, str], Router] | None = None
 
 
 def set_admin_route_compiler(
-    compiler: Callable[[AdminSite, Any, str], None],
-    factory: Callable[[AdminSite, str], Any],
+    compiler: Callable[[AdminSite, Application, str], None],
+    factory: Callable[[AdminSite, str], Router],
 ) -> None:
     """Register views compiler callbacks to avoid circular or inline imports."""
     global _ROUTE_COMPILER, _ROUTER_FACTORY
@@ -474,7 +551,7 @@ class AdminSite:
         """Return a configured Router containing all admin CRUD routes."""
         if _ROUTER_FACTORY is None:
             raise RuntimeError("Admin views router factory is not initialized.")
-        return cast("Router", _ROUTER_FACTORY(self, prefix))
+        return _ROUTER_FACTORY(self, prefix)
 
 
 # Global singleton instance
@@ -486,4 +563,5 @@ __all__ = [
     "ModelAdmin",
     "RelationshipMetadata",
     "admin",
+    "humanize_name",
 ]

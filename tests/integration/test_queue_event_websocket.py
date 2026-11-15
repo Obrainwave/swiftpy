@@ -103,6 +103,8 @@ async def test_queue_to_event_to_websocket_end_to_end() -> None:
 
     queue_disp = QueueDispatcher(prefix=prefix)
     QueueDispatcher.set_instance(queue_disp)
+    prev_trusted = Job._trusted_classes.copy()
+    Job.allow_job_class(OrderCompletedJob)
 
     try:
         # Connect client A and client B to room 'orders', and client C to room 'billing'
@@ -159,7 +161,11 @@ async def test_queue_to_event_to_websocket_end_to_end() -> None:
         # 8. Clean up Redis keys and singletons guaranteed even if test assertions fail
         host = os.getenv("REDIS_HOST", "127.0.0.1")
         port = int(os.getenv("REDIS_PORT", "6379"))
-        redis_client = aioredis.Redis(host=host, port=port)
+        redis_client = aioredis.Redis(
+            host=host,
+            port=port,
+            password=os.getenv("REDIS_PASSWORD") or None,
+        )
         try:
             keys = await redis_client.keys(f"{prefix}*")
             if keys:
@@ -174,3 +180,4 @@ async def test_queue_to_event_to_websocket_end_to_end() -> None:
         EventDispatcher.set_instance(None)
         QueueDispatcher.set_instance(None)
         Job.set_trusted_namespaces(None)
+        Job._trusted_classes = prev_trusted

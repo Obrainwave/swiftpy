@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import posixpath
 import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -16,17 +17,20 @@ from swiftpy.mail.exceptions import (
 )
 
 _CRLF_PATTERN = re.compile(r"[\r\n\0]")
+_STREAM_CHUNK_SIZE = 65536
 
 
 def _sanitize_filename(name: str) -> str:
-    """Sanitize filename to prevent header injection or directory traversal in headers."""
+    """Sanitize filename to prevent header injection, traversal, or quote escapes."""
     if _CRLF_PATTERN.search(name):
         raise HeaderInjectionError(
             f"Attachment filename '{name}' contains illegal CRLF or null bytes"
         )
-    # Take basename only to prevent directory traversal in Content-Disposition
-    cleaned = Path(name).name.strip()
-    return cleaned or "attachment"
+    # Normalize Windows/POSIX separators so traversal segments never survive basename extraction
+    cleaned = posixpath.basename(name.replace("\\", "/")).strip()
+    if cleaned in ("", ".", ".."):
+        return "attachment"
+    return cleaned.replace("\\", "\\\\").replace('"', '\\"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +45,6 @@ class Attachment:
     content: bytes | None = None
     stream: AsyncIterator[bytes] | BinaryIO | None = None
     size: int | None = None
-    _cache: list[bytes] = field(default_factory=list, repr=False, compare=False)
 
     @classmethod
     def from_path(
@@ -147,18 +150,15 @@ class Attachment:
         )
 
     async def read_bytes(self, max_size: int | None = None) -> bytes:
-        """Read attachment bytes asynchronously without blocking the event loop."""
-        if self._cache:
-            data = self._cache[0]
-            if max_size is not None and len(data) > max_size:
-                raise AttachmentTooLargeError(
-                    f"Attachment '{self.filename}' ({len(data)} bytes) exceeds size limit ({max_size} bytes)"
-                )
-            return data
-
+        """Read attachment bytes asynchronously with incremental size enforcement."""
         if self.content is not None:
-            data = self.content
-        elif self.path is not None:
+            if max_size is not None and len(self.content) > max_size:
+                raise AttachmentTooLargeError(
+                    f"Attachment '{self.filename}' ({len(self.content)} bytes) exceeds size limit ({max_size} bytes)"
+                )
+            return self.content
+
+        if self.path is not None:
 
             def _sync_read(p: Path) -> bytes:
                 try:
@@ -166,11 +166,31 @@ class Attachment:
                         raise AttachmentNotFoundError(
                             f"Attachment file not found at '{p}'"
                         )
-                    return p.read_bytes()
+                    stat_size = p.stat().st_size
+                    if max_size is not None and stat_size > max_size:
+                        raise AttachmentTooLargeError(
+                            f"Attachment '{self.filename}' ({stat_size} bytes) exceeds size limit ({max_size} bytes)"
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    with p.open("rb") as handle:
+                        while True:
+                            chunk = handle.read(_STREAM_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if max_size is not None and total > max_size:
+                                raise AttachmentTooLargeError(
+                                    f"Attachment '{self.filename}' exceeds size limit ({max_size} bytes)"
+                                )
+                            chunks.append(chunk)
+                    return b"".join(chunks)
                 except (FileNotFoundError, AttachmentNotFoundError) as exc:
                     raise AttachmentNotFoundError(
                         f"Attachment file not found at '{p}'"
                     ) from exc
+                except AttachmentTooLargeError:
+                    raise
                 except PermissionError as exc:
                     raise MailAttachmentError(
                         f"Permission denied reading attachment at '{p}': {exc}"
@@ -180,8 +200,9 @@ class Attachment:
                         f"Error reading attachment file at '{p}': {exc}"
                     ) from exc
 
-            data = await asyncio.to_thread(_sync_read, self.path)
-        elif self.stream is not None:
+            return await asyncio.to_thread(_sync_read, self.path)
+
+        if self.stream is not None:
             stream_obj = self.stream
             try:
                 if isinstance(stream_obj, AsyncIterator):
@@ -194,32 +215,36 @@ class Attachment:
                             raise AttachmentTooLargeError(
                                 f"Attachment '{self.filename}' exceeds stream size limit ({max_size} bytes)"
                             )
-                    data = b"".join(chunks)
-                else:
-                    bio: BinaryIO = stream_obj
+                    return b"".join(chunks)
 
-                    def _sync_read_bio() -> bytes:
-                        if hasattr(bio, "seek"):
-                            bio.seek(0)
-                        return bio.read()
+                bio: BinaryIO = stream_obj
 
-                    data = await asyncio.to_thread(_sync_read_bio)
+                def _sync_read_bio() -> bytes:
+                    if hasattr(bio, "seek"):
+                        bio.seek(0)
+                    bio_chunks: list[bytes] = []
+                    bio_total = 0
+                    while True:
+                        chunk = bio.read(_STREAM_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        bio_total += len(chunk)
+                        if max_size is not None and bio_total > max_size:
+                            raise AttachmentTooLargeError(
+                                f"Attachment '{self.filename}' exceeds stream size limit ({max_size} bytes)"
+                            )
+                        bio_chunks.append(chunk)
+                    return b"".join(bio_chunks)
+
+                return await asyncio.to_thread(_sync_read_bio)
             except AttachmentTooLargeError:
                 raise
             except Exception as exc:
                 raise MailAttachmentError(
                     f"Failed to read attachment stream for '{self.filename}': {exc}"
                 ) from exc
-        else:
-            raise ValueError("Attachment has no readable content source")
 
-        if max_size is not None and len(data) > max_size:
-            raise AttachmentTooLargeError(
-                f"Attachment '{self.filename}' ({len(data)} bytes) exceeds size limit ({max_size} bytes)"
-            )
-
-        self._cache.append(data)
-        return data
+        raise ValueError("Attachment has no readable content source")
 
     @staticmethod
     def _detect_mime(filename: str) -> str:

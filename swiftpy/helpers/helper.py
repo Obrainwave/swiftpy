@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from swiftpy.cache.cache import Cache
-from swiftpy.core.config import Config
+from swiftpy.core.config import Config, env, env_bool
 from swiftpy.core.container import get_container
 from swiftpy.core.container_exceptions import BindingNotFoundError, ResolutionError
 from swiftpy.events.dispatcher import EventDispatcher
@@ -95,11 +94,6 @@ def resolve(target: type[Any]) -> Any:
     return get_container().resolve(target)
 
 
-def env(key: str, default: Any = None) -> Any:
-    """Retrieve environment variables."""
-    return os.getenv(key, default)
-
-
 def dispatcher() -> EventDispatcher:
     """Retrieve the application EventDispatcher."""
     try:
@@ -174,6 +168,7 @@ __all__ = [
     "dispatch",
     "dispatcher",
     "env",
+    "env_bool",
     "event",
     "mail",
     "pluralize",

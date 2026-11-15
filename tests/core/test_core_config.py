@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+import importlib
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
 
+import config.app as config_app_mod
+import config.cors as config_cors_mod
+import config.events as config_events_mod
+import config.filesystems as config_filesystems_mod
+import config.queue as config_queue_mod
+from swiftpy.ai.middleware import AIRateLimitMiddleware
+from swiftpy.ai.rag.reranker import CohereReranker
 from swiftpy.core.application import Application
 from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.container import Container, get_container, set_container
+from swiftpy.events.redis_bus import RedisEventBus
 from swiftpy.helpers.helper import config
+from swiftpy.queue.job import Job
+
+
+@pytest.fixture(autouse=True)
+def _restore_config_singleton_and_container() -> Generator[None, None, None]:
+    prev_cfg = Config._instance
+    prev_container = get_container()
+    yield
+    Config._instance = prev_cfg
+    set_container(prev_container)
 
 
 def test_config_dotted_get_and_set() -> None:
@@ -219,3 +240,151 @@ def test_global_config_helper() -> None:
     assert config("database.pool.max") == 75
     assert config("missing.param", default=999) == 999
     assert config() is app.config
+
+
+def test_config_list_coercion_and_cors_strict_bools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CORE-2 & INF-3 / G-3: list env coercion preserves entries and bool parsing rejects 'false'."""
+    monkeypatch.setenv("CORS_ALLOW_CREDENTIALS", "false")
+    reloaded_cors = importlib.reload(config_cors_mod)
+    assert reloaded_cors.CONFIG["allow_credentials"] is False
+    monkeypatch.delenv("CORS_ALLOW_CREDENTIALS", raising=False)
+    importlib.reload(config_cors_mod)
+
+    cfg_csv = Config.load(
+        config_dir="config",
+        env={
+            "CORS_ALLOWED_ORIGINS": "https://*.example.com, https://app.example.com",
+            "CORS_ALLOW_CREDENTIALS": "false",
+        },
+    )
+    assert cfg_csv.get("cors.allowed_origins") == [
+        "https://*.example.com",
+        "https://app.example.com",
+    ]
+    assert cfg_csv.get("cors.allow_credentials") is False
+
+    cfg_nested = Config.load(
+        config_dir="config",
+        env={
+            "CORS__ALLOWED_ORIGINS": "https://*.example.com",
+            "CORS__ALLOW_CREDENTIALS": "0",
+        },
+    )
+    assert cfg_nested.get("cors.allowed_origins") == ["https://*.example.com"]
+    assert cfg_nested.get("cors.allow_credentials") is False
+
+    cfg_json = Config.load(
+        config_dir="config",
+        env={"CORS__ALLOWED_ORIGINS": '["https://a.example.com", "https://b.example.com"]'},
+    )
+    assert cfg_json.get("cors.allowed_origins") == [
+        "https://a.example.com",
+        "https://b.example.com",
+    ]
+
+
+def test_config_secure_defaults_debug_queue_events_filesystems(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G-2 / G-3 / P1-S5: debug defaults False, Redis DBs match .env.example, no fallback signing secret."""
+    for env_key in (
+        "APP_DEBUG",
+        "APP_ENV",
+        "APP_KEY",
+        "APP_ENABLE_BENCHMARKS",
+        "REDIS_QUEUE_DB",
+        "REDIS_EVENTS_DB",
+        "FILESYSTEM_SIGNING_KEY",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+    for mod in (
+        config_app_mod,
+        config_queue_mod,
+        config_events_mod,
+        config_filesystems_mod,
+    ):
+        importlib.reload(mod)
+
+    try:
+        cfg = Config.load(config_dir="config", env={})
+        assert cfg.get("app.debug") is False
+        assert cfg.get("app.enable_benchmarks") is False
+        assert cfg.get("queue.connections.redis.database") == 1
+        assert cfg.get("events.redis.database") == 2
+        assert cfg.get("filesystems.signing_key") == ""
+
+        prod_cfg = Config.load(config_dir="config", env={"APP_ENV": "production"})
+        assert prod_cfg.get("app.debug") is False
+        prod_app = Application(auto_discover_providers=False, config=prod_cfg)
+        assert prod_app.debug is False
+    finally:
+        for mod in (
+            config_app_mod,
+            config_queue_mod,
+            config_events_mod,
+            config_filesystems_mod,
+        ):
+            importlib.reload(mod)
+
+
+@pytest.mark.asyncio
+async def test_runtime_subsystems_prefer_config_over_os_environ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-S5: Config values take precedence over ambient os.environ across runtime subsystems."""
+    prev_instance = Config._instance
+    prev_container = get_container()
+    prev_job_key = Job._app_key
+    prev_bus_key = RedisEventBus._app_key
+    try:
+        Job.set_app_key(None)
+        RedisEventBus.set_app_key(None)
+        monkeypatch.setenv("REDIS_HOST", "env-redis-override")
+        monkeypatch.setenv("REDIS_PASSWORD", "env-redis-password")
+        monkeypatch.setenv("APP_KEY", "env-app-key-override")
+        monkeypatch.setenv("COHERE_API_KEY", "env-cohere-override")
+
+        cfg = Config(
+            {
+                "app": {"env": "local", "key": ""},
+                "ai": {
+                    "redis": {
+                        "host": "10.20.30.40",
+                        "port": 6379,
+                        "password": "cfg-redis-password",
+                    },
+                    "rerankers": {"cohere": {"api_key": "cfg-cohere-key"}},
+                },
+            }
+        )
+        container = Container()
+        container.instance(Config, cfg)
+        set_container(container)
+        Config._instance = cfg
+
+        mw = AIRateLimitMiddleware(storage="redis", config=cfg)
+        client = await mw.get_redis_client()
+        assert client is not None
+        try:
+            conn_kwargs = client.connection_pool.connection_kwargs
+            assert conn_kwargs.get("host") == "10.20.30.40"
+            assert conn_kwargs.get("password") == "cfg-redis-password"
+        finally:
+            await client.aclose()
+
+        # Explicit empty Config 'app.key' must not be overridden by ambient os.environ APP_KEY
+        assert RedisEventBus.get_app_key() in ("", None)
+        assert Job.get_app_key(strict=False) in ("", None)
+
+        # Explicit empty api_key and Config cohere key must not be bypassed by COHERE_API_KEY
+        reranker_empty = CohereReranker(api_key="", config=Config({}))
+        assert reranker_empty._api_key == ""
+        reranker_cfg = CohereReranker(config=cfg)
+        assert reranker_cfg._api_key == "cfg-cohere-key"
+    finally:
+        Job.set_app_key(prev_job_key)
+        RedisEventBus.set_app_key(prev_bus_key)
+        Config._instance = prev_instance
+        set_container(prev_container)

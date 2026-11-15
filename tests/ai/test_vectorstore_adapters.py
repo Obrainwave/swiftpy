@@ -5,13 +5,9 @@ import math
 import uuid
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.client import AI
@@ -43,80 +39,10 @@ from swiftpy.core.container import Container, set_container
 # Lightweight Mock Transport & Response (supports both httpx and fallback)
 # ==============================================================================
 
-class _FakeResponse:
-    def __init__(self, status_code: int, json_data: Any = None, text: str = "") -> None:
-        self.status_code = status_code
-        self._json_data = json_data
-        self.text = text or (json.dumps(json_data) if json_data is not None else "")
-
-    def json(self) -> Any:
-        return self._json_data
-
-
-class _FakeUrl:
-    def __init__(self, url_str: str, params: dict[str, Any] | None = None) -> None:
-        parsed = urlparse(url_str)
-        self.path = parsed.path
-        self.host = parsed.netloc.split(":")[0] if parsed.netloc else ""
-        query_parts: list[str] = []
-        if parsed.query:
-            query_parts.append(parsed.query)
-        if params:
-            for k, v in params.items():
-                query_parts.append(f"{k}={v}")
-        self.query = "&".join(query_parts).encode("utf-8")
-
-
-class _FakeRequest:
-    def __init__(
-        self,
-        method: str,
-        url: str,
-        json_data: Any = None,
-        headers: dict[str, str] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> None:
-        self.method = method
-        self.url = _FakeUrl(url, params)
-        self._body = json.dumps(json_data).encode("utf-8") if json_data is not None else b""
-        self.content = self._body
-        self.headers = headers or {}
-
-    def read(self) -> bytes:
-        return self._body
-
-
-class _FakeAsyncClient:
-    def __init__(self, handler: Callable[[Any], Any]) -> None:
-        self._handler = handler
-        self.is_closed = False
-
-    async def get(self, url: str, params: Any = None, headers: Any = None, timeout: float = 30.0) -> Any:
-        req = _FakeRequest("GET", url, headers=headers, params=params)
-        return self._handler(req)
-
-    async def post(self, url: str, json: Any = None, headers: Any = None, params: Any = None, timeout: float = 30.0) -> Any:
-        req = _FakeRequest("POST", url, json_data=json, headers=headers, params=params)
-        return self._handler(req)
-
-    async def put(self, url: str, json: Any = None, headers: Any = None, params: Any = None, timeout: float = 30.0) -> Any:
-        req = _FakeRequest("PUT", url, json_data=json, headers=headers, params=params)
-        return self._handler(req)
-
-    async def delete(self, url: str, params: Any = None, headers: Any = None, timeout: float = 30.0) -> Any:
-        req = _FakeRequest("DELETE", url, headers=headers, params=params)
-        return self._handler(req)
-
-    async def aclose(self) -> None:
-        self.is_closed = True
-
-
-def _make_response(status_code: int, json_data: Any = None, text: str = "") -> Any:
-    if httpx is not None:
-        if json_data is not None:
-            return httpx.Response(status_code, json=json_data)
-        return httpx.Response(status_code, text=text)
-    return _FakeResponse(status_code, json_data=json_data, text=text)
+def _make_response(status_code: int, json_data: Any = None, text: str = "") -> httpx.Response:
+    if json_data is not None:
+        return httpx.Response(status_code, json=json_data)
+    return httpx.Response(status_code, text=text)
 
 
 # ==============================================================================
@@ -630,12 +556,8 @@ def _make_mock_adapter(
     metric: str = "cosine",
     namespace: str = "",
 ) -> VectorStore:
-    client: Any
-    if httpx is not None:
-        transport = httpx.MockTransport(mock_handler)
-        client = httpx.AsyncClient(transport=transport)
-    else:
-        client = _FakeAsyncClient(mock_handler)
+    transport = httpx.MockTransport(mock_handler)
+    client = httpx.AsyncClient(transport=transport)
 
     pool = AIHttpPool(client=client)
 
@@ -934,7 +856,9 @@ async def test_disabled_ai_module_raises() -> None:
 @pytest.mark.asyncio
 async def test_all_adapter_capabilities() -> None:
     """Verify that all adapters expose their declared VectorStoreCapabilities."""
-    dummy_pool = AIHttpPool(client=_FakeAsyncClient(lambda req: _make_response(200)))
+    dummy_pool = AIHttpPool(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200)))
+    )
 
     qdrant = QdrantAdapter(http_pool=dummy_pool)
     chroma = ChromaAdapter(http_pool=dummy_pool)
@@ -1199,11 +1123,7 @@ async def test_di_container_shared_http_pool_lifecycle() -> None:
     container.instance(Config, config)
 
     # Register a single shared AIHttpPool
-    mock_client = (
-        httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200)))
-        if httpx is not None
-        else _FakeAsyncClient(lambda req: _make_response(200))
-    )
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200)))
     shared_pool = AIHttpPool(client=mock_client)
     container.instance(AIHttpPool, shared_pool)
 
@@ -1230,10 +1150,17 @@ async def test_di_container_shared_http_pool_lifecycle() -> None:
     client4 = lancedb._http_pool.get_client()
     assert client1 is client2 is client3 is client4
 
-    # Close shared pool
+    # Close shared pool: caller-injected clients stay open for caller ownership
     await shared_pool.aclose()
-    assert mock_client.is_closed is True
+    assert mock_client.is_closed is False
     assert shared_pool._client is None
+    await mock_client.aclose()
+
+    # Pool-owned clients created by AIHttpPool itself are closed on aclose()
+    owned_pool = AIHttpPool()
+    owned_client = owned_pool.get_client()
+    await owned_pool.aclose()
+    assert owned_client.is_closed is True
 
 
 def test_handle_adapter_http_error_codes_and_sanitization() -> None:

@@ -3,19 +3,14 @@ from __future__ import annotations
 import ast
 import asyncio
 import datetime
-import inspect
 import math
 import operator
+import zoneinfo
 from collections.abc import Callable
 from typing import Any
 
-from swiftpy.ai.tools.base_tool import BaseTool
-
-try:
-    import zoneinfo
-except ImportError:
-    zoneinfo = None  # type: ignore[assignment]
-
+from swiftpy.ai.exceptions import AIConfigurationError
+from swiftpy.ai.tools.base_tool import BaseTool, is_async_callable
 
 # ==============================================================================
 # 1. Calculator Tool (AST-Safe Evaluation, Resource Bounds, Zero eval)
@@ -75,6 +70,8 @@ def _safe_eval_node(node: ast.AST, depth: int = 0, max_depth: int = 20) -> Any:
             raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
         operand = _safe_eval_node(node.operand, depth + 1, max_depth)
         res = op(operand)
+        if isinstance(res, complex):
+            raise TypeError("Complex numbers are not supported in math expressions")
         if isinstance(res, float) and (math.isnan(res) or math.isinf(res)):
             raise ValueError("Unary operation resulted in non-finite value (NaN or Infinity)")
         return res
@@ -86,18 +83,25 @@ def _safe_eval_node(node: ast.AST, depth: int = 0, max_depth: int = 20) -> Any:
         left = _safe_eval_node(node.left, depth + 1, max_depth)
         right = _safe_eval_node(node.right, depth + 1, max_depth)
 
-        # Guard against exponent explosion / resource exhaustion
+        # Guard against exponent explosion / resource exhaustion before evaluating pow()
         if isinstance(node.op, ast.Pow):
-            if right > 1000 or (isinstance(right, (int, float)) and right < -1000):
+            if isinstance(left, bool) or isinstance(right, bool):
+                raise TypeError("Boolean operands are not permitted in math expressions")
+            if right > 1000 or right < -1000:
                 raise ValueError("Exponent too large in power calculation (exceeds magnitude limit of 1000)")
-            if abs(left) > 1e100 and right > 1:
-                raise ValueError("Base value too large for exponentiation")
+            if isinstance(left, (int, float)) and abs(left) > 1 and isinstance(right, (int, float)) and right > 0:
+                if abs(left) > 1e100 and right > 1:
+                    raise ValueError("Base value too large for exponentiation")
+                if math.log10(abs(left)) * float(right) > 1000:
+                    raise ValueError("Exponent too large in power calculation (result exceeds digit limit)")
 
         try:
             res = op(left, right)
         except OverflowError as exc:
             raise ValueError("Numeric calculation overflow") from exc
 
+        if isinstance(res, complex):
+            raise TypeError("Complex numbers are not supported in math expressions")
         if isinstance(res, float) and (math.isnan(res) or math.isinf(res)):
             raise ValueError("Binary operation resulted in non-finite value (NaN or Infinity)")
         return res
@@ -105,6 +109,10 @@ def _safe_eval_node(node: ast.AST, depth: int = 0, max_depth: int = 20) -> Any:
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name):
             raise TypeError("Only direct math function calls are permitted (attribute and method access forbidden)")
+        if node.keywords:
+            raise ValueError("Keyword arguments are not permitted in math function calls")
+        if any(isinstance(arg, ast.Starred) for arg in node.args):
+            raise ValueError("Starred arguments are not permitted in math function calls")
         fn_name = node.func.id.lower()
         fn = _SAFE_FUNCTIONS.get(fn_name)
         if fn is None:
@@ -115,12 +123,29 @@ def _safe_eval_node(node: ast.AST, depth: int = 0, max_depth: int = 20) -> Any:
         except (ValueError, OverflowError) as exc:
             raise ValueError(f"Function '{fn_name}' failed: {exc}") from exc
 
+        if isinstance(res, complex):
+            raise TypeError("Complex numbers are not supported in math expressions")
         if isinstance(res, float) and (math.isnan(res) or math.isinf(res)):
             raise ValueError(f"Function '{fn_name}' produced a non-finite result (NaN or Infinity)")
         return res
 
     # Explicit rejection of unauthorized constructs (attributes, subscripts, comprehensions, etc.)
     raise ValueError(f"Disallowed expression element '{type(node).__name__}'")
+
+
+def _evaluate_math_expression(clean_expr: str, max_ast_depth: int) -> int | float:
+    """Parse and safely evaluate a math expression synchronously for threadpool offload."""
+    tree = ast.parse(clean_expr, mode="eval")
+    result = _safe_eval_node(tree, depth=0, max_depth=max_ast_depth)
+    if isinstance(result, complex):
+        raise TypeError("Complex numbers are not supported in math expressions")
+    if isinstance(result, float):
+        if result.is_integer():
+            return int(result)
+        return result
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result
+    raise ValueError(f"Unsupported numeric result type: {type(result).__name__}")
 
 
 class CalculatorTool(BaseTool):
@@ -178,11 +203,11 @@ class CalculatorTool(BaseTool):
             }
 
         try:
-            tree = ast.parse(clean_expr, mode="eval")
-            result = _safe_eval_node(tree, depth=0, max_depth=self._max_ast_depth)
-            # If result is float with integer value, return cleaner representation
-            if isinstance(result, float) and result.is_integer():
-                result = int(result)
+            result = await asyncio.to_thread(
+                _evaluate_math_expression,
+                clean_expr,
+                self._max_ast_depth,
+            )
             return {"expression": clean_expr, "result": result}
         except (SyntaxError, ZeroDivisionError, ValueError, TypeError, OverflowError) as exc:
             return {"expression": clean_expr, "error": str(exc)}
@@ -240,7 +265,7 @@ class DateTimeTool(BaseTool):
         tz: datetime.tzinfo = datetime.UTC
         tz_name = timezone or "UTC"
 
-        if zoneinfo is not None and tz_name.upper() != "UTC":
+        if tz_name.upper() != "UTC":
             try:
                 tz = zoneinfo.ZoneInfo(tz_name)
             except (KeyError, ValueError):
@@ -315,61 +340,45 @@ class WebSearchTool(BaseTool):
         if not isinstance(raw_query, str):
             raise TypeError(f"query must be a string, got {type(raw_query).__name__}")
 
-        if not isinstance(max_results, int) or max_results <= 0:
+        if isinstance(max_results, bool) or not isinstance(max_results, int):
+            raise TypeError(f"max_results must be an integer, got {type(max_results).__name__}")
+        if max_results <= 0:
             raise ValueError(f"max_results must be a positive integer > 0, got {max_results}")
 
         clean_query = raw_query.strip()
         if not clean_query:
             return {"query": clean_query, "results": []}
 
-        if self._search_fn is not None:
-            try:
-                if inspect.iscoroutinefunction(self._search_fn):
-                    coro = self._search_fn(clean_query, max_results=max_results)
-                    raw_res = await asyncio.wait_for(coro, timeout=self._timeout)
-                else:
-                    call_fn = self._search_fn
-                    coro_sync = asyncio.to_thread(call_fn, clean_query, max_results=max_results)
-                    raw_res = await asyncio.wait_for(coro_sync, timeout=self._timeout)
+        if self._search_fn is None:
+            raise AIConfigurationError(
+                "WebSearchTool requires a configured 'search_fn' callable; "
+                "synthetic search results are disabled."
+            )
 
-                # Normalize results
-                if isinstance(raw_res, dict):
-                    return raw_res
-                if isinstance(raw_res, list):
-                    return {"query": clean_query, "results": raw_res[:max_results]}
-                return {"query": clean_query, "results": [{"content": str(raw_res)}]}
-            except TimeoutError:
-                return {
-                    "query": clean_query,
-                    "error": f"Search operation timed out after {self._timeout}s",
-                    "results": [],
-                }
-            except Exception as exc:  # noqa: BLE001
-                return {
-                    "query": clean_query,
-                    "error": f"Search function failed: {exc!s}",
-                    "results": [],
-                }
+        try:
+            if is_async_callable(self._search_fn):
+                coro = self._search_fn(clean_query, max_results=max_results)
+                raw_res = await asyncio.wait_for(coro, timeout=self._timeout)
+            else:
+                call_fn = self._search_fn
+                coro_sync = asyncio.to_thread(call_fn, clean_query, max_results=max_results)
+                raw_res = await asyncio.wait_for(coro_sync, timeout=self._timeout)
 
-        # Built-in synthetic fallback for development and testing
-        synthetic_results = [
-            {
-                "title": f"Search Results for '{clean_query}'",
-                "snippet": f"Summary details and factual information regarding {clean_query}.",
-                "url": f"https://example.com/search?q={clean_query.replace(' ', '+')}",
-            },
-            {
-                "title": f"In-depth Analysis: {clean_query.title()}",
-                "snippet": f"Comprehensive data and contextual analysis for {clean_query}.",
-                "url": f"https://example.com/analysis?q={clean_query.replace(' ', '+')}",
-            },
-            {
-                "title": f"Reference Documentation for {clean_query.title()}",
-                "snippet": f"Official documentation and technical guides regarding {clean_query}.",
-                "url": f"https://example.com/docs?q={clean_query.replace(' ', '+')}",
-            },
-        ]
-        return {
-            "query": clean_query,
-            "results": synthetic_results[:max_results],
-        }
+            # Normalize results
+            if isinstance(raw_res, dict):
+                return raw_res
+            if isinstance(raw_res, list):
+                return {"query": clean_query, "results": raw_res[:max_results]}
+            return {"query": clean_query, "results": [{"content": str(raw_res)}]}
+        except TimeoutError:
+            return {
+                "query": clean_query,
+                "error": f"Search operation timed out after {self._timeout}s",
+                "results": [],
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "query": clean_query,
+                "error": f"Search function failed: {exc!s}",
+                "results": [],
+            }

@@ -350,7 +350,7 @@ class Blueprint:
 
     def vector(self, name: str, dimensions: int = 1536) -> ColumnDefinition:
         """Create a pgvector vector column with specified dimensions."""
-        if not isinstance(dimensions, int) or dimensions <= 0:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(
                 f"Vector dimensions must be a positive integer, got {dimensions}"
             )

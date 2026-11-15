@@ -36,8 +36,12 @@ class ExistsRule:
 
         try:
             active_conn = get_active_connection()
-            if active_conn is not None and self.pool is None:
-                row = await active_conn.fetchval(query, value)
+            if active_conn is not None:
+                if hasattr(active_conn, "transaction"):
+                    async with active_conn.transaction():
+                        row = await active_conn.fetchval(query, value)
+                else:
+                    row = await active_conn.fetchval(query, value)
                 return row is not None
 
             active_pool = self.pool

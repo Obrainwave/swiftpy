@@ -5,11 +5,7 @@ import json
 import math
 from typing import Any
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.client import AI
@@ -88,14 +84,14 @@ async def test_embed_validation() -> None:
 
     # Single embed validation
     with pytest.raises(TypeError, match="Expected string"):
-        await client.embed(123)  # type: ignore[arg-type]
+        await client.embed(json.loads("123"))
 
     with pytest.raises(ValueError, match="Cannot embed empty"):
         await client.embed("   ")
 
     # Batch embed validation
     with pytest.raises(TypeError, match="must be a string"):
-        await client.embed_batch(["valid", None])  # type: ignore[list-item]
+        await client.embed_batch(json.loads('["valid", null]'))
 
     with pytest.raises(ValueError, match="is empty or whitespace"):
         await client.embed_batch(["valid", "  "])
@@ -390,11 +386,15 @@ async def test_embed_batch_rejects_inconsistent_dimensions_and_nan(
             client=mock_client_factory(
                 lambda r: httpx.Response(
                     200,
-                    json={
-                        "data": [
-                            {"index": 0, "embedding": [0.1, float("nan"), 0.3, 0.4]}
-                        ]
-                    },
+                    content=json.dumps(
+                        {
+                            "data": [
+                                {"index": 0, "embedding": [0.1, float("nan"), 0.3, 0.4]}
+                            ]
+                        },
+                        allow_nan=True,
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
                 )
             )
         ),

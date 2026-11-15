@@ -42,8 +42,8 @@ class BuggyRule:
     """A custom rule that has a bug and raises TypeError during execution."""
 
     def validate(self, field: str, value: Any) -> bool:
-        # Intentionally cause a TypeError inside the rule execution
-        return len(None) > 0  # type: ignore[arg-type]
+        # Intentionally raise a TypeError inside the rule execution
+        raise TypeError("Simulated rule implementation bug")
 
 
 @pytest.mark.asyncio

@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-import math
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
 import asyncpg
 
+from swiftpy.ai.pool import AIHttpPool
 from swiftpy.ai.vectorstore.base import (
     SearchResult,
     VectorRecord,
     VectorStore,
     VectorStoreCapabilities,
+    dedupe_preserve_order,
+    normalize_record,
+    validate_collection_name,
+    validate_record_id,
+    validate_vector,
 )
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
-from swiftpy.database.identifiers import quote_identifier, validate_identifier
+from swiftpy.database.identifiers import (
+    MAX_IDENTIFIER_LENGTH,
+    quote_identifier,
+    validate_identifier,
+)
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection
 
@@ -45,28 +55,19 @@ def _format_vector(vector: Sequence[float]) -> str:
     return f"[{','.join(str(float(x)) for x in vector)}]"
 
 
-def _validate_vector(vector: Sequence[float], dimensions: int, metric: str) -> list[float]:
-    """Validate vector elements for finite values, dimensional correctness, and non-zero cosine norm."""
-    if not isinstance(vector, (list, tuple)) or not vector:
-        raise ValueError("Vector must be a non-empty sequence of floats.")
-    if len(vector) != dimensions:
-        raise ValueError(f"Vector dimension {len(vector)} does not match collection dimension {dimensions}")
-
-    parsed: list[float] = []
-    for idx, x in enumerate(vector):
-        if not isinstance(x, (int, float)) or isinstance(x, bool):
-            raise TypeError(f"Vector element at index {idx} must be a number, got {type(x).__name__}")
-        fx = float(x)
-        if math.isnan(fx) or math.isinf(fx):
-            raise ValueError(f"Vector element at index {idx} contains NaN or Infinite value.")
-        parsed.append(fx)
-
-    if metric == "cosine":
-        norm = math.sqrt(sum(x * x for x in parsed))
-        if norm == 0.0:
-            raise ValueError("Zero vector cannot be used with cosine distance metric.")
-
-    return parsed
+def _bounded_pg_identifier(full_name: str, compact_prefix: str, suffix: str, hash_source: str) -> str:
+    """Keep PostgreSQL identifier within MAX_IDENTIFIER_LENGTH (63B) deterministically."""
+    if len(full_name.encode("utf-8")) <= MAX_IDENTIFIER_LENGTH:
+        validate_identifier(full_name)
+        return full_name
+    digest = hashlib.sha256(hash_source.encode("utf-8")).hexdigest()[:10]
+    safe_prefix = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in compact_prefix)
+    head = "swiftpy_v_"
+    tail = f"_{digest}{suffix}"
+    max_body = MAX_IDENTIFIER_LENGTH - len(head) - len(tail)
+    candidate = f"{head}{safe_prefix[:max(0, max_body)]}{tail}"
+    validate_identifier(candidate)
+    return candidate
 
 
 class PgVectorAdapter(VectorStore):
@@ -84,7 +85,12 @@ class PgVectorAdapter(VectorStore):
         dimensions: int = 1536,
         metric: str = "cosine",
         pool: DatabasePool | asyncpg.Pool | None = None,
+        config: Config | None = None,
+        http_pool: AIHttpPool | None = None,
     ) -> None:
+        validate_collection_name(collection_name)
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
+            raise ValueError(f"Dimensions must be a positive integer, got {dimensions}")
         norm_metric = metric.lower().strip()
         if norm_metric not in METRIC_CONFIG:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(METRIC_CONFIG.keys())}")
@@ -93,8 +99,12 @@ class PgVectorAdapter(VectorStore):
         self._dimensions = dimensions
         self._metric = norm_metric
         self._pool = pool
+        self._config = config
+        self._http_pool = http_pool
+        self._owned_db_pool: DatabasePool | None = None
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._pool_lock = asyncio.Lock()
 
     @property
     def metric(self) -> str:
@@ -111,22 +121,28 @@ class PgVectorAdapter(VectorStore):
             metadata_filtering=True,
             nested_metadata_filtering=True,
             namespaces=False,
-            pagination=True,
+            pagination=False,
             batch_upsert=True,
             native_distance_metrics=("cosine", "l2", "inner_product"),
         )
 
     def _get_table_name(self, name: str | None = None) -> str:
-        coll = name or self._collection_name
+        coll = self._collection_name if name is None else validate_collection_name(name)
         table = f"swiftpy_vectors_{coll}"
-        validate_identifier(table)
-        return table
+        return _bounded_pg_identifier(table, coll, "", coll)
 
-    def _get_index_name(self, name: str | None = None) -> str:
-        coll = name or self._collection_name
-        idx = f"swiftpy_vectors_{coll}_{self._metric}_hnsw_idx"
-        validate_identifier(idx)
-        return idx
+    def _get_index_name(self, name: str | None = None, metric: str | None = None) -> str:
+        coll = self._collection_name if name is None else validate_collection_name(name)
+        active_metric = metric or self._metric
+        idx = f"swiftpy_vectors_{coll}_{active_metric}_hnsw_idx"
+        return _bounded_pg_identifier(idx, coll, f"_{active_metric}_idx", f"{coll}:{active_metric}")
+
+    async def aclose(self) -> None:
+        """Close any internally created DatabasePool owned by this adapter instance."""
+        async with self._pool_lock:
+            if self._owned_db_pool is not None:
+                await self._owned_db_pool.close()
+                self._owned_db_pool = None
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[asyncpg.Connection]:
@@ -145,20 +161,32 @@ class PgVectorAdapter(VectorStore):
             else:
                 pool = self._pool
         else:
-            try:
-                container = get_container()
+            container = get_container()
+            if container.has(DatabasePool):
                 db_pool = container.resolve(DatabasePool)
                 try:
                     pool = db_pool.get_pool()
                 except RuntimeError:
                     pool = await db_pool.init()
-            except (RuntimeError, LookupError, KeyError):
-                try:
-                    config = Config.get_instance()
-                except RuntimeError:
-                    config = Config()
-                db_pool = DatabasePool(config)
-                pool = await db_pool.init()
+            else:
+                async with self._pool_lock:
+                    if self._owned_db_pool is None:
+                        cfg = self._config
+                        if cfg is None:
+                            if container.has(Config):
+                                cfg = container.resolve(Config)
+                            else:
+                                try:
+                                    cfg = Config.get_instance()
+                                except RuntimeError:
+                                    cfg = Config()
+                        self._owned_db_pool = DatabasePool(cfg)
+                        pool = await self._owned_db_pool.init()
+                    else:
+                        try:
+                            pool = self._owned_db_pool.get_pool()
+                        except RuntimeError:
+                            pool = await self._owned_db_pool.init()
 
         conn = await pool.acquire()
         try:
@@ -173,34 +201,32 @@ class PgVectorAdapter(VectorStore):
         metric: str = "cosine",
     ) -> None:
         """Create or initialize the collection table with pgvector extension and HNSW index."""
-        if not name or not name.strip():
-            raise ValueError("Collection name must be a non-empty string.")
-        if dimensions <= 0:
+        validate_collection_name(name)
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(f"Dimensions must be a positive integer, got {dimensions}")
         norm_metric = metric.lower().strip()
         if norm_metric not in METRIC_CONFIG:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(METRIC_CONFIG.keys())}")
 
-        self._collection_name = name
-        self._dimensions = dimensions
-        self._metric = norm_metric
-
         table = self._get_table_name(name)
         quoted_table = quote_identifier(table)
-        idx_name = self._get_index_name(name)
+        idx_name = self._get_index_name(name, metric=norm_metric)
         quoted_idx = quote_identifier(idx_name)
-        opclass = METRIC_CONFIG[self._metric]["opclass"]
+        opclass = METRIC_CONFIG[norm_metric]["opclass"]
 
         async with self._connection() as conn:
             # 1. Ensure pgvector extension exists
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-            # 2. Check for dimension mismatch on pre-existing collection
+            # 2. Check for dimension mismatch on pre-existing collection in active schema
             dim_sql = """
-            SELECT atttypmod
+            SELECT pg_attribute.atttypmod
             FROM pg_attribute
             JOIN pg_class ON pg_class.oid = pg_attribute.attrelid
-            WHERE pg_class.relname = $1 AND pg_attribute.attname = 'embedding';
+            JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+            WHERE pg_class.relname = $1
+              AND pg_namespace.nspname = current_schema()
+              AND pg_attribute.attname = 'embedding';
             """
             existing_dim = await conn.fetchval(dim_sql, table)
             if existing_dim is not None and existing_dim > 0 and existing_dim != dimensions:
@@ -228,6 +254,9 @@ class PgVectorAdapter(VectorStore):
             """
             await conn.execute(create_index_sql)
 
+        self._collection_name = name
+        self._dimensions = dimensions
+        self._metric = norm_metric
         self._initialized = True
 
     async def _ensure_collection(self) -> None:
@@ -247,10 +276,8 @@ class PgVectorAdapter(VectorStore):
         content: str = "",
     ) -> None:
         """Insert or update a single vector record."""
-        if not isinstance(id, str) or not id.strip():
-            raise ValueError("Record id must be a non-empty string.")
-
-        parsed_vec = _validate_vector(vector, self._dimensions, self._metric)
+        rec_id = validate_record_id(id)
+        parsed_vec = validate_vector(vector, self._dimensions, self._metric)
         await self._ensure_collection()
         table = quote_identifier(self._get_table_name())
 
@@ -267,7 +294,7 @@ class PgVectorAdapter(VectorStore):
         vec_str = _format_vector(parsed_vec)
 
         async with self._connection() as conn:
-            await conn.execute(sql, id, vec_str, content, meta_json)
+            await conn.execute(sql, rec_id, vec_str, content, meta_json)
 
     async def upsert_batch(
         self,
@@ -284,34 +311,13 @@ class PgVectorAdapter(VectorStore):
 
         formatted_rows: list[tuple[str, str, str, str]] = []
         for rec in records:
-            if isinstance(rec, VectorRecord):
-                rec_id = rec.id
-                rec_vec = rec.vector
-                rec_meta = rec.metadata
-                rec_content = rec.content
-            elif isinstance(rec, tuple):
-                rec_id = rec[0]
-                rec_vec = rec[1]
-                rec_meta = rec[2] if len(rec) > 2 and rec[2] is not None else {}
-                rec_content = rec[3] if len(rec) > 3 and isinstance(rec[3], str) else ""
-            elif isinstance(rec, dict):
-                rec_id = rec["id"]
-                rec_vec = rec["vector"]
-                rec_meta = rec.get("metadata") or {}
-                rec_content = rec.get("content", "")
-            else:
-                raise TypeError(f"Unsupported record format: {type(rec).__name__}")
-
-            if not isinstance(rec_id, str) or not rec_id.strip():
-                raise ValueError("Record id must be a non-empty string.")
-
-            parsed_vec = _validate_vector(rec_vec, self._dimensions, self._metric)
+            norm_rec = normalize_record(rec, self._dimensions, self._metric)
             formatted_rows.append(
                 (
-                    rec_id,
-                    _format_vector(parsed_vec),
-                    rec_content,
-                    json.dumps(rec_meta),
+                    norm_rec.id,
+                    _format_vector(norm_rec.vector),
+                    norm_rec.content,
+                    json.dumps(norm_rec.metadata),
                 )
             )
 
@@ -345,7 +351,7 @@ class PgVectorAdapter(VectorStore):
         if limit <= 0:
             raise ValueError(f"Limit must be a positive integer, got {limit}")
 
-        parsed_vec = _validate_vector(vector, self._dimensions, self._metric)
+        parsed_vec = validate_vector(vector, self._dimensions, self._metric)
         await self._ensure_collection()
 
         table = quote_identifier(self._get_table_name())
@@ -411,8 +417,9 @@ class PgVectorAdapter(VectorStore):
         return bool(str(result).strip() != "DELETE 0")
 
     async def delete_batch(self, ids: Sequence[str]) -> int:
-        """Delete multiple vector records by ids."""
-        if not ids:
+        """Delete multiple deduplicated vector records by ids."""
+        unique_ids = dedupe_preserve_order(ids)
+        if not unique_ids:
             return 0
 
         await self._ensure_collection()
@@ -420,7 +427,7 @@ class PgVectorAdapter(VectorStore):
         sql = f"DELETE FROM {table} WHERE id = ANY($1::varchar[]);"
 
         async with self._connection() as conn:
-            result = await conn.execute(sql, list(ids))
+            result = await conn.execute(sql, unique_ids)
 
         try:
             return int(str(result).strip().split()[-1])

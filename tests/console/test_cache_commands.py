@@ -11,34 +11,6 @@ from swiftpy.console.cli import CLI
 from swiftpy.console.commands.cache import CacheCommand
 from swiftpy.core.application import Application
 from swiftpy.core.config import Config
-from swiftpy.http.route_cache import RouteCache
-
-
-def test_route_cache_build_load_clear(tmp_path: Path) -> None:
-    app = Application()
-
-    @app.get("/test-route")
-    async def sample_handler() -> str:
-        return "ok"
-
-    cache_file = tmp_path / "routes.json"
-
-    # 1. Build
-    data = RouteCache.build(app, cache_path=cache_file)
-    assert cache_file.is_file()
-    assert data["count"] >= 1
-    assert any(r["path"] == "/test-route" for r in data["routes"])
-
-    # 2. Load
-    loaded = RouteCache.load(cache_path=cache_file)
-    assert loaded is not None
-    assert loaded["count"] == data["count"]
-
-    # 3. Clear
-    cleared = RouteCache.clear(cache_path=cache_file)
-    assert cleared is True
-    assert not cache_file.exists()
-    assert RouteCache.load(cache_path=cache_file) is None
 
 
 def test_config_dump_load_cache(tmp_path: Path) -> None:
@@ -100,7 +72,7 @@ def test_cli_cache_build_and_clear_handlers(
     args_build = argparse.Namespace(app="main:app", cache_dir=str(cache_dir))
     CacheCommand.handle_build(args_build)
 
-    assert (cache_dir / "routes.json").is_file()
+    assert not (cache_dir / "routes.json").exists()
     assert (cache_dir / "config.json").is_file()
     assert (cache_dir / "prompts.json").is_file()
 
@@ -108,7 +80,6 @@ def test_cli_cache_build_and_clear_handlers(
     args_clear = argparse.Namespace(cache_dir=str(cache_dir))
     CacheCommand.handle_clear(args_clear)
 
-    assert not (cache_dir / "routes.json").exists()
     assert not (cache_dir / "config.json").exists()
     assert not (cache_dir / "prompts.json").exists()
 

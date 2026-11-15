@@ -26,18 +26,53 @@ def _validate_no_crlf(value: str, field_name: str) -> None:
         )
 
 
-def _validate_address(raw_address: str, field_name: str = "recipient") -> str:
-    """Validate and normalize an email address or formatted name <addr> string."""
+def parse_mail_address(
+    raw_address: str, field_name: str = "recipient"
+) -> tuple[str, str]:
+    """Parse and validate an email address or 'Display Name <addr>' into (name, email)."""
     _validate_no_crlf(raw_address, field_name)
     cleaned = raw_address.strip()
     if not cleaned:
         raise InvalidAddressError(f"{field_name} address cannot be empty")
 
-    _name, addr = email.utils.parseaddr(cleaned)
+    name, addr = email.utils.parseaddr(cleaned)
+    if not addr and cleaned.endswith(">") and "<" in cleaned:
+        prefix, _, candidate = cleaned[:-1].rpartition("<")
+        candidate_stripped = candidate.strip()
+        if (
+            candidate_stripped
+            and "<" not in candidate_stripped
+            and ">" not in candidate_stripped
+            and "," not in candidate_stripped
+        ):
+            addr = candidate_stripped
+            name = prefix.strip().strip('"')
+
     target = addr if addr else cleaned
     if not _BASIC_EMAIL_REGEX.match(target):
         raise InvalidAddressError(f"Invalid email address '{cleaned}' in {field_name}")
-    return cleaned
+    return name.strip(), target
+
+
+def format_mail_address(
+    raw_or_address: str,
+    name: str | None = None,
+    *,
+    field_name: str = "recipient",
+) -> str:
+    """Validate and RFC-format an address, quoting display names containing commas."""
+    parsed_name, addr = parse_mail_address(raw_or_address, field_name=field_name)
+    display_name = name.strip() if name is not None and name.strip() else parsed_name
+    if display_name:
+        _validate_no_crlf(display_name, f"{field_name}_name")
+        return email.utils.formataddr((display_name, addr))
+    return addr
+
+
+def _validate_address(raw_address: str, field_name: str = "recipient") -> str:
+    """Validate and normalize an email address or formatted name <addr> string."""
+    parse_mail_address(raw_address, field_name=field_name)
+    return raw_address.strip()
 
 
 def _normalize_recipients(
@@ -145,11 +180,7 @@ class MailMessage:
 
     def all_recipient_addresses(self) -> list[str]:
         """Extract just the pure email addresses from to, cc, and bcc."""
-        recipients: list[str] = []
-        for r in self.to + self.cc + self.bcc:
-            _, addr = email.utils.parseaddr(r)
-            recipients.append(addr if addr else r)
-        return recipients
+        return [parse_mail_address(r, field_name="recipient")[1] for r in self.to + self.cc + self.bcc]
 
 
-__all__ = ["MailMessage"]
+__all__ = ["MailMessage", "format_mail_address", "parse_mail_address"]

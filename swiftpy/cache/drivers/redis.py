@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -24,13 +25,11 @@ from swiftpy.support.redis_config import resolve_redis_params
 logger = logging.getLogger("swiftpy.cache")
 
 _INCR_WITH_TTL_LUA = """
+local existed = redis.call('exists', KEYS[1])
 local current = redis.call('incrby', KEYS[1], ARGV[1])
 local ttl = tonumber(ARGV[2])
-if ttl and ttl > 0 then
-    local pttl = redis.call('pttl', KEYS[1])
-    if pttl < 0 then
-        redis.call('pexpire', KEYS[1], math.floor(ttl * 1000))
-    end
+if existed == 0 and ttl and ttl > 0 then
+    redis.call('pexpire', KEYS[1], math.max(1, math.floor(ttl * 1000)))
 end
 return current
 """
@@ -323,72 +322,95 @@ class RedisDriver(CacheDriver):
         lock_timeout: float = 10.0,
     ) -> Any:
         """
-        Get an item from Redis, or execute callback with cross-instance distributed lock protection.
+        Get an item from Redis, or execute callback with in-process coalescing and distributed lock protection.
 
-        Uses Redis SET NX to coordinate cross-task and cross-instance execution so that
-        concurrent requests across multiple drivers or processes only invoke callback once.
-        If the lock times out, executes callback directly without caching and logs a warning.
+        Uses both per-key asyncio lock coalescing and Redis SET NX (millisecond PX expiration)
+        so concurrent requests across coroutines or processes invoke callback at most once.
+        Even if ``lock_timeout <= 0``, attempts a single non-blocking SET NX acquisition before falling back.
         """
         # Fast path
         cached = await self.get(key, _SENTINEL)
         if cached is not _SENTINEL:
             return cached
 
-        client = await self.get_client()
-        lock_key = f"{self.prefix}lock:{key}"
-        token = uuid.uuid4().hex
-        deadline = time.monotonic() + lock_timeout
+        async with self._acquire_key_lock(key, lock_timeout=lock_timeout) as local_acquired:
+            if not local_acquired:
+                logger.warning(
+                    "Cache lock timed out waiting for key '%s'; computing value directly without caching",
+                    key,
+                )
+                if inspect.iscoroutinefunction(callback):
+                    return await callback()
+                res = callback()
+                return await res if inspect.isawaitable(res) else res
 
-        while time.monotonic() < deadline:
-            # Try to acquire distributed lock
-            acquired = await client.set(
-                lock_key,
-                token,
-                ex=int(lock_timeout) if lock_timeout >= 1 else 1,
-                nx=True,
-            )
-            if acquired:
-                try:
-                    # Double-checked locking
-                    cached = await self.get(key, _SENTINEL)
-                    if cached is not _SENTINEL:
-                        return cached
-
-                    if inspect.iscoroutinefunction(callback):
-                        result = await callback()
-                    else:
-                        res = callback()
-                        result = await res if inspect.isawaitable(res) else res
-
-                    await self.set(key, result, ttl)
-                    return result
-                finally:
-                    # Safe release: release only if token matches
-                    lua_release = (
-                        "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                        "return redis.call('del', KEYS[1]) "
-                        "else return 0 end"
-                    )
-                    try:
-                        await client.eval(lua_release, 1, lock_key, token)
-                    except RedisError as exc:
-                        logger.debug("Failed to release lock %s: %s", lock_key, exc)
-
-            # Wait and poll for value to be populated
-            await asyncio.sleep(0.02)
+            # Re-check after winning the in-process key lock
             cached = await self.get(key, _SENTINEL)
             if cached is not _SENTINEL:
                 return cached
 
-        # Fallback if timeout elapsed: compute directly without caching and log warning
-        logger.warning(
-            "Cache lock timed out waiting for key '%s'; computing value directly without caching",
-            key,
-        )
-        if inspect.iscoroutinefunction(callback):
-            return await callback()
-        res = callback()
-        return await res if inspect.isawaitable(res) else res
+            client = await self.get_client()
+            lock_key = f"{self.prefix}lock:{key}"
+            token = uuid.uuid4().hex
+            lock_ttl_ms = (
+                max(1, math.ceil(float(lock_timeout) * 1000))
+                if lock_timeout > 0
+                else 1000
+            )
+            deadline = time.monotonic() + max(0.0, float(lock_timeout))
+
+            while True:
+                # Try to acquire distributed lock with millisecond precision
+                acquired = await client.set(
+                    lock_key,
+                    token,
+                    px=lock_ttl_ms,
+                    nx=True,
+                )
+                if acquired:
+                    try:
+                        # Double-checked locking
+                        cached = await self.get(key, _SENTINEL)
+                        if cached is not _SENTINEL:
+                            return cached
+
+                        if inspect.iscoroutinefunction(callback):
+                            result = await callback()
+                        else:
+                            res = callback()
+                            result = await res if inspect.isawaitable(res) else res
+
+                        await self.set(key, result, ttl)
+                        return result
+                    finally:
+                        lua_release = (
+                            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                            "return redis.call('del', KEYS[1]) "
+                            "else return 0 end"
+                        )
+                        try:
+                            await client.eval(lua_release, 1, lock_key, token)
+                        except RedisError as exc:
+                            logger.debug("Failed to release lock %s: %s", lock_key, exc)
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                await asyncio.sleep(min(0.02, remaining))
+                cached = await self.get(key, _SENTINEL)
+                if cached is not _SENTINEL:
+                    return cached
+
+            # Fallback if timeout elapsed: compute directly without caching and log warning
+            logger.warning(
+                "Cache lock timed out waiting for key '%s'; computing value directly without caching",
+                key,
+            )
+            if inspect.iscoroutinefunction(callback):
+                return await callback()
+            res = callback()
+            return await res if inspect.isawaitable(res) else res
 
     async def close(self) -> None:
         if self._client is not None and self._owns_client:

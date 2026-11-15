@@ -4,12 +4,16 @@ import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, BinaryIO
+from urllib.parse import quote
 
 from swiftpy.core.container import get_container
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.filesystem.drivers.base import StorageDriver
 from swiftpy.filesystem.events import FileDeleted, FileMoved, FileUploaded
-from swiftpy.filesystem.exceptions import ReadOnlyFileSystemError
+from swiftpy.filesystem.exceptions import (
+    DriverNotSupportedError,
+    ReadOnlyFileSystemError,
+)
 from swiftpy.filesystem.metadata import FileMetadata
 from swiftpy.filesystem.paths import PathNormalizer
 from swiftpy.filesystem.visibility import Visibility
@@ -17,6 +21,20 @@ from swiftpy.http.response import StreamingResponse
 
 if TYPE_CHECKING:
     from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
+
+
+def _format_content_disposition(filename: str) -> str:
+    """Build an RFC-safe Content-Disposition attachment header escaping quotes and stripping control bytes."""
+    raw = os.path.basename(filename.replace("\\", "/"))
+    cleaned = "".join(ch for ch in raw if ord(ch) >= 32 and ord(ch) != 127)
+    if not cleaned:
+        cleaned = "download"
+    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii").strip() or "download"
+    escaped_ascii = ascii_name.replace("\\", "\\\\").replace('"', '\\"')
+    if cleaned != ascii_name:
+        encoded_utf8 = quote(cleaned, safe="")
+        return f'attachment; filename="{escaped_ascii}"; filename*=UTF-8\'\'{encoded_utf8}'
+    return f'attachment; filename="{escaped_ascii}"'
 
 
 class StorageDisk:
@@ -288,6 +306,25 @@ class StorageDisk:
         target = self._apply_prefix(path)
         return await self.driver.temporary_url(target, expires_in=expires_in)
 
+    def verify_temporary_url(
+        self,
+        signed_url: str,
+        *,
+        method: str = "GET",
+        now: float | None = None,
+    ) -> str:
+        verifier = getattr(self.driver, "verify_temporary_url", None)
+        if not callable(verifier):
+            raise DriverNotSupportedError(
+                f"Storage driver '{type(self.driver).__name__}' does not support temporary URL verification."
+            )
+        verified_path = verifier(signed_url, method=method, now=now)
+        if not isinstance(verified_path, str):
+            raise TypeError(
+                f"Expected verify_temporary_url to return str path, got {type(verified_path).__name__}."
+            )
+        return self._strip_prefix(verified_path)
+
     async def get_visibility(self, path: str) -> Visibility:
         target = self._apply_prefix(path)
         return await self.driver.get_visibility(target)
@@ -328,7 +365,7 @@ class StorageDisk:
 
         resp_headers: dict[str, str] = {
             "content-type": mime,
-            "content-disposition": f'attachment; filename="{filename}"',
+            "content-disposition": _format_content_disposition(filename),
             "content-length": str(file_size),
         }
         if headers:

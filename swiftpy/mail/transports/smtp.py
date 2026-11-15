@@ -2,28 +2,50 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import email.utils
 import logging
 import ssl
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Protocol
+
+from swiftpy.mail.envelope import Envelope
+
+
+class _AiosmtplibModule(Protocol):
+    @property
+    def SMTP(self) -> Callable[..., Any]: ...
+
+
+aiosmtplib: _AiosmtplibModule | None
+_AioAuthError: type[Exception]
+_AioConnectError: type[Exception]
+_AioSMTPException: type[Exception]
+_AioRecipientsRefused: type[Exception]
+_AioTimeoutError: type[Exception]
 
 try:
-    import aiosmtplib
+    import aiosmtplib as _aiosmtplib
     from aiosmtplib.errors import (
-        SMTPAuthenticationError as _AioAuthError,
+        SMTPAuthenticationError as _ImportedAioAuthError,
     )
     from aiosmtplib.errors import (
-        SMTPConnectError as _AioConnectError,
+        SMTPConnectError as _ImportedAioConnectError,
     )
     from aiosmtplib.errors import (
-        SMTPException as _AioSMTPException,
+        SMTPException as _ImportedAioSMTPException,
     )
     from aiosmtplib.errors import (
-        SMTPRecipientsRefused as _AioRecipientsRefused,
+        SMTPRecipientsRefused as _ImportedAioRecipientsRefused,
     )
     from aiosmtplib.errors import (
-        SMTPTimeoutError as _AioTimeoutError,
+        SMTPTimeoutError as _ImportedAioTimeoutError,
     )
+
+    aiosmtplib = _aiosmtplib
+    _AioAuthError = _ImportedAioAuthError
+    _AioConnectError = _ImportedAioConnectError
+    _AioSMTPException = _ImportedAioSMTPException
+    _AioRecipientsRefused = _ImportedAioRecipientsRefused
+    _AioTimeoutError = _ImportedAioTimeoutError
 except ImportError:
     aiosmtplib = None
     _AioAuthError = Exception
@@ -31,8 +53,6 @@ except ImportError:
     _AioSMTPException = Exception
     _AioRecipientsRefused = Exception
     _AioTimeoutError = Exception
-
-from swiftpy.mail.envelope import Envelope
 from swiftpy.mail.exceptions import (
     MailAuthenticationError,
     MailConnectionError,
@@ -40,7 +60,7 @@ from swiftpy.mail.exceptions import (
     MailTimeoutError,
     MailTransportError,
 )
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.message import MailMessage, parse_mail_address
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.transports.base import MailTransport
 
@@ -64,6 +84,8 @@ class SMTPTransport(MailTransport):
         validate_certs: bool = True,
         default_from: tuple[str, str | None] | None = None,
         use_native: bool | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -74,13 +96,19 @@ class SMTPTransport(MailTransport):
         self.validate_certs = validate_certs
         self.default_from = default_from
         self.use_native = use_native if use_native is not None else (aiosmtplib is None)
+        self.max_attachment_size_bytes = max_attachment_size_bytes
+        self.max_message_size_bytes = max_message_size_bytes
 
     @classmethod
     def from_config(
         cls,
         config: dict[str, Any],
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> SMTPTransport:
+        raw_att = config.get("max_attachment_size_bytes", max_attachment_size_bytes)
+        raw_msg = config.get("max_message_size_bytes", max_message_size_bytes)
         return cls(
             host=str(config.get("host", "127.0.0.1")),
             port=int(config.get("port", 587)),
@@ -91,6 +119,8 @@ class SMTPTransport(MailTransport):
             validate_certs=bool(config.get("validate_certs", True)),
             default_from=default_from,
             use_native=config.get("use_native"),
+            max_attachment_size_bytes=int(raw_att) if raw_att is not None else None,
+            max_message_size_bytes=int(raw_msg) if raw_msg is not None else None,
         )
 
     def _create_ssl_context(self) -> ssl.SSLContext:
@@ -112,7 +142,12 @@ class SMTPTransport(MailTransport):
     async def _send_aiosmtplib(self, message: MailMessage) -> MailSendResult:
         assert aiosmtplib is not None
 
-        email_msg = await Envelope.build(message, default_from=self.default_from)
+        email_msg = await Envelope.build(
+            message,
+            default_from=self.default_from,
+            max_message_size_bytes=self.max_message_size_bytes,
+            max_attachment_size_bytes=self.max_attachment_size_bytes,
+        )
 
         use_tls = self.encryption in ("tls", "ssl")
         start_tls = self.encryption == "starttls"
@@ -130,8 +165,7 @@ class SMTPTransport(MailTransport):
 
         all_recipients = message.all_recipient_addresses()
         from_header = str(email_msg["From"])
-        _, from_address = email.utils.parseaddr(from_header)
-        sender_addr = from_address or from_header
+        _, sender_addr = parse_mail_address(from_header, field_name="from_address")
 
         try:
             async with client:
@@ -208,18 +242,22 @@ class SMTPTransport(MailTransport):
 
     async def _send_native(self, message: MailMessage) -> MailSendResult:
         """Pure-Python asynchronous RFC 5321 SMTP implementation using asyncio streams."""
-        email_msg = await Envelope.build(message, default_from=self.default_from)
+        email_msg = await Envelope.build(
+            message,
+            default_from=self.default_from,
+            max_message_size_bytes=self.max_message_size_bytes,
+            max_attachment_size_bytes=self.max_attachment_size_bytes,
+        )
         all_recipients = message.all_recipient_addresses()
         from_header = str(email_msg["From"])
-        _, from_address = email.utils.parseaddr(from_header)
-        sender_addr = from_address or from_header
+        _, sender_addr = parse_mail_address(from_header, field_name="from_address")
 
         use_tls = self.encryption in ("tls", "ssl")
         start_tls = self.encryption == "starttls"
         ssl_ctx = self._create_ssl_context() if (use_tls or start_tls) else None
 
         try:
-            reader, writer = await asyncio.wait_for(
+            reader, current_writer = await asyncio.wait_for(
                 asyncio.open_connection(
                     self.host,
                     self.port,
@@ -227,6 +265,7 @@ class SMTPTransport(MailTransport):
                 ),
                 timeout=self.timeout,
             )
+            _kept_plain_writer = current_writer
         except TimeoutError as exc:
             raise MailTimeoutError(
                 f"Connection to SMTP server {self.host}:{self.port} timed out"
@@ -257,8 +296,8 @@ class SMTPTransport(MailTransport):
             return code, "\n".join(lines)
 
         async def _send_cmd(cmd: str) -> tuple[int, str]:
-            writer.write(f"{cmd}\r\n".encode())
-            await writer.drain()
+            current_writer.write(f"{cmd}\r\n".encode())
+            await current_writer.drain()
             return await _read_reply()
 
         try:
@@ -287,20 +326,20 @@ class SMTPTransport(MailTransport):
                     )
 
                 loop = asyncio.get_running_loop()
-                protocol = getattr(writer, "_protocol", None)
-                if not isinstance(protocol, asyncio.BaseProtocol):
-                    raise MailTransportError(
-                        "Stream protocol unavailable for TLS upgrade"
-                    )
+                protocol = current_writer.transport.get_protocol()
                 new_transport = await loop.start_tls(
-                    writer.transport,
+                    current_writer.transport,
                     protocol,
                     ssl_ctx,
                     server_hostname=self.host if self.validate_certs else None,
                 )
-                writer._transport = new_transport  # type: ignore[attr-defined]
-                if protocol and hasattr(protocol, "_transport"):
-                    protocol._transport = new_transport
+                if not isinstance(new_transport, asyncio.WriteTransport):
+                    raise MailTransportError(
+                        "Stream transport unavailable after TLS upgrade"
+                    )
+                current_writer = asyncio.StreamWriter(
+                    new_transport, protocol, reader, loop
+                )
 
                 code, ehlo_post_tls = await _send_cmd("EHLO swiftpy.local")
                 if code != 250:
@@ -313,7 +352,7 @@ class SMTPTransport(MailTransport):
                 auth_str = f"\0{self.username}\0{self.password}".encode()
                 auth_b64 = base64.b64encode(auth_str).decode("ascii")
                 code, auth_resp = await _send_cmd(f"AUTH PLAIN {auth_b64}")
-                if code == 535 or (code >= 500 and code != 502):
+                if code == 535 or (code >= 500 and code not in (500, 501, 502, 504)):
                     raise MailAuthenticationError(
                         f"SMTP authentication failed ({code}): {auth_resp}"
                     )
@@ -373,16 +412,16 @@ class SMTPTransport(MailTransport):
 
             # 8. Transmit message with RFC 5321 dot-stuffing
             raw_bytes = email_msg.as_bytes()
-            lines = raw_bytes.splitlines()
-            stuffed_lines: list[bytes] = []
-            for line in lines:
-                if line.startswith(b"."):
-                    stuffed_lines.append(b"." + line)
-                else:
-                    stuffed_lines.append(line)
+            normalized_bytes = raw_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if normalized_bytes.endswith(b"\n"):
+                normalized_bytes = normalized_bytes[:-1]
+            stuffed_lines = [
+                b"." + line if line.startswith(b".") else line
+                for line in normalized_bytes.split(b"\n")
+            ]
             body_payload = b"\r\n".join(stuffed_lines) + b"\r\n.\r\n"
-            writer.write(body_payload)
-            await writer.drain()
+            current_writer.write(body_payload)
+            await current_writer.drain()
 
             msg_code, msg_resp = await _read_reply()
             if msg_code not in (250, 200):
@@ -413,18 +452,15 @@ class SMTPTransport(MailTransport):
 
         except TimeoutError as exc:
             raise MailTimeoutError(f"SMTP transmission timed out: {exc}") from exc
-        except (
-            ConnectionResetError,
-            BrokenPipeError,
-            ConnectionAbortedError,
-        ) as exc:
-            raise MailConnectionError(f"SMTP connection lost: {exc}") from exc
+        except (OSError, ssl.SSLError) as exc:
+            raise MailConnectionError(f"SMTP connection or TLS error: {exc}") from exc
         finally:
             try:
-                writer.close()
-                await writer.wait_closed()
+                current_writer.close()
+                await current_writer.wait_closed()
             except (OSError, TimeoutError):
                 logger.debug("Error while closing SMTP client writer", exc_info=True)
+            del _kept_plain_writer
 
 
 __all__ = ["SMTPTransport"]

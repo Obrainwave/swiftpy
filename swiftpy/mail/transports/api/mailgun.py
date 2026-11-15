@@ -5,9 +5,11 @@ from typing import Any
 import httpx
 
 from swiftpy.mail.exceptions import MailConfigurationError, MailValidationError
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.message import MailMessage, format_mail_address
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.transports.api.base import ApiMailTransport
+
+type _MultipartFileValue = tuple[str | None, str] | tuple[str | None, bytes, str]
 
 
 class MailgunTransport(ApiMailTransport):
@@ -23,8 +25,16 @@ class MailgunTransport(ApiMailTransport):
         endpoint: str = "https://api.mailgun.net/v3",
         client: httpx.AsyncClient | None = None,
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> None:
-        super().__init__(timeout=timeout, client=client, default_from=default_from)
+        super().__init__(
+            timeout=timeout,
+            client=client,
+            default_from=default_from,
+            max_attachment_size_bytes=max_attachment_size_bytes,
+            max_message_size_bytes=max_message_size_bytes,
+        )
         self.api_key = api_key
         self.domain = domain
         self.endpoint = endpoint.rstrip("/")
@@ -34,6 +44,8 @@ class MailgunTransport(ApiMailTransport):
         cls,
         config: dict[str, Any],
         default_from: tuple[str, str | None] | None = None,
+        max_attachment_size_bytes: int | None = None,
+        max_message_size_bytes: int | None = None,
     ) -> MailgunTransport:
         api_key = str(config.get("api_key", ""))
         domain = str(config.get("domain", ""))
@@ -45,6 +57,12 @@ class MailgunTransport(ApiMailTransport):
             timeout=timeout,
             endpoint=endpoint,
             default_from=default_from,
+            max_attachment_size_bytes=cls._resolve_size_limit(
+                max_attachment_size_bytes, config, "max_attachment_size_bytes"
+            ),
+            max_message_size_bytes=cls._resolve_size_limit(
+                max_message_size_bytes, config, "max_message_size_bytes"
+            ),
         )
 
     async def send(self, message: MailMessage) -> MailSendResult:
@@ -61,54 +79,63 @@ class MailgunTransport(ApiMailTransport):
         from_addr, from_name = self._resolve_from(
             message.from_address, message.from_name
         )
-        formatted_from = f"{from_name} <{from_addr}>" if from_name else from_addr
+        formatted_from = format_mail_address(from_addr, from_name, field_name="from")
 
-        form_data: dict[str, Any] = {
-            "from": formatted_from,
-            "subject": message.subject,
-            "to": message.to,
-        }
-        if message.cc:
-            form_data["cc"] = message.cc
-        if message.bcc:
-            form_data["bcc"] = message.bcc
+        multipart_fields: list[tuple[str, _MultipartFileValue]] = [
+            ("from", (None, formatted_from)),
+            ("subject", (None, message.subject)),
+        ]
+        for recipient in message.to:
+            multipart_fields.append(
+                ("to", (None, format_mail_address(recipient, field_name="to")))
+            )
+        for recipient in message.cc:
+            multipart_fields.append(
+                ("cc", (None, format_mail_address(recipient, field_name="cc")))
+            )
+        for recipient in message.bcc:
+            multipart_fields.append(
+                ("bcc", (None, format_mail_address(recipient, field_name="bcc")))
+            )
 
         if message.reply_to:
-            form_data["h:Reply-To"] = message.reply_to
+            multipart_fields.append(
+                (
+                    "h:Reply-To",
+                    (None, format_mail_address(message.reply_to, field_name="reply_to")),
+                )
+            )
 
         if message.text_body:
-            form_data["text"] = message.text_body
+            multipart_fields.append(("text", (None, message.text_body)))
         if message.html_body:
-            form_data["html"] = message.html_body
+            multipart_fields.append(("html", (None, message.html_body)))
         if not message.text_body and not message.html_body:
-            form_data["text"] = ""
+            multipart_fields.append(("text", (None, "")))
 
         for k, v in message.headers.items():
-            form_data[f"h:{k}"] = v
+            multipart_fields.append((f"h:{k}", (None, str(v))))
+        for tag in message.tags:
+            multipart_fields.append(("o:tag", (None, str(tag))))
+        for k, v in message.metadata.items():
+            multipart_fields.append((f"v:{k}", (None, str(v))))
 
-        files: list[tuple[str, tuple[str, bytes, str]]] = []
-        for att in message.attachments:
-            content = await att.read_bytes()
+        loaded_attachments = await self._read_attachments_with_limits(message)
+        for att, content in loaded_attachments:
             field_name = "inline" if att.disposition == "inline" else "attachment"
-            files.append((field_name, (att.filename, content, att.content_type)))
+            multipart_fields.append(
+                (field_name, (att.filename, content, att.content_type))
+            )
 
         url = f"{self.endpoint}/{self.domain}/messages"
         client = await self._get_client()
 
         try:
-            if files:
-                response = await client.post(
-                    url,
-                    data=form_data,
-                    files=files,
-                    auth=("api", self.api_key),
-                )
-            else:
-                response = await client.post(
-                    url,
-                    data=form_data,
-                    auth=("api", self.api_key),
-                )
+            response = await client.post(
+                url,
+                files=multipart_fields,
+                auth=("api", self.api_key),
+            )
             response.raise_for_status()
             try:
                 res_data = response.json()
@@ -119,7 +146,7 @@ class MailgunTransport(ApiMailTransport):
                 success=True,
                 message_id=msg_id,
                 provider="mailgun",
-                accepted=list(message.to),
+                accepted=message.all_recipient_addresses(),
                 rejected=[],
                 raw_response=res_data,
             )

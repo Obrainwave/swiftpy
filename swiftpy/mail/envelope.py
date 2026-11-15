@@ -9,7 +9,12 @@ from swiftpy.mail.exceptions import (
     AttachmentTooLargeError,
     MailValidationError,
 )
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.message import (
+    MailMessage,
+    _validate_no_crlf,
+    format_mail_address,
+    parse_mail_address,
+)
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
@@ -21,9 +26,7 @@ def _html_to_plain_text(html_content: str) -> str:
 
 
 def _format_address(address: str, name: str | None = None) -> str:
-    if name:
-        return email.utils.formataddr((name, address))
-    return address
+    return format_mail_address(address, name, field_name="address")
 
 
 class Envelope:
@@ -52,12 +55,23 @@ class Envelope:
         from_addr = message.from_address
         from_name = message.from_name
         if not from_addr and default_from:
-            from_addr, default_name = default_from
+            default_addr, default_name = default_from
+            if default_addr:
+                parsed_name, parsed_addr = parse_mail_address(
+                    default_addr, field_name="default_from"
+                )
+                from_addr = parsed_addr
+            else:
+                parsed_name = ""
+            if default_name:
+                _validate_no_crlf(default_name, "default_from_name")
             if not from_name:
-                from_name = default_name
+                from_name = default_name or parsed_name or None
 
         if from_addr:
-            msg["From"] = _format_address(from_addr, from_name)
+            msg["From"] = format_mail_address(
+                from_addr, from_name, field_name="from_address"
+            )
         else:
             raise MailValidationError(
                 "Email message must specify a from_address or have a default configured"
@@ -65,15 +79,21 @@ class Envelope:
 
         # To
         if message.to:
-            msg["To"] = ", ".join(message.to)
+            msg["To"] = ", ".join(
+                format_mail_address(r, field_name="to") for r in message.to
+            )
 
         # Cc
         if message.cc:
-            msg["Cc"] = ", ".join(message.cc)
+            msg["Cc"] = ", ".join(
+                format_mail_address(r, field_name="cc") for r in message.cc
+            )
 
         # Reply-To
         if message.reply_to:
-            msg["Reply-To"] = message.reply_to
+            msg["Reply-To"] = format_mail_address(
+                message.reply_to, field_name="reply_to"
+            )
 
         # Date & Message-ID
         msg["Date"] = email.utils.formatdate(localtime=False)

@@ -2,11 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -378,7 +374,7 @@ class SimulatedRedisClient:
 
 async def test_redis_store_default_and_custom_ttl() -> None:
     fake = SimulatedRedisClient()
-    store = RedisConversationStore(redis_client=fake, default_ttl=3600)  # type: ignore[arg-type]
+    store = RedisConversationStore(redis_client=fake, default_ttl=3600)
 
     conv = Conversation().add_system("Sys").add_user("U1")
 
@@ -397,7 +393,7 @@ async def test_redis_store_default_and_custom_ttl() -> None:
 
 async def test_redis_store_handles_corrupted_json() -> None:
     fake = SimulatedRedisClient()
-    store = RedisConversationStore(redis_client=fake)  # type: ignore[arg-type]
+    store = RedisConversationStore(redis_client=fake)
 
     fake.data["ai:conversation:corrupt_session"] = "{bad json corrupted"
 
@@ -407,7 +403,7 @@ async def test_redis_store_handles_corrupted_json() -> None:
 
 async def test_redis_store_translates_exists_and_delete_errors() -> None:
     fake = SimulatedRedisClient()
-    store = RedisConversationStore(redis_client=fake)  # type: ignore[arg-type]
+    store = RedisConversationStore(redis_client=fake)
 
     fake.fail_ops.add("exists")
     with pytest.raises(AIConnectionError, match="Failed to check conversation existence"):
@@ -421,7 +417,7 @@ async def test_redis_store_translates_exists_and_delete_errors() -> None:
 
 async def test_redis_store_session_isolation_and_replacement() -> None:
     fake = SimulatedRedisClient()
-    store = RedisConversationStore(redis_client=fake)  # type: ignore[arg-type]
+    store = RedisConversationStore(redis_client=fake)
 
     conv1 = Conversation().add_user("User A")
     conv2 = Conversation().add_user("User B")

@@ -4,16 +4,30 @@ import asyncio
 import html
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-try:
-    import jinja2
-except ImportError:
-    jinja2 = None
+from typing import Any, Protocol
 
 from swiftpy.mail.exceptions import MailValidationError
+
+
+class _Jinja2Module(Protocol):
+    FileSystemLoader: Any
+    select_autoescape: Any
+
+
+_jinja_sandbox_env_cls: Callable[..., Any] | None
+jinja2: _Jinja2Module | None
+try:
+    import jinja2 as _jinja2
+    from jinja2.sandbox import SandboxedEnvironment as _SandboxedEnvironment
+
+    jinja2 = _jinja2
+    _jinja_sandbox_env_cls = _SandboxedEnvironment
+except ImportError:
+    jinja2 = None
+    _jinja_sandbox_env_cls = None
 
 logger = logging.getLogger("swiftpy.mail.templates")
 
@@ -38,11 +52,11 @@ class MailTemplateRenderer:
 
     _instance: MailTemplateRenderer | None = None
 
-    def __init__(self, template_dir: str | Path = "resources/views") -> None:
+    def __init__(self, template_dir: str | Path = "views") -> None:
         self.template_dir = Path(template_dir)
         self._jinja_env: Any = None
-        if jinja2 is not None:
-            self._jinja_env = jinja2.Environment(
+        if jinja2 is not None and _jinja_sandbox_env_cls is not None:
+            self._jinja_env = _jinja_sandbox_env_cls(
                 loader=jinja2.FileSystemLoader(str(self.template_dir)),
                 autoescape=jinja2.select_autoescape(["html", "xml"]),
                 enable_async=True,
@@ -92,11 +106,15 @@ class MailTemplateRenderer:
             text_template_file = f"{base_name}.txt"
 
             if await asyncio.to_thread(html_path.is_file):
-                template = self._jinja_env.get_template(html_template_file)
+                template = await asyncio.to_thread(
+                    self._jinja_env.get_template, html_template_file
+                )
                 html_content = await template.render_async(context)
 
             if await asyncio.to_thread(text_path.is_file):
-                template = self._jinja_env.get_template(text_template_file)
+                template = await asyncio.to_thread(
+                    self._jinja_env.get_template, text_template_file
+                )
                 text_content = await template.render_async(context)
         else:
             if await asyncio.to_thread(html_path.is_file):
@@ -128,6 +146,10 @@ class MailTemplateRenderer:
             parts = path.split(".")
             curr: Any = context
             for part in parts:
+                if part.startswith("_"):
+                    raise MailValidationError(
+                        f"Access to private or dunder template attribute '{part}' is forbidden"
+                    )
                 if isinstance(curr, dict) and part in curr:
                     curr = curr[part]
                 elif hasattr(curr, part):

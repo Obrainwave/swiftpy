@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -254,7 +255,7 @@ async def test_increment_and_decrement(
 
     # Guard against non-numeric
     with pytest.raises(TypeError, match="must be a numeric"):
-        await qb.increment("views", "five")  # type: ignore[arg-type]
+        await qb.increment("views", json.loads('"five"'))
 
     # Guard against unconstrained mass update
     qb_unguarded = Query.table("articles")
@@ -404,24 +405,24 @@ def test_empty_where_group_is_omitted() -> None:
 def test_where_in_empty_list_compiles_to_false() -> None:
     qb = Query.table("users").where_in("id", [])
     sql, bindings = qb.to_sql()
-    assert 'WHERE 1 = 0' in sql
+    assert 'WHERE FALSE' in sql
     assert bindings == []
 
     qb_chained = Query.table("users").where("status", "active").or_where_in("id", [])
     sql2, bindings2 = qb_chained.to_sql()
-    assert 'WHERE "status" = $1 OR 1 = 0' in sql2
+    assert 'WHERE "status" = $1 OR FALSE' in sql2
     assert bindings2 == ["active"]
 
 
 def test_where_not_in_empty_list_compiles_to_true() -> None:
     qb = Query.table("users").where_not_in("id", [])
     sql, bindings = qb.to_sql()
-    assert 'WHERE 1 = 1' in sql
+    assert 'WHERE TRUE' in sql
     assert bindings == []
 
     qb_chained = Query.table("users").where("status", "active").where_not_in("id", [])
     sql2, bindings2 = qb_chained.to_sql()
-    assert 'WHERE "status" = $1 AND 1 = 1' in sql2
+    assert 'WHERE "status" = $1 AND TRUE' in sql2
     assert bindings2 == ["active"]
 
 

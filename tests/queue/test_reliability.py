@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import uuid
+from collections.abc import Generator
+from typing import TypedDict
 
 import pytest
 import redis.asyncio as aioredis
@@ -11,6 +13,7 @@ import redis.asyncio as aioredis
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
 from swiftpy.queue.worker import QueueWorker
+from swiftpy.support.redis_config import resolve_redis_params
 
 
 class RecordingJob(Job):
@@ -22,9 +25,17 @@ class RecordingJob(Job):
         self.value = value
 
     async def handle(self) -> None:
-        host = os.getenv("REDIS_HOST", "127.0.0.1")
-        port = int(os.getenv("REDIS_PORT", "6379"))
-        client = aioredis.Redis(host=host, port=port, decode_responses=True)
+        params = resolve_redis_params(section="queue")
+        host = os.getenv("REDIS_HOST", str(params["host"]))
+        port = int(os.getenv("REDIS_PORT", str(params["port"])))
+        db = int(params["database"])
+        client = aioredis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=os.getenv("REDIS_PASSWORD") or params["password"],
+            decode_responses=True,
+        )
         try:
             await client.rpush(self.key, str(self.value))
         finally:
@@ -37,9 +48,17 @@ class BlockingJob(Job):
         self.started_key = started_key
 
     async def handle(self) -> None:
-        host = os.getenv("REDIS_HOST", "127.0.0.1")
-        port = int(os.getenv("REDIS_PORT", "6379"))
-        c = aioredis.Redis(host=host, port=port, decode_responses=True)
+        params = resolve_redis_params(section="queue")
+        host = os.getenv("REDIS_HOST", str(params["host"]))
+        port = int(os.getenv("REDIS_PORT", str(params["port"])))
+        db = int(params["database"])
+        c = aioredis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=os.getenv("REDIS_PASSWORD") or params["password"],
+            decode_responses=True,
+        )
         try:
             await c.set(self.started_key, "started")
             await asyncio.sleep(10.0)  # Long running task
@@ -47,23 +66,42 @@ class BlockingJob(Job):
             await c.aclose()
 
 
+@pytest.fixture(autouse=True)
+def allow_reliability_jobs() -> Generator[None, None, None]:
+    prev_trusted = Job._trusted_classes.copy()
+    Job.allow_job_class(RecordingJob)
+    Job.allow_job_class(BlockingJob)
+    try:
+        yield
+    finally:
+        Job._trusted_classes = prev_trusted
+
+
+class _RedisParams(TypedDict):
+    host: str
+    port: int
+    password: str | None
+    prefix: str
+
+
 @pytest.fixture
-def redis_params() -> dict[str, object]:
+def redis_params() -> _RedisParams:
     return {
         "host": os.getenv("REDIS_HOST", "127.0.0.1"),
         "port": int(os.getenv("REDIS_PORT", "6379")),
+        "password": os.getenv("REDIS_PASSWORD") or None,
         "prefix": f"test_q_{uuid.uuid4().hex[:6]}:",
     }
 
 
 @pytest.mark.asyncio
 async def test_successful_job_is_acked_and_removed_from_processing_and_leases(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """Verifies that an executed job is acked and removed from processing and lease sets."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
     res_key = f"res_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         job = RecordingJob(key=res_key, value="done")
@@ -94,11 +132,11 @@ async def test_successful_job_is_acked_and_removed_from_processing_and_leases(
 
 @pytest.mark.asyncio
 async def test_kill_after_pop_redelivers_expired_lease_via_reaper(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """Simulates a worker dying after pop without acking; reaper redelivers expired job."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         job = RecordingJob(key="dummy_key", value="survived", tries=3)
@@ -143,11 +181,11 @@ async def test_kill_after_pop_redelivers_expired_lease_via_reaper(
 
 @pytest.mark.asyncio
 async def test_reaper_moves_expired_job_to_dlq_when_tries_exhausted(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """If a job's lease expires and attempts >= tries, reaper moves it directly to DLQ."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         # Job allows only 1 try
@@ -180,11 +218,11 @@ async def test_reaper_moves_expired_job_to_dlq_when_tries_exhausted(
 
 @pytest.mark.asyncio
 async def test_cancellation_requeues_job_at_head_preserving_attempts(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """A worker task cancelled mid-execution releases the job back to the head of the queue."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         started_key = f"started_{uuid.uuid4().hex[:6]}"

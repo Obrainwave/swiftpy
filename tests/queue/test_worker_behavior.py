@@ -4,13 +4,18 @@ import asyncio
 import os
 import signal
 import uuid
+from collections.abc import Generator
+from typing import TypedDict
+from unittest.mock import AsyncMock
 
 import pytest
 import redis.asyncio as aioredis
 
+from swiftpy.console.cli import CLI
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
 from swiftpy.queue.worker import QueueWorker
+from swiftpy.support.redis_config import resolve_redis_params
 
 
 class FastJob(Job):
@@ -30,9 +35,17 @@ class ConcurrentTrackingJob(Job):
         self.index = index
 
     async def handle(self) -> None:
-        host = os.getenv("REDIS_HOST", "127.0.0.1")
-        port = int(os.getenv("REDIS_PORT", "6379"))
-        c = aioredis.Redis(host=host, port=port, decode_responses=True)
+        params = resolve_redis_params(section="queue")
+        host = os.getenv("REDIS_HOST", str(params["host"]))
+        port = int(os.getenv("REDIS_PORT", str(params["port"])))
+        db = int(params["database"])
+        c = aioredis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=os.getenv("REDIS_PASSWORD") or params["password"],
+            decode_responses=True,
+        )
         try:
             curr = await c.incr(f"{self.key}:active")
             await c.rpush(f"{self.key}:max", str(curr))
@@ -42,11 +55,30 @@ class ConcurrentTrackingJob(Job):
             await c.aclose()
 
 
+@pytest.fixture(autouse=True)
+def allow_worker_behavior_jobs() -> Generator[None, None, None]:
+    prev_trusted = Job._trusted_classes.copy()
+    Job.allow_job_class(FastJob)
+    Job.allow_job_class(ConcurrentTrackingJob)
+    try:
+        yield
+    finally:
+        Job._trusted_classes = prev_trusted
+
+
+class _RedisParams(TypedDict):
+    host: str
+    port: int
+    password: str | None
+    prefix: str
+
+
 @pytest.fixture
-def redis_params() -> dict[str, object]:
+def redis_params() -> _RedisParams:
     return {
         "host": os.getenv("REDIS_HOST", "127.0.0.1"),
         "port": int(os.getenv("REDIS_PORT", "6379")),
+        "password": os.getenv("REDIS_PASSWORD") or None,
         "prefix": f"test_wb_{uuid.uuid4().hex[:6]}:",
     }
 
@@ -68,12 +100,12 @@ def test_invalid_queue_names_raise_value_error() -> None:
 
 @pytest.mark.asyncio
 async def test_worker_concurrency_bound_respected(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """When concurrency=3, no more than 3 jobs execute concurrently."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
     track_key = f"track_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         # Push 6 jobs
@@ -103,11 +135,11 @@ async def test_worker_concurrency_bound_respected(
 
 @pytest.mark.asyncio
 async def test_failed_list_capping(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """Dead letter queue must be capped by failed_max_size."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params, failed_max_size=3)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params, failed_max_size=3)
 
     try:
         # Push 6 failures
@@ -131,11 +163,11 @@ async def test_failed_list_capping(
 
 @pytest.mark.asyncio
 async def test_retry_failed_and_flush_failed_helpers(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
 ) -> None:
     """Verify retry_failed and flush_failed helpers on dispatcher."""
     q_name = f"q_{uuid.uuid4().hex[:6]}"
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
 
     try:
         job1 = FastJob(key="k1", index=1)
@@ -176,32 +208,24 @@ async def test_retry_failed_and_flush_failed_helpers(
 
 
 @pytest.mark.asyncio
-async def test_signal_handlers_restored_on_worker_exit() -> None:
+async def test_signal_handlers_restored_on_worker_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Worker must restore original signal handlers upon exit."""
     orig_sigterm = signal.getsignal(signal.SIGTERM)
     worker = QueueWorker(queues="default", stop_when_empty=True, sleep=0.01)
 
-    # Mock dispatcher to avoid connecting to redis
-    class FakeDispatcher:
-        async def reap_expired_leases(self, q: str) -> int:
-            return 0
-
-        async def pop_and_lease(self, *a: object, **kw: object) -> None:
-            return None
-
-        async def size(self, q: str) -> int:
-            return 0
-
-        async def delayed_size(self, q: str) -> int:
-            return 0
-
-        async def processing_size(self, q: str) -> int:
-            return 0
-
-        async def close(self) -> None:
-            pass
-
-    worker.dispatcher = FakeDispatcher()  # type: ignore[assignment]
+    # Mock dispatcher methods to avoid connecting to redis
+    monkeypatch.setattr(
+        worker.dispatcher, "reap_expired_leases", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        worker.dispatcher, "pop_and_lease", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(worker.dispatcher, "size", AsyncMock(return_value=0))
+    monkeypatch.setattr(worker.dispatcher, "delayed_size", AsyncMock(return_value=0))
+    monkeypatch.setattr(worker.dispatcher, "processing_size", AsyncMock(return_value=0))
+    monkeypatch.setattr(worker.dispatcher, "close", AsyncMock())
     await worker.work()
 
     curr_sigterm = signal.getsignal(signal.SIGTERM)
@@ -210,12 +234,10 @@ async def test_signal_handlers_restored_on_worker_exit() -> None:
 
 @pytest.mark.asyncio
 async def test_queue_cli_commands_and_app_failure(
-    redis_params: dict[str, object],
+    redis_params: _RedisParams,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify queue:failed, queue:retry, and queue:flush CLI commands and --app failure."""
-    from swiftpy.console.cli import CLI
-
     q_name = f"q_{uuid.uuid4().hex[:6]}"
     prefix = str(redis_params["prefix"])
 
@@ -225,7 +247,7 @@ async def test_queue_cli_commands_and_app_failure(
         cli.run(["queue:work", "--app", "nonexistent_app_module:app", "--prefix", prefix])
 
     # 2. Add failed job directly
-    dispatcher = QueueDispatcher(**redis_params)  # type: ignore[arg-type]
+    dispatcher = QueueDispatcher(**redis_params)
     try:
         await dispatcher.push_failed(
             job=None,

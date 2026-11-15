@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from swiftpy.core.context import Context
 from swiftpy.core.exceptions import HttpException
 from swiftpy.http.middleware import Handler, Middleware
@@ -17,14 +19,22 @@ class AdminMiddleware(Middleware):
     """
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
-        user = Context.get("auth.user") or request.state.get("user")
-        if not user:
+        user = Context.get("auth.user")
+        if user is None:
+            user = Context.get("__swiftpy_current_user__")
+        if user is None:
+            user = request.state.get("user")
+        if user is None:
             raise HttpException(
                 status_code=401,
                 message="Unauthenticated: Please authenticate first",
             )
 
-        is_admin = getattr(user, "is_admin", False)
+        is_admin = (
+            user.get("is_admin") is True
+            if isinstance(user, Mapping)
+            else getattr(user, "is_admin", None) is True
+        )
         if not is_admin:
             raise HttpException(
                 status_code=403,

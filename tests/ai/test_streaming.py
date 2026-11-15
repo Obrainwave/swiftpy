@@ -5,11 +5,7 @@ import json
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import Any
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
+import httpx
 import pytest
 
 from swiftpy.ai.client import AI

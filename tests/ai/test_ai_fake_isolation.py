@@ -127,12 +127,11 @@ async def test_rag_pipeline_interception() -> None:
     store = VectorStore.in_memory(collection="rag_fake_test", dimensions=1536)
     retriever = Retriever(vectorstore=store, top_k=2)
 
-    await retriever.add_documents(
-        documents=["SwiftPY features an asynchronous ASGI core."],
-        ids=["doc_1"],
-    )
-
     with AI.fake("Sourced answer: SwiftPY is asynchronous.") as fake:
+        await retriever.add_documents(
+            documents=["SwiftPY features an asynchronous ASGI core."],
+            ids=["doc_1"],
+        )
         pipeline = rag().retriever(retriever)
         result = await pipeline.run("What is SwiftPY?")
         assert result.text == "Sourced answer: SwiftPY is asynchronous."

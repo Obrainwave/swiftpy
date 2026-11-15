@@ -8,6 +8,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import bcrypt
 
@@ -28,9 +29,17 @@ from swiftpy.http.response import Response, json_response, unauthorized
 
 logger = logging.getLogger("swiftpy.auth.api_key")
 
-_EPHEMERAL_PEPPER: bytes | None = None
+_EPHEMERAL_PEPPERS: WeakKeyDictionary[Config, bytes] = WeakKeyDictionary()
 _DUMMY_HASH: str = "0" * 64
 MIN_PEPPER_BYTES: int = 32
+
+
+def _prepare_bcrypt_secret(raw_key_or_secret: str) -> bytes:
+    """Encode API secret for bcrypt, SHA-256 pre-hashing secrets over bcrypt's 72-byte cap."""
+    raw_bytes = raw_key_or_secret.encode("utf-8")
+    if len(raw_bytes) > 72:
+        return hashlib.sha256(raw_bytes).hexdigest().encode("ascii")
+    return raw_bytes
 
 
 def _validate_pepper_bytes(pepper: str | bytes, *, source: str = "AUTH_KEY_PEPPER") -> bytes:
@@ -48,14 +57,21 @@ def get_server_pepper(config: Config | None = None) -> bytes:
     Retrieve the server pepper used for HMAC-SHA256 API key hashing (Decision D-2).
 
     In production (debug=False), fails fast if AUTH_KEY_PEPPER is missing or <32 bytes.
-    In debug/development mode, if missing, generates a per-process ephemeral pepper and logs a warning.
+    In debug/development mode, binds an isolated ephemeral pepper onto the resolved Config.
     """
-    global _EPHEMERAL_PEPPER
     if config is None:
+        cfg: Config | None = None
         try:
-            cfg = Config.get_instance()
-        except (RuntimeError, ValueError):
-            cfg = Config()
+            container = get_container()
+            if container.has(Config):
+                cfg = container.resolve(Config)
+        except RuntimeError:
+            pass
+        if cfg is None:
+            try:
+                cfg = Config.get_instance()
+            except (RuntimeError, ValueError):
+                cfg = Config()
     else:
         cfg = config
 
@@ -79,13 +95,15 @@ def get_server_pepper(config: Config | None = None) -> bytes:
         is_debug = app_env not in ("production", "prod")
 
     if is_debug:
-        if _EPHEMERAL_PEPPER is None:
-            _EPHEMERAL_PEPPER = secrets.token_bytes(32)
+        existing = _EPHEMERAL_PEPPERS.get(cfg)
+        if existing is None:
+            existing = secrets.token_bytes(32)
+            _EPHEMERAL_PEPPERS[cfg] = existing
             logger.warning(
                 "SECURITY WARNING: No AUTH_KEY_PEPPER configured. Generated an ephemeral "
                 "server pepper for debug/development. Set AUTH_KEY_PEPPER in your environment."
             )
-        return _EPHEMERAL_PEPPER
+        return existing
 
     raise ConfigurationError(
         "AUTH_KEY_PEPPER is not configured. A server pepper of at least 32 bytes is required in production."
@@ -114,21 +132,28 @@ def generate_api_key(prefix: str = "sk_live_") -> tuple[str, str, str]:
 def hash_api_key(
     raw_key_or_secret: str,
     pepper: str | bytes | None = None,
-    rounds: int = 12,
+    rounds: int | None = None,
+    *,
+    config: Config | None = None,
 ) -> str:
     """
-    Hash an API key secret using HMAC-SHA256 with server pepper (Decision D-2),
-    or fallback to bcrypt if rounds is explicitly provided without pepper.
+    Hash an API key secret using HMAC-SHA256 with the server pepper (Decision D-2).
+    Defaults to get_server_pepper(config) when pepper is omitted; uses legacy bcrypt
+    only when rounds is explicitly requested without a pepper.
     """
-    if pepper is not None:
-        p_bytes = _validate_pepper_bytes(pepper, source="Server pepper")
+    if pepper is not None or rounds is None:
+        p_bytes = (
+            _validate_pepper_bytes(pepper, source="Server pepper")
+            if pepper is not None
+            else get_server_pepper(config)
+        )
         return hmac.new(
             p_bytes, raw_key_or_secret.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    # Legacy bcrypt fallback
+    # Legacy bcrypt opt-in (only when rounds is explicitly provided without pepper)
     salt = bcrypt.gensalt(rounds=rounds)
-    return bcrypt.hashpw(raw_key_or_secret.encode("utf-8"), salt).decode("utf-8")
+    return bcrypt.hashpw(_prepare_bcrypt_secret(raw_key_or_secret), salt).decode("utf-8")
 
 
 def verify_api_key_hash(
@@ -143,7 +168,7 @@ def verify_api_key_hash(
     if hashed.startswith("$2"):
         try:
             return bcrypt.checkpw(
-                raw_key_or_secret.encode("utf-8"), hashed.encode("utf-8")
+                _prepare_bcrypt_secret(raw_key_or_secret), hashed.encode("utf-8")
             )
         except (ValueError, TypeError):
             return False

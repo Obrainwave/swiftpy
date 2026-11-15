@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import abc
+import asyncio
+import datetime
+import hashlib
 import json
 import logging
-from collections.abc import Sequence
-from typing import Any
+import time
+import weakref
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from typing import Any, ClassVar
 
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
@@ -14,11 +20,35 @@ from swiftpy.ai.exceptions import AIConnectionError
 from swiftpy.ai.providers.base import Message, ToolCall
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
-from swiftpy.database.identifiers import quote_identifier, validate_identifier
+from swiftpy.database.identifiers import (
+    MAX_IDENTIFIER_LENGTH,
+    quote_identifier,
+    validate_identifier,
+)
 from swiftpy.database.pool import DatabasePool
+from swiftpy.database.transaction import get_active_connection
 from swiftpy.support.redis_config import resolve_redis_params
 
 logger = logging.getLogger("swiftpy.ai.agents.memory")
+
+
+def _bounded_index_name(table_name: str, suffix: str = "_session") -> str:
+    """Return a PostgreSQL identifier within MAX_IDENTIFIER_LENGTH (63 bytes)."""
+    candidate = f"idx_{table_name}{suffix}"
+    if len(candidate.encode()) <= MAX_IDENTIFIER_LENGTH:
+        return validate_identifier(candidate)
+    digest = hashlib.sha256(f"{table_name}:{suffix}".encode()).hexdigest()[:8]
+    tail = f"_{digest}{suffix}"
+    prefix_budget = MAX_IDENTIFIER_LENGTH - len(tail.encode())
+    trimmed_prefix = f"idx_{table_name}"[:prefix_budget].rstrip("_")
+    return validate_identifier(f"{trimmed_prefix}{tail}")
+
+
+def _resolve_expiry(ttl: float | None, default_ttl: float | None) -> datetime.datetime | None:
+    effective = ttl if ttl is not None else default_ttl
+    if effective is None or effective <= 0:
+        return None
+    return datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=float(effective))
 
 
 def _serialize_tool_call(tc: ToolCall) -> dict[str, Any]:
@@ -152,14 +182,47 @@ class BaseMemoryBackend(abc.ABC):
 class InMemoryMemoryBackend(BaseMemoryBackend):
     """
     In-memory agent memory backend for unit tests, local debugging,
-    and ephemeral agent executions.
+    and ephemeral agent executions with optional TTL expiration.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, default_ttl: float | None = None) -> None:
+        if default_ttl is not None and (
+            isinstance(default_ttl, bool)
+            or not isinstance(default_ttl, (int, float))
+            or float(default_ttl) <= 0
+        ):
+            raise ValueError(f"default_ttl must be a positive number, got {default_ttl}")
+        self.default_ttl = default_ttl
         self._messages: dict[str, list[dict[str, Any]]] = {}
         self._state: dict[str, dict[str, Any]] = {}
+        self._msg_expires: dict[str, float] = {}
+        self._state_expires: dict[str, float] = {}
+
+    def _prune_expired(self, session_id: str) -> None:
+        now = time.monotonic()
+        msg_exp = self._msg_expires.get(session_id)
+        if msg_exp is not None and now >= msg_exp:
+            self._msg_expires.pop(session_id, None)
+            self._messages.pop(session_id, None)
+        state_exp = self._state_expires.get(session_id)
+        if state_exp is not None and now >= state_exp:
+            self._state_expires.pop(session_id, None)
+            self._state.pop(session_id, None)
+
+    def _apply_ttl(
+        self,
+        expiry_map: dict[str, float],
+        session_id: str,
+        ttl: float | None,
+    ) -> None:
+        effective = ttl if ttl is not None else self.default_ttl
+        if effective is not None and effective > 0:
+            expiry_map[session_id] = time.monotonic() + float(effective)
+        else:
+            expiry_map.pop(session_id, None)
 
     async def load_messages(self, session_id: str) -> list[Message]:
+        self._prune_expired(session_id)
         stored = self._messages.get(session_id, [])
         return [_deserialize_message(item) for item in stored]
 
@@ -170,6 +233,7 @@ class InMemoryMemoryBackend(BaseMemoryBackend):
         ttl: int | None = None,
     ) -> None:
         self._messages[session_id] = [_serialize_message(m) for m in messages]
+        self._apply_ttl(self._msg_expires, session_id, ttl)
 
     async def append_message(
         self,
@@ -177,34 +241,54 @@ class InMemoryMemoryBackend(BaseMemoryBackend):
         message: Message,
         ttl: int | None = None,
     ) -> None:
+        self._prune_expired(session_id)
         if session_id not in self._messages:
             self._messages[session_id] = []
         self._messages[session_id].append(_serialize_message(message))
+        self._apply_ttl(self._msg_expires, session_id, ttl)
 
     async def clear(self, session_id: str) -> None:
         self._messages.pop(session_id, None)
         self._state.pop(session_id, None)
+        self._msg_expires.pop(session_id, None)
+        self._state_expires.pop(session_id, None)
 
     async def exists(self, session_id: str) -> bool:
+        self._prune_expired(session_id)
         return session_id in self._messages or session_id in self._state
 
     async def get_state(self, session_id: str, key: str, default: Any = None) -> Any:
+        self._prune_expired(session_id)
         return self._state.get(session_id, {}).get(key, default)
 
-    async def set_state(self, session_id: str, key: str, value: Any) -> None:
+    async def set_state(
+        self,
+        session_id: str,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ) -> None:
+        self._prune_expired(session_id)
         if session_id not in self._state:
             self._state[session_id] = {}
         self._state[session_id][key] = value
+        self._apply_ttl(self._state_expires, session_id, ttl)
 
     async def get_all_state(self, session_id: str) -> dict[str, Any]:
+        self._prune_expired(session_id)
         return dict(self._state.get(session_id, {}))
 
 
 class RedisMemoryBackend(BaseMemoryBackend):
     """
     Redis-backed agent memory backend for distributed, horizontally scalable
-    persistence across calls and worker nodes.
+    persistence across calls and worker nodes, with shared pooled clients and
+    atomic hash-based state updates.
     """
+
+    _POOLS: ClassVar[
+        weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, aioredis.ConnectionPool]]
+    ] = weakref.WeakKeyDictionary()
 
     def __init__(
         self,
@@ -227,32 +311,37 @@ class RedisMemoryBackend(BaseMemoryBackend):
         clean = session_id.strip()
         return f"{self._key_prefix}:{clean}:state"
 
+    @classmethod
+    def _get_or_create_pool(cls, url: str) -> aioredis.ConnectionPool:
+        loop = asyncio.get_running_loop()
+        loop_pools = cls._POOLS.get(loop)
+        if loop_pools is None:
+            loop_pools = {}
+            cls._POOLS[loop] = loop_pools
+        pool = loop_pools.get(url)
+        if pool is None:
+            pool = aioredis.ConnectionPool.from_url(
+                url,
+                decode_responses=True,
+                socket_timeout=5.0,
+                socket_connect_timeout=5.0,
+            )
+            loop_pools[url] = pool
+        return pool
+
     async def get_client(self) -> aioredis.Redis:
         if self._client is None:
             cfg = self._config or Config.get_instance()
             params = resolve_redis_params(cfg, section="ai")
-            connection_kwargs: dict[str, Any] = {
-                "decode_responses": True,
-                "socket_timeout": 5.0,
-                "socket_connect_timeout": 5.0,
-            }
-            if params["password"]:
-                connection_kwargs["password"] = params["password"]
-            if params["ssl"]:
-                connection_kwargs["ssl"] = True
-
-            self._client = aioredis.Redis(
-                host=params["host"],
-                port=params["port"],
-                db=params["database"],
-                **connection_kwargs,
-            )
+            redis_url = str(params["url"])
+            pool = self._get_or_create_pool(redis_url)
+            self._client = aioredis.Redis(connection_pool=pool)
         return self._client
 
     async def close(self) -> None:
         if self._owns_client and self._client is not None:
             try:
-                await self._client.aclose()
+                await self._client.aclose(close_connection_pool=False)
             except (RedisError, OSError) as exc:
                 logger.debug("Failed to close Redis client gracefully: %s", exc)
             finally:
@@ -323,35 +412,50 @@ class RedisMemoryBackend(BaseMemoryBackend):
         msg_key = self._msg_key(session_id)
         state_key = self._state_key(session_id)
         try:
-            await client.delete(msg_key)
-            await client.delete(state_key)
+            await client.delete(msg_key, state_key)
         except RedisError as exc:
             raise AIConnectionError(f"Failed to clear agent memory in Redis: {exc}") from exc
 
     async def exists(self, session_id: str) -> bool:
         client = await self.get_client()
         msg_key = self._msg_key(session_id)
+        state_key = self._state_key(session_id)
         try:
-            return bool(await client.exists(msg_key))
+            return bool(await client.exists(msg_key, state_key))
         except RedisError as exc:
             raise AIConnectionError(f"Failed to check agent memory in Redis: {exc}") from exc
 
     async def get_state(self, session_id: str, key: str, default: Any = None) -> Any:
-        state = await self.get_all_state(session_id)
-        return state.get(key, default)
-
-    async def set_state(self, session_id: str, key: str, value: Any) -> None:
         client = await self.get_client()
         state_key = self._state_key(session_id)
-        state = await self.get_all_state(session_id)
-        state[key] = value
-        payload = json.dumps(state)
-        effective_ttl = self.default_ttl
         try:
+            raw = await client.hget(state_key, key)
+        except RedisError as exc:
+            raise AIConnectionError(f"Failed to get agent state from Redis: {exc}") from exc
+        if raw is None:
+            return default
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return raw
+
+    async def set_state(
+        self,
+        session_id: str,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ) -> None:
+        client = await self.get_client()
+        state_key = self._state_key(session_id)
+        payload = json.dumps(value)
+        effective_ttl = ttl if ttl is not None else self.default_ttl
+        try:
+            pipe = client.pipeline()
+            pipe.hset(state_key, key, payload)
             if effective_ttl is not None and effective_ttl > 0:
-                await client.set(state_key, payload, ex=effective_ttl)
-            else:
-                await client.set(state_key, payload)
+                pipe.expire(state_key, effective_ttl)
+            await pipe.execute()
         except RedisError as exc:
             raise AIConnectionError(f"Failed to set agent state in Redis: {exc}") from exc
 
@@ -359,31 +463,41 @@ class RedisMemoryBackend(BaseMemoryBackend):
         client = await self.get_client()
         state_key = self._state_key(session_id)
         try:
-            raw = await client.get(state_key)
+            raw_map = await client.hgetall(state_key)
         except RedisError as exc:
             raise AIConnectionError(f"Failed to get agent state from Redis: {exc}") from exc
-        if raw is None:
+        if not raw_map:
             return {}
-        try:
-            data = json.loads(raw)
-            return dict(data) if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return {}
+        decoded: dict[str, Any] = {}
+        for k, raw_val in raw_map.items():
+            try:
+                decoded[str(k)] = json.loads(raw_val)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                decoded[str(k)] = raw_val
+        return decoded
 
 
 class DatabaseMemoryBackend(BaseMemoryBackend):
     """
     Database-backed agent memory backend storing persistent conversation
-    and agent state in PostgreSQL using parameterized queries.
-    Uses dedicated relational tables for atomic appends and concurrency safety.
+    and agent state in PostgreSQL using parameterized queries, active transaction
+    connection reuse, bounded index names, and optional TTL expiration.
     """
 
     def __init__(
         self,
         pool: DatabasePool | None = None,
         table_name: str = "agent_memories",
+        default_ttl: int | None = None,
     ) -> None:
+        if default_ttl is not None and (
+            isinstance(default_ttl, bool)
+            or not isinstance(default_ttl, (int, float))
+            or float(default_ttl) <= 0
+        ):
+            raise ValueError(f"default_ttl must be a positive number, got {default_ttl}")
         self._pool = pool
+        self.default_ttl = default_ttl
         self.table_name = validate_identifier(table_name)
         messages_table = (
             f"{table_name}_messages"
@@ -397,6 +511,7 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         )
         self.messages_table = validate_identifier(messages_table)
         self.state_table = validate_identifier(state_table)
+        self._messages_index = _bounded_index_name(self.messages_table, "_session")
         self._table_checked = False
 
     def _get_pool(self) -> DatabasePool:
@@ -409,15 +524,29 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         except Exception as exc:
             raise RuntimeError(f"DatabasePool could not be resolved for agent memory: {exc}") from exc
 
+    @asynccontextmanager
+    async def _connection(self) -> AsyncIterator[Any]:
+        active = get_active_connection()
+        if active is not None:
+            yield active
+            return
+
+        db_pool = self._get_pool()
+        try:
+            raw_pool = db_pool.get_pool()
+        except RuntimeError:
+            raw_pool = await db_pool.init()
+
+        async with raw_pool.acquire() as conn:
+            yield conn
+
     async def ensure_table(self) -> None:
-        """Create the storage tables if they do not already exist."""
+        """Create the storage tables and TTL columns if they do not already exist."""
         if self._table_checked:
             return
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
         msg_table_q = quote_identifier(self.messages_table)
         state_table_q = quote_identifier(self.state_table)
-        idx_name_q = quote_identifier(f"idx_{self.messages_table}_session")
+        idx_name_q = quote_identifier(self._messages_index)
         messages_sql = f"""
         CREATE TABLE IF NOT EXISTS {msg_table_q} (
             id BIGSERIAL PRIMARY KEY,
@@ -427,8 +556,10 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
             name VARCHAR(255),
             tool_call_id VARCHAR(255),
             tool_calls JSONB,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMPTZ
         );
+        ALTER TABLE {msg_table_q} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
         CREATE INDEX IF NOT EXISTS {idx_name_q} ON {msg_table_q} (session_id, id);
         """
         state_sql = f"""
@@ -437,25 +568,27 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
             key VARCHAR(255) NOT NULL,
             value JSONB NOT NULL,
             updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMPTZ,
             PRIMARY KEY (session_id, key)
         );
+        ALTER TABLE {state_table_q} ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
         """
-        async with raw_pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(messages_sql)
             await conn.execute(state_sql)
-        self._table_checked = True
+        if get_active_connection() is None:
+            self._table_checked = True
 
     async def load_messages(self, session_id: str) -> list[Message]:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
         sql = f"""
         SELECT role, content, name, tool_call_id, tool_calls
         FROM {quote_identifier(self.messages_table)}
         WHERE session_id = $1
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
         ORDER BY id ASC;
         """
-        async with raw_pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(sql, session_id)
 
         messages: list[Message] = []
@@ -488,14 +621,14 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         ttl: int | None = None,
     ) -> None:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
+        expires_at = _resolve_expiry(ttl, self.default_ttl)
         delete_sql = f"DELETE FROM {quote_identifier(self.messages_table)} WHERE session_id = $1;"
         insert_sql = f"""
-        INSERT INTO {quote_identifier(self.messages_table)} (session_id, role, content, name, tool_call_id, tool_calls)
-        VALUES ($1, $2, $3, $4, $5, $6);
+        INSERT INTO {quote_identifier(self.messages_table)}
+            (session_id, role, content, name, tool_call_id, tool_calls, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7);
         """
-        async with raw_pool.acquire() as conn, conn.transaction():
+        async with self._connection() as conn, conn.transaction():
             await conn.execute(delete_sql, session_id)
             for msg in messages:
                 tc_json = (
@@ -511,6 +644,7 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
                     msg.name,
                     msg.tool_call_id,
                     tc_json,
+                    expires_at,
                 )
 
     async def append_message(
@@ -520,18 +654,18 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
         ttl: int | None = None,
     ) -> None:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
+        expires_at = _resolve_expiry(ttl, self.default_ttl)
         insert_sql = f"""
-        INSERT INTO {quote_identifier(self.messages_table)} (session_id, role, content, name, tool_call_id, tool_calls)
-        VALUES ($1, $2, $3, $4, $5, $6);
+        INSERT INTO {quote_identifier(self.messages_table)}
+            (session_id, role, content, name, tool_call_id, tool_calls, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7);
         """
         tc_json = (
             json.dumps([_serialize_tool_call(tc) for tc in message.tool_calls])
             if message.tool_calls
             else None
         )
-        async with raw_pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 insert_sql,
                 session_id,
@@ -540,30 +674,50 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
                 message.name,
                 message.tool_call_id,
                 tc_json,
+                expires_at,
             )
 
     async def clear(self, session_id: str) -> None:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
-        async with raw_pool.acquire() as conn, conn.transaction():
-            await conn.execute(f"DELETE FROM {quote_identifier(self.messages_table)} WHERE session_id = $1;", session_id)
-            await conn.execute(f"DELETE FROM {quote_identifier(self.state_table)} WHERE session_id = $1;", session_id)
+        async with self._connection() as conn, conn.transaction():
+            await conn.execute(
+                f"DELETE FROM {quote_identifier(self.messages_table)} WHERE session_id = $1;",
+                session_id,
+            )
+            await conn.execute(
+                f"DELETE FROM {quote_identifier(self.state_table)} WHERE session_id = $1;",
+                session_id,
+            )
 
     async def exists(self, session_id: str) -> bool:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
-        async with raw_pool.acquire() as conn:
-            row = await conn.fetchrow(f"SELECT 1 FROM {quote_identifier(self.messages_table)} WHERE session_id = $1 LIMIT 1;", session_id)
-        return row is not None
+        sql = f"""
+        SELECT (
+            EXISTS(
+                SELECT 1 FROM {quote_identifier(self.messages_table)}
+                WHERE session_id = $1
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+            )
+            OR EXISTS(
+                SELECT 1 FROM {quote_identifier(self.state_table)}
+                WHERE session_id = $1
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+            )
+        ) AS has_memory;
+        """
+        async with self._connection() as conn:
+            val = await conn.fetchval(sql, session_id)
+        return bool(val)
 
     async def get_state(self, session_id: str, key: str, default: Any = None) -> Any:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
-        sql = f"SELECT value FROM {quote_identifier(self.state_table)} WHERE session_id = $1 AND key = $2;"
-        async with raw_pool.acquire() as conn:
+        sql = f"""
+        SELECT value FROM {quote_identifier(self.state_table)}
+        WHERE session_id = $1
+          AND key = $2
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP);
+        """
+        async with self._connection() as conn:
             row = await conn.fetchrow(sql, session_id, key)
         if not row or row["value"] is None:
             return default
@@ -575,26 +729,37 @@ class DatabaseMemoryBackend(BaseMemoryBackend):
                 return raw
         return raw
 
-    async def set_state(self, session_id: str, key: str, value: Any) -> None:
+    async def set_state(
+        self,
+        session_id: str,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ) -> None:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
+        expires_at = _resolve_expiry(ttl, self.default_ttl)
         payload = json.dumps(value)
         sql = f"""
-        INSERT INTO {quote_identifier(self.state_table)} (session_id, key, value, updated_at)
-        VALUES ($1, $2, $3::jsonb, CURRENT_TIMESTAMP)
+        INSERT INTO {quote_identifier(self.state_table)}
+            (session_id, key, value, updated_at, expires_at)
+        VALUES ($1, $2, $3::jsonb, CURRENT_TIMESTAMP, $4)
         ON CONFLICT (session_id, key)
-        DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;
+        DO UPDATE SET
+            value = EXCLUDED.value,
+            updated_at = CURRENT_TIMESTAMP,
+            expires_at = EXCLUDED.expires_at;
         """
-        async with raw_pool.acquire() as conn:
-            await conn.execute(sql, session_id, key, payload)
+        async with self._connection() as conn:
+            await conn.execute(sql, session_id, key, payload, expires_at)
 
     async def get_all_state(self, session_id: str) -> dict[str, Any]:
         await self.ensure_table()
-        pool = self._get_pool()
-        raw_pool = pool.get_pool()
-        sql = f"SELECT key, value FROM {quote_identifier(self.state_table)} WHERE session_id = $1;"
-        async with raw_pool.acquire() as conn:
+        sql = f"""
+        SELECT key, value FROM {quote_identifier(self.state_table)}
+        WHERE session_id = $1
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP);
+        """
+        async with self._connection() as conn:
             rows = await conn.fetch(sql, session_id)
         result: dict[str, Any] = {}
         for r in rows:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
 from swiftpy.core.config import ConfigurationError
 from swiftpy.validation.protocols import ValidatorRule
 from swiftpy.validation.rules.builtin import (
+    BailRule,
     BetweenRule,
     BoolRule,
     EmailRule,
@@ -25,55 +27,74 @@ from swiftpy.validation.rules.unique import UniqueRule
 
 
 def _split_unescaped(text: str, delimiter: str) -> list[str]:
-    """Split text by delimiter, ignoring escaped delimiters (e.g. \\| or \\:)."""
+    """Split text by delimiter, ignoring escaped delimiters (e.g. \\| or \\:) while preserving backslash pairs."""
     tokens: list[str] = []
     current: list[str] = []
-    escaped = False
-    for char in text:
-        if escaped:
-            if char == delimiter:
-                current.append(char)
-            elif char == "\\":
-                current.append("\\")
-            else:
-                current.append("\\" + char)
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == delimiter:
+    i = 0
+    n = len(text)
+    while i < n:
+        char = text[i]
+        if char == "\\":
+            if i + 1 < n and text[i + 1] == delimiter:
+                current.append(delimiter)
+                i += 2
+                continue
+            if i + 1 < n and text[i + 1] == "\\":
+                current.append("\\\\")
+                i += 2
+                continue
+            current.append("\\")
+            i += 1
+            continue
+        if char == delimiter:
             tokens.append("".join(current))
             current = []
-        else:
-            current.append(char)
-    if escaped:
-        current.append("\\")
+            i += 1
+            continue
+        current.append(char)
+        i += 1
     tokens.append("".join(current))
     return tokens
 
 
 def _parse_num(val: str) -> int | float:
-    """Parse string into int or float if numeric."""
+    """Parse string into finite int or float, raising ConfigurationError on invalid input."""
     clean = val.strip()
+    if not clean:
+        raise ConfigurationError("Numeric validation rule argument cannot be empty")
     try:
-        if "." in clean:
-            return float(clean)
+        if any(ch in clean for ch in (".", "e", "E")):
+            num = float(clean)
+            if not math.isfinite(num):
+                raise ConfigurationError(
+                    f"Validation rule numeric argument must be finite, got '{val}'"
+                )
+            return num
         return int(clean)
-    except ValueError:
-        return 0
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"Expected numeric validation rule argument, got '{val}'"
+        ) from exc
 
 
 def _parse_between(v: str) -> BetweenRule:
-    parts = [p.strip() for p in v.split(",") if p.strip()]
-    if len(parts) < 2:
+    parts = [p.strip() for p in v.split(",")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
         raise ConfigurationError(
             f"between rule requires min and max arguments, e.g. 'between:1,10' (got '{v}')"
         )
-    return BetweenRule(_parse_num(parts[0]), _parse_num(parts[1]))
+    min_val = _parse_num(parts[0])
+    max_val = _parse_num(parts[1])
+    if min_val > max_val:
+        raise ConfigurationError(
+            f"between rule min ({min_val}) cannot be greater than max ({max_val})"
+        )
+    return BetweenRule(min_val, max_val)
 
 
 def _parse_unique(v: str) -> UniqueRule:
     parts = [p.strip() for p in v.split(",")]
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[0] or not parts[1]:
         raise ConfigurationError(
             "unique rule requires table and column arguments, e.g. 'unique:users,email'"
         )
@@ -99,10 +120,40 @@ def _parse_unique(v: str) -> UniqueRule:
     )
 
 
+def _parse_exists(v: str) -> ExistsRule:
+    parts = [p.strip() for p in v.split(",")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ConfigurationError(
+            f"exists rule requires table and column arguments, e.g. 'exists:users,id' (got '{v}')"
+        )
+    return ExistsRule(table=parts[0], column=parts[1])
+
+
+def _parse_in_values(v: str) -> list[str]:
+    values = [x.strip() for x in v.split(",") if x.strip()]
+    if not values:
+        raise ConfigurationError(
+            f"in/not_in rule requires at least one allowed/disallowed value (got '{v}')"
+        )
+    return values
+
+
+def _parse_regex(v: str) -> RegexRule:
+    pattern = v.strip()
+    if not pattern:
+        raise ConfigurationError("regex rule requires a non-empty pattern argument")
+    return RegexRule(pattern)
+
+
 def _parse_email(v: str = "") -> EmailRule:
     if v:
         return EmailRule(lowercase=(v.strip().lower() in ("lowercase", "ci", "lc")))
     return EmailRule()
+
+
+_REQUIRED_ARG_RULES: frozenset[str] = frozenset(
+    {"min", "max", "between", "in", "in_", "not_in", "regex", "unique", "exists"}
+)
 
 
 class RuleRegistry:
@@ -118,6 +169,7 @@ class RuleRegistry:
     def _register_builtins(self) -> None:
         self.register("required", RequiredRule)
         self.register("nullable", NullableRule)
+        self.register("bail", BailRule)
         self.register("str", StrRule)
         self.register("string", StrRule)
         self.register("int", IntRule)
@@ -130,27 +182,12 @@ class RuleRegistry:
         self.register("min", lambda v: MinRule(_parse_num(v)))
         self.register("max", lambda v: MaxRule(_parse_num(v)))
         self.register("between", _parse_between)
-        self.register(
-            "in",
-            lambda v: InRule([x.strip() for x in v.split(",") if x.strip()]),
-        )
-        self.register(
-            "in_",
-            lambda v: InRule([x.strip() for x in v.split(",") if x.strip()]),
-        )
-        self.register(
-            "not_in",
-            lambda v: NotInRule([x.strip() for x in v.split(",") if x.strip()]),
-        )
-        self.register("regex", lambda v: RegexRule(v.strip()))
+        self.register("in", lambda v: InRule(_parse_in_values(v)))
+        self.register("in_", lambda v: InRule(_parse_in_values(v)))
+        self.register("not_in", lambda v: NotInRule(_parse_in_values(v)))
+        self.register("regex", _parse_regex)
         self.register("unique", _parse_unique)
-        self.register(
-            "exists",
-            lambda v: ExistsRule(
-                table=v.split(",")[0].strip(),
-                column=v.split(",")[1].strip(),
-            ),
-        )
+        self.register("exists", _parse_exists)
 
     def register(self, name: str, rule_target: Any) -> None:
         """Register a custom rule by name."""
@@ -202,17 +239,31 @@ class RuleRegistry:
                 raise ValueError(f"Unknown validation rule '{name}'")
 
             if arg is not None:
+                if name in _REQUIRED_ARG_RULES and not arg:
+                    raise ConfigurationError(
+                        f"Validation rule '{name}' requires a non-empty argument"
+                    )
                 return factory(arg)
             else:
+                if name in _REQUIRED_ARG_RULES:
+                    raise ConfigurationError(
+                        f"Validation rule '{name}' requires an argument"
+                    )
                 try:
                     return factory() if callable(factory) else factory
-                except TypeError:
-                    return factory
+                except TypeError as exc:
+                    raise ConfigurationError(
+                        f"Validation rule '{name}' requires valid arguments: {exc}"
+                    ) from exc
 
         raise TypeError(f"Unsupported validation rule type: {type(rule_item)}")
 
-    def parse_rules(self, rules_input: str | Sequence[Any] | set[Any]) -> list[Any]:
-        """Parse a pipe-separated string or sequence of rules into a list of rule instances."""
+    def parse_rules(self, rules_input: str | Sequence[Any]) -> list[Any]:
+        """Parse a pipe-separated string or ordered sequence of rules into a list of rule instances."""
+        if isinstance(rules_input, (set, frozenset)):
+            raise TypeError(
+                "Validation rules cannot be an unordered set; use a pipe-delimited string or list/tuple."
+            )
         if isinstance(rules_input, str):
             raw_list = [
                 r.strip() for r in _split_unescaped(rules_input, "|") if r.strip()

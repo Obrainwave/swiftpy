@@ -145,6 +145,7 @@ async def test_database_observability_driver_live() -> None:
 
     pool = DatabasePool(config=cfg)
     driver = DatabaseObservabilityDriver(pool=pool, table_name="ai_observations_test")
+    await driver.ensure_table()
     await driver.clear()
 
     manager = AIObservabilityManager(drivers=[driver])

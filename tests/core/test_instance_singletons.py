@@ -6,7 +6,7 @@ import pytest
 
 from swiftpy.core.application import Application
 from swiftpy.core.config import Config
-from swiftpy.core.container import set_container
+from swiftpy.core.container import Container, set_container
 from swiftpy.core.container_exceptions import ResolutionError
 from swiftpy.database.orm.model import (
     _MODEL_REGISTRY,
@@ -80,8 +80,8 @@ def test_two_applications_do_not_share_singletons() -> None:
 
 
 def test_helpers_raise_resolution_error_when_provider_not_registered() -> None:
-    app = Application(config={}, auto_discover_providers=False)
-    set_container(app.container)
+    empty_container = Container()
+    set_container(empty_container)
 
     with pytest.raises(ResolutionError, match="EventDispatcher"):
         dispatcher()

@@ -12,6 +12,24 @@ from swiftpy.core.config import Config, ConfigurationError
 logger = logging.getLogger("swiftpy.database.pool")
 
 
+def _create_ssl_context(
+    cafile: str | None,
+    *,
+    verify_mode: ssl.VerifyMode,
+    check_hostname: bool,
+) -> ssl.SSLContext:
+    """Create an SSLContext while translating file/SSL errors into ConfigurationError."""
+    try:
+        ctx = ssl.create_default_context(cafile=cafile)
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Failed to load database SSL CA configuration (cafile={cafile!r}): {exc}"
+        ) from exc
+    ctx.check_hostname = check_hostname
+    ctx.verify_mode = verify_mode
+    return ctx
+
+
 def _build_ssl_context(
     ssl_opt: Any,
     ssl_ca_file: str | None = None,
@@ -32,10 +50,9 @@ def _build_ssl_context(
             "(encrypted connection without certificate verification). "
             "Prefer explicit 'verify-full' or 'verify-ca' in production."
         )
-        ctx = ssl.create_default_context(cafile=cafile)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+        return _create_ssl_context(
+            cafile, verify_mode=ssl.CERT_NONE, check_hostname=False
+        )
 
     if isinstance(ssl_opt, ssl.SSLContext):
         return ssl_opt
@@ -51,25 +68,21 @@ def _build_ssl_context(
                 "Prefer explicit 'verify-full' or 'verify-ca' in production.",
                 ssl_opt,
             )
-            ctx = ssl.create_default_context(cafile=cafile)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            return ctx
+            return _create_ssl_context(
+                cafile, verify_mode=ssl.CERT_NONE, check_hostname=False
+            )
         if mode == "require":
-            ctx = ssl.create_default_context(cafile=cafile)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            return ctx
+            return _create_ssl_context(
+                cafile, verify_mode=ssl.CERT_NONE, check_hostname=False
+            )
         if mode == "verify-ca":
-            ctx = ssl.create_default_context(cafile=cafile)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            return ctx
+            return _create_ssl_context(
+                cafile, verify_mode=ssl.CERT_REQUIRED, check_hostname=False
+            )
         if mode == "verify-full":
-            ctx = ssl.create_default_context(cafile=cafile)
-            ctx.check_hostname = True
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            return ctx
+            return _create_ssl_context(
+                cafile, verify_mode=ssl.CERT_REQUIRED, check_hostname=True
+            )
 
     raise ConfigurationError(
         f"Unsupported database SSL mode: {ssl_opt!r}. "
@@ -84,6 +97,11 @@ class DatabasePool:
         self.config = config
         self._pool: asyncpg.Pool | None = None
         self._init_lock = asyncio.Lock()
+
+    @property
+    def is_initialized(self) -> bool:
+        """Return whether the underlying asyncpg pool has been initialized."""
+        return self._pool is not None
 
     async def init(self) -> asyncpg.Pool:
         """
@@ -139,11 +157,17 @@ class DatabasePool:
             statement_timeout = float(
                 self.config.get("database.timeouts.statement", 30.0)
             )
-            server_settings: dict[str, str] | None = None
+            tx_timeout_raw = self.config.get("database.timeouts.transaction", None)
+            settings: dict[str, str] = {}
             if statement_timeout > 0:
-                server_settings = {
-                    "statement_timeout": str(int(statement_timeout * 1000))
-                }
+                settings["statement_timeout"] = str(int(statement_timeout * 1000))
+            if tx_timeout_raw is not None:
+                tx_timeout = float(tx_timeout_raw)
+                if tx_timeout > 0:
+                    settings["idle_in_transaction_session_timeout"] = str(
+                        int(tx_timeout * 1000)
+                    )
+            server_settings: dict[str, str] | None = settings or None
 
             self._pool = await asyncpg.create_pool(
                 host=str(self.config.get(f"{conn_path}.host", "127.0.0.1")),

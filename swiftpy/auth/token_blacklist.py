@@ -3,13 +3,69 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections.abc import Awaitable, Sequence
+from typing import Any, Protocol
 
 import redis.asyncio as aioredis
 
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.core.config import Config
-from swiftpy.core.container import get_container
+from swiftpy.core.container import Container, get_container
 from swiftpy.support.redis_config import build_redis_url
+
+
+class _BlacklistPipeline(Protocol):
+    def exists(self, *names: str) -> Any: ...
+    def get(self, name: str, /) -> Any: ...
+    def execute(self) -> Awaitable[list[Any]]: ...
+
+
+class _BlacklistRedisClient(Protocol):
+    def pipeline(self) -> _BlacklistPipeline: ...
+    def set(
+        self, name: str, value: str, /, ex: int | None = None
+    ) -> Awaitable[bool | str | bytes | None]: ...
+    def scan(
+        self,
+        cursor: int = 0,
+        match: str | None = None,
+        count: int | None = None,
+    ) -> Awaitable[tuple[int, Sequence[bytes | str]]]: ...
+    def delete(self, *names: str) -> Awaitable[int]: ...
+    def aclose(self) -> Awaitable[None]: ...
+
+
+def _validate_positive_ttl(ttl: int | None) -> int | None:
+    """Validate explicit blacklist TTL overrides so <= 0 never silently extends to 7 days."""
+    if ttl is None:
+        return None
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        raise ValueError("ttl must be a positive integer")
+    return ttl
+
+
+def is_token_blacklist_enabled(config: Config | None = None) -> bool:
+    """Return whether JWT token blacklist revocation checking is enabled."""
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = Config.get_instance()
+        except (RuntimeError, ValueError):
+            return True
+
+    for key in (
+        "auth.guards.jwt.blacklist_enabled",
+        "auth.jwt.blacklist_enabled",
+        "auth.blacklist_enabled",
+    ):
+        val = cfg.get(key)
+        if val is not None:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.strip().lower() not in ("false", "0", "no", "off")
+            return bool(val)
+    return True
 
 
 class TokenBlacklist:
@@ -23,27 +79,29 @@ class TokenBlacklist:
 
     def __init__(
         self,
-        redis_client: aioredis.Redis | None = None,
+        redis_client: _BlacklistRedisClient | None = None,
         redis_url: str | None = None,
         prefix: str = "jwt_blacklist:",
         default_ttl: int = 604800,  # 7 days
         max_token_lifetime: int = 604800,  # 7 days
         issuer: JWTIssuer | None = None,
         config: Config | None = None,
+        container: Container | None = None,
     ) -> None:
-        self._client = redis_client
+        self._client: _BlacklistRedisClient | None = redis_client
         self._redis_url = redis_url
         self.prefix = prefix
         self.default_ttl = default_ttl
         self.max_token_lifetime = max_token_lifetime
         self._issuer = issuer
         self._config = config
+        self._container = container
         self._owns_client = redis_client is None
         self._lock = asyncio.Lock()
         self._local_cache: dict[tuple[str, str], float] = {}
         self._local_cache_ttl: float = 2.0
 
-    async def get_client(self) -> aioredis.Redis:
+    async def get_client(self) -> _BlacklistRedisClient:
         """Lazily initialize and return the async Redis client safely under lock."""
         if self._client is None:
             async with self._lock:
@@ -58,9 +116,13 @@ class TokenBlacklist:
                                 cfg = Config()
                         url = build_redis_url(cfg, section="auth")
 
-                    self._client = aioredis.from_url(url, decode_responses=True)
+                    created: _BlacklistRedisClient = aioredis.from_url(
+                        url, decode_responses=True
+                    )
+                    self._client = created
                     self._owns_client = True
 
+        assert self._client is not None
         return self._client
 
     async def revoke(self, jti: str, ttl: int | None = None) -> None:
@@ -70,9 +132,10 @@ class TokenBlacklist:
         if not jti:
             raise ValueError("JWT ID (jti) cannot be empty")
 
+        validated_ttl = _validate_positive_ttl(ttl)
         client = await self.get_client()
         key = f"{self.prefix}{jti}"
-        raw_ttl = ttl if (ttl is not None and ttl > 0) else self.default_ttl
+        raw_ttl = validated_ttl if validated_ttl is not None else self.default_ttl
         expiration = min(raw_ttl, self.max_token_lifetime)
 
         self._local_cache.clear()
@@ -89,6 +152,12 @@ class TokenBlacklist:
         attacker-chosen TTL / unbounded memory DoS (P2-A3).
         """
         active_issuer = issuer or self._issuer
+        if (
+            active_issuer is None
+            and self._container is not None
+            and self._container.has(JWTIssuer)
+        ):
+            active_issuer = self._container.resolve(JWTIssuer)
         if active_issuer is None:
             try:
                 container = get_container()
@@ -102,8 +171,8 @@ class TokenBlacklist:
                 "JWTIssuer is required to cryptographically verify token signature before revocation."
             )
 
-        # Cryptographically verify signature (exp expiration is checked manually for TTL calculation)
-        payload = active_issuer.decode_token(token, verify_exp=False)
+        # Cryptographically verify signature; exp and future nbf are handled below so future-active tokens can be pre-emptively revoked
+        payload = active_issuer.decode_token(token, verify_exp=False, verify_nbf=False)
 
         jti = payload.get("jti")
         if not jti:
@@ -139,9 +208,12 @@ class TokenBlacklist:
         if subject is None or str(subject) == "":
             raise ValueError("Subject cannot be empty")
 
+        validated_ttl = _validate_positive_ttl(ttl)
         client = await self.get_client()
         sub_key = f"{self.prefix}sub:{subject}"
-        raw_ttl = ttl if (ttl is not None and ttl > 0) else self.max_token_lifetime
+        raw_ttl = (
+            validated_ttl if validated_ttl is not None else self.max_token_lifetime
+        )
         expiration = min(raw_ttl, self.max_token_lifetime)
         now = int(time.time())
         self._local_cache.clear()

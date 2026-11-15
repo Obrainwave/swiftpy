@@ -3,7 +3,7 @@ from __future__ import annotations
 import types
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from typing import Any, Self
+from typing import Any, Self, TypedDict
 
 from swiftpy.mail.mailable import Mailable
 from swiftpy.mail.manager import MailManager
@@ -11,6 +11,14 @@ from swiftpy.mail.message import MailMessage
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.queue.job import SendQueuedMailableJob
 from swiftpy.mail.transports.base import MailTransport
+
+
+class _SentMailRecord(TypedDict):
+    """Correlated record of a message captured by MailFake."""
+
+    message: MailMessage
+    mailable: Mailable | None
+    mailer: str | None
 
 
 class MailFake(MailTransport):
@@ -23,6 +31,7 @@ class MailFake(MailTransport):
     def __init__(self) -> None:
         self.sent_messages: list[MailMessage] = []
         self.sent_mailables: list[Mailable] = []
+        self.sent_records: list[_SentMailRecord] = []
         self.queued_mailables: list[dict[str, Any]] = []
         self._token: Token[MailFake | None] | None = None
 
@@ -48,13 +57,28 @@ class MailFake(MailTransport):
     ) -> None:
         Mail.restore()
 
-    async def send(self, message: MailMessage) -> MailSendResult:
+    async def send(
+        self,
+        message: MailMessage,
+        *,
+        mailable: Mailable | None = None,
+        mailer: str | None = None,
+    ) -> MailSendResult:
         self.sent_messages.append(message)
+        if mailable is not None:
+            self.sent_mailables.append(mailable)
+        self.sent_records.append(
+            {
+                "message": message,
+                "mailable": mailable,
+                "mailer": mailer,
+            }
+        )
         return MailSendResult(
             success=True,
             message_id=f"fake-{len(self.sent_messages)}",
             provider="fake",
-            accepted=list(message.to),
+            accepted=message.all_recipient_addresses(),
             rejected=[],
         )
 
@@ -74,6 +98,41 @@ class MailFake(MailTransport):
             }
         )
 
+    @staticmethod
+    def _record_matches(
+        record: _SentMailRecord,
+        mailable_cls_or_filter: type[Mailable]
+        | Callable[[MailMessage], bool]
+        | None,
+        recipient: str | None,
+    ) -> tuple[bool, str | None]:
+        msg = record["message"]
+        if recipient and recipient not in msg.all_recipient_addresses():
+            return False, None
+
+        if mailable_cls_or_filter is not None:
+            if isinstance(mailable_cls_or_filter, type) and issubclass(
+                mailable_cls_or_filter, Mailable
+            ):
+                if not isinstance(record["mailable"], mailable_cls_or_filter):
+                    return False, None
+                suffix = f" to recipient '{recipient}'" if recipient else ""
+                return (
+                    True,
+                    f"Unexpected mailable of type '{mailable_cls_or_filter.__name__}' was sent{suffix}",
+                )
+            if not isinstance(mailable_cls_or_filter, type) and callable(
+                mailable_cls_or_filter
+            ):
+                if not mailable_cls_or_filter(msg):
+                    return False, None
+                suffix = f" to recipient '{recipient}'" if recipient else ""
+                return True, f"Unexpected email matching predicate was sent{suffix}"
+
+        if recipient:
+            return True, f"Unexpected email sent to recipient '{recipient}'"
+        return True, "Unexpected email was sent"
+
     def assert_sent(
         self,
         mailable_cls_or_filter: type[Mailable]
@@ -83,27 +142,11 @@ class MailFake(MailTransport):
         count: int | None = None,
     ) -> None:
         """Assert that matching emails were sent."""
-        matches: list[MailMessage] = []
-
-        for msg in self.sent_messages:
-            if recipient and recipient not in msg.all_recipient_addresses():
-                continue
-            if mailable_cls_or_filter is not None:
-                if isinstance(mailable_cls_or_filter, type) and issubclass(
-                    mailable_cls_or_filter, Mailable
-                ):
-                    matching_mailable = any(
-                        isinstance(m, mailable_cls_or_filter)
-                        for m in self.sent_mailables
-                    )
-                    if not matching_mailable:
-                        continue
-                elif not isinstance(mailable_cls_or_filter, type) and callable(
-                    mailable_cls_or_filter
-                ):
-                    if not mailable_cls_or_filter(msg):
-                        continue
-            matches.append(msg)
+        matches = [
+            record["message"]
+            for record in self.sent_records
+            if self._record_matches(record, mailable_cls_or_filter, recipient)[0]
+        ]
 
         if count is not None:
             assert len(matches) == count, (
@@ -120,28 +163,12 @@ class MailFake(MailTransport):
         recipient: str | None = None,
     ) -> None:
         """Assert that no matching emails were sent."""
-        for msg in self.sent_messages:
-            if recipient and recipient in msg.all_recipient_addresses():
-                raise AssertionError(
-                    f"Unexpected email sent to recipient '{recipient}'"
-                )
-            if mailable_cls_or_filter is not None:
-                if isinstance(mailable_cls_or_filter, type) and issubclass(
-                    mailable_cls_or_filter, Mailable
-                ):
-                    if any(
-                        isinstance(m, mailable_cls_or_filter)
-                        for m in self.sent_mailables
-                    ):
-                        raise AssertionError(
-                            f"Unexpected mailable of type '{mailable_cls_or_filter.__name__}' was sent"
-                        )
-                elif (
-                    not isinstance(mailable_cls_or_filter, type)
-                    and callable(mailable_cls_or_filter)
-                    and mailable_cls_or_filter(msg)
-                ):
-                    raise AssertionError("Unexpected email matching predicate was sent")
+        for record in self.sent_records:
+            matched, reason = self._record_matches(
+                record, mailable_cls_or_filter, recipient
+            )
+            if matched:
+                raise AssertionError(reason)
 
     def assert_queued(
         self,
@@ -175,6 +202,7 @@ class MailFake(MailTransport):
     def reset(self) -> None:
         self.sent_messages.clear()
         self.sent_mailables.clear()
+        self.sent_records.clear()
         self.queued_mailables.clear()
 
 
@@ -233,21 +261,20 @@ class Mail:
         mailer: str | None = None,
     ) -> MailSendResult:
         """Deliver an email immediately."""
-        fake_instance = cls._fake_var.get()
-        if fake_instance is not None:
-            if isinstance(mailable_or_message, Mailable):
-                fake_instance.sent_mailables.append(mailable_or_message)
-                msg = await mailable_or_message.build_message()
-            else:
-                msg = mailable_or_message
-            return await fake_instance.send(msg)
-
         if isinstance(mailable_or_message, Mailable):
             msg = await mailable_or_message.build_message()
             target_mailer = mailer or mailable_or_message.mailer_name
+            sent_mailable: Mailable | None = mailable_or_message
         else:
             msg = mailable_or_message
             target_mailer = mailer
+            sent_mailable = None
+
+        fake_instance = cls._fake_var.get()
+        if fake_instance is not None:
+            return await fake_instance.send(
+                msg, mailable=sent_mailable, mailer=target_mailer
+            )
 
         return await cls._manager().send(msg, mailer=target_mailer)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import os
 import subprocess
 import sys
@@ -50,7 +51,7 @@ def test_new_command_scaffolds_complete_structure(
         content = cfg_file.read_text(encoding="utf-8")
         assert "CONFIG =" in content or "CONFIG:" in content
 
-    # 3. Verify 7 service providers
+    # 3. Verify 8 service providers
     expected_providers = [
         "app_service_provider.py",
         "auth_service_provider.py",
@@ -58,6 +59,7 @@ def test_new_command_scaffolds_complete_structure(
         "database_service_provider.py",
         "event_service_provider.py",
         "filesystem_service_provider.py",
+        "mail_service_provider.py",
         "queue_service_provider.py",
     ]
     for prov in expected_providers:
@@ -103,9 +105,10 @@ def test_new_command_scaffolds_complete_structure(
     assert (app_dir / "pyproject.toml").is_file()
     assert (app_dir / "README.md").is_file()
 
-    # 9. Verify .env and .env.example with secure 32-byte APP_KEY
+    # 9. Verify .env and .env.example with secure 32-byte APP_KEY and JWT_SECRET
     env_example = (app_dir / ".env.example").read_text(encoding="utf-8")
     assert "APP_KEY=\n" in env_example or env_example.endswith("APP_KEY=")
+    assert "JWT_SECRET=\n" in env_example or env_example.endswith("JWT_SECRET=")
 
     env_active = (app_dir / ".env").read_text(encoding="utf-8")
     assert "APP_KEY=" in env_active
@@ -118,6 +121,9 @@ def test_new_command_scaffolds_complete_structure(
         validate=True,
     )
     assert len(decoded_key) == 32
+    jwt_lines = [ln.strip() for ln in env_active.splitlines() if ln.startswith("JWT_SECRET=")]
+    assert len(jwt_lines) == 1
+    assert len(jwt_lines[0].split("=", 1)[1]) >= 32
 
     # 10. Verify .env is excluded from git and docker build context
     dockerignore = (app_dir / ".dockerignore").read_text(encoding="utf-8")
@@ -191,6 +197,10 @@ async def test_scaffolded_app_e2e_lifecycle(
     # Prepend project to sys.path so generated modules can be imported
     monkeypatch.syspath_prepend(str(app_dir))
 
+    # Ensure JWT_SECRET is present in env when Config.load runs without dotenv auto-loading
+    if not (monkeypatch and os.getenv("JWT_SECRET")):
+        monkeypatch.setenv("JWT_SECRET", "e2e-scaffold-jwt-secret-at-least-32-bytes!!")
+
     # Initialize application with generated project root
     app = Application(project_root=app_dir)
 
@@ -198,7 +208,7 @@ async def test_scaffolded_app_e2e_lifecycle(
     assert app.config.get("app.name") == "SwiftPY"
     assert app.config.get("app.cipher") == "AES-256-GCM"
 
-    # 2. Verify all 7 providers were auto-discovered and registered
+    # 2. Verify all 8 providers were auto-discovered and registered
     provider_names = {type(p).__name__ for p in app._providers}
     assert "AppServiceProvider" in provider_names
     assert "AuthServiceProvider" in provider_names
@@ -206,11 +216,12 @@ async def test_scaffolded_app_e2e_lifecycle(
     assert "DatabaseServiceProvider" in provider_names
     assert "EventServiceProvider" in provider_names
     assert "FilesystemServiceProvider" in provider_names
+    assert "MailServiceProvider" in provider_names
     assert "QueueServiceProvider" in provider_names
 
     # 3. Mount generated routes/api.py into the application
-    from routes.api import router as api_router
-    app.include_router(api_router, prefix="/api")
+    api_module = importlib.import_module("routes.api")
+    app.include_router(api_module.router, prefix="/api")
 
     # 4. Verify route registration
     route_paths = [r.path for r in app.router.routes]
@@ -220,8 +231,8 @@ async def test_scaffolded_app_e2e_lifecycle(
     # 5. Mock database pool connection to test full lifespan startup and shutdown without external postgres
     if app.container.has(DatabasePool):
         pool = app.container.resolve(DatabasePool)
-        pool.init = AsyncMock()
-        pool.close = AsyncMock()
+        monkeypatch.setattr(pool, "init", AsyncMock())
+        monkeypatch.setattr(pool, "close", AsyncMock())
 
     # 6. Execute normal application lifespan startup and shutdown
     await app.startup()

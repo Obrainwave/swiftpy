@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -292,7 +293,14 @@ async def test_di_current_user_injection_and_guard_401() -> None:
     secret = "s" * 40
     app = Application(
         auto_discover_providers=False,
-        config={"auth": {"jwt": {"secret": secret}}},
+        config={
+            "auth": {"jwt": {"secret": secret}},
+            "redis": {
+                "host": os.getenv("REDIS_HOST", "127.0.0.1"),
+                "port": int(os.getenv("REDIS_PORT", "6379")),
+                "password": os.getenv("REDIS_PASSWORD") or None,
+            },
+        },
     )
     issuer = JWTIssuer(secret=secret)
     app.container.instance(JWTIssuer, issuer)

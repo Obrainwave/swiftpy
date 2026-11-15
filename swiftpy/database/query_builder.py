@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast, overload
@@ -21,6 +22,80 @@ from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection
 
 _MISSING = object()
+
+_HAVING_AGGREGATE_RE = re.compile(
+    r"^(COUNT|SUM|AVG|MIN|MAX)\(\s*(DISTINCT\s+)?(\*|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _validate_boolean(boolean: str, *, context: str = "WHERE") -> str:
+    if not isinstance(boolean, str):
+        raise TypeError(f"{context} boolean operator must be a string.")
+    bool_op = boolean.upper().strip()
+    if bool_op not in {"AND", "OR"}:
+        raise ValueError(
+            f"{context} boolean operator must be 'AND' or 'OR', got {boolean!r}."
+        )
+    return bool_op
+
+
+def _parse_having_aggregate(column: str) -> str | None:
+    match = _HAVING_AGGREGATE_RE.fullmatch(column.strip())
+    if match is None:
+        return None
+    func = match.group(1).upper()
+    distinct_kw = "DISTINCT " if match.group(2) else ""
+    target = match.group(3)
+    if target == "*":
+        if func != "COUNT" or distinct_kw:
+            raise ValueError(
+                f"Wildcard '*' in HAVING is only allowed with COUNT(*), got {column!r}."
+            )
+        return "COUNT(*)"
+    safe_target = validate_identifier(target, allow_dotted=True, allow_wildcard=False)
+    return f"{func}({distinct_kw}{quote_identifier(safe_target, allow_dotted=True, allow_wildcard=False)})"
+
+
+def _normalize_raw_bindings(
+    sql: str,
+    bindings: Sequence[Any] | None,
+    *,
+    method: str,
+) -> list[Any]:
+    if bindings is None:
+        bindings_list: list[Any] = []
+    elif isinstance(bindings, (str, bytes, bytearray)) or not isinstance(
+        bindings, Sequence
+    ):
+        raise TypeError(
+            f"{method} bindings must be a sequence (list or tuple), not {type(bindings).__name__}."
+        )
+    else:
+        bindings_list = list(bindings)
+
+    placeholder_count = sql.count("?")
+    if placeholder_count != len(bindings_list):
+        raise QueryError(
+            f"Placeholder count mismatch in {method}: SQL expression contains "
+            f"{placeholder_count} '?' placeholder(s), but {len(bindings_list)} binding(s) were provided."
+        )
+    return bindings_list
+
+
+def _compile_raw_sql(raw: Raw, start_idx: int) -> tuple[str, list[Any], int]:
+    if not raw.bindings:
+        return raw.sql, [], start_idx
+    idx = start_idx
+
+    def _replace(_match: re.Match[str]) -> str:
+        nonlocal idx
+        placeholder = f"${idx}"
+        idx += 1
+        return placeholder
+
+    compiled_sql = re.sub(r"\?", _replace, raw.sql, count=len(raw.bindings))
+    return compiled_sql, list(raw.bindings), idx
 
 
 class Column:
@@ -203,7 +278,7 @@ class QueryBuilder:
         return self
 
     def select_raw(
-        self, sql: str, bindings: list[Any] | None = None
+        self, sql: str, bindings: Sequence[Any] | None = None
     ) -> QueryBuilder:
         """
         Add a raw SQL expression to the SELECT projection.
@@ -217,9 +292,10 @@ class QueryBuilder:
         """
         if not isinstance(sql, str):
             raise TypeError("select_raw SQL expression must be a string.")
+        bindings_list = _normalize_raw_bindings(sql, bindings, method="select_raw")
         if self._columns == ["*"]:
             self._columns = []
-        self._columns.append(Raw(sql, bindings or []))
+        self._columns.append(Raw(sql, bindings_list))
         return self
 
     def select_count(
@@ -329,7 +405,7 @@ class QueryBuilder:
         boolean: str = "AND",
     ) -> QueryBuilder:
         column = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
-        bool_op = "OR" if boolean.upper() == "OR" else "AND"
+        bool_op = _validate_boolean(boolean, context="WHERE")
 
         if value is _MISSING:
             operator = "="
@@ -372,7 +448,7 @@ class QueryBuilder:
 
         if operator in {"IN", "NOT IN"} and not isinstance(value, (list, tuple, QueryBuilder)):
             raise QueryError(
-                f"Operator '{operator}' requires a list or QueryBuilder subquery, got {type(value).__name__}."
+                f"Operator '{operator}' requires a list, tuple, or QueryBuilder subquery, got {type(value).__name__}."
             )
 
         self._wheres.append((column, operator, value))
@@ -465,6 +541,39 @@ class QueryBuilder:
         """Add a safe case-insensitive ILIKE clause with escaped wildcards."""
         return self.where_like(column, value, case_insensitive=True, match=match, boolean=boolean)
 
+    def or_where_like(
+        self,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> QueryBuilder:
+        """Add an OR WHERE LIKE / ILIKE clause with escaped wildcards."""
+        return self.where_like(
+            column,
+            value,
+            case_insensitive=case_insensitive,
+            match=match,
+            boolean="OR",
+        )
+
+    def or_where_ilike(
+        self,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> QueryBuilder:
+        """Add a safe OR case-insensitive ILIKE clause with escaped wildcards."""
+        return self.where_like(
+            column,
+            value,
+            case_insensitive=True,
+            match=match,
+            boolean="OR",
+        )
+
     def where_between(
         self,
         column: str,
@@ -476,7 +585,7 @@ class QueryBuilder:
         if isinstance(values, (str, bytes)) or len(values) != 2:
             raise QueryError("where_between expects a sequence of exactly two elements (min, max).")
         col = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
-        bool_op = "OR" if boolean.upper() == "OR" else "AND"
+        bool_op = _validate_boolean(boolean, context="WHERE")
         self._where_clauses.append(
             _WhereBetweenClause(bool_op, col, (values[0], values[1]), negated=False)
         )
@@ -493,7 +602,7 @@ class QueryBuilder:
         if isinstance(values, (str, bytes)) or len(values) != 2:
             raise QueryError("where_not_between expects a sequence of exactly two elements (min, max).")
         col = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
-        bool_op = "OR" if boolean.upper() == "OR" else "AND"
+        bool_op = _validate_boolean(boolean, context="WHERE")
         self._where_clauses.append(
             _WhereBetweenClause(bool_op, col, (values[0], values[1]), negated=True)
         )
@@ -531,10 +640,10 @@ class QueryBuilder:
         Compiles to:
             WHERE "status" = $1 AND ("role" = $2 OR "role" = $3) AND "age" >= $4
         """
+        bool_op = _validate_boolean(boolean, context="WHERE")
         sub_builder = QueryBuilder(self._table)
         callback(sub_builder)
         if sub_builder._where_clauses:
-            bool_op = "OR" if boolean.upper() == "OR" else "AND"
             self._where_clauses.append(
                 _WhereGroupClause(bool_op, tuple(sub_builder._where_clauses))
             )
@@ -550,7 +659,7 @@ class QueryBuilder:
     def where_raw(
         self,
         sql: str,
-        bindings: list[Any] | None = None,
+        bindings: Sequence[Any] | None = None,
         *,
         boolean: str = "AND",
     ) -> QueryBuilder:
@@ -566,15 +675,9 @@ class QueryBuilder:
         """
         if not isinstance(sql, str):
             raise TypeError("where_raw SQL expression must be a string.")
-        bindings_list = list(bindings) if bindings is not None else []
-        placeholder_count = sql.count("?")
-        if placeholder_count != len(bindings_list):
-            raise QueryError(
-                f"Placeholder count mismatch in where_raw: SQL expression contains "
-                f"{placeholder_count} '?' placeholder(s), but {len(bindings_list)} binding(s) were provided."
-            )
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        bindings_list = _normalize_raw_bindings(sql, bindings, method="where_raw")
         raw = Raw(sql, bindings_list)
-        bool_op = "OR" if boolean.upper() == "OR" else "AND"
         self._raw_wheres.append(raw)
         self._where_clauses.append(_WhereRawClause(bool_op, raw))
         return self
@@ -582,17 +685,18 @@ class QueryBuilder:
     def or_where_raw(
         self,
         sql: str,
-        bindings: list[Any] | None = None,
+        bindings: Sequence[Any] | None = None,
     ) -> QueryBuilder:
         """Add an OR WHERE raw expression."""
         return self.where_raw(sql, bindings, boolean="OR")
 
     def where_null(self, column: str, *, boolean: str = "AND") -> QueryBuilder:
         """Add an 'IS NULL' clause for the specified column."""
+        bool_op = _validate_boolean(boolean, context="WHERE")
         safe_col = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
         raw = Raw(f"{quote_identifier(safe_col, allow_wildcard=False)} IS NULL")
         self._raw_wheres.append(raw)
-        self._where_clauses.append(_WhereRawClause(boolean.upper(), raw))
+        self._where_clauses.append(_WhereRawClause(bool_op, raw))
         return self
 
     def or_where_null(self, column: str) -> QueryBuilder:
@@ -601,10 +705,11 @@ class QueryBuilder:
 
     def where_not_null(self, column: str, *, boolean: str = "AND") -> QueryBuilder:
         """Add an 'IS NOT NULL' clause for the specified column."""
+        bool_op = _validate_boolean(boolean, context="WHERE")
         safe_col = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
         raw = Raw(f"{quote_identifier(safe_col, allow_wildcard=False)} IS NOT NULL")
         self._raw_wheres.append(raw)
-        self._where_clauses.append(_WhereRawClause(boolean.upper(), raw))
+        self._where_clauses.append(_WhereRawClause(bool_op, raw))
         return self
 
     def or_where_not_null(self, column: str) -> QueryBuilder:
@@ -778,20 +883,13 @@ class QueryBuilder:
         if operator not in allowed_operators:
             raise ValueError(f"Operator '{operator}' is not allowed in HAVING clause.")
 
-        if (
-            column.strip() not in self._select_aliases
-            and not any(
-                column.strip().upper().startswith(fn)
-                for fn in ("COUNT(", "SUM(", "AVG(", "MIN(", "MAX(")
-            )
-        ):
-            validate_identifier(column.strip(), allow_dotted=True, allow_wildcard=False)
+        col = column.strip()
+        if col not in self._select_aliases and _parse_having_aggregate(col) is None:
+            validate_identifier(col, allow_dotted=True, allow_wildcard=False)
 
-        bool_op = boolean.upper().strip()
-        if bool_op not in {"AND", "OR"}:
-            raise ValueError("HAVING boolean operator must be 'AND' or 'OR'.")
+        bool_op = _validate_boolean(boolean, context="HAVING")
 
-        self._havings.append((bool_op, column.strip(), operator, val))
+        self._havings.append((bool_op, col, operator, val))
         return self
 
     def or_having(
@@ -806,7 +904,7 @@ class QueryBuilder:
     def having_raw(
         self,
         sql: str,
-        bindings: list[Any] | None = None,
+        bindings: Sequence[Any] | None = None,
         boolean: str = "AND",
     ) -> QueryBuilder:
         """
@@ -821,22 +919,13 @@ class QueryBuilder:
         if not isinstance(sql, str):
             raise TypeError("HAVING raw expression must be a string.")
 
-        bindings_list = list(bindings) if bindings is not None else []
-        placeholder_count = sql.count("?")
-        if placeholder_count != len(bindings_list):
-            raise QueryError(
-                f"Placeholder count mismatch in having_raw: SQL expression contains "
-                f"{placeholder_count} '?' placeholder(s), but {len(bindings_list)} binding(s) were provided."
-            )
-
-        bool_op = boolean.upper().strip()
-        if bool_op not in {"AND", "OR"}:
-            raise ValueError("HAVING boolean operator must be 'AND' or 'OR'.")
+        bindings_list = _normalize_raw_bindings(sql, bindings, method="having_raw")
+        bool_op = _validate_boolean(boolean, context="HAVING")
         self._raw_havings.append((bool_op, Raw(sql, bindings_list)))
         return self
 
     def or_having_raw(
-        self, sql: str, bindings: list[Any] | None = None
+        self, sql: str, bindings: Sequence[Any] | None = None
     ) -> QueryBuilder:
         """Add an OR raw SQL condition to the HAVING clause with parameter bindings."""
         return self.having_raw(sql, bindings, boolean="OR")
@@ -876,14 +965,8 @@ class QueryBuilder:
                 continue
 
             if isinstance(column, Raw):
-                sql = column.sql
-
-                for binding in column.bindings:
-                    sql = sql.replace("?", f"${idx}", 1)
-
-                    bindings.append(binding)
-                    idx += 1
-
+                sql, raw_bindings, idx = _compile_raw_sql(column, idx)
+                bindings.extend(raw_bindings)
                 select_parts.append(sql)
                 continue
 
@@ -911,6 +994,45 @@ class QueryBuilder:
         return " " + " ".join(clauses)
 
     @staticmethod
+    def _compile_simple_where(
+        boolean: str,
+        column: str,
+        operator: str,
+        value: Any,
+        idx: int,
+    ) -> tuple[tuple[str, str], list[Any], int]:
+        col_quoted = quote_identifier(column)
+        if isinstance(value, QueryBuilder):
+            sub_sql, sub_bindings = value.to_sql(idx)
+            return (
+                (boolean, f"{col_quoted} {operator} ({sub_sql})"),
+                sub_bindings,
+                idx + len(sub_bindings),
+            )
+
+        if operator in {"IN", "NOT IN"} and isinstance(value, (list, tuple)):
+            if not value:
+                return (boolean, "FALSE" if operator == "IN" else "TRUE"), [], idx
+            placeholders = [f"${idx + i}" for i in range(len(value))]
+            return (
+                (boolean, f"{col_quoted} {operator} ({', '.join(placeholders)})"),
+                list(value),
+                idx + len(value),
+            )
+
+        if value is None and operator in {"IS", "IS NOT"}:
+            return (boolean, f"{col_quoted} {operator} NULL"), [], idx
+
+        if operator in {"LIKE", "ILIKE"}:
+            return (
+                (boolean, f"{col_quoted} {operator} ${idx} ESCAPE '\\'"),
+                [value],
+                idx + 1,
+            )
+
+        return (boolean, f"{col_quoted} {operator} ${idx}"), [value], idx + 1
+
+    @staticmethod
     def _compile_clauses(
         clause_list: Sequence[_WhereClauseType], start_idx: int
     ) -> tuple[list[tuple[str, str]], list[Any], int]:
@@ -930,11 +1052,8 @@ class QueryBuilder:
                 continue
 
             if isinstance(clause, _WhereRawClause):
-                sql = clause.raw.sql
-                for binding in clause.raw.bindings:
-                    sql = sql.replace("?", f"${idx}", 1)
-                    bindings.append(binding)
-                    idx += 1
+                sql, raw_bindings, idx = _compile_raw_sql(clause.raw, idx)
+                bindings.extend(raw_bindings)
                 clauses.append((clause.boolean, sql))
                 continue
 
@@ -954,41 +1073,11 @@ class QueryBuilder:
                 continue
 
             if isinstance(clause, _WhereClause):
-                col_quoted = quote_identifier(clause.column)
-                operator = clause.operator
-                value = clause.value
-
-                if isinstance(value, QueryBuilder):
-                    sub_sql, sub_bindings = value.to_sql(idx)
-                    clauses.append((clause.boolean, f"{col_quoted} {operator} ({sub_sql})"))
-                    bindings.extend(sub_bindings)
-                    idx += len(sub_bindings)
-                    continue
-
-                if operator in {"IN", "NOT IN"} and isinstance(value, (list, tuple)):
-                    if not value:
-                        clauses.append((clause.boolean, "1 = 0" if operator == "IN" else "1 = 1"))
-                        continue
-
-                    placeholders = [f"${idx + i}" for i in range(len(value))]
-                    clauses.append((clause.boolean, f"{col_quoted} {operator} ({', '.join(placeholders)})"))
-                    bindings.extend(value)
-                    idx += len(value)
-                    continue
-
-                if value is None and operator in {"IS", "IS NOT"}:
-                    clauses.append((clause.boolean, f"{col_quoted} {operator} NULL"))
-                    continue
-
-                if operator in {"LIKE", "ILIKE"}:
-                    clauses.append((clause.boolean, f"{col_quoted} {operator} ${idx} ESCAPE '\\'"))
-                    bindings.append(value)
-                    idx += 1
-                    continue
-
-                clauses.append((clause.boolean, f"{col_quoted} {operator} ${idx}"))
-                bindings.append(value)
-                idx += 1
+                compiled_clause, clause_bindings, idx = QueryBuilder._compile_simple_where(
+                    clause.boolean, clause.column, clause.operator, clause.value, idx
+                )
+                clauses.append(compiled_clause)
+                bindings.extend(clause_bindings)
                 continue
 
         return clauses, bindings, idx
@@ -1004,45 +1093,15 @@ class QueryBuilder:
             bindings = []
             idx = start_idx
             for column, operator, value in self._wheres:
-                col_quoted = quote_identifier(column)
-                if isinstance(value, QueryBuilder):
-                    sub_sql, sub_bindings = value.to_sql(idx)
-                    clauses.append(("AND", f"{col_quoted} {operator} ({sub_sql})"))
-                    bindings.extend(sub_bindings)
-                    idx += len(sub_bindings)
-                    continue
-
-                if operator in {"IN", "NOT IN"} and isinstance(value, list):
-                    if not value:
-                        clauses.append(("AND", "1 = 0" if operator == "IN" else "1 = 1"))
-                        continue
-
-                    placeholders = [f"${idx + i}" for i in range(len(value))]
-                    clauses.append(("AND", f"{col_quoted} {operator} ({', '.join(placeholders)})"))
-                    bindings.extend(value)
-                    idx += len(value)
-                    continue
-
-                if value is None and operator in {"IS", "IS NOT"}:
-                    clauses.append(("AND", f"{col_quoted} {operator} NULL"))
-                    continue
-
-                if operator in {"LIKE", "ILIKE"}:
-                    clauses.append(("AND", f"{col_quoted} {operator} ${idx} ESCAPE '\\'"))
-                    bindings.append(value)
-                    idx += 1
-                    continue
-
-                clauses.append(("AND", f"{col_quoted} {operator} ${idx}"))
-                bindings.append(value)
-                idx += 1
+                compiled_clause, clause_bindings, idx = QueryBuilder._compile_simple_where(
+                    "AND", column, operator, value, idx
+                )
+                clauses.append(compiled_clause)
+                bindings.extend(clause_bindings)
 
             for raw in self._raw_wheres:
-                sql = raw.sql
-                for binding in raw.bindings:
-                    sql = sql.replace("?", f"${idx}", 1)
-                    bindings.append(binding)
-                    idx += 1
+                sql, raw_bindings, idx = _compile_raw_sql(raw, idx)
+                bindings.extend(raw_bindings)
                 clauses.append(("AND", sql))
 
         if not clauses:
@@ -1067,11 +1126,8 @@ class QueryBuilder:
         for bool_op, column, operator, value in self._havings:
             if column in self._select_aliases:
                 expr = self._select_aliases[column]
-            elif any(
-                column.upper().startswith(fn)
-                for fn in ("COUNT(", "SUM(", "AVG(", "MIN(", "MAX(")
-            ):
-                expr = column
+            elif (agg_expr := _parse_having_aggregate(column)) is not None:
+                expr = agg_expr
             else:
                 expr = quote_identifier(column, allow_dotted=True, allow_wildcard=False)
 
@@ -1088,11 +1144,8 @@ class QueryBuilder:
             idx += 1
 
         for bool_op, raw in self._raw_havings:
-            sql = raw.sql
-            for binding in raw.bindings:
-                sql = sql.replace("?", f"${idx}", 1)
-                bindings.append(binding)
-                idx += 1
+            sql, raw_bindings, idx = _compile_raw_sql(raw, idx)
+            bindings.extend(raw_bindings)
             clauses.append((bool_op, sql))
 
         if not clauses:
@@ -1315,19 +1368,11 @@ class QueryBuilder:
         data: dict[str, Any],
         *,
         returning: Sequence[str] | str | None = None,
+        allow_default_values: bool = False,
     ) -> dict[str, Any]:
         """Insert a row and return the RETURNING row as a dictionary."""
-        if not isinstance(data, dict) or not data:
+        if not isinstance(data, dict) or (not data and not allow_default_values):
             raise QueryError("Cannot execute INSERT with empty data dictionary.")
-
-        columns = [
-            quote_identifier(column, allow_dotted=False, allow_wildcard=False)
-            for column in data
-        ]
-
-        values = list(data.values())
-
-        placeholders = [f"${i}" for i in range(1, len(values) + 1)]
 
         if returning is None or returning == "*":
             returning_clause = "*"
@@ -1344,12 +1389,26 @@ class QueryBuilder:
                 raise ValueError("returning list cannot be empty")
             returning_clause = ", ".join(returning_cols)
 
-        sql = (
-            f"INSERT INTO {quote_identifier(self._table)} "
-            f"({', '.join(columns)}) "
-            f"VALUES ({', '.join(placeholders)}) "
-            f"RETURNING {returning_clause}"
-        )
+        if not data:
+            values: list[Any] = []
+            sql = (
+                f"INSERT INTO {quote_identifier(self._table)} "
+                f"DEFAULT VALUES "
+                f"RETURNING {returning_clause}"
+            )
+        else:
+            columns = [
+                quote_identifier(column, allow_dotted=False, allow_wildcard=False)
+                for column in data
+            ]
+            values = list(data.values())
+            placeholders = [f"${i}" for i in range(1, len(values) + 1)]
+            sql = (
+                f"INSERT INTO {quote_identifier(self._table)} "
+                f"({', '.join(columns)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"RETURNING {returning_clause}"
+            )
 
         conn = await self._connection()
 

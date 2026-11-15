@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import secrets
 import time
 from collections.abc import Callable, Sequence
 from typing import Any, Self
@@ -10,6 +11,7 @@ from swiftpy.ai.providers.base import LLMResponse, TokenUsage
 from swiftpy.ai.rag.context_formatter import (
     ContextFormatter,
     NumberedListFormatter,
+    escape_context_boundaries,
 )
 from swiftpy.ai.rag.reranker import (
     BaseReranker,
@@ -17,7 +19,7 @@ from swiftpy.ai.rag.reranker import (
     CrossEncoderReranker,
 )
 from swiftpy.ai.rag.result import RAGResult, calculate_token_cost
-from swiftpy.ai.rag.retriever import Retriever
+from swiftpy.ai.rag.retriever import Retriever, truncate_to_token_budget
 from swiftpy.ai.vectorstore.base import SearchResult
 
 DEFAULT_PROMPT_TEMPLATE: str = (
@@ -60,10 +62,12 @@ class RAGPipelineBuilder:
         self._reranker: BaseReranker | None = None
         self._formatter: ContextFormatter = NumberedListFormatter()
         self._generator: AIClient | str | Callable[..., Any] | None = None
+        self._generator_kwargs: dict[str, Any] = {}
         self._prompt_template: str | Callable[[str, str], str] = DEFAULT_PROMPT_TEMPLATE
         self._system_prompt: str | None = DEFAULT_SYSTEM_PROMPT
         self._top_k: int | None = None
         self._rerank_top_n: int | None = None
+        self._max_context_tokens: int | None = None
         self._model: str | None = None
         self._temperature: float | None = None
         self._max_tokens: int | None = None
@@ -166,10 +170,12 @@ class RAGPipelineBuilder:
         """
         if generator is None:
             self._generator = None
+            self._generator_kwargs = {}
             return self
 
         if isinstance(generator, (AIClient, str)) or callable(generator):
             self._generator = generator
+            self._generator_kwargs = dict(kwargs)
             return self
 
         raise TypeError(f"Invalid generator type: {type(generator).__name__}")
@@ -221,17 +227,31 @@ class RAGPipelineBuilder:
 
     def max_tokens(self, tokens: int) -> Self:
         """Set the generator max_tokens."""
-        if not isinstance(tokens, int) or tokens <= 0:
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
             raise ValueError(f"max_tokens must be a positive integer, got {tokens}")
         self._max_tokens = tokens
         return self
 
-    def _render_prompt(self, query: str, context: str) -> str:
-        """Format the user prompt with the query and context."""
-        if callable(self._prompt_template):
-            return self._prompt_template(query, context)
+    def max_context_tokens(self, tokens: int) -> Self:
+        """Set the maximum approximate token budget for retrieved context chunks."""
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+            raise ValueError(f"max_context_tokens must be a positive integer, got {tokens}")
+        self._max_context_tokens = tokens
+        return self
 
-        return self._prompt_template.format(query=query, context=context)
+    def _render_prompt(self, query: str, context: str) -> str:
+        """Format the user prompt with the query and boundary-escaped context."""
+        safe_context = escape_context_boundaries(context)
+        nonce = secrets.token_hex(8)
+        delimited_context = (
+            f"<<<CONTEXT_{nonce}>>>\n"
+            f"{safe_context}\n"
+            f"<<<END CONTEXT_{nonce}>>>"
+        )
+        if callable(self._prompt_template):
+            return self._prompt_template(query, delimited_context)
+
+        return self._prompt_template.format(query=query, context=delimited_context)
 
     async def _invoke_generator(
         self,
@@ -239,6 +259,7 @@ class RAGPipelineBuilder:
         query: str,
         context: str,
         sources: list[SearchResult],
+        gen_kwargs: dict[str, Any] | None = None,
     ) -> tuple[str, TokenUsage, str, float, dict[str, Any]]:
         """
         Execute the generator and return (content, token_usage, model, latency_ms, raw).
@@ -254,6 +275,18 @@ class RAGPipelineBuilder:
             has_var_keyword = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
+            merged_extra = {**self._generator_kwargs, **(gen_kwargs or {})}
+            if has_var_keyword:
+                call_kwargs.update(merged_extra)
+            else:
+                for key, val in merged_extra.items():
+                    if key in params:
+                        call_kwargs[key] = val
+                    else:
+                        raise TypeError(
+                            f"Generator does not accept unexpected keyword argument '{key}'"
+                        )
+
             if "query" in params or has_var_keyword:
                 call_kwargs["query"] = query
             if "context" in params or has_var_keyword:
@@ -311,23 +344,16 @@ class RAGPipelineBuilder:
         # 2. AIClient generator
         client: AIClient
         if isinstance(self._generator, AIClient):
-            client = AIClient(
-                config=self._generator._config,
-                http_pool=self._generator._http_pool,
-                default_provider=self._generator._provider_name,
+            client = self._generator.clone(
+                include_messages=False,
+                include_conversation=False,
             )
-            # Inherit settings if not explicitly overridden
-            client._model = self._model or self._generator._model
-            client._temperature = (
-                self._temperature
-                if self._temperature is not None
-                else self._generator._temperature
-            )
-            client._max_tokens = (
-                self._max_tokens
-                if self._max_tokens is not None
-                else self._generator._max_tokens
-            )
+            if self._model is not None:
+                client.model(self._model)
+            if self._temperature is not None:
+                client.temperature(self._temperature)
+            if self._max_tokens is not None:
+                client.max_tokens(self._max_tokens)
         elif isinstance(self._generator, str):
             client = ai(default_provider=self._generator)
             if self._model:
@@ -344,6 +370,27 @@ class RAGPipelineBuilder:
                 client.temperature(self._temperature)
             if self._max_tokens is not None:
                 client.max_tokens(self._max_tokens)
+
+        merged_client_kwargs = {**self._generator_kwargs, **(gen_kwargs or {})}
+        for key, val in merged_client_kwargs.items():
+            if key == "model" and val is not None:
+                client.model(str(val))
+            elif key == "temperature" and val is not None:
+                client.temperature(val)
+            elif key == "max_tokens" and val is not None:
+                client.max_tokens(val)
+            elif key == "top_p" and val is not None:
+                client.top_p(val)
+            elif key == "stop" and val is not None:
+                client.stop(val)
+            elif key == "extra" and isinstance(val, dict):
+                client.extra(**val)
+            elif key == "metadata" and isinstance(val, dict):
+                client.metadata(**val)
+            else:
+                raise TypeError(
+                    f"Unexpected keyword argument for LLM generator: '{key}'"
+                )
 
         if self._system_prompt:
             client.system(self._system_prompt)
@@ -364,9 +411,10 @@ class RAGPipelineBuilder:
         Execute the complete RAG pipeline for the given query:
         1. Embeds the query and retrieves ranked chunks from vector store
         2. Reranks chunks (if reranker is configured)
-        3. Formats context using configured formatting strategy
-        4. Synthesizes answer using generator
-        5. Computes token usage and estimated dollar cost
+        3. Truncates chunks to token budget (if configured)
+        4. Formats context using configured formatting strategy
+        5. Synthesizes answer using generator
+        6. Computes token usage and estimated dollar cost
         """
         if self._retriever is None:
             raise ValueError("Retriever must be configured before running the pipeline.")
@@ -374,11 +422,61 @@ class RAGPipelineBuilder:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("Query must be a non-empty string.")
 
+        remaining_kwargs = dict(kwargs)
+        if "top_k" in remaining_kwargs:
+            top_k_val = remaining_kwargs.pop("top_k")
+            if top_k_val is not None and (
+                isinstance(top_k_val, bool)
+                or not isinstance(top_k_val, int)
+                or top_k_val <= 0
+            ):
+                raise ValueError(f"top_k must be greater than 0, got {top_k_val}")
+            effective_top_k = top_k_val if top_k_val is not None else self._top_k
+        else:
+            effective_top_k = self._top_k
+
+        retrieve_sig = inspect.signature(self._retriever.retrieve)
+        retrieve_params = retrieve_sig.parameters
+        explicit_retrieve_keys = {
+            name
+            for name, p in retrieve_params.items()
+            if name not in ("self", "query")
+            and p.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        has_retrieve_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in retrieve_params.values()
+        )
+        gen_explicit_keys: set[str] = set()
+        if callable(self._generator) and not isinstance(self._generator, AIClient):
+            gen_sig = inspect.signature(self._generator)
+            gen_explicit_keys = {
+                name
+                for name, p in gen_sig.parameters.items()
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            }
+
+        retrieve_kwargs: dict[str, Any] = {}
+        if "top_k" in explicit_retrieve_keys or has_retrieve_var_kw:
+            retrieve_kwargs["top_k"] = effective_top_k
+
+        gen_kwargs: dict[str, Any] = {}
+        for key, val in remaining_kwargs.items():
+            if key in explicit_retrieve_keys or (
+                has_retrieve_var_kw and key not in gen_explicit_keys
+            ):
+                retrieve_kwargs[key] = val
+            else:
+                gen_kwargs[key] = val
+
         # 1. Retrieve
         retrieved = await self._retriever.retrieve(
             query=query,
-            top_k=self._top_k,
-            **kwargs,
+            **retrieve_kwargs,
         )
 
         # 2. Rerank (optional)
@@ -390,6 +488,13 @@ class RAGPipelineBuilder:
             )
         else:
             ranked = retrieved
+
+        # 2b. Optional token-budget truncation
+        if self._max_context_tokens is not None:
+            ranked = truncate_to_token_budget(
+                ranked,
+                max_tokens=self._max_context_tokens,
+            )
 
         # 3. Context formatting
         formatted_context = self._formatter.format(ranked)
@@ -403,6 +508,7 @@ class RAGPipelineBuilder:
             query=query,
             context=formatted_context,
             sources=ranked,
+            gen_kwargs=gen_kwargs,
         )
 
         # 6. Cost calculation

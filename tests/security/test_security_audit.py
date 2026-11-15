@@ -190,8 +190,9 @@ async def test_auth_token_blacklist_revocation() -> None:
             self.store = store
             self.ops: list[Any] = []
 
-        def exists(self, key: str) -> None:
-            self.ops.append(lambda: 1 if key in self.store else 0)
+        def exists(self, *names: str) -> None:
+            for key in names:
+                self.ops.append(lambda k=key: 1 if k in self.store else 0)
 
         def get(self, key: str) -> None:
             self.ops.append(lambda: self.store.get(key))
@@ -209,11 +210,29 @@ async def test_auth_token_blacklist_revocation() -> None:
         async def get(self, key: str) -> str | None:
             return self.store.get(key)
 
-        async def set(self, key: str, value: str, ex: int | None = None) -> None:
-            self.store[key] = value
+        async def set(self, name: str, value: str, ex: int | None = None) -> None:
+            self.store[name] = value
+
+        async def scan(
+            self,
+            cursor: int = 0,
+            match: str | None = None,
+            count: int | None = None,
+        ) -> tuple[int, list[bytes | str]]:
+            return (0, list(self.store.keys()))
+
+        async def delete(self, *names: str) -> int:
+            deleted = 0
+            for name in names:
+                if self.store.pop(name, None) is not None:
+                    deleted += 1
+            return deleted
+
+        async def aclose(self) -> None:
+            pass
 
     mock_redis = MockRedis()
-    blacklist = TokenBlacklist(redis_client=mock_redis, issuer=issuer)  # type: ignore[arg-type]
+    blacklist = TokenBlacklist(redis_client=mock_redis, issuer=issuer)
 
     # Before revocation: not revoked
     assert await blacklist.is_revoked(jti) is False

@@ -1,15 +1,11 @@
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Sequence
 from typing import Any
 
-try:
-    import httpx
-    _HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
-except ImportError:
-    httpx = None
-    _HTTP_ERRORS = (TimeoutError, OSError)
+import httpx
 
 from swiftpy.ai.exceptions import (
     AIConnectionError,
@@ -18,15 +14,24 @@ from swiftpy.ai.exceptions import (
 from swiftpy.ai.pool import AIHttpPool
 from swiftpy.ai.vectorstore.base import (
     ALLOWED_METRICS,
+    RESERVED_META_KEYS,
     SearchResult,
     VectorRecord,
     VectorStore,
     VectorStoreCapabilities,
+    dedupe_preserve_order,
+    encode_path_segment,
     handle_adapter_http_error,
     normalize_record,
+    validate_collection_name,
+    validate_filter_operators,
+    validate_pinecone_environment,
+    validate_pinecone_url,
     validate_vector,
 )
 from swiftpy.core.config import Config
+
+_HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError, OSError)
 
 _PINECONE_METRIC_MAP = {
     "cosine": "cosine",
@@ -54,6 +59,7 @@ class PineconeAdapter(VectorStore):
         http_pool: AIHttpPool | None = None,
         **kwargs: Any,
     ) -> None:
+        validate_collection_name(collection_name)
         self._config = config or Config()
         if not self._config.get("ai.enabled", True):
             raise AIModuleDisabledError("AI module is disabled in configuration (ai.enabled is false).")
@@ -70,14 +76,19 @@ class PineconeAdapter(VectorStore):
 
         cfg_key = self._config.get("ai.vectorstores.pinecone.api_key", "")
         self._api_key = api_key if api_key is not None else str(cfg_key)
-        self._environment = environment or str(self._config.get("ai.vectorstores.pinecone.environment", "us-east-1"))
+        raw_env = environment or str(self._config.get("ai.vectorstores.pinecone.environment", "us-east-1"))
+        self._environment = validate_pinecone_environment(raw_env)
 
         cfg_base = self._config.get("ai.vectorstores.pinecone.base_url", "")
         raw_base = base_url or str(cfg_base)
+        self._explicit_base_url = bool(raw_base)
         if raw_base:
-            self._base_url = raw_base.rstrip("/")
+            self._base_url = validate_pinecone_url(raw_base, require_pinecone_host=False)
         else:
-            self._base_url = f"https://{self._collection}.svc.{self._environment}.pinecone.io"
+            self._base_url = validate_pinecone_url(
+                f"https://{self._collection}.svc.{self._environment}.pinecone.io",
+                require_pinecone_host=True,
+            )
 
         self._http_pool = http_pool or AIHttpPool.get_instance()
 
@@ -88,7 +99,7 @@ class PineconeAdapter(VectorStore):
             metadata_filtering=True,
             nested_metadata_filtering=False,
             namespaces=True,
-            pagination=True,
+            pagination=False,
             batch_upsert=True,
             native_distance_metrics=("cosine", "l2", "inner_product"),
         )
@@ -105,15 +116,12 @@ class PineconeAdapter(VectorStore):
         dimensions: int,
         metric: str = "cosine",
     ) -> None:
+        validate_collection_name(name)
         norm_metric = metric.lower().strip()
         if norm_metric not in ALLOWED_METRICS:
             raise ValueError(f"Unsupported metric '{metric}'. Expected one of {sorted(ALLOWED_METRICS)}")
-        if dimensions <= 0:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
             raise ValueError(f"Dimensions must be positive, got {dimensions}")
-
-        self._collection = name
-        self._dimensions = dimensions
-        self._metric = norm_metric
 
         pinecone_metric = _PINECONE_METRIC_MAP[norm_metric]
         url = "https://api.pinecone.io/indexes"
@@ -139,8 +147,27 @@ class PineconeAdapter(VectorStore):
             )
             if resp.status_code not in (200, 201, 409):
                 handle_adapter_http_error(resp.status_code, resp.text, "pinecone")
+            resp_data: Any = {}
+            try:
+                resp_data = resp.json()
+            except ValueError:
+                resp_data = {}
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[pinecone] Connection error: {err}") from err
+
+        self._collection = name
+        self._dimensions = dimensions
+        self._metric = norm_metric
+
+        if isinstance(resp_data, dict) and resp_data.get("host"):
+            raw_host = str(resp_data["host"]).strip()
+            candidate = raw_host if raw_host.startswith("https://") else f"https://{raw_host}"
+            self._base_url = validate_pinecone_url(candidate, require_pinecone_host=True)
+        elif not self._explicit_base_url:
+            self._base_url = validate_pinecone_url(
+                f"https://{name}.svc.{self._environment}.pinecone.io",
+                require_pinecone_host=True,
+            )
 
     async def upsert(
         self,
@@ -170,9 +197,15 @@ class PineconeAdapter(VectorStore):
 
         vectors_payload: list[dict[str, Any]] = []
         for r in norm_records:
+            user_meta = {
+                k: copy.deepcopy(v)
+                for k, v in r.metadata.items()
+                if k not in RESERVED_META_KEYS
+            }
             meta = {
+                **user_meta,
                 "_content": r.content,
-                **r.metadata,
+                "_orig_id": r.id,
             }
             vectors_payload.append({
                 "id": r.id,
@@ -219,11 +252,16 @@ class PineconeAdapter(VectorStore):
             "namespace": self._namespace,
         }
 
-        if filter:
-            pine_filter: dict[str, Any] = {}
-            for k, v in filter.items():
-                pine_filter[k] = {"$eq": v} if not isinstance(v, dict) else v
-            body["filter"] = pine_filter
+        if filter is not None:
+            validate_filter_operators(filter, nested_allowed=False)
+            if filter:
+                pine_filter: dict[str, Any] = {}
+                for k, v in filter.items():
+                    if k.startswith("$"):
+                        pine_filter[k] = v
+                    else:
+                        pine_filter[k] = {"$eq": v} if not isinstance(v, dict) else v
+                body["filter"] = pine_filter
 
         client = self._http_pool.get_client()
         try:
@@ -243,7 +281,8 @@ class PineconeAdapter(VectorStore):
         for item in matches:
             meta_raw = item.get("metadata") or {}
             content = str(meta_raw.get("_content", ""))
-            clean_meta = {k: v for k, v in meta_raw.items() if k != "_content"}
+            orig_id = str(meta_raw.get("_orig_id") or item.get("id", ""))
+            clean_meta = {k: v for k, v in meta_raw.items() if k not in RESERVED_META_KEYS}
             raw_score = float(item.get("score", 0.0))
             if self._metric == "l2":
                 score = -math.sqrt(max(0.0, raw_score))
@@ -252,7 +291,7 @@ class PineconeAdapter(VectorStore):
             values = item.get("values")
             results.append(
                 SearchResult(
-                    id=str(item.get("id", "")),
+                    id=orig_id,
                     score=score,
                     metadata=clean_meta,
                     content=content,
@@ -289,11 +328,12 @@ class PineconeAdapter(VectorStore):
             item = vectors[id]
             meta_raw = item.get("metadata") or {}
             content = str(meta_raw.get("_content", ""))
-            clean_meta = {k: v for k, v in meta_raw.items() if k != "_content"}
+            orig_id = str(meta_raw.get("_orig_id") or id)
+            clean_meta = {k: v for k, v in meta_raw.items() if k not in RESERVED_META_KEYS}
             values = item.get("values")
 
             return SearchResult(
-                id=id,
+                id=orig_id,
                 score=1.0,
                 metadata=clean_meta,
                 content=content,
@@ -325,21 +365,37 @@ class PineconeAdapter(VectorStore):
             raise AIConnectionError(f"[pinecone] Connection error: {err}") from err
 
     async def delete_batch(self, ids: Sequence[str]) -> int:
-        if not ids:
+        unique_ids = dedupe_preserve_order(ids)
+        if not unique_ids:
             return 0
 
-        existing_count = 0
-        for item_id in ids:
-            if await self.get(item_id) is not None:
-                existing_count += 1
+        client = self._http_pool.get_client()
+        fetch_url = f"{self._base_url}/vectors/fetch"
+        params: list[tuple[str, str | int | float | bool | None]] = [("ids", item_id) for item_id in unique_ids]
+        params.append(("namespace", self._namespace))
 
-        if existing_count == 0:
+        try:
+            fetch_resp = await client.get(
+                fetch_url,
+                params=params,
+                headers=self._get_headers(),
+                timeout=self._timeout,
+            )
+            if fetch_resp.status_code == 404:
+                return 0
+            if fetch_resp.status_code != 200:
+                handle_adapter_http_error(fetch_resp.status_code, fetch_resp.text, "pinecone")
+            vectors = fetch_resp.json().get("vectors", {})
+        except _HTTP_ERRORS as err:
+            raise AIConnectionError(f"[pinecone] Connection error: {err}") from err
+
+        existing_ids = [item_id for item_id in unique_ids if item_id in vectors]
+        if not existing_ids:
             return 0
 
         url = f"{self._base_url}/vectors/delete"
-        body = {"ids": list(ids), "namespace": self._namespace}
+        body = {"ids": existing_ids, "namespace": self._namespace}
 
-        client = self._http_pool.get_client()
         try:
             resp = await client.post(
                 url,
@@ -349,7 +405,7 @@ class PineconeAdapter(VectorStore):
             )
             if resp.status_code != 200:
                 handle_adapter_http_error(resp.status_code, resp.text, "pinecone")
-            return existing_count
+            return len(existing_ids)
         except _HTTP_ERRORS as err:
             raise AIConnectionError(f"[pinecone] Connection error: {err}") from err
 
@@ -374,7 +430,8 @@ class PineconeAdapter(VectorStore):
             raise AIConnectionError(f"[pinecone] Connection error: {err}") from err
 
     async def drop_collection(self, name: str) -> None:
-        url = f"https://api.pinecone.io/indexes/{name}"
+        validated = validate_collection_name(name)
+        url = f"https://api.pinecone.io/indexes/{encode_path_segment(validated)}"
         client = self._http_pool.get_client()
         try:
             resp = await client.delete(

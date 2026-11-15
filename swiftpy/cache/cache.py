@@ -69,6 +69,32 @@ class Cache:
         """Alias for driver()."""
         return self.driver(name)
 
+    def _build_store_prefix(self, store_config: dict[str, Any]) -> str:
+        """Resolve cache store prefix consistently including optional app.name namespace."""
+        app_name = str(self.config.get("app.name", "")).strip()
+        raw_val = (
+            store_config["prefix"]
+            if "prefix" in store_config
+            else self.config.get("cache.prefix", "swiftpy_cache:")
+        )
+        raw_prefix = str(raw_val) if raw_val is not None else "swiftpy_cache:"
+        if (
+            app_name
+            and not raw_prefix.startswith(f"{app_name}:")
+            and not raw_prefix.startswith(f"{app_name}_")
+        ):
+            return f"{app_name}:{raw_prefix}"
+        return raw_prefix
+
+    def _resolve_store_ttl(self, store_config: dict[str, Any]) -> float | None:
+        """Resolve default TTL while distinguishing explicit None or 0.0 values."""
+        default_ttl = (
+            store_config["ttl"]
+            if "ttl" in store_config
+            else self.config.get("cache.default_ttl", None)
+        )
+        return float(default_ttl) if default_ttl is not None else None
+
     def _resolve_driver(self, name: str) -> CacheDriver:
         if name in self._custom_creators:
             creator = self._custom_creators[name]
@@ -84,37 +110,19 @@ class Cache:
         driver_type = store_config.get("driver", name)
 
         if driver_type == "memory":
-            prefix = str(
-                store_config.get(
-                    "prefix", self.config.get("cache.prefix", "swiftpy_cache:")
-                )
+            prefix = self._build_store_prefix(store_config)
+            ttl_val = self._resolve_store_ttl(store_config)
+            raw_max_items = (
+                store_config["max_items"]
+                if "max_items" in store_config
+                else self.config.get("cache.max_items", 1000)
             )
-            default_ttl = store_config.get(
-                "ttl", self.config.get("cache.default_ttl", None)
-            )
-            ttl_val = float(default_ttl) if default_ttl is not None else None
-            return MemoryDriver(prefix=prefix, default_ttl=ttl_val)
+            max_items = int(raw_max_items) if raw_max_items is not None else None
+            return MemoryDriver(prefix=prefix, default_ttl=ttl_val, max_items=max_items)
 
         if driver_type == "redis":
-            app_name = str(self.config.get("app.name", "")).strip()
-            raw_prefix = str(
-                store_config.get(
-                    "prefix", self.config.get("cache.prefix", "swiftpy_cache:")
-                )
-            )
-            if (
-                app_name
-                and not raw_prefix.startswith(f"{app_name}:")
-                and not raw_prefix.startswith(f"{app_name}_")
-            ):
-                prefix = f"{app_name}:{raw_prefix}"
-            else:
-                prefix = raw_prefix
-
-            default_ttl = store_config.get(
-                "ttl", self.config.get("cache.default_ttl", None)
-            )
-            ttl_val = float(default_ttl) if default_ttl is not None else None
+            prefix = self._build_store_prefix(store_config)
+            ttl_val = self._resolve_store_ttl(store_config)
             host = store_config.get("host")
             port = store_config.get("port")
             password = store_config.get("password")
@@ -194,8 +202,11 @@ class Cache:
         key: str,
         ttl: float | None,
         callback: Callable[[], Any] | Callable[[], Awaitable[Any]],
+        lock_timeout: float = 10.0,
     ) -> Any:
-        return await self.driver().remember(key, ttl, callback)
+        return await self.driver().remember(
+            key, ttl, callback, lock_timeout=lock_timeout
+        )
 
     async def forget(self, key: str) -> bool:
         return await self.driver().forget(key)
@@ -217,11 +228,15 @@ class Cache:
     ) -> bool:
         return await self.driver().add(key, value, ttl)
 
-    async def increment(self, key: str, value: int = 1) -> int:
-        return await self.driver().increment(key, value)
+    async def increment(
+        self, key: str, value: int = 1, ttl: float | None = None
+    ) -> int:
+        return await self.driver().increment(key, value, ttl=ttl)
 
-    async def decrement(self, key: str, value: int = 1) -> int:
-        return await self.driver().decrement(key, value)
+    async def decrement(
+        self, key: str, value: int = 1, ttl: float | None = None
+    ) -> int:
+        return await self.driver().decrement(key, value, ttl=ttl)
 
     async def close(self) -> None:
         for drv in self._drivers.values():

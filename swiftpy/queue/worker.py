@@ -12,10 +12,12 @@ from typing import Any
 
 from redis.exceptions import NoScriptError, RedisError
 
+from swiftpy.core.config import ConfigurationError
 from swiftpy.core.container import get_container
 from swiftpy.database.pool import DatabasePool
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job, JobSerializationError
+from swiftpy.support.keys import validate_signing_key
 
 logger = logging.getLogger("swiftpy.queue")
 
@@ -51,6 +53,8 @@ class QueueWorker:
         timeout: float | None = None,
         worker_id: str | None = None,
         concurrency: int = 1,
+        promote_interval: float = 0.1,
+        allow_unsigned: bool | None = None,
     ) -> None:
         if isinstance(queues, str):
             raw_queues = [q.strip() for q in queues.split(",") if q.strip()]
@@ -77,6 +81,8 @@ class QueueWorker:
         self.timeout = timeout
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.concurrency = max(1, int(concurrency))
+        self.promote_interval = max(0.01, float(promote_interval))
+        self.allow_unsigned = allow_unsigned
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._original_handlers: dict[signal.Signals, Any] = {}
@@ -183,17 +189,20 @@ class QueueWorker:
 
     async def _pop_next_job(self) -> tuple[str, str] | None:
         """
-        Check all monitored queues in order, promote delayed jobs, reap expired leases,
+        Check all monitored queues in order, throttled delayed-job promotion & lease reaping,
         and atomically pop & lease the first available job payload.
         """
+        now = time.monotonic()
+        if (
+            self._last_promoted_at <= 0.0
+            or (now - self._last_promoted_at) >= self.promote_interval
+        ):
+            self._last_promoted_at = now
+            for queue in self.queues:
+                await self._promote_delayed_jobs(queue)
+                await self.dispatcher.reap_expired_leases(queue)
+
         for queue in self.queues:
-            # 1. Promote any delayed jobs due for this queue
-            await self._promote_delayed_jobs(queue)
-
-            # 2. Reap expired leases across workers
-            await self.dispatcher.reap_expired_leases(queue)
-
-            # 3. Atomically pop from ready queue to worker processing list with lease
             lease_duration = (self.timeout + 30.0) if self.timeout else 60.0
             raw_payload = await self.dispatcher.pop_and_lease(
                 queue,
@@ -256,7 +265,7 @@ class QueueWorker:
 
         # 2. Reconstruct Job instance
         try:
-            job = Job.deserialize(data)
+            job = Job.deserialize(data, allow_unsigned=self.allow_unsigned)
         except (
             JobSerializationError,
             TypeError,
@@ -306,7 +315,10 @@ class QueueWorker:
                 self.worker_id,
                 job.job_id,
             )
-            requeue_payload = json.dumps(job.serialize(), ensure_ascii=False)
+            requeue_payload = json.dumps(
+                job.serialize(allow_unsigned=self.allow_unsigned),
+                ensure_ascii=False,
+            )
             await self.dispatcher.release(
                 queue,
                 self.worker_id,
@@ -360,7 +372,10 @@ class QueueWorker:
                 job.attempts + 1,
                 job.tries,
             )
-            requeue_payload = json.dumps(job.serialize(), ensure_ascii=False)
+            requeue_payload = json.dumps(
+                job.serialize(allow_unsigned=self.allow_unsigned),
+                ensure_ascii=False,
+            )
             await self.dispatcher.release(
                 queue,
                 self.worker_id,
@@ -406,6 +421,21 @@ class QueueWorker:
         """
         Run the worker loop pulling and executing jobs.
         """
+        effective_key = Job.get_app_key()
+        unsigned_allowed = (
+            self.allow_unsigned
+            if self.allow_unsigned is not None
+            else Job.get_allow_unsigned()
+        )
+        if effective_key is None or not str(effective_key).strip():
+            if not unsigned_allowed:
+                raise ConfigurationError(
+                    "APP_KEY (>=32 bytes) is required to run QueueWorker. "
+                    "Configure APP_KEY or pass allow_unsigned=True for local tests."
+                )
+        else:
+            validate_signing_key(str(effective_key), purpose="APP_KEY")
+
         self._setup_signal_handlers()
         self._is_working = True
 
@@ -428,26 +458,45 @@ class QueueWorker:
 
         try:
             while not self._should_stop:
-                # Check maximum job limit
-                if (
-                    self.max_jobs is not None
-                    and (self.jobs_processed + self.jobs_failed) >= self.max_jobs
-                ):
-                    logger.info(
-                        "Worker %s reached max_jobs limit (%d)",
-                        self.worker_id,
-                        self.max_jobs,
-                    )
-                    break
+                # Check maximum job limit including in-flight tasks
+                if self.max_jobs is not None:
+                    completed = self.jobs_processed + self.jobs_failed
+                    if completed >= self.max_jobs:
+                        logger.info(
+                            "Worker %s reached max_jobs limit (%d)",
+                            self.worker_id,
+                            self.max_jobs,
+                        )
+                        break
+                    if completed + len(self._active_tasks) >= self.max_jobs:
+                        await asyncio.wait(
+                            self._active_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        continue
 
-                job_data = await self._pop_next_job()
+                acquired = False
+                if self.concurrency > 1:
+                    await self._semaphore.acquire()
+                    acquired = True
+                try:
+                    job_data = await self._pop_next_job()
+                except BaseException:
+                    if acquired:
+                        self._semaphore.release()
+                    raise
+
                 if job_data is not None:
                     queue, raw_payload = job_data
                     if self.concurrency > 1:
-                        await self._semaphore.acquire()
-                        task = asyncio.create_task(
-                            self._run_job_with_semaphore(queue, raw_payload)
-                        )
+                        try:
+                            task = asyncio.create_task(
+                                self._run_job_with_semaphore(queue, raw_payload)
+                            )
+                        except BaseException:
+                            if acquired:
+                                self._semaphore.release()
+                            raise
                         self._active_tasks.add(task)
 
                         def _on_done(t: asyncio.Task[Any]) -> None:
@@ -470,8 +519,17 @@ class QueueWorker:
                             )
                     continue
 
+                if acquired:
+                    self._semaphore.release()
+
                 # No active job available
                 if self.stop_when_empty and await self._all_queues_empty():
+                    if self._active_tasks:
+                        await asyncio.wait(
+                            self._active_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        continue
                     logger.info(
                         "Worker %s stopping because queues are empty",
                         self.worker_id,

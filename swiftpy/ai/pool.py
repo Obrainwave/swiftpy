@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
+import httpx
 
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
@@ -34,6 +31,7 @@ class AIHttpPool:
 
         self._custom_client = client
         self._client: httpx.AsyncClient | None = client
+        self._owns_client: bool = client is None
 
     @property
     def max_connections(self) -> int:
@@ -73,11 +71,6 @@ class AIHttpPool:
         cls._instance = pool
 
     def _build_client(self) -> httpx.AsyncClient:
-        if httpx is None:
-            raise RuntimeError(
-                "The 'httpx' package is required for outbound AI HTTP calls. "
-                "Ensure dependencies are installed."
-            )
         limits = httpx.Limits(
             max_connections=self.max_connections,
             max_keepalive_connections=self.max_keepalive_connections,
@@ -95,10 +88,15 @@ class AIHttpPool:
         """
         if self._client is None or self._client.is_closed:
             self._client = self._build_client()
+            self._owns_client = True
         return self._client
 
     async def aclose(self) -> None:
-        """Close the shared client connection pool and release resources safely."""
-        if self._client is not None and not self._client.is_closed:
+        """Close the pool-owned client connection pool and release resources safely."""
+        if (
+            self._owns_client
+            and self._client is not None
+            and not self._client.is_closed
+        ):
             await self._client.aclose()
         self._client = None

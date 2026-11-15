@@ -4,6 +4,7 @@ import pytest
 
 from swiftpy.core.config import Config
 from swiftpy.filesystem.disk import StorageDisk
+from swiftpy.filesystem.drivers.local import LocalStorageDriver
 from swiftpy.filesystem.exceptions import DiskNotFoundError, DriverNotSupportedError
 from swiftpy.filesystem.manager import FilesystemManager
 
@@ -66,8 +67,6 @@ def test_manager_extend_custom_driver() -> None:
         }
     })
     manager = FilesystemManager(cfg)
-
-    from swiftpy.filesystem.drivers.local import LocalStorageDriver
 
     manager.extend("custom", lambda conf: LocalStorageDriver(root="storage/custom"))
     disk = manager.disk("custom_disk")

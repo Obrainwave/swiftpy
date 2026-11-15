@@ -147,19 +147,25 @@ async def test_create_executes_exactly_one_query(
 
 
 @pytest.mark.asyncio
-async def test_save_raises_when_pk_unset_on_existing_model() -> None:
+async def test_save_raises_when_pk_unset_on_existing_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     doc = await UuidDocument.create(title="Has PK")
-    doc.uuid = None  # type: ignore[assignment]
+    monkeypatch.setattr(doc, "uuid", None)
     with pytest.raises((ValueError, RuntimeError), match=r"(?i)primary key"):
         await doc.save()
 
 
 def test_composite_primary_key_explicitly_unsupported() -> None:
     with pytest.raises(ValueError, match=r"(?i)composite|primary key"):
-
-        class CompositeTupleModel(Model):
-            __table__ = "composite_items"
-            __primary_key__ = ("org_id", "user_id")  # type: ignore[assignment]
+        type(
+            "CompositeTupleModel",
+            (Model,),
+            {
+                "__table__": "composite_items",
+                "__primary_key__": ("org_id", "user_id"),
+            },
+        )
 
     with pytest.raises(ValueError, match=r"(?i)composite|primary key"):
 

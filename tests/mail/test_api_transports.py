@@ -69,7 +69,12 @@ async def test_resend_deep_payload_verification() -> None:
     assert result.success is True
     assert result.message_id == "re_msg_12345"
     assert result.provider == "resend"
-    assert result.accepted == ["to1@example.com", "to2@example.com"]
+    assert result.accepted == [
+        "to1@example.com",
+        "to2@example.com",
+        "cc1@example.com",
+        "bcc1@example.com",
+    ]
 
     # Verify every element of the captured request payload
     assert captured_payload["from"] == "Custom Sender <custom@app.com>"

@@ -221,3 +221,70 @@ def test_discover_providers_from_different_cwd_and_skip_underscore_files(
     provider_classes = [type(p) for p in app._providers]
     assert AppServiceProvider in provider_classes
     assert DatabaseServiceProvider in provider_classes
+
+
+def test_discover_providers_no_sys_path_leak_and_registers_synthetic_module(
+    tmp_path: Path,
+) -> None:
+    """CORE-6: discover_providers does not mutate sys.path permanently and registers sys.modules."""
+    isolated_root = tmp_path / "isolated_proj"
+    providers_dir = isolated_root / "app" / "providers"
+    providers_dir.mkdir(parents=True)
+    (isolated_root / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (providers_dir / "__init__.py").write_text("", encoding="utf-8")
+    (providers_dir / "custom_provider.py").write_text(
+        """from __future__ import annotations
+
+import sys
+from swiftpy.core.providers.base import ServiceProvider
+
+
+class IsolatedTestProvider(ServiceProvider):
+    module_in_sys_modules = __name__ in sys.modules
+
+    def register(self) -> None:
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    synthetic_dir = tmp_path / "external_providers"
+    synthetic_dir.mkdir()
+    (synthetic_dir / "dataclass_provider.py").write_text(
+        """from __future__ import annotations
+
+from dataclasses import dataclass
+from swiftpy.core.providers.base import ServiceProvider
+
+
+@dataclass
+class ProviderMeta:
+    name: str
+
+
+class SyntheticDataclassProvider(ServiceProvider):
+    meta = ProviderMeta(name="ok")
+
+    def register(self) -> None:
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    before_sys_path = list(sys.path)
+    try:
+        discovered = discover_providers(providers_dir, project_root=isolated_root)
+        assert [c.__name__ for c in discovered] == ["IsolatedTestProvider"]
+        assert getattr(discovered[0], "module_in_sys_modules", False) is True
+        assert str(isolated_root.resolve()) not in sys.path
+        assert sys.path == before_sys_path
+
+        synthetic = discover_providers(synthetic_dir)
+        assert [c.__name__ for c in synthetic] == ["SyntheticDataclassProvider"]
+        assert synthetic[0].__module__ in sys.modules
+    finally:
+        sys.modules.pop("app", None)
+        sys.modules.pop("app.providers", None)
+        sys.modules.pop("app.providers.custom_provider", None)
+        sys.modules.pop("_swiftpy_providers.custom_provider", None)
+        sys.modules.pop("_swiftpy_providers.dataclass_provider", None)

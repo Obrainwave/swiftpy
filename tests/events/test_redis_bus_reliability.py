@@ -35,6 +35,7 @@ async def test_shared_pool_not_closed_by_components(
     pool = aioredis.BlockingConnectionPool(
         host=redis_host,
         port=redis_port,
+        password=os.getenv("REDIS_PASSWORD") or None,
         decode_responses=True,
         max_connections=10,
     )
@@ -75,9 +76,9 @@ async def test_redis_bus_hmac_signing(
     redis_host: str, redis_port: int
 ) -> None:
     """Ensure HMAC-SHA256 signs bus messages, drops unsigned/tampered ones, and handles key rotation."""
-    key = "secret_key_1"
+    key = "secret_key_1_32bytes_long_padded"
     RedisEventBus.set_app_key(key)
-    RedisEventBus.set_previous_keys(["old_key_rot"])
+    RedisEventBus.set_previous_keys(["old_key_rot_32bytes_long_padded!"])
 
     prefix = f"test_hmac_{int(time.time() * 1000)}:"
     bus = RedisEventBus(
@@ -136,7 +137,7 @@ async def test_redis_bus_hmac_signing(
             "sender_id": "other",
             "timestamp": time.time(),
         }
-        rot_sig = RedisEventBus._compute_signature(rot_envelope, "old_key_rot")
+        rot_sig = RedisEventBus._compute_signature(rot_envelope, "old_key_rot_32bytes_long_padded!")
         rot_envelope["signature"] = rot_sig
         await client.publish(channel, json.dumps(rot_envelope))
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import operator
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, Self
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,6 +12,14 @@ import pytest
 
 from swiftpy.console.commands.seed import SeedCommand
 from swiftpy.database.seeder import Seeder
+
+
+def _noop_recorder(_ev: str) -> None:
+    return None
+
+
+_record_tx_event: Callable[[str], None] = _noop_recorder
+_record_fail_event: Callable[[str], None] = _noop_recorder
 
 # Shared execution log for sequence testing
 shared_execution_log: list[str] = []
@@ -59,14 +69,14 @@ async def test_seeder_call_rejects_abstract_and_invalid_types() -> None:
 
     # 1. Abstract seeder subclass
     with pytest.raises(TypeError, match="Must be a non-abstract subclass of Seeder"):
-        await parent.call(AbstractChildSeeder)  # type: ignore[type-abstract]
+        await operator.methodcaller("call", AbstractChildSeeder)(parent)
 
     # 2. Unrelated class
     class NotASeeder:
         pass
 
     with pytest.raises(TypeError, match="Must be a non-abstract subclass of Seeder"):
-        await parent.call(NotASeeder)  # type: ignore[arg-type]
+        await operator.methodcaller("call", NotASeeder)(parent)
 
 
 def test_seed_command_finds_seeder_class_in_directory_and_dotted(tmp_path: Path) -> None:
@@ -113,11 +123,12 @@ async def test_seed_command_execution_inside_transaction_and_commits(tmp_path: P
     tx_events: list[str] = []
 
     seeder_code = f"""from __future__ import annotations
+import sys
+
 from swiftpy.database.seeder import Seeder
 
 class MockDatabaseSeeder(Seeder):
     async def run(self) -> None:
-        import sys
         # Record execution inside transaction
         sys.modules['{__name__}']._record_tx_event('seeder_run')
 """
@@ -128,7 +139,8 @@ class MockDatabaseSeeder(Seeder):
         tx_events.append(ev)
 
     # Attach recorder to module for seeder code to access
-    sys.modules[__name__]._record_tx_event = _record  # type: ignore[attr-defined]
+    global _record_tx_event
+    _record_tx_event = _record
 
     args = argparse.Namespace(
         app="main:app",
@@ -175,11 +187,12 @@ async def test_seed_command_execution_failure_triggers_rollback(tmp_path: Path) 
     tx_events: list[str] = []
 
     seeder_code = f"""from __future__ import annotations
+import sys
+
 from swiftpy.database.seeder import Seeder
 
 class FailingDatabaseSeeder(Seeder):
     async def run(self) -> None:
-        import sys
         sys.modules['{__name__}']._record_fail_event('seeder_fail')
         raise RuntimeError("Database write error during seeding")
 """
@@ -189,7 +202,8 @@ class FailingDatabaseSeeder(Seeder):
     def _record(ev: str) -> None:
         tx_events.append(ev)
 
-    sys.modules[__name__]._record_fail_event = _record  # type: ignore[attr-defined]
+    global _record_fail_event
+    _record_fail_event = _record
 
     args = argparse.Namespace(
         app="main:app",

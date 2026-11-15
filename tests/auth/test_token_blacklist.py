@@ -6,6 +6,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+import redis.asyncio as aioredis
 
 from swiftpy.auth.jwt_issuer import InvalidSignatureError, JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist
@@ -65,6 +66,7 @@ async def test_forged_exp_capped_at_max_ttl() -> None:
     assert await blacklist.is_revoked(jti) is True
 
     client = await blacklist.get_client()
+    assert isinstance(client, aioredis.Redis)
     key = f"{prefix}{jti}"
     redis_ttl = await client.ttl(key)
     # Must be capped at max_token_lifetime (allowing slight drift)

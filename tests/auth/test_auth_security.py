@@ -11,6 +11,7 @@ import uuid
 from typing import Any
 
 import pytest
+import redis.asyncio as aioredis
 
 from swiftpy.auth import (
     ApiKeyGuard,
@@ -655,6 +656,7 @@ async def test_token_blacklist_ttl_and_expired_behavior() -> None:
 
     # Verify TTL in Redis is between 1 and 120
     client = await blacklist.get_client()
+    assert isinstance(client, aioredis.Redis)
     key = f"{blacklist.prefix}{jti}"
     redis_ttl = await client.ttl(key)
     assert 0 < redis_ttl <= 120
@@ -682,7 +684,7 @@ async def test_token_blacklist_redis_failure_fails_closed(
         async def is_revoked(self, jti: str, **kwargs: Any) -> bool:
             raise ConnectionError("Redis cluster unreachable at 10.0.0.42:6379")
 
-    app = Application()
+    app = Application(debug=True)
     app.container.instance(JWTIssuer, issuer)
     app.container.instance(TokenBlacklist, BrokenBlacklist())
 
@@ -886,7 +888,7 @@ async def test_api_key_guard_database_failure_fails_closed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Verify that database query errors during API key verification fail closed with generic 503 and log detail."""
-    app = Application()
+    app = Application(debug=True)
     app.container.instance(DatabasePool, ensure_db_pool)
 
     @app.get("/data")

@@ -65,12 +65,59 @@ class FileTooLargeError(FileUploadError, PayloadTooLargeError):
         super().__init__(message=message)
 
 
-class InvalidMimeTypeError(FileUploadError):
+class InvalidMimeTypeError(FileValidationError):
     """Raised when an uploaded file's MIME type does not match allowed types."""
 
+    def __init__(
+        self,
+        errors_or_message: str | dict[str, list[str]] = "Invalid file MIME type.",
+        message: str | None = None,
+        headers: dict[str, str] | None = None,
+        field_name: str = "file",
+    ) -> None:
+        errors, resolved_msg = _normalize_validation_args(
+            errors_or_message,
+            message=message,
+            default_message="Invalid file MIME type.",
+            field_name=field_name,
+        )
+        super().__init__(errors=errors, message=resolved_msg, headers=headers)
 
-class InvalidFileExtensionError(FileUploadError):
+
+class InvalidFileExtensionError(FileValidationError):
     """Raised when an uploaded file's extension is disallowed."""
+
+    def __init__(
+        self,
+        errors_or_message: str | dict[str, list[str]] = "Invalid file extension.",
+        message: str | None = None,
+        headers: dict[str, str] | None = None,
+        field_name: str = "file",
+    ) -> None:
+        errors, resolved_msg = _normalize_validation_args(
+            errors_or_message,
+            message=message,
+            default_message="Invalid file extension.",
+            field_name=field_name,
+        )
+        super().__init__(errors=errors, message=resolved_msg, headers=headers)
+
+
+def _normalize_validation_args(
+    errors_or_message: str | dict[str, list[str]],
+    *,
+    message: str | None,
+    default_message: str,
+    field_name: str,
+) -> tuple[dict[str, list[str]], str]:
+    if isinstance(errors_or_message, str):
+        resolved_msg = message or errors_or_message
+        return {field_name: [resolved_msg]}, resolved_msg
+    first_msg = next(
+        (msgs[0] for msgs in errors_or_message.values() if msgs),
+        default_message,
+    )
+    return errors_or_message, message or first_msg
 
 
 class MalformedMultipartError(FileUploadError, HttpException):

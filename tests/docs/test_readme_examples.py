@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import ClassVar
+import os
+from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 
@@ -21,10 +23,17 @@ from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.core.config import Config
 from swiftpy.database.migrations import Blueprint, Migration, Schema, SchemaGrammar
 from swiftpy.database.orm import HasMany, HasOne, Model
+from swiftpy.database.pagination import Paginator, SimplePaginator
 from swiftpy.database.pool import DatabasePool
+from swiftpy.database.query_builder import Query
+from swiftpy.filesystem import Storage
+from swiftpy.mail.templates.renderer import MailTemplateRenderer
 from swiftpy.queue import Job
-from swiftpy.queue.job import _dispatch_handler, set_dispatch_handler
+from swiftpy.queue import job as queue_job
+from swiftpy.queue.job import set_dispatch_handler
 from swiftpy.testing.http_client import TestClient
+from swiftpy.validation import FormRequest
+from swiftpy.validation.rules import email, min_, required, string, unique
 
 # ==============================================================================
 # 1. Minimal Application Entrypoint (README Example 1)
@@ -38,6 +47,11 @@ async def test_readme_minimal_application_entrypoint() -> None:
         {
             "app": {"name": "SwiftPY Store API", "env": "testing", "debug": True},
             "auth": {"jwt": {"secret": test_secret}},
+            "redis": {
+                "host": os.getenv("REDIS_HOST", "127.0.0.1"),
+                "port": int(os.getenv("REDIS_PORT", "6379")),
+                "password": os.getenv("REDIS_PASSWORD") or None,
+            },
         }
     )
 
@@ -50,8 +64,8 @@ async def test_readme_minimal_application_entrypoint() -> None:
     app.middleware([RequestId, SecurityHeaders, CORS])
 
     @app.get("/ping")
-    async def ping(request: Request) -> Response:
-        return json_response({"message": "pong"})
+    async def ping(request: Request) -> dict[str, str]:
+        return {"message": "pong"}
 
     @app.group("/api/v1")
     def v1_routes(group: RouteGroup) -> None:
@@ -291,7 +305,7 @@ class SendWelcomeEmail(Job):
 async def test_readme_asynchronous_queues_and_jobs() -> None:
     test_key = "k" * 32
     orig_app_key = Job.get_app_key()
-    orig_handler = _dispatch_handler
+    orig_handler = queue_job._dispatch_handler
 
     try:
         Job.set_app_key(test_key)
@@ -332,3 +346,138 @@ async def test_readme_asynchronous_queues_and_jobs() -> None:
     finally:
         Job.set_app_key(orig_app_key)
         set_dispatch_handler(orig_handler)
+
+
+# ==============================================================================
+# 5. Pagination, Query Builder, Storage, Validation, & Documented Keys
+# ==============================================================================
+
+
+def test_readme_pagination_and_query_builder_contracts() -> None:
+    paginator = Paginator(items=[{"id": 1}, {"id": 2}], total=5, per_page=2, current_page=1)
+    payload = paginator.to_dict()
+    assert payload["current_page"] == 1
+    assert payload["last_page"] == 3
+    assert payload["has_more_pages"] is True
+    assert payload["has_previous_page"] is False
+
+    simple = SimplePaginator(items=[{"id": 1}], per_page=20, current_page=1, has_more=False)
+    assert simple.has_more_pages is False
+
+    sql, params = (
+        Query.table("orders")
+        .select("country")
+        .select_count("id", alias="total_orders")
+        .select_sum("amount", alias="total_revenue")
+        .group_by("country")
+        .having("total_orders", ">", 10)
+        .order_by("total_revenue", "DESC")
+        .to_sql()
+    )
+    assert 'GROUP BY "country"' in sql
+    assert "HAVING COUNT" in sql
+    assert params == [10]
+
+
+@pytest.mark.asyncio
+async def test_readme_storage_facade_example(tmp_path: Path) -> None:
+    app_config = Config(
+        {
+            "app": {"name": "SwiftPY Docs", "env": "testing", "debug": True, "key": "k" * 32},
+            "filesystems": {
+                "default": "local",
+                "signing_key": "k" * 32,
+                "disks": {
+                    "local": {
+                        "driver": "local",
+                        "root": str(tmp_path / "private"),
+                        "visibility": "private",
+                    }
+                },
+            },
+        }
+    )
+    app = Application(config=app_config, auto_discover_providers=False)
+    assert app is not None
+
+    pdf_bytes = b"%PDF-1.4\nREADME storage smoke\n"
+    await Storage.disk("local").put("reports/annual_2026.pdf", pdf_bytes)
+    assert await Storage.exists("reports/annual_2026.pdf")
+    assert await Storage.size("reports/annual_2026.pdf") == len(pdf_bytes)
+    assert isinstance(await Storage.mime_type("reports/annual_2026.pdf"), str)
+
+    @app.get("/reports/download")
+    async def download_report(request: Request) -> Response:
+        return await Storage.download(
+            "reports/annual_2026.pdf", name="Annual_Report_2026.pdf"
+        )
+
+    client = TestClient(app)
+    resp = await client.get("/reports/download")
+    assert resp.status_code == 200
+    assert resp.body == pdf_bytes
+    assert "Annual_Report_2026.pdf" in resp.headers.get("content-disposition", "")
+
+
+class ReadmeRegisterRequest(FormRequest):
+    def rules(self) -> dict[str, Any]:
+        return {
+            "name": [required(), string(), min_(3)],
+            "email": [required(), email()],
+            "password": [required(), string(), min_(8)],
+        }
+
+
+@pytest.mark.asyncio
+async def test_readme_form_request_validation_example() -> None:
+    _unused_unique_ref = unique
+    app_config = Config({"app": {"name": "SwiftPY Docs", "env": "testing", "debug": True}})
+    app = Application(config=app_config, auto_discover_providers=False)
+
+    @app.post("/register")
+    async def register(form: ReadmeRegisterRequest) -> Response:
+        data = form.validated()
+        return json_response({"name": data["name"], "email": data["email"]}, status_code=201)
+
+    client = TestClient(app)
+    bad = await client.post(
+        "/register",
+        json={"name": "Al", "email": "not-an-email", "password": "short"},
+    )
+    assert bad.status_code == 422
+
+    ok = await client.post(
+        "/register",
+        json={"name": "Alice", "email": "alice@example.com", "password": "secret-password"},
+    )
+    assert ok.status_code == 201
+    assert ok.json() == {"name": "Alice", "email": "alice@example.com"}
+
+
+def test_readme_documented_config_and_env_keys() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    env_example = (repo_root / ".env.example").read_text(encoding="utf-8")
+    for key in (
+        "APP_ENV=local",
+        "APP_DEBUG=false",
+        "APP_KEY=",
+        "DB_CONNECTION=postgresql",
+        "DB_SSL=disable",
+        "DB_SSL_CA_FILE=",
+        "FILESYSTEM_DISK=local",
+        "MAIL_MAILER=smtp",
+        "JWT_SECRET=",
+        "AUTH_KEY_PEPPER=",
+        "CORS_ALLOWED_ORIGINS=",
+        "CORS_ALLOW_CREDENTIALS=false",
+    ):
+        assert key in env_example
+
+    cfg = Application(auto_discover_providers=False).config
+    assert cfg.get("app.env") in {"local", "testing", "production"}
+    assert cfg.get("filesystems.default") == "local"
+    assert isinstance(cfg.get("cors.allow_credentials"), bool)
+
+    assert (repo_root / "views" / "mail").is_dir()
+    renderer = MailTemplateRenderer()
+    assert renderer.template_dir.name == "views"

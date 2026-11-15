@@ -5,11 +5,14 @@ from typing import Any
 
 import pytest
 
+from swiftpy.auth.auth_manager import AuthManager, CurrentUser, current_user
+from swiftpy.auth.jwt_guard import JWTGuard
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.core.application import Application
 from swiftpy.core.exceptions import UnauthorizedError
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
+from swiftpy.http.router import RouteGroup
 from swiftpy.testing.http_client import TestClient
 
 
@@ -103,10 +106,6 @@ async def test_100_concurrent_requests_through_framework_auth_pipeline() -> None
     routed through SwiftPY's real JWTGuard middleware, AuthManager, current_user(),
     and container-resolved CurrentUser dependency injection.
     """
-    from swiftpy.auth.auth_manager import AuthManager, CurrentUser, current_user
-    from swiftpy.auth.jwt_guard import JWTGuard
-    from swiftpy.http.router import RouteGroup
-
     app = Application()
     issuer = JWTIssuer(secret="full-pipeline-concurrency-secret-key-32b!!")
     app.container.instance(JWTIssuer, issuer)

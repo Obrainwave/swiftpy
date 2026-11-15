@@ -182,10 +182,10 @@ async def test_validator_magic_bytes_rejects_incorrect_ext_with_correct_content(
 
 
 @pytest.mark.asyncio
-async def test_validator_magic_bytes_allows_unknown_formats_passthrough() -> None:
-    # Custom binary format not in known magic byte dictionary
+async def test_validator_magic_bytes_rejects_unknown_formats_fail_closed() -> None:
+    """G-7: Unknown/unmapped MIME formats must fail closed when magic_bytes=True."""
     custom_bytes = b"\xaa\xbb\xcc\xdd\xee\xff custom proprietary format"
     async with open_upload(custom_bytes, "data.xyz", "application/x-custom") as upload:
         validator = FileValidator({"magic_bytes": True})
-        # Passes through because no magic signature is defined for application/x-custom
-        await validator.validate(upload)
+        with pytest.raises(FileValidationError):
+            await validator.validate(upload)

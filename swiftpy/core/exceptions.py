@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar, get_type_hints
 
 from swiftpy.database.exceptions import ModelNotFoundError, RecordNotFoundError
+from swiftpy.filesystem.exceptions import FileValidationError
 from swiftpy.http.exceptions import (
     ClientDisconnect,
     HttpException,
@@ -270,7 +271,7 @@ class ExceptionHandler:
             )
 
         # 3. Framework validation errors ONLY (no duck-typing on .errors)
-        if isinstance(exc, (ValidationError, ValidationException)):
+        if isinstance(exc, (ValidationError, ValidationException, FileValidationError)):
             logger.info(
                 "HTTP 422 %s %s: %s",
                 req_method,

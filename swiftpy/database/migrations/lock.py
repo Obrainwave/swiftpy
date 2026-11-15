@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Self
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 # Deterministic 64-bit signed integer key: 'SWIFTPY' in hex -> 0x53574946545059
 DEFAULT_MIGRATION_LOCK_KEY: int = 0x53574946545059
@@ -66,6 +69,11 @@ class MigrationLock:
         if not self.is_locked:
             return False
 
+        is_closed = getattr(self.connection, "is_closed", None)
+        if callable(is_closed) and is_closed():
+            self.is_locked = False
+            return False
+
         unlocked: bool = await self.connection.fetchval(
             "SELECT pg_advisory_unlock($1);", self.key
         )
@@ -82,4 +90,15 @@ class MigrationLock:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
-        await self.release()
+        try:
+            await self.release()
+        except Exception as release_exc:
+            if exc_type is not None:
+                logger.warning(
+                    "Failed to release migration lock (key=%s) during exception unwind (%s): %s",
+                    hex(self.key),
+                    exc_type.__name__,
+                    release_exc,
+                )
+                return
+            raise

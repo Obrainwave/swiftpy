@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
-from swiftpy.core.config import Config
+from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container
 from swiftpy.core.context import Context
+from swiftpy.http.exceptions import ClientDisconnect
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response
 
@@ -28,7 +30,12 @@ class MiddlewarePipeline:
         self.container = container
         self.middleware = list(middleware)
 
-    def wrap(self, handler: Handler) -> Handler:
+    def wrap(
+        self,
+        handler: Handler,
+        *,
+        exception_handler: Callable[[Exception, Request], Awaitable[Response]] | None = None,
+    ) -> Handler:
         wrapped = handler
 
         for middleware_cls in reversed(self.middleware):
@@ -44,7 +51,14 @@ class MiddlewarePipeline:
                 middleware = self.container.resolve(middleware_cls)
 
                 async def next_handler(req: Request) -> Response:
-                    return await current(req, *args, **kwargs)
+                    if exception_handler is None:
+                        return await current(req, *args, **kwargs)
+                    try:
+                        return await current(req, *args, **kwargs)
+                    except ClientDisconnect:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        return await exception_handler(exc, req)
 
                 return await middleware.handle(request, next_handler)
 
@@ -105,10 +119,97 @@ class CORSMiddleware(Middleware):
 
     def __init__(self, config: Config) -> None:
         self._config = config
+        self._parse_cors_settings()
 
     def _get_cors_config(self) -> dict[str, Any]:
         raw = self._config.get("cors", {})
         return raw if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _normalize_list(
+        value: Any,
+        *,
+        default: Sequence[str] = (),
+        field: str = "",
+    ) -> list[str]:
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return list(default) if default else []
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    parsed = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise ConfigurationError(
+                        f"CORS configuration field '{field}' contains invalid JSON list: '{value}'"
+                    ) from exc
+                if not isinstance(parsed, list):
+                    raise ConfigurationError(
+                        f"CORS configuration field '{field}' expects a JSON array"
+                    )
+                items = [str(item).strip() for item in parsed if str(item).strip()]
+            else:
+                items = [item.strip() for item in stripped.split(",") if item.strip()]
+            return items if items or not default else list(default)
+        if isinstance(value, (list, tuple, set)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return items if items or not default else list(default)
+        raise ConfigurationError(
+            f"CORS configuration field '{field}' must be a sequence or comma-separated string, got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _normalize_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    def _parse_cors_settings(
+        self,
+    ) -> tuple[list[str], list[str], list[str], list[str], bool, int | None]:
+        cfg = self._get_cors_config()
+        allowed_origins = self._normalize_list(
+            cfg.get("allowed_origins"),
+            field="allowed_origins",
+        )
+        allowed_methods = self._normalize_list(
+            cfg.get("allowed_methods"),
+            default=("GET", "HEAD", "POST"),
+            field="allowed_methods",
+        )
+        allowed_headers = self._normalize_list(
+            cfg.get("allowed_headers"),
+            field="allowed_headers",
+        )
+        expose_headers = self._normalize_list(
+            cfg.get("expose_headers"),
+            field="expose_headers",
+        )
+        allow_credentials = self._normalize_bool(
+            cfg.get("allow_credentials"),
+            default=False,
+        )
+        if "*" in allowed_origins and allow_credentials:
+            raise ConfigurationError(
+                "Invalid CORS configuration: 'allowed_origins' cannot include '*' when 'allow_credentials' is True."
+            )
+        max_age: int | None = (
+            int(cfg["max_age"]) if cfg.get("max_age") is not None else 600
+        )
+        return (
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
+            expose_headers,
+            allow_credentials,
+            max_age,
+        )
 
     @staticmethod
     def _is_origin_allowed(origin: str, allowed_origins: Sequence[str]) -> bool:
@@ -119,21 +220,18 @@ class CORSMiddleware(Middleware):
         return origin in allowed_origins
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
+        (
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
+            expose_headers,
+            allow_credentials,
+            max_age,
+        ) = self._parse_cors_settings()
+
         origin = request.headers.get("origin")
         if not origin:
             return await next_handler(request)
-
-        cfg = self._get_cors_config()
-        allowed_origins: list[str] = list(cfg.get("allowed_origins") or [])
-        allowed_methods: list[str] = list(
-            cfg.get("allowed_methods") or ["GET", "HEAD", "POST"]
-        )
-        allowed_headers: list[str] = list(cfg.get("allowed_headers") or [])
-        expose_headers: list[str] = list(cfg.get("expose_headers") or [])
-        allow_credentials: bool = bool(cfg.get("allow_credentials", False))
-        max_age: int | None = (
-            int(cfg["max_age"]) if cfg.get("max_age") is not None else 600
-        )
 
         is_preflight = (
             request.method.upper() == "OPTIONS"

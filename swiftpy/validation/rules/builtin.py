@@ -6,6 +6,8 @@ import urllib.parse
 from collections.abc import Sequence
 from typing import Any
 
+from swiftpy.core.config import ConfigurationError
+
 # Strict RFC-compliant email regex patterns
 _LOCAL_PART_REGEX = re.compile(
     r"^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*$"
@@ -77,7 +79,7 @@ class BoolRule:
             return True
         if isinstance(value, int) and value in (0, 1):
             return True
-        return isinstance(value, str) and value.lower() in (
+        return isinstance(value, str) and value.strip().lower() in (
             "true",
             "false",
             "1",
@@ -257,19 +259,17 @@ class RegexRule:
     """Validates that a field value matches a specific regular expression."""
 
     def __init__(self, pattern: str | re.Pattern[str]) -> None:
-        self._compile_error = False
         if isinstance(pattern, re.Pattern):
-            self.pattern: re.Pattern[str] | None = pattern
+            self.pattern: re.Pattern[str] = pattern
         else:
             try:
                 self.pattern = re.compile(pattern)
-            except re.error:
-                self._compile_error = True
-                self.pattern = None
+            except re.error as exc:
+                raise ConfigurationError(
+                    f"Invalid regular expression pattern '{pattern}': {exc}"
+                ) from exc
 
     def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
-        if self._compile_error or self.pattern is None:
-            return False
         if not isinstance(value, (str, int, float)) or isinstance(value, bool):
             return False
         try:
@@ -279,6 +279,18 @@ class RegexRule:
 
     def message(self, field: str) -> str:
         return f"The {field} field format is invalid."
+
+
+class BailRule:
+    """Marker rule instructing Validator to stop validating a field after its first failure."""
+
+    is_bail_rule: bool = True
+
+    def validate(self, field: str, value: Any, data: dict[str, Any]) -> bool:
+        return True
+
+    def message(self, field: str) -> str:
+        return ""
 
 
 # Rule factories
@@ -342,7 +354,12 @@ def regex(pattern: str | re.Pattern[str]) -> RegexRule:
     return RegexRule(pattern)
 
 
+def bail() -> BailRule:
+    return BailRule()
+
+
 __all__ = [
+    "BailRule",
     "BetweenRule",
     "BoolRule",
     "EmailRule",
@@ -355,6 +372,7 @@ __all__ = [
     "RegexRule",
     "StrRule",
     "UrlRule",
+    "bail",
     "between",
     "bool_",
     "boolean",

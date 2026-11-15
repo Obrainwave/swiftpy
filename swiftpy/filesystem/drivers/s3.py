@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import mimetypes
+import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -19,6 +21,23 @@ from swiftpy.filesystem.paths import PathNormalizer
 from swiftpy.filesystem.visibility import Visibility
 
 _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+_S3_SPOOL_THRESHOLD = 1024 * 1024  # 1 MiB bounded RAM threshold for streaming PUTs
+
+
+def _create_s3_spool() -> tempfile.SpooledTemporaryFile[bytes]:
+    return tempfile.SpooledTemporaryFile(max_size=_S3_SPOOL_THRESHOLD)
+
+
+async def _iter_s3_spool(
+    spool: tempfile.SpooledTemporaryFile[bytes],
+    chunk_size: int,
+) -> AsyncIterator[bytes]:
+    await asyncio.to_thread(spool.seek, 0)
+    while True:
+        chunk = await asyncio.to_thread(spool.read, chunk_size)
+        if not chunk:
+            break
+        yield chunk
 
 
 def _get_signature_key(key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
@@ -93,14 +112,18 @@ class S3StorageDriver(StorageDriver):
 
     def _get_key_path(self, key: str) -> str:
         clean = PathNormalizer.normalize(key)
-        if self.endpoint and self.use_path_style:
-            return f"/{self.bucket}/{clean}" if clean else f"/{self.bucket}"
-        if not self.endpoint and self.use_path_style:
-            return f"/{self.bucket}/{clean}" if clean else f"/{self.bucket}"
-        return f"/{clean}" if clean else "/"
+        if self.use_path_style:
+            resource = f"/{self.bucket}/{clean}" if clean else f"/{self.bucket}"
+        else:
+            resource = f"/{clean}" if clean else "/"
+        if self._base_path:
+            if resource == "/":
+                return self._base_path
+            return f"{self._base_path}{resource}"
+        return resource
 
     def _build_url(self, key: str, query: str = "") -> str:
-        path = self._get_key_path(key)
+        path = quote(self._get_key_path(key), safe="/-_.~")
         url = f"{self._scheme}://{self._host}{path}"
         if query:
             url = f"{url}?{query}"
@@ -119,14 +142,16 @@ class S3StorageDriver(StorageDriver):
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
 
-        req_headers = dict(headers)
+        req_headers: dict[str, str] = {
+            str(k).lower(): str(v).strip() for k, v in headers.items()
+        }
         req_headers["host"] = self._host
         req_headers["x-amz-date"] = amz_date
         req_headers["x-amz-content-sha256"] = payload_hash
 
         # Canonical headers
-        sorted_keys = sorted(k.lower() for k in req_headers)
-        canonical_headers = "".join(f"{k}:{req_headers[k].strip()}\n" for k in sorted_keys)
+        sorted_keys = sorted(req_headers)
+        canonical_headers = "".join(f"{k}:{req_headers[k]}\n" for k in sorted_keys)
         signed_headers = ";".join(sorted_keys)
 
         canonical_uri = quote(path, safe="/-_.~")
@@ -243,25 +268,52 @@ class S3StorageDriver(StorageDriver):
         chunk_size: int = 64 * 1024,
         visibility: Visibility | str | None = None,
     ) -> int:
-        # Buffer bytes to perform single signed PUT
-        chunks: list[bytes] = []
-        total = 0
-        if isinstance(stream, AsyncIterator):
-            async for chunk in stream:
-                if chunk:
-                    chunks.append(chunk)
-                    total += len(chunk)
-        else:
-            while True:
-                chunk = stream.read(chunk_size)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
+        clean = PathNormalizer.normalize(path)
+        key_path = self._get_key_path(clean)
+        vis = Visibility(visibility) if visibility is not None else self.default_visibility
+        acl = "public-read" if vis == Visibility.PUBLIC else "private"
+        mime, _ = mimetypes.guess_type(clean)
 
-        full_content = b"".join(chunks)
-        await self.write(path, full_content, visibility=visibility)
-        return total
+        spool = _create_s3_spool()
+        hasher = hashlib.sha256()
+        total = 0
+        try:
+            if isinstance(stream, AsyncIterator):
+                async for chunk in stream:
+                    if chunk:
+                        total += len(chunk)
+                        hasher.update(chunk)
+                        await asyncio.to_thread(spool.write, chunk)
+            else:
+                while True:
+                    chunk = await asyncio.to_thread(stream.read, chunk_size)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    hasher.update(chunk)
+                    await asyncio.to_thread(spool.write, chunk)
+
+            payload_hash = hasher.hexdigest()
+            headers = {
+                "content-type": mime or "application/octet-stream",
+                "x-amz-acl": acl,
+                "content-length": str(total),
+            }
+            signed_headers = self._sign_headers("PUT", key_path, "", headers, payload_hash)
+            url = self._build_url(clean)
+
+            resp = await self._client.put(
+                url,
+                headers=signed_headers,
+                content=_iter_s3_spool(spool, chunk_size),
+            )
+            if resp.status_code == 403:
+                raise PermissionError(f"S3 PUT denied for '{path}': {self._parse_s3_error(resp.text)}")
+            if resp.status_code not in (200, 201, 204):
+                raise RuntimeError(f"S3 PUT failed with status {resp.status_code}: {self._parse_s3_error(resp.text)}")
+            return total
+        finally:
+            await asyncio.to_thread(spool.close)
 
     async def read(self, path: str) -> bytes:
         clean = PathNormalizer.normalize(path)
@@ -372,8 +424,10 @@ class S3StorageDriver(StorageDriver):
         return meta.last_modified
 
     async def checksum(self, path: str, algorithm: str = "sha256") -> str:
-        data = await self.read(path)
-        return hashlib.new(algorithm, data).hexdigest()
+        hasher = hashlib.new(algorithm)
+        async for chunk in self.read_stream(path):
+            hasher.update(chunk)
+        return hasher.hexdigest()
 
     async def files(self, directory: str = "", recursive: bool = False) -> list[str]:
         clean = PathNormalizer.normalize(directory) if directory else ""
@@ -400,7 +454,7 @@ class S3StorageDriver(StorageDriver):
             if resp.status_code == 403:
                 raise PermissionError(f"S3 list files denied for '{directory}': {self._parse_s3_error(resp.text)}")
             if resp.status_code != 200:
-                return []
+                raise RuntimeError(f"S3 list files failed with status {resp.status_code}: {self._parse_s3_error(resp.text)}")
 
             keys, _, is_truncated, next_token = self._parse_list_objects_v2(resp.text)
             for k in keys:
@@ -439,7 +493,9 @@ class S3StorageDriver(StorageDriver):
             if resp.status_code == 403:
                 raise PermissionError(f"S3 list directories denied for '{directory}': {self._parse_s3_error(resp.text)}")
             if resp.status_code != 200:
-                return []
+                raise RuntimeError(
+                    f"S3 list directories failed with status {resp.status_code}: {self._parse_s3_error(resp.text)}"
+                )
 
             keys, prefixes, is_truncated, next_token = self._parse_list_objects_v2(resp.text)
             for p in prefixes:
@@ -483,7 +539,8 @@ class S3StorageDriver(StorageDriver):
     async def url(self, path: str) -> str:
         clean = PathNormalizer.normalize(path)
         if self.public_url:
-            return f"{self.public_url.rstrip('/')}/{clean}"
+            encoded = quote(clean, safe="/-_.~")
+            return f"{self.public_url.rstrip('/')}/{encoded}"
         return self._build_url(clean)
 
     async def temporary_url(
@@ -492,12 +549,16 @@ class S3StorageDriver(StorageDriver):
         expires_in: int | timedelta,
         timestamp: datetime | None = None,
     ) -> str:
+        if isinstance(expires_in, bool):
+            raise TypeError("expires_in must be an integer or timedelta, not bool.")
         clean = PathNormalizer.normalize(path)
         duration = (
             int(expires_in)
             if isinstance(expires_in, (int, float))
             else int(expires_in.total_seconds())
         )
+        if duration <= 0:
+            raise ValueError("expires_in must be greater than 0 seconds.")
         now = timestamp or datetime.now(UTC)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
@@ -512,10 +573,11 @@ class S3StorageDriver(StorageDriver):
         }
         canonical_query = urlencode(sorted(query_params.items()))
         key_path = self._get_key_path(clean)
+        encoded_key_path = quote(key_path, safe="/-_.~")
 
         canonical_headers = f"host:{self._host}\n"
         canonical_request = (
-            f"GET\n{quote(key_path, safe='/-_.~')}\n{canonical_query}\n"
+            f"GET\n{encoded_key_path}\n{canonical_query}\n"
             f"{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
         )
 
@@ -528,7 +590,7 @@ class S3StorageDriver(StorageDriver):
         signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
         final_query = f"{canonical_query}&X-Amz-Signature={signature}"
-        return f"{self._scheme}://{self._host}{key_path}?{final_query}"
+        return f"{self._scheme}://{self._host}{encoded_key_path}?{final_query}"
 
     async def get_visibility(self, path: str) -> Visibility:
         clean = PathNormalizer.normalize(path)

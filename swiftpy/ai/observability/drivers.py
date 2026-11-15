@@ -10,22 +10,45 @@ from typing import Any
 
 import asyncpg
 
+from swiftpy.ai.providers.base import redact_sensitive_text
 from swiftpy.core.container import get_container
 from swiftpy.database.identifiers import quote_identifier, validate_identifier
 from swiftpy.database.pool import DatabasePool
+
+_SECRET_METADATA_TOKENS: tuple[str, ...] = (
+    "api_key",
+    "apikey",
+    "x_api_key",
+    "password",
+    "secret",
+    "token",
+    "authorization",
+    "private_key",
+)
+
+
+def _sanitize_metadata_value(value: Any) -> Any:
+    """Recursively redact sensitive keys/values inside metadata containers."""
+    if isinstance(value, dict):
+        return sanitize_metadata(value)
+    if isinstance(value, list):
+        return [_sanitize_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_metadata_value(item) for item in value)
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    return value
 
 
 def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """Strip sensitive secrets, tokens, passwords, and credentials from observation metadata."""
     redacted: dict[str, Any] = {}
     for k, v in metadata.items():
-        lower_k = k.lower()
-        if any(secret in lower_k for secret in ("api_key", "password", "secret", "token", "authorization")):
+        norm_k = str(k).lower().replace("-", "_")
+        if any(secret in norm_k for secret in _SECRET_METADATA_TOKENS):
             redacted[k] = "[REDACTED]"
-        elif isinstance(v, dict):
-            redacted[k] = sanitize_metadata(v)
         else:
-            redacted[k] = v
+            redacted[k] = _sanitize_metadata_value(v)
     return redacted
 
 
@@ -50,6 +73,8 @@ class AIObservation:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.error_message:
+            self.error_message = redact_sensitive_text(self.error_message)
         if self.metadata:
             self.metadata = sanitize_metadata(self.metadata)
 
@@ -284,6 +309,104 @@ def _truncate_file_sync(file_path: Path) -> None:
             f.truncate(0)
 
 
+def _read_tail_observations_sync(
+    file_path: Path,
+    limit: int,
+    offset: int,
+    start_date: datetime | str | None,
+    end_date: datetime | str | None,
+    provider: str | None,
+    model: str | None,
+    status: str | None,
+) -> list[AIObservation]:
+    """Read filtered observations newest-first and stop once offset+limit rows are matched."""
+    lines = _read_file_sync(file_path)
+    target = offset + limit
+    observations: list[AIObservation] = []
+    for line in reversed(lines):
+        try:
+            data = json.loads(line)
+            obs = AIObservation.from_dict(data)
+            if _matches_filters(
+                obs,
+                start_date=start_date,
+                end_date=end_date,
+                provider=provider,
+                model=model,
+                status=status,
+            ):
+                observations.append(obs)
+                if target > 0 and len(observations) >= target:
+                    break
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return observations[offset : offset + limit]
+
+
+def _compute_file_stats_sync(file_path: Path) -> dict[str, Any]:
+    """Stream JSONL observations line-by-line to compute stats in bounded memory."""
+    total_calls = 0
+    successful_calls = 0
+    failed_calls = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_tokens = 0
+    total_cost = 0.0
+    total_latency_ms = 0.0
+    by_provider: dict[str, dict[str, Any]] = {}
+    by_model: dict[str, dict[str, Any]] = {}
+
+    if file_path.is_file():
+        with file_path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    obs = AIObservation.from_dict(data)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                total_calls += 1
+                if obs.status == "success":
+                    successful_calls += 1
+                else:
+                    failed_calls += 1
+                total_input_tokens += obs.input_tokens
+                total_output_tokens += obs.output_tokens
+                total_tokens += obs.total_tokens
+                total_cost += obs.cost
+                total_latency_ms += obs.latency_ms
+
+                p = obs.provider or "unknown"
+                if p not in by_provider:
+                    by_provider[p] = {"calls": 0, "tokens": 0, "cost": 0.0}
+                by_provider[p]["calls"] += 1
+                by_provider[p]["tokens"] += obs.total_tokens
+                by_provider[p]["cost"] = round(by_provider[p]["cost"] + obs.cost, 6)
+
+                m = obs.model or "unknown"
+                if m not in by_model:
+                    by_model[m] = {"calls": 0, "tokens": 0, "cost": 0.0}
+                by_model[m]["calls"] += 1
+                by_model[m]["tokens"] += obs.total_tokens
+                by_model[m]["cost"] = round(by_model[m]["cost"] + obs.cost, 6)
+
+    avg_latency_ms = total_latency_ms / total_calls if total_calls > 0 else 0.0
+    return {
+        "total_calls": total_calls,
+        "successful_calls": successful_calls,
+        "failed_calls": failed_calls,
+        "total_tokens": total_tokens,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_cost": round(total_cost, 6),
+        "avg_latency_ms": round(avg_latency_ms, 2),
+        "by_provider": by_provider,
+        "by_model": by_model,
+    }
+
+
 class FileObservabilityDriver(BaseObservabilityDriver):
     """
     File-based observability driver writing structured JSON lines to storage/logs/ai.log.
@@ -311,73 +434,21 @@ class FileObservabilityDriver(BaseObservabilityDriver):
         status: str | None = None,
     ) -> list[AIObservation]:
         async with self._lock:
-            lines = await asyncio.to_thread(_read_file_sync, self.log_path)
-
-        observations: list[AIObservation] = []
-        for line in reversed(lines):
-            try:
-                data = json.loads(line)
-                obs = AIObservation.from_dict(data)
-                if _matches_filters(
-                    obs,
-                    start_date=start_date,
-                    end_date=end_date,
-                    provider=provider,
-                    model=model,
-                    status=status,
-                ):
-                    observations.append(obs)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-        return observations[offset : offset + limit]
+            return await asyncio.to_thread(
+                _read_tail_observations_sync,
+                self.log_path,
+                limit,
+                offset,
+                start_date,
+                end_date,
+                provider,
+                model,
+                status,
+            )
 
     async def get_stats(self) -> dict[str, Any]:
-        observations = await self.get_observations(limit=100000, offset=0)
-
-        total_calls = len(observations)
-        total_input_tokens = sum(r.input_tokens for r in observations)
-        total_output_tokens = sum(r.output_tokens for r in observations)
-        total_tokens = sum(r.total_tokens for r in observations)
-        total_cost = sum(r.cost for r in observations)
-        avg_latency_ms = (
-            sum(r.latency_ms for r in observations) / total_calls
-            if total_calls > 0
-            else 0.0
-        )
-        successful_calls = sum(1 for r in observations if r.status == "success")
-        failed_calls = sum(1 for r in observations if r.status != "success")
-
-        by_provider: dict[str, dict[str, Any]] = {}
-        by_model: dict[str, dict[str, Any]] = {}
-
-        for r in observations:
-            p = r.provider or "unknown"
-            if p not in by_provider:
-                by_provider[p] = {"calls": 0, "tokens": 0, "cost": 0.0}
-            by_provider[p]["calls"] += 1
-            by_provider[p]["tokens"] += r.total_tokens
-            by_provider[p]["cost"] = round(by_provider[p]["cost"] + r.cost, 6)
-
-            m = r.model or "unknown"
-            if m not in by_model:
-                by_model[m] = {"calls": 0, "tokens": 0, "cost": 0.0}
-            by_model[m]["calls"] += 1
-            by_model[m]["tokens"] += r.total_tokens
-            by_model[m]["cost"] = round(by_model[m]["cost"] + r.cost, 6)
-
-        return {
-            "total_calls": total_calls,
-            "successful_calls": successful_calls,
-            "failed_calls": failed_calls,
-            "total_tokens": total_tokens,
-            "total_input_tokens": total_input_tokens,
-            "total_output_tokens": total_output_tokens,
-            "total_cost": round(total_cost, 6),
-            "avg_latency_ms": round(avg_latency_ms, 2),
-            "by_provider": by_provider,
-            "by_model": by_model,
-        }
+        async with self._lock:
+            return await asyncio.to_thread(_compute_file_stats_sync, self.log_path)
 
     async def clear(self) -> None:
         async with self._lock:
@@ -414,8 +485,37 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
                 f"DatabasePool could not be resolved for AI observability: {exc}"
             ) from exc
 
+    def get_ddl(self) -> str:
+        """Return PostgreSQL DDL statements required to provision the observations table."""
+        table_q = quote_identifier(self.table_name)
+        idx_ts_q = quote_identifier(f"idx_{self.table_name}_timestamp")
+        idx_prompt_q = quote_identifier(f"idx_{self.table_name}_prompt_hash")
+        return f"""
+        CREATE TABLE IF NOT EXISTS {table_q} (
+            id VARCHAR(64) PRIMARY KEY,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            model VARCHAR(255) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            cost DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            prompt_hash VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'success',
+            error_message TEXT,
+            ttft_ms DOUBLE PRECISION,
+            duration_ms DOUBLE PRECISION,
+            metadata JSONB
+        );
+        ALTER TABLE {table_q} ADD COLUMN IF NOT EXISTS ttft_ms DOUBLE PRECISION;
+        ALTER TABLE {table_q} ADD COLUMN IF NOT EXISTS duration_ms DOUBLE PRECISION;
+        CREATE INDEX IF NOT EXISTS {idx_ts_q} ON {table_q} (timestamp DESC);
+        CREATE INDEX IF NOT EXISTS {idx_prompt_q} ON {table_q} (prompt_hash);
+        """
+
     async def ensure_table(self) -> None:
-        """Create the ai_observations storage table and indexes if not existing."""
+        """Explicit schema setup helper to provision the ai_observations table and indexes."""
         if self._table_checked:
             return
 
@@ -424,38 +524,12 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
                 return
 
             pool = await self._get_pool()
-            table_q = quote_identifier(self.table_name)
-            idx_ts_q = quote_identifier(f"idx_{self.table_name}_timestamp")
-            idx_prompt_q = quote_identifier(f"idx_{self.table_name}_prompt_hash")
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS {table_q} (
-                id VARCHAR(64) PRIMARY KEY,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                model VARCHAR(255) NOT NULL,
-                provider VARCHAR(64) NOT NULL,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-                cost DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-                prompt_hash VARCHAR(64) NOT NULL,
-                status VARCHAR(32) NOT NULL DEFAULT 'success',
-                error_message TEXT,
-                ttft_ms DOUBLE PRECISION,
-                duration_ms DOUBLE PRECISION,
-                metadata JSONB
-            );
-            ALTER TABLE {table_q} ADD COLUMN IF NOT EXISTS ttft_ms DOUBLE PRECISION;
-            ALTER TABLE {table_q} ADD COLUMN IF NOT EXISTS duration_ms DOUBLE PRECISION;
-            CREATE INDEX IF NOT EXISTS {idx_ts_q} ON {table_q} (timestamp DESC);
-            CREATE INDEX IF NOT EXISTS {idx_prompt_q} ON {table_q} (prompt_hash);
-            """
+            ddl = self.get_ddl()
             async with pool.acquire() as conn:
                 await conn.execute(ddl)
             self._table_checked = True
 
     async def record(self, observation: AIObservation) -> None:
-        await self.ensure_table()
         pool = await self._get_pool()
         sql = f"""
         INSERT INTO {quote_identifier(self.table_name)} (
@@ -504,7 +578,6 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
         model: str | None = None,
         status: str | None = None,
     ) -> list[AIObservation]:
-        await self.ensure_table()
         pool = await self._get_pool()
 
         where_clauses: list[str] = []
@@ -596,7 +669,6 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
         return results
 
     async def get_stats(self) -> dict[str, Any]:
-        await self.ensure_table()
         pool = await self._get_pool()
         table_q = quote_identifier(self.table_name)
         sql_summary = f"""
@@ -686,7 +758,6 @@ class DatabaseObservabilityDriver(BaseObservabilityDriver):
         }
 
     async def clear(self) -> None:
-        await self.ensure_table()
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             await conn.execute(f"TRUNCATE TABLE {quote_identifier(self.table_name)};")

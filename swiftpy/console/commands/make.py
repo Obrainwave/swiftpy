@@ -205,6 +205,11 @@ class MakeCommand:
             default=None,
             help="The table to be altered",
         )
+        parser_mig.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the migration if a file with the same name already exists",
+        )
         parser_mig.set_defaults(
             _handler=MakeCommand.handle_migration,
         )
@@ -235,6 +240,12 @@ class MakeCommand:
             dest="path",
             default=None,
             help="The directory where the model should be saved (defaults to app/models)",
+        )
+        parser_model.add_argument(
+            "--migration-path",
+            dest="migration_path",
+            default=None,
+            help="The directory where the generated migration should be saved (defaults to database/migrations)",
         )
         parser_model.add_argument(
             "--force",
@@ -417,6 +428,11 @@ class MakeCommand:
             dest="path",
             default=None,
             help="Migration target directory when --migration is specified",
+        )
+        parser_api_key.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the generated migration if it already exists",
         )
         parser_api_key.set_defaults(
             _handler=MakeCommand.handle_api_key,
@@ -723,9 +739,10 @@ class MakeCommand:
             mig_name = f"create_{table_name}_table"
             mig_args = argparse.Namespace(
                 name=mig_name,
-                path=None,
+                path=getattr(args, "migration_path", None),
                 create=table_name,
                 table=None,
+                force=bool(getattr(args, "force", False)),
             )
             MakeCommand.handle_migration(mig_args)
 
@@ -757,6 +774,7 @@ class MakeCommand:
                 create="api_keys",
                 table=None,
                 stub="migration.api_keys",
+                force=bool(getattr(args, "force", False)),
             )
             MakeCommand.handle_migration(mig_args)
 

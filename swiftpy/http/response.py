@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+import inspect
 import json
-from collections.abc import AsyncIterator, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
+
+
+@runtime_checkable
+class _SupportsKeysAndGetItem(Protocol):
+    def keys(self) -> Iterable[str]: ...
+    def __getitem__(self, key: str, /) -> str: ...
 
 
 def _validate_header_pair(name: str, value: str) -> tuple[str, str]:
@@ -116,14 +130,10 @@ class ResponseHeaders(MutableMapping[str, str]):
     def __len__(self) -> int:
         return len({k.lower() for k, _ in self._items})
 
-    def update(  # type: ignore[override]
+    def update(
         self,
-        other: (
-            Mapping[str, str]
-            | Sequence[tuple[str, str]]
-            | ResponseHeaders
-            | None
-        ) = None,
+        other: _SupportsKeysAndGetItem | Iterable[tuple[str, str]] | None = None,
+        /,
         **kwargs: str,
     ) -> None:
         if other is not None:
@@ -139,6 +149,10 @@ class ResponseHeaders(MutableMapping[str, str]):
             elif isinstance(other, Mapping):
                 for k, v in other.items():
                     self[k] = v
+            elif isinstance(other, _SupportsKeysAndGetItem):
+                keys = other.keys()
+                for k in keys:
+                    self[k] = other[k]
             else:
                 pairs = list(other)
                 keys_to_replace = {k.lower() for k, _ in pairs}
@@ -225,7 +239,7 @@ class Response:
         """Append a Set-Cookie header without overwriting previously added cookies."""
         self.headers.add("Set-Cookie", cookie_value)
 
-    async def send(self, send: Any) -> None:
+    async def send(self, send: Any, *, send_body: bool = True) -> None:
         body_bytes = (
             self.content.encode("utf-8")
             if isinstance(self.content, str)
@@ -257,7 +271,7 @@ class Response:
         await send(
             {
                 "type": "http.response.body",
-                "body": body_bytes,
+                "body": body_bytes if send_body else b"",
             }
         )
 
@@ -283,7 +297,7 @@ class StreamingResponse(Response):
 
         self.iterator = iterator
 
-    async def send(self, send: Any) -> None:
+    async def send(self, send: Any, *, send_body: bool = True) -> None:
         raw_headers = [
             (
                 _validate_header_pair(key, value)[0].encode("latin-1"),
@@ -300,23 +314,31 @@ class StreamingResponse(Response):
             }
         )
 
-        async for chunk in self.iterator:
-            chunk_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        try:
+            if send_body:
+                async for chunk in self.iterator:
+                    chunk_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk_bytes,
+                            "more_body": True,
+                        }
+                    )
+
             await send(
                 {
                     "type": "http.response.body",
-                    "body": chunk_bytes,
-                    "more_body": True,
+                    "body": b"",
+                    "more_body": False,
                 }
             )
-
-        await send(
-            {
-                "type": "http.response.body",
-                "body": b"",
-                "more_body": False,
-            }
-        )
+        finally:
+            aclose = getattr(self.iterator, "aclose", None)
+            if callable(aclose):
+                close_res = aclose()
+                if inspect.isawaitable(close_res):
+                    await close_res
 
 
 def json_response(

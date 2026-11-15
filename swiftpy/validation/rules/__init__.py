@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from swiftpy.validation.rules.builtin import (
+    BailRule,
     BetweenRule,
     BoolRule,
     EmailRule,
@@ -13,6 +14,7 @@ from swiftpy.validation.rules.builtin import (
     RegexRule,
     StrRule,
     UrlRule,
+    bail,
     between,
     bool_,
     boolean,
@@ -44,6 +46,7 @@ from swiftpy.validation.rules.required import (
 from swiftpy.validation.rules.unique import UniqueRule, unique
 
 __all__ = [
+    "BailRule",
     "BetweenRule",
     "BoolRule",
     "EmailRule",
@@ -61,6 +64,7 @@ __all__ = [
     "StrRule",
     "UniqueRule",
     "UrlRule",
+    "bail",
     "between",
     "bool_",
     "boolean",

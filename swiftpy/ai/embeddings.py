@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import math
 from collections.abc import Sequence
 from typing import Any
 
-try:
-    import httpx
-    _HTTPX_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError)
-except ImportError:
-    httpx = None
-    _HTTPX_ERRORS = (TimeoutError, OSError)
+import httpx
 
+_HTTPX_ERRORS: tuple[type[Exception], ...] = (httpx.TimeoutException, httpx.RequestError)
+
+from swiftpy.ai._deterministic import generate_deterministic_embedding
+from swiftpy.ai._fake import AIFake
 from swiftpy.ai.exceptions import (
     AIAuthenticationError,
     AIConfigurationError,
@@ -22,48 +20,12 @@ from swiftpy.ai.exceptions import (
     AIRateLimitError,
 )
 from swiftpy.ai.pool import AIHttpPool
+from swiftpy.ai.providers.base import redact_sensitive_text
 from swiftpy.core.config import Config
-from swiftpy.testing.fakes.ai_fake import AIFake
 
 PROVIDER_MAX_BATCH_SIZE: dict[str, int] = {
     "openai": 2048,
 }
-
-
-def generate_deterministic_embedding(text: str, dimensions: int = 1536) -> list[float]:
-    """
-    Generate deterministic, normalized test embeddings using character n-grams and SHA-256 feature hashing.
-
-    This provides dependency-free embeddings for development and functional testing;
-    it is not a substitute for trained semantic embedding models.
-    """
-    if not text or not text.strip():
-        return [0.0] * dimensions
-
-    vec = [0.0] * dimensions
-    raw_words = [w.strip(".,;:!?\"'()[]{}").lower() for w in text.split() if w.strip()]
-
-    for word in raw_words:
-        tokens = [f"<{word}>"]
-        word_len = len(word)
-        for n in (3, 4, 5):
-            if word_len >= n:
-                for i in range(word_len - n + 1):
-                    tokens.append(word[i : i + n])
-
-        for tok in tokens:
-            digest = hashlib.sha256(tok.encode("utf-8")).digest()
-            for i in range(2):
-                idx = int.from_bytes(digest[i * 4 : (i + 1) * 4], "big") % dimensions
-                sign = 1.0 if digest[i] % 2 == 0 else -1.0
-                vec[idx] += sign
-
-    # Normalize vector to unit length (L2 norm)
-    norm = math.sqrt(sum(x * x for x in vec))
-    if norm > 0.0:
-        vec = [x / norm for x in vec]
-
-    return vec
 
 
 class EmbeddingsClient:
@@ -103,16 +65,25 @@ class EmbeddingsClient:
 
         return provider, api_key, base_url, default_model
 
+    def _resolve_timeout(self, provider: str) -> float:
+        raw_cfg = self._config.get(f"ai.providers.{provider}", {})
+        if isinstance(raw_cfg, dict) and raw_cfg.get("timeout") is not None:
+            return float(raw_cfg["timeout"])
+        return float(self._http_pool.timeout)
+
     async def _embed_chunk_openai(
         self,
         texts: list[str],
         model: str,
         base_url: str,
         api_key: str,
+        timeout: float | None = None,
     ) -> list[list[float]]:
         if not api_key:
-            # Fallback to deterministic embedding for mock/test environments
-            return [generate_deterministic_embedding(t) for t in texts]
+            raise AIConfigurationError(
+                "Missing API key for embedding provider 'openai'. "
+                "Please configure 'ai.providers.openai.api_key' or set OPENAI_API_KEY."
+            )
 
         url = f"{base_url}/embeddings"
         headers = {
@@ -124,35 +95,38 @@ class EmbeddingsClient:
             "input": texts,
         }
 
+        effective_timeout = self._resolve_timeout("openai") if timeout is None else timeout
         client = self._http_pool.get_client()
         try:
-            response = await client.post(url, headers=headers, json=payload, timeout=60.0)
+            response = await client.post(url, headers=headers, json=payload, timeout=effective_timeout)
         except _HTTPX_ERRORS as exc:
+            safe_exc = redact_sensitive_text(str(exc), api_key=api_key)
             raise AIConnectionError(
-                f"Failed to connect to embedding endpoint: {exc}",
+                f"Failed to connect to embedding endpoint: {safe_exc}",
                 provider="openai",
             ) from exc
 
+        safe_body = redact_sensitive_text(response.text, api_key=api_key)
         if response.status_code in (401, 403):
             raise AIAuthenticationError(
-                f"OpenAI embedding authentication failed: {response.text}",
+                f"OpenAI embedding authentication failed: {safe_body}",
                 provider="openai",
                 status_code=response.status_code,
-                response_body=response.text,
+                response_body=safe_body,
             )
         if response.status_code == 429:
             raise AIRateLimitError(
-                f"OpenAI embedding rate limit exceeded: {response.text}",
+                f"OpenAI embedding rate limit exceeded: {safe_body}",
                 provider="openai",
                 status_code=response.status_code,
-                response_body=response.text,
+                response_body=safe_body,
             )
         if response.status_code >= 400:
             raise AIProviderError(
-                f"OpenAI embedding error ({response.status_code}): {response.text}",
+                f"OpenAI embedding error ({response.status_code}): {safe_body}",
                 provider="openai",
                 status_code=response.status_code,
-                response_body=response.text,
+                response_body=safe_body,
             )
 
         try:
@@ -290,6 +264,13 @@ class EmbeddingsClient:
 
         if prov_name == "deterministic":
             return [generate_deterministic_embedding(t) for t in texts]
+        if not api_key:
+            raise AIConfigurationError(
+                f"Missing API key for embedding provider '{prov_name}'. "
+                f"Please configure 'ai.providers.{prov_name}.api_key' or set OPENAI_API_KEY."
+            )
+
+        effective_timeout = self._resolve_timeout(prov_name)
 
         # Respect provider-specific maximum batch size limits
         max_allowed = PROVIDER_MAX_BATCH_SIZE.get(prov_name, chunk_size)
@@ -311,6 +292,7 @@ class EmbeddingsClient:
                     model=target_model,
                     base_url=base_url,
                     api_key=api_key,
+                    timeout=effective_timeout,
                 )
 
         # Create tasks and handle cancellation on failure
@@ -330,3 +312,10 @@ class EmbeddingsClient:
             embeddings.extend(res)
 
         return embeddings
+
+
+__all__ = [
+    "PROVIDER_MAX_BATCH_SIZE",
+    "EmbeddingsClient",
+    "generate_deterministic_embedding",
+]

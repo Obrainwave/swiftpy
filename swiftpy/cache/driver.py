@@ -4,7 +4,8 @@ import asyncio
 import inspect
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 logger = logging.getLogger("swiftpy.cache")
@@ -106,14 +107,16 @@ class CacheDriver(ABC):
 
         If the key does not exist, it is initialized to the given value with optional TTL.
         """
-        current = await self.get(key, 0)
+        current = await self.get(key, _SENTINEL)
+        is_new = current is _SENTINEL
+        base = 0 if is_new else current
         try:
-            new_value = int(current) + value
+            new_value = int(base) + value
         except (ValueError, TypeError):
             raise TypeError(
-                f"Cannot increment non-numeric cached value of type {type(current).__name__}"
+                f"Cannot increment non-numeric cached value of type {type(base).__name__}"
             )
-        await self.set(key, new_value, ttl)
+        await self.set(key, new_value, ttl if is_new else None)
         return new_value
 
     async def decrement(
@@ -123,6 +126,41 @@ class CacheDriver(ABC):
         Decrement the value of an item in the cache.
         """
         return await self.increment(key, -value, ttl)
+
+    @asynccontextmanager
+    async def _acquire_key_lock(
+        self, key: str, lock_timeout: float = 10.0
+    ) -> AsyncIterator[bool]:
+        """Acquire an in-process per-key lock with reference-counted cleanup."""
+        async with self._meta_lock:
+            if key not in self._remember_locks:
+                self._remember_locks[key] = _LockWithRef()
+            entry = self._remember_locks[key]
+            entry.refs += 1
+
+        acquired = False
+        try:
+            if lock_timeout <= 0:
+                if not entry.lock.locked():
+                    await entry.lock.acquire()
+                    acquired = True
+            else:
+                try:
+                    await asyncio.wait_for(
+                        entry.lock.acquire(), timeout=float(lock_timeout)
+                    )
+                    acquired = True
+                except TimeoutError:
+                    acquired = False
+
+            yield acquired
+        finally:
+            if acquired:
+                entry.lock.release()
+            async with self._meta_lock:
+                entry.refs -= 1
+                if entry.refs <= 0:
+                    self._remember_locks.pop(key, None)
 
     async def remember(
         self,
@@ -143,19 +181,8 @@ class CacheDriver(ABC):
         if cached is not _SENTINEL:
             return cached
 
-        # Stampede protection: acquire key-specific lock with reference counting
-        async with self._meta_lock:
-            if key not in self._remember_locks:
-                self._remember_locks[key] = _LockWithRef()
-            entry = self._remember_locks[key]
-            entry.refs += 1
-
-        acquired = False
-        try:
-            try:
-                await asyncio.wait_for(entry.lock.acquire(), timeout=lock_timeout)
-                acquired = True
-            except TimeoutError:
+        async with self._acquire_key_lock(key, lock_timeout=lock_timeout) as acquired:
+            if not acquired:
                 logger.warning(
                     "Cache lock timed out waiting for key '%s'; computing value directly without caching",
                     key,
@@ -182,13 +209,6 @@ class CacheDriver(ABC):
 
             await self.set(key, result, ttl)
             return result
-        finally:
-            if acquired:
-                entry.lock.release()
-            async with self._meta_lock:
-                entry.refs -= 1
-                if entry.refs <= 0:
-                    self._remember_locks.pop(key, None)
 
     async def close(self) -> None:
         """

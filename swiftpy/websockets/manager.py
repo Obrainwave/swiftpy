@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
+from weakref import WeakSet
 
 from swiftpy.core.container import get_container
 from swiftpy.events.redis_bus import RedisEventBus
+from swiftpy.http.response import encode_json
 from swiftpy.websockets.connection import (
     WebSocketConnection,
     WebSocketDisconnect,
@@ -31,6 +34,36 @@ class WebSocketManager:
         self._rooms: dict[str, set[WebSocketConnection]] = defaultdict(set)
         self._connection_rooms: dict[WebSocketConnection, set[str]] = defaultdict(set)
         self._lock = asyncio.Lock()
+        self._instance_id: str = uuid.uuid4().hex
+        self._subscribed_buses: WeakSet[RedisEventBus] = WeakSet()
+
+    def subscribe_to_bus(self, bus: RedisEventBus) -> None:
+        """Subscribe this manager to distributed WebSocket broadcasts on the given RedisEventBus."""
+        if bus in self._subscribed_buses:
+            return
+        bus.subscribe("websocket.broadcast", self._handle_distributed_broadcast)
+        self._subscribed_buses.add(bus)
+
+    def unsubscribe_from_bus(self, bus: RedisEventBus) -> None:
+        """Unsubscribe this manager from distributed WebSocket broadcasts on the given RedisEventBus."""
+        if bus in self._subscribed_buses:
+            bus.unsubscribe("websocket.broadcast", self._handle_distributed_broadcast)
+            self._subscribed_buses.discard(bus)
+
+    async def _handle_distributed_broadcast(self, payload: Any) -> None:
+        """Deliver a cross-worker broadcast event locally while ignoring messages sent by this worker."""
+        if not isinstance(payload, dict):
+            return
+        if payload.get("sender_id") == self._instance_id:
+            return
+        if "message" not in payload:
+            return
+        room = payload.get("room")
+        await self.broadcast(
+            payload["message"],
+            room=room if isinstance(room, str) or room is None else str(room),
+            distribute=False,
+        )
 
     @classmethod
     def get_instance(cls) -> WebSocketManager:
@@ -170,12 +203,14 @@ class WebSocketManager:
         else:
             recipients = candidates
 
-        # 1. Single serialization for JSON and text payloads (P9-W3)
+        # 1. Single serialization for JSON and text payloads (P9-W3, WS-2)
         prepared_text: str | None = None
         prepared_bytes: bytes | None = None
+        distributed_message: Any = message
 
         if isinstance(message, (dict, list)):
-            prepared_text = json.dumps(message)
+            prepared_text = encode_json(message).decode("utf-8")
+            distributed_message = json.loads(prepared_text)
         elif isinstance(message, str):
             prepared_text = message
         elif isinstance(message, bytes):
@@ -214,7 +249,7 @@ class WebSocketManager:
                 for conn in failed_conns:
                     await self.disconnect(conn)
 
-        # 2. Cross-worker distributed fan-out via RedisEventBus (P9-W3, P6-Q6)
+        # 2. Cross-worker distributed fan-out via RedisEventBus (P9-W3, P6-Q6, WS-2)
         if distribute:
             try:
                 container = get_container()
@@ -222,7 +257,11 @@ class WebSocketManager:
                     bus = container.resolve(RedisEventBus)
                     await bus.publish(
                         "websocket.broadcast",
-                        {"message": message, "room": room},
+                        {
+                            "message": distributed_message,
+                            "room": room,
+                            "sender_id": self._instance_id,
+                        },
                         local=False,
                     )
             except Exception as exc:  # noqa: BLE001

@@ -72,7 +72,9 @@ async def test_broadcast_serializes_json_once() -> None:
 
     payload = {"type": "news_flash", "id": 12345, "headline": "Breaking news"}
 
-    with patch("swiftpy.websockets.manager.json.dumps", side_effect=json.dumps) as mock_dumps:
+    with patch(
+        "swiftpy.http.response.json.dumps", side_effect=json.dumps
+    ) as mock_dumps:
         await manager.broadcast(payload)
         assert mock_dumps.call_count == 1
 
@@ -202,12 +204,13 @@ async def test_distributed_broadcast_publishes_to_event_bus() -> None:
     # Local recipient received it
     assert len(local_client.received_messages) == 1
 
-    # Bus received publish call
+    # Bus received publish call with sender_id for worker deduplication
     mock_bus.publish.assert_awaited_once_with(
         "websocket.broadcast",
         {
             "message": {"action": "chat_message", "text": "hello distributed"},
             "room": "chat",
+            "sender_id": manager._instance_id,
         },
         local=False,
     )

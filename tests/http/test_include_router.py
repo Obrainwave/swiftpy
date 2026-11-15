@@ -6,7 +6,7 @@ from swiftpy.core.application import Application
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
-from swiftpy.http.router import RouteRegistrationError, Router
+from swiftpy.http.router import Router, RouteRegistrationError
 from swiftpy.testing.http_client import TestClient
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from swiftpy.console.loader import load_application
+from swiftpy.core.config import env
 from swiftpy.database.migrations.migrator import Migrator
 from swiftpy.database.pool import DatabasePool
 
@@ -139,8 +140,8 @@ class MigrateCommand:
         if getattr(args, "force", False):
             return
         env_val = (
-            os.getenv("SWIFTPY_APP__ENV")
-            or os.getenv("APP_ENV")
+            env("SWIFTPY_APP__ENV")
+            or env("APP_ENV")
             or (
                 str(app.config.get("app.env") or app.config.get("env") or "")
                 if app is not None and hasattr(app, "config")

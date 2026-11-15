@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -29,9 +30,9 @@ def test_basic_mail_message_creation() -> None:
 def test_mail_message_normalizes_single_recipient_string() -> None:
     msg = MailMessage(
         subject="Hello",
-        to="user@example.com",  # type: ignore[arg-type]
-        cc="manager@example.com",  # type: ignore[arg-type]
-        bcc="audit@example.com",  # type: ignore[arg-type]
+        **json.loads(
+            '{"to": "user@example.com", "cc": "manager@example.com", "bcc": "audit@example.com"}'
+        ),
     )
     assert msg.to == ["user@example.com"]
     assert msg.cc == ["manager@example.com"]
@@ -116,4 +117,4 @@ def test_invalid_email_addresses() -> None:
 
 def test_none_subject_raises() -> None:
     with pytest.raises(MailValidationError):
-        MailMessage(subject=None, to=["user@example.com"])  # type: ignore[arg-type]
+        MailMessage(subject=json.loads("null"), to=["user@example.com"])

@@ -26,53 +26,60 @@ def _build_invoker(handler: EventHandler) -> Callable[[str, Any], Any]:
 
     params = list(sig.parameters.values())
 
-    # Check for *args or **kwargs
-    has_varargs = any(
-        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    pos_params = [
+        p
         for p in params
-    )
-    if has_varargs:
-        return lambda event, payload: handler(payload)
-
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
     kw_only = [p for p in params if p.kind == inspect.Parameter.KEYWORD_ONLY]
-    if kw_only:
-        kw_names = tuple(p.name for p in kw_only)
-        pos_params = [
-            p
-            for p in params
-            if p.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-        ]
-        num_pos = len(pos_params)
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
 
-        def _kw_invoker(event: str, payload: Any) -> Any:
+    req_pos = sum(1 for p in pos_params if p.default is inspect.Parameter.empty)
+    num_pos = len(pos_params)
+
+    if req_pos >= 2 or (
+        num_pos >= 2
+        and pos_params[0].name in ("event", "event_name")
+        and pos_params[1].name == "payload"
+    ):
+        pos_mode = 2
+    elif num_pos >= 1 or has_var_pos:
+        pos_mode = 1
+    else:
+        pos_mode = 0
+
+    kw_names = tuple(p.name for p in kw_only)
+    pass_all_kw = has_var_kw and not kw_only and pos_mode == 0 and not has_var_pos
+
+    def _compiled_invoker(event: str, payload: Any) -> Any:
+        pos_args: tuple[Any, ...]
+        if pos_mode == 2:
+            pos_args = (event, payload)
+        elif pos_mode == 1:
+            pos_args = (payload,)
+        else:
+            pos_args = ()
+
+        if pass_all_kw:
+            return handler(*pos_args, event=event, payload=payload)
+
+        if kw_names:
             kwargs: dict[str, Any] = {}
             for name in kw_names:
                 if name == "payload":
                     kwargs["payload"] = payload
                 elif name == "event":
                     kwargs["event"] = event
-            if num_pos == 0:
-                return handler(**kwargs)
-            if num_pos == 1:
-                return handler(payload, **kwargs)
-            return handler(event, payload, **kwargs)
+            return handler(*pos_args, **kwargs)
 
-        return _kw_invoker
+        return handler(*pos_args)
 
-    required_params = [p for p in params if p.default is inspect.Parameter.empty]
-    num_req = len(required_params)
-
-    if num_req == 0:
-        if len(params) >= 1:
-            return lambda event, payload: handler(payload)
-        return lambda event, payload: handler()
-    if num_req == 1:
-        return lambda event, payload: handler(payload)
-    return lambda event, payload: handler(event, payload)
+    return _compiled_invoker
 
 
 @dataclass(slots=True)
@@ -277,13 +284,13 @@ class EventDispatcher:
         self._wildcard_registry = [
             reg
             for reg in self._wildcard_registry
-            if not (reg.pattern == event and reg.handler == handler)
+            if not (reg.pattern == event_str and reg.handler == handler)
         ]
         return len(self._registry) < initial_len
 
-    def forget(self, event: str | None = None) -> None:
+    def forget(self, event: str | type[Any] | None = None) -> None:
         """
-        Forget listeners for a specific event or wildcard pattern,
+        Forget listeners for a specific event, event class, or wildcard pattern,
         or clear all registered listeners if event is None.
         """
         if event is None:
@@ -291,8 +298,11 @@ class EventDispatcher:
             self._exact_registry.clear()
             self._wildcard_registry.clear()
         else:
-            self._registry = [reg for reg in self._registry if reg.pattern != event]
-            self._exact_registry.pop(event, None)
+            event_str = _normalize_event_name(event)
+            self._registry = [
+                reg for reg in self._registry if reg.pattern != event_str
+            ]
+            self._exact_registry.pop(event_str, None)
             self._wildcard_registry = [
-                reg for reg in self._wildcard_registry if reg.pattern != event
+                reg for reg in self._wildcard_registry if reg.pattern != event_str
             ]

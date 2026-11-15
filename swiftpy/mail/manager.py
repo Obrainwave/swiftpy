@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
 from swiftpy.mail.config import MailConfig
-from swiftpy.mail.exceptions import MailConfigurationError, MailerNotFoundError
-from swiftpy.mail.message import MailMessage
+from swiftpy.mail.exceptions import (
+    AttachmentTooLargeError,
+    MailConfigurationError,
+    MailerNotFoundError,
+)
+from swiftpy.mail.message import MailMessage, _validate_no_crlf, parse_mail_address
 from swiftpy.mail.models import MailSendResult
 from swiftpy.mail.transports.api.mailgun import MailgunTransport
 from swiftpy.mail.transports.api.resend import ResendTransport
@@ -44,6 +49,9 @@ class MailManager:
 
     @classmethod
     def get_instance(cls) -> MailManager:
+        if cls._instance is not None:
+            return cls._instance
+
         try:
             container = get_container()
             if container.has(cls):
@@ -51,8 +59,7 @@ class MailManager:
         except RuntimeError:
             pass
 
-        if cls._instance is None:
-            cls._instance = cls()
+        cls._instance = cls()
         return cls._instance
 
     @property
@@ -109,35 +116,64 @@ class MailManager:
 
         driver_type = str(mailer_config.get("transport", "")).lower()
 
+        cfg = self.mail_config
+        max_att_val = mailer_config.get(
+            "max_attachment_size_bytes", cfg.max_attachment_size_bytes
+        )
+        max_msg_val = mailer_config.get(
+            "max_message_size_bytes", cfg.max_message_size_bytes
+        )
+        max_att = int(max_att_val) if max_att_val is not None else None
+        max_msg = int(max_msg_val) if max_msg_val is not None else None
+
         if driver_type in self._custom_creators:
             return self._custom_creators[driver_type](mailer_config)
 
         if driver_type == "smtp":
             return SMTPTransport.from_config(
-                mailer_config, default_from=self.default_from
+                mailer_config,
+                default_from=self.default_from,
+                max_attachment_size_bytes=max_att,
+                max_message_size_bytes=max_msg,
             )
 
         if driver_type in ("console", "log"):
-            return ConsoleTransport.from_config(mailer_config)
+            return ConsoleTransport.from_config(
+                mailer_config,
+                max_attachment_size_bytes=max_att,
+                max_message_size_bytes=max_msg,
+            )
 
         if driver_type == "sendmail":
             return SendmailTransport.from_config(
-                mailer_config, default_from=self.default_from
+                mailer_config,
+                default_from=self.default_from,
+                max_attachment_size_bytes=max_att,
+                max_message_size_bytes=max_msg,
             )
 
         if driver_type == "resend":
             return ResendTransport.from_config(
-                mailer_config, default_from=self.default_from
+                mailer_config,
+                default_from=self.default_from,
+                max_attachment_size_bytes=max_att,
+                max_message_size_bytes=max_msg,
             )
 
         if driver_type == "sendgrid":
             return SendGridTransport.from_config(
-                mailer_config, default_from=self.default_from
+                mailer_config,
+                default_from=self.default_from,
+                max_attachment_size_bytes=max_att,
+                max_message_size_bytes=max_msg,
             )
 
         if driver_type == "mailgun":
             return MailgunTransport.from_config(
-                mailer_config, default_from=self.default_from
+                mailer_config,
+                default_from=self.default_from,
+                max_attachment_size_bytes=max_att,
+                max_message_size_bytes=max_msg,
             )
 
         raise MailConfigurationError(f"Unsupported mail transport: '{driver_type}'")
@@ -148,14 +184,51 @@ class MailManager:
         mailer: str | None = None,
     ) -> MailSendResult:
         """Deliver an email message using the specified or default mailer."""
-        if not message.from_address:
-            addr, name = self.default_from
-            message.from_address = addr
-            if not message.from_name:
-                message.from_name = name
+        cfg = self.mail_config
+        default_addr, default_name = cfg.from_address, cfg.from_name
+        if default_addr:
+            parse_mail_address(default_addr, field_name="default_from")
+        if default_name:
+            _validate_no_crlf(default_name, "default_from_name")
+
+        outbound_from_addr = message.from_address or default_addr or None
+        outbound_from_name = (
+            message.from_name
+            if message.from_address
+            else (message.from_name or default_name)
+        )
+        outbound = replace(
+            message,
+            to=list(message.to),
+            cc=list(message.cc),
+            bcc=list(message.bcc),
+            from_address=outbound_from_addr,
+            from_name=outbound_from_name,
+            context=dict(message.context),
+            attachments=list(message.attachments),
+            headers=dict(message.headers),
+            tags=list(message.tags),
+            metadata=dict(message.metadata),
+        )
+
+        # Enforce upfront limits for known sizes across all transports
+        total_known = len((outbound.text_body or "").encode("utf-8")) + len(
+            (outbound.html_body or "").encode("utf-8")
+        )
+        for att in outbound.attachments:
+            if att.size is not None:
+                if att.size > cfg.max_attachment_size_bytes:
+                    raise AttachmentTooLargeError(
+                        f"Attachment '{att.filename}' ({att.size} bytes) exceeds size limit ({cfg.max_attachment_size_bytes} bytes)"
+                    )
+                total_known += att.size
+        if total_known > cfg.max_message_size_bytes:
+            raise AttachmentTooLargeError(
+                f"Total email size ({total_known} bytes) exceeds configured limit ({cfg.max_message_size_bytes} bytes)"
+            )
 
         transport = self.mailer(mailer)
-        return await transport.send(message)
+        return await transport.send(outbound)
 
     async def close(self) -> None:
         """Close and clean up all instantiated mail transports."""

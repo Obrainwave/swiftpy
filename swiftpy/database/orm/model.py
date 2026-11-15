@@ -40,6 +40,7 @@ from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.support.strings import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
+_TRelModel = TypeVar("_TRelModel", bound="Model")
 _MISSING = object()
 logger = logging.getLogger(__name__)
 
@@ -108,19 +109,27 @@ class ModelQueryBuilder[T: Model]:
         """Add an OR nested WHERE group."""
         return self.where_group(callback, boolean="OR")
 
-    def where_in(self, column: str, values: list[Any]) -> Self:
+    def where_in(
+        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> Self:
         self.builder.where_in(column, values)
         return self
 
-    def or_where_in(self, column: str, values: list[Any]) -> Self:
+    def or_where_in(
+        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> Self:
         self.builder.or_where_in(column, values)
         return self
 
-    def where_not_in(self, column: str, values: list[Any]) -> Self:
+    def where_not_in(
+        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> Self:
         self.builder.where_not_in(column, values)
         return self
 
-    def or_where_not_in(self, column: str, values: list[Any]) -> Self:
+    def or_where_not_in(
+        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> Self:
         self.builder.or_where_not_in(column, values)
         return self
 
@@ -131,8 +140,26 @@ class ModelQueryBuilder[T: Model]:
         *,
         case_insensitive: bool = False,
         match: str = "contains",
+        boolean: str = "AND",
     ) -> Self:
         self.builder.where_like(
+            column,
+            value,
+            case_insensitive=case_insensitive,
+            match=match,
+            boolean=boolean,
+        )
+        return self
+
+    def or_where_like(
+        self,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> Self:
+        self.builder.or_where_like(
             column, value, case_insensitive=case_insensitive, match=match
         )
         return self
@@ -143,8 +170,19 @@ class ModelQueryBuilder[T: Model]:
         value: str,
         *,
         match: str = "contains",
+        boolean: str = "AND",
     ) -> Self:
-        self.builder.where_ilike(column, value, match=match)
+        self.builder.where_ilike(column, value, match=match, boolean=boolean)
+        return self
+
+    def or_where_ilike(
+        self,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> Self:
+        self.builder.or_where_ilike(column, value, match=match)
         return self
 
     def where_between(
@@ -183,11 +221,11 @@ class ModelQueryBuilder[T: Model]:
         self.builder.or_where_not_null(column)
         return self
 
-    def where_raw(self, sql: str, bindings: list[Any] | None = None) -> Self:
+    def where_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
         self.builder.where_raw(sql, bindings)
         return self
 
-    def or_where_raw(self, sql: str, bindings: list[Any] | None = None) -> Self:
+    def or_where_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
         self.builder.or_where_raw(sql, bindings)
         return self
 
@@ -257,7 +295,7 @@ class ModelQueryBuilder[T: Model]:
     def having_raw(
         self,
         sql: str,
-        bindings: list[Any] | None = None,
+        bindings: Sequence[Any] | None = None,
         boolean: str = "AND",
     ) -> Self:
         self.builder.having_raw(sql, bindings, boolean=boolean)
@@ -466,7 +504,7 @@ class ModelQueryBuilder[T: Model]:
         self,
         count: int,
         callback: Callable[[list[T]], Awaitable[bool | None] | bool | None],
-        column: str = "id",
+        column: str | None = None,
     ) -> bool:
         """
         Process hydrated model records in batches ordered by ID, advancing past the last observed ID.
@@ -475,7 +513,8 @@ class ModelQueryBuilder[T: Model]:
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("Chunk count must be an integer >= 1.")
 
-        col = validate_identifier(column, allow_dotted=False, allow_wildcard=False)
+        target_column = self.model_cls.__primary_key__ if column is None else column
+        col = validate_identifier(target_column, allow_dotted=False, allow_wildcard=False)
         last_id: Any = None
         base_query = self.clone()
         base_query.builder._limit_value = None
@@ -611,8 +650,11 @@ class ModelQueryBuilder[T: Model]:
         data: dict[str, Any],
         *,
         returning: Sequence[str] | str | None = None,
+        allow_default_values: bool = False,
     ) -> dict[str, Any]:
-        return await self.builder.insert_returning(data, returning=returning)
+        return await self.builder.insert_returning(
+            data, returning=returning, allow_default_values=allow_default_values
+        )
 
     @overload
     async def insert(self, data: dict[str, Any], *, returning: None = None) -> int: ...
@@ -712,7 +754,7 @@ class Model:
     __field_defaults__: ClassVar[dict[str, Any]]
     __field_factories__: ClassVar[dict[str, Any]]
     __vector_fields__: ClassVar[dict[str, VectorFieldInfo]]
-    __relations_config__: ClassVar[dict[str, Relation]]
+    __relations_config__: ClassVar[dict[str, Relation[Any]]]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -808,7 +850,7 @@ class Model:
         cls.__vector_fields__ = vectors
 
         # Inherit relations from ancestors and discover newly declared relations
-        relations: dict[str, Relation] = {}
+        relations: dict[str, Relation[Any]] = {}
         for base in reversed(cls.__mro__[1:]):
             relations.update(getattr(base, "__relations_config__", {}))
 
@@ -906,7 +948,7 @@ class Model:
         return inst
 
     def __init__(self, **kwargs: Any) -> None:
-        self._loaded_relations: dict[str, Any] = {}
+        self._loaded_relations: dict[str, Sequence[Model] | Model | None] = {}
         self._exists: bool = False
         self._original: dict[str, Any] = {}
         self._init_keys: set[str] = set()
@@ -1023,12 +1065,19 @@ class Model:
                     return value
         return value
 
-    @staticmethod
-    def _persistable(value: Any) -> Any:
+    @classmethod
+    def _persistable(cls, value: Any, field_name: str | None = None) -> Any:
         if isinstance(value, Model):
             return value.get_primary_key()
+        vector_fields = getattr(cls, "__vector_fields__", {})
+        is_vector = (
+            field_name in vector_fields
+            if field_name is not None
+            else bool(vector_fields)
+        )
         if (
-            isinstance(value, list)
+            is_vector
+            and isinstance(value, list)
             and value
             and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value)
         ):
@@ -1144,22 +1193,30 @@ class Model:
         return cls.query().or_where_group(callback)
 
     @classmethod
-    def where_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+    def where_in(
+        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> ModelQueryBuilder[Self]:
         """Add a WHERE IN clause to the query."""
         return cls.query().where_in(column, values)
 
     @classmethod
-    def or_where_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+    def or_where_in(
+        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> ModelQueryBuilder[Self]:
         """Add an OR WHERE IN clause to the query."""
         return cls.query().or_where_in(column, values)
 
     @classmethod
-    def where_not_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+    def where_not_in(
+        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> ModelQueryBuilder[Self]:
         """Add a WHERE NOT IN clause to the query."""
         return cls.query().where_not_in(column, values)
 
     @classmethod
-    def or_where_not_in(cls, column: str, values: list[Any]) -> ModelQueryBuilder[Self]:
+    def or_where_not_in(
+        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+    ) -> ModelQueryBuilder[Self]:
         """Add an OR WHERE NOT IN clause to the query."""
         return cls.query().or_where_not_in(column, values)
 
@@ -1171,8 +1228,26 @@ class Model:
         *,
         case_insensitive: bool = False,
         match: str = "contains",
+        boolean: str = "AND",
     ) -> ModelQueryBuilder[Self]:
         return cls.query().where_like(
+            column,
+            value,
+            case_insensitive=case_insensitive,
+            match=match,
+            boolean=boolean,
+        )
+
+    @classmethod
+    def or_where_like(
+        cls,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().or_where_like(
             column, value, case_insensitive=case_insensitive, match=match
         )
 
@@ -1183,8 +1258,19 @@ class Model:
         value: str,
         *,
         match: str = "contains",
+        boolean: str = "AND",
     ) -> ModelQueryBuilder[Self]:
-        return cls.query().where_ilike(column, value, match=match)
+        return cls.query().where_ilike(column, value, match=match, boolean=boolean)
+
+    @classmethod
+    def or_where_ilike(
+        cls,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> ModelQueryBuilder[Self]:
+        return cls.query().or_where_ilike(column, value, match=match)
 
     @classmethod
     def where_between(
@@ -1232,14 +1318,14 @@ class Model:
 
     @classmethod
     def where_raw(
-        cls, sql: str, bindings: list[Any] | None = None
+        cls, sql: str, bindings: Sequence[Any] | None = None
     ) -> ModelQueryBuilder[Self]:
         """Add a raw SQL where clause."""
         return cls.query().where_raw(sql, bindings)
 
     @classmethod
     def or_where_raw(
-        cls, sql: str, bindings: list[Any] | None = None
+        cls, sql: str, bindings: Sequence[Any] | None = None
     ) -> ModelQueryBuilder[Self]:
         """Add an OR raw SQL where clause."""
         return cls.query().or_where_raw(sql, bindings)
@@ -1308,7 +1394,7 @@ class Model:
         cls,
         count: int,
         callback: Callable[[list[Self]], Awaitable[bool | None] | bool | None],
-        column: str = "id",
+        column: str | None = None,
     ) -> bool:
         return await cls.query().chunk_by_id(count, callback, column=column)
 
@@ -1513,6 +1599,31 @@ class Model:
 
         await _do_dispatch()
 
+    def _build_insert_data(self) -> dict[str, Any]:
+        """Build column payload for INSERT, preserving defaults and non-None values."""
+        pk_name = self.__primary_key__
+        data: dict[str, Any] = {}
+        for name in self.__fields__:
+            val = getattr(self, name, None)
+            if name == pk_name:
+                if val is not None:
+                    data[name] = self._persistable(val, field_name=name)
+            elif name in self._init_keys or val is not None:
+                data[name] = self._persistable(val, field_name=name)
+        return data
+
+    def _apply_returning_row(
+        self, row: dict[str, Any], insert_keys: Iterable[str]
+    ) -> None:
+        """Apply RETURNING * columns onto the model and record persisted state."""
+        cls = self.__class__
+        for col, val in row.items():
+            if col in cls.__fields__:
+                setattr(self, col, cls._coerce_db_value(col, val))
+            elif col == cls.__primary_key__:
+                setattr(self, col, val)
+        self._mark_persisted([*insert_keys, *row.keys()])
+
     @classmethod
     async def create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
         """Create and persist a new model instance, validating mass assignment rules."""
@@ -1526,18 +1637,11 @@ class Model:
 
         await cls._dispatch_lifecycle_event("creating", instance, is_after_event=False)
 
-        insert_data = {
-            k: instance._persistable(getattr(instance, k))
-            for k in instance._init_keys
-            if k in cls.__fields__
-        }
-        row = await cls.query().insert_returning(insert_data)
-        for col, val in row.items():
-            if col in cls.__fields__:
-                setattr(instance, col, cls._coerce_db_value(col, val))
-            elif col == cls.__primary_key__:
-                setattr(instance, col, val)
-        instance._mark_persisted([*insert_data.keys(), *row.keys()])
+        insert_data = instance._build_insert_data()
+        row = await cls.query().insert_returning(
+            insert_data, allow_default_values=True
+        )
+        instance._apply_returning_row(row, insert_data.keys())
 
         await cls._dispatch_lifecycle_event("created", instance, is_after_event=True)
         return instance
@@ -1555,18 +1659,11 @@ class Model:
 
         await cls._dispatch_lifecycle_event("creating", instance, is_after_event=False)
 
-        insert_data = {
-            k: instance._persistable(getattr(instance, k))
-            for k in instance._init_keys
-            if k in cls.__fields__
-        }
-        row = await cls.query().insert_returning(insert_data)
-        for col, val in row.items():
-            if col in cls.__fields__:
-                setattr(instance, col, cls._coerce_db_value(col, val))
-            elif col == cls.__primary_key__:
-                setattr(instance, col, val)
-        instance._mark_persisted([*insert_data.keys(), *row.keys()])
+        insert_data = instance._build_insert_data()
+        row = await cls.query().insert_returning(
+            insert_data, allow_default_values=True
+        )
+        instance._apply_returning_row(row, insert_data.keys())
 
         await cls._dispatch_lifecycle_event("created", instance, is_after_event=True)
         return instance
@@ -1582,17 +1679,20 @@ class Model:
                     f"Cannot save existing {self.__class__.__name__} without primary key '{pk_name}'."
                 )
 
-            changed = {
-                name: self._persistable(val)
-                for name, val in self.get_dirty().items()
-                if name != pk_name
-            }
-            if not changed:
+            if not any(name != pk_name for name in self.get_dirty()):
                 return
 
             await self.__class__._dispatch_lifecycle_event(
                 "updating", self, is_after_event=False
             )
+
+            changed = {
+                name: self._persistable(val, field_name=name)
+                for name, val in self.get_dirty().items()
+                if name != pk_name
+            }
+            if not changed:
+                return
 
             if "updated_at" in self.__fields__:
                 now = datetime.now(UTC)
@@ -1613,24 +1713,11 @@ class Model:
             "creating", self, is_after_event=False
         )
 
-        data = {
-            name: self._persistable(getattr(self, name))
-            for name in self.__fields__
-            if (
-                (
-                    name != pk_name
-                    and (
-                        name in self._init_keys or getattr(self, name, None) is not None
-                    )
-                )
-                or (name == pk_name and getattr(self, name, None) is not None)
-            )
-        }
-        row = await self.__class__.query().insert_returning(data)
-        for col, val in row.items():
-            if col in self.__fields__ or col == pk_name:
-                setattr(self, col, val)
-        self._mark_persisted([*data, *row])
+        data = self._build_insert_data()
+        row = await self.__class__.query().insert_returning(
+            data, allow_default_values=True
+        )
+        self._apply_returning_row(row, data.keys())
         await self.__class__._dispatch_lifecycle_event(
             "created", self, is_after_event=True
         )
@@ -1769,38 +1856,117 @@ class Model:
                 data[rel_name] = rel_value
         return data
 
+    @overload
+    def has_many(
+        self,
+        related: type[_TRelModel],
+        foreign_key: str | None = None,
+        local_key: str | None = None,
+    ) -> HasMany[_TRelModel]: ...
+
+    @overload
+    def has_many(
+        self,
+        related: str,
+        foreign_key: str | None = None,
+        local_key: str | None = None,
+    ) -> HasMany[Any]: ...
+
     def has_many(
         self,
         related: str | type[Model],
         foreign_key: str | None = None,
-        local_key: str = "id",
-    ) -> HasMany:
+        local_key: str | None = None,
+    ) -> HasMany[Any]:
         """Construct a HasMany relationship instance."""
-        rel = HasMany(related, foreign_key, local_key)
+        if isinstance(related, str):
+            rel: HasMany[Any] = HasMany(related, foreign_key, local_key)
+        else:
+            rel = HasMany(related, foreign_key, local_key)
         rel.owner_cls = self.__class__
         return rel
+
+    @overload
+    def belongs_to(
+        self,
+        related: type[_TRelModel],
+        foreign_key: str | None = None,
+        local_key: str | None = None,
+    ) -> BelongsTo[_TRelModel]: ...
+
+    @overload
+    def belongs_to(
+        self,
+        related: str,
+        foreign_key: str | None = None,
+        local_key: str | None = None,
+    ) -> BelongsTo[Any]: ...
 
     def belongs_to(
         self,
         related: str | type[Model],
         foreign_key: str | None = None,
-        local_key: str = "id",
-    ) -> BelongsTo:
+        local_key: str | None = None,
+    ) -> BelongsTo[Any]:
         """Construct a BelongsTo relationship instance."""
-        rel = BelongsTo(related, foreign_key, local_key)
+        if isinstance(related, str):
+            rel: BelongsTo[Any] = BelongsTo(related, foreign_key, local_key)
+        else:
+            rel = BelongsTo(related, foreign_key, local_key)
         rel.owner_cls = self.__class__
         return rel
+
+    @overload
+    def has_one(
+        self,
+        related: type[_TRelModel],
+        foreign_key: str | None = None,
+        local_key: str | None = None,
+    ) -> HasOne[_TRelModel]: ...
+
+    @overload
+    def has_one(
+        self,
+        related: str,
+        foreign_key: str | None = None,
+        local_key: str | None = None,
+    ) -> HasOne[Any]: ...
 
     def has_one(
         self,
         related: str | type[Model],
         foreign_key: str | None = None,
-        local_key: str = "id",
-    ) -> HasOne:
+        local_key: str | None = None,
+    ) -> HasOne[Any]:
         """Construct a HasOne relationship instance."""
-        rel = HasOne(related, foreign_key, local_key)
+        if isinstance(related, str):
+            rel: HasOne[Any] = HasOne(related, foreign_key, local_key)
+        else:
+            rel = HasOne(related, foreign_key, local_key)
         rel.owner_cls = self.__class__
         return rel
+
+    @overload
+    def belongs_to_many(
+        self,
+        related: type[_TRelModel],
+        pivot_table: str | None = None,
+        foreign_pivot_key: str | None = None,
+        related_pivot_key: str | None = None,
+        parent_key: str | None = None,
+        related_key: str | None = None,
+    ) -> BelongsToMany[_TRelModel]: ...
+
+    @overload
+    def belongs_to_many(
+        self,
+        related: str,
+        pivot_table: str | None = None,
+        foreign_pivot_key: str | None = None,
+        related_pivot_key: str | None = None,
+        parent_key: str | None = None,
+        related_key: str | None = None,
+    ) -> BelongsToMany[Any]: ...
 
     def belongs_to_many(
         self,
@@ -1808,18 +1974,28 @@ class Model:
         pivot_table: str | None = None,
         foreign_pivot_key: str | None = None,
         related_pivot_key: str | None = None,
-        parent_key: str = "id",
-        related_key: str = "id",
-    ) -> BelongsToMany:
+        parent_key: str | None = None,
+        related_key: str | None = None,
+    ) -> BelongsToMany[Any]:
         """Construct a BelongsToMany relationship instance."""
-        rel = BelongsToMany(
-            related,
-            pivot_table,
-            foreign_pivot_key,
-            related_pivot_key,
-            parent_key,
-            related_key,
-        )
+        if isinstance(related, str):
+            rel: BelongsToMany[Any] = BelongsToMany(
+                related,
+                pivot_table,
+                foreign_pivot_key,
+                related_pivot_key,
+                parent_key,
+                related_key,
+            )
+        else:
+            rel = BelongsToMany(
+                related,
+                pivot_table,
+                foreign_pivot_key,
+                related_pivot_key,
+                parent_key,
+                related_key,
+            )
         rel.owner_cls = self.__class__
         return rel
 
@@ -1838,9 +2014,11 @@ class Model:
 
     def __hash__(self) -> int:
         pk = self.get_primary_key()
-        if pk is not None:
-            return hash((self.__class__, pk))
-        return hash(id(self))
+        if pk is None:
+            raise TypeError(
+                f"Unsaved {self.__class__.__name__} without primary key is unhashable."
+            )
+        return hash((self.__class__, pk))
 
 
 __all__ = [

@@ -2,13 +2,13 @@
 
 **An ASGI-native, Eloquent-style Python web framework combining the developer experience of FastAPI with the elegance and structure of Laravel.**
 
-[![CI](https://github.com/your-org/swiftpy/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/your-org/swiftpy/actions)
+[![CI](https://github.com/obrainwave/swiftpy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/obrainwave/swiftpy/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![Status: Production-Hardened](https://img.shields.io/badge/status-production--hardened-green.svg)](./DEVLOG.md)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Types: Mypy Strict](https://img.shields.io/badge/types-mypy%20strict-blue.svg)](https://mypy-lang.org/)
-[![Tests: 650+ Passing](https://img.shields.io/badge/tests-650%2B%20passing-brightgreen.svg)](./DEVLOG.md)
+[![Tests: Automated Suite](https://img.shields.io/badge/tests-pytest%20suite-brightgreen.svg)](./DEVLOG.md)
 
 ---
 
@@ -26,13 +26,13 @@ SwiftPY brings the joy and productivity of Laravel to the modern asynchronous Py
 - **At-Least-Once Queues & Signed Bus**: Robust background jobs with Redis visibility timeout leases, HMAC-SHA256 envelope signing, dead-letter routing, and a cryptographically protected cross-worker event bus.
 - **WebSocket Gateway**: Structured WebSocket connection management, topic subscriptions, broadcast fan-out, ping/pong heartbeats, and strict same-origin handshake validation.
 - **Zero-Config Provider Auto-Discovery**: Automatic service provider discovery in `app/providers/` that registers container dependencies behind the scenes without manual entrypoint registration.
-- **Developer CLI (`swiftpy`)**: Built-in CLI for running migrations, rolling back batches, inspecting migration status, scaffolding typed migrations, linking public storage, running queue workers, and starting the ASGI dev server.
+- **Developer CLI (`swiftpy`)**: Built-in CLI for scaffolding new projects (`new`) and components (`make:*`), running/rolling back/resetting/seeding migrations (`migrate*`, `db:seed`), linking public storage, managing queue workers and failed jobs, precompiling caches, and starting the ASGI server.
 
 ---
 
 ## Status & Roadmap
 
-All core architectural, storage, and security hardening phases have been completed and verified against a comprehensive 650+ test suite:
+All core architectural, storage, AI, and security hardening phases have been completed and verified against an automated PostgreSQL + Redis pytest suite:
 
 | Milestone | Component Focus | Status |
 |---|---|---|
@@ -72,7 +72,7 @@ All benchmarks were measured under concurrent load using `wrk` against the conta
 - **$O(1)$ Static Routing**: Direct dictionary hash lookup for non-parameterized routes bypasses regex scanning.
 - **DI Reflection Caching**: Container parameter reflection (`inspect.signature` / `get_type_hints`) is cached permanently after the first call.
 - **Redis Pipelining & Token Cache**: Batching blacklist commands into atomic pipelines with in-memory TTL caching speeds up JWT validation.
-- **Precompiled Production Cache (`swiftpy cache:build`)**: Precompiles routes, configuration, and prompt templates into serialized JSON files (`bootstrap/cache/`) to eliminate startup file parsing overhead.
+- **Precompiled Production Cache (`swiftpy cache:build`)**: Precompiles configuration (`bootstrap/cache/config.json`) and prompt templates (`bootstrap/cache/prompts.json`) into serialized JSON files to eliminate startup file parsing overhead (note: legacy `RouteCache` was removed under Decision `G-16` in favor of direct `$O(1)$` static route registration).
 
 ---
 
@@ -104,8 +104,9 @@ app.middleware([RequestId, SecurityHeaders, CORS])
 
 
 @app.get("/ping")
-async def ping(request: Request) -> Response:
-    return json_response({"message": "pong"})
+async def ping(request: Request) -> dict[str, str]:
+    # Plain dict/list return values are automatically serialized to JSON (Decision G-16)
+    return {"message": "pong"}
 
 
 @app.group("/api/v1")
@@ -245,7 +246,7 @@ if await Storage.exists("reports/annual_2026.pdf"):
 @app.get("/reports/download")
 async def download_report(request: Request) -> Response:
     return await Storage.download(
-        "reports/annual_2026.pdf", filename="Annual_Report_2026.pdf"
+        "reports/annual_2026.pdf", name="Annual_Report_2026.pdf"
     )
 ```
 
@@ -255,17 +256,17 @@ Declare typed validation schemas that fail closed before your controller handler
 
 ```python
 from app.models.user import User
-from swiftpy import Request, Response, json_response
-from swiftpy.http.validation import FormRequest
-from swiftpy.validation.rules import email, min_len, required, unique
+from swiftpy import Response, json_response
+from swiftpy.validation import FormRequest
+from swiftpy.validation.rules import email, min_, required, string, unique
 
 
 class RegisterRequest(FormRequest):
-    def rules(self) -> dict:
+    def rules(self) -> dict[str, object]:
         return {
-            "name": [required(), min_len(3)],
+            "name": [required(), string(), min_(3)],
             "email": [required(), email(), unique("users", "email")],
-            "password": [required(), min_len(8)],
+            "password": [required(), string(), min_(8)],
         }
 
 
@@ -347,35 +348,42 @@ await SendWelcomeEmail(user_id=42, email="alice@example.com").dispatch(delay=60.
 SwiftPY provides a unified CLI entrypoint for common development and production workflows:
 
 ```bash
+# Scaffold a new SwiftPY project
+swiftpy new my_service
+
 # Start the ASGI server (production default: reload=False)
 swiftpy start --host 0.0.0.0 --port 8000 --workers 4
 
 # Start local dev server with auto-reload
 swiftpy start --reload
 
-# Start the background queue worker
+# Start the background queue worker & inspect/retry Dead Letter Queue jobs
 swiftpy queue:work --queue default --sleep 1.0
+swiftpy queue:failed --limit 50
+swiftpy queue:retry --all
+swiftpy queue:flush
 
-# Run pending database migrations
+# Run, inspect, rollback, reset, and seed database migrations
 swiftpy migrate
-
-# Inspect migration status and batch history
 swiftpy migrate:status
-
-# Rollback the last migration batch
 swiftpy migrate:rollback
+swiftpy migrate:reset
+swiftpy db:seed
 
-# Scaffold a new migration with smart table name inference
+# Scaffold migrations, models, requests, API keys, mailables, and more
 swiftpy make:migration create_posts_table
-swiftpy make:migration add_status_to_orders
+swiftpy make:model Post --migration
+swiftpy make:request RegisterRequest
+swiftpy make:mail WelcomeEmail
+swiftpy make:api-key --name billing-client
 
-# Create a symbolic link from public/storage to storage/app/public
+# Create symbolic links from public/storage to storage/app/public
 swiftpy storage:link
 
-# Precompile routes, configuration, and prompt templates for zero cold-start latency
+# Precompile configuration and prompt templates (bootstrap/cache/)
 swiftpy cache:build
 
-# Clear all precompiled application caches
+# Clear precompiled application caches
 swiftpy cache:clear
 ```
 
@@ -387,19 +395,22 @@ SwiftPY reads environment variables and YAML/Python configuration files with str
 
 | Environment Variable | Config Path | Default | Description |
 |---|---|---|---|
-| `APP_ENV` | `app.env` | `"development"` | Environment (`development`, `testing`, `production`). In production, `debug=True` is prohibited. |
-| `APP_KEY` | `app.key` | None | Primary 32+ byte application secret key used for HMAC envelope signing on queue jobs and event bus. |
-| `JWT_SECRET` | `auth.jwt.secret` | None | Secret key for JWT HS256 signing (at least 32 bytes required in production). |
-| `AUTH_KEY_PEPPER` | `auth.guards.api_key.pepper` | None | Secret pepper for API key hashing (at least 32 bytes required in production). |
-| `HTTP_MAX_BODY_SIZE` | `http.max_body_size` | `2097152` (2 MiB) | Maximum allowed HTTP request body size in bytes. Returns 413 when exceeded. |
-| `HTTP_MAX_CONTENT_LENGTH` | `http.max_content_length` | `2097152` (2 MiB) | Maximum allowed Content-Length in bytes. Rejects excessive payloads before chunk accumulation. |
-| `HTTP_MAX_JSON_DEPTH` | `http.max_json_depth` | `32` | Maximum allowed JSON nesting recursion depth to prevent stack exhaustion attacks. |
-| `FILESYSTEM_DEFAULT` | `filesystem.default` | `"local"` | Default disk driver (`local`, `public`, `s3`). |
-| `WEBSOCKETS_ALLOWED_ORIGINS` | `websockets.allowed_origins` | None | Comma-separated list of allowed origins. When unset, enforces strict same-origin policy against `Host` (D-14). |
-| `WEBSOCKETS_MAX_MESSAGE_SIZE` | `websockets.max_message_size` | `1048576` (1 MiB) | Maximum allowed incoming WebSocket message size. Exceeding closes connection with code 1009. |
-| `DB_SSL` | `database.connections.postgresql.ssl` | `"disable"` | PostgreSQL SSL mode (`disable`, `require`, `verify-ca`, `verify-full`). |
-| `DB_SSL_CA_FILE` | `database.connections.postgresql.ssl_ca_file` | None | Filepath to CA certificate when `DB_SSL` is `verify-ca` or `verify-full`. |
-| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | `[]` | Comma-separated list of allowed CORS origins. |
+| `APP_ENV` | `app.env` | `"local"` | Environment (`"local"`, `"testing"`, `"production"`). In production, `debug=True` is prohibited. |
+| `APP_DEBUG` | `app.debug` | `False` | Enable debug mode (`true`/`false`); fails closed in production if enabled. |
+| `APP_KEY` | `app.key` | `""` | Primary `>= 32`-byte application secret key for HMAC queue/event-bus signing and signed local URLs. |
+| `JWT_SECRET` | `auth.guards.jwt.secret` | `None` | Secret key for JWT HS256 signing (`>= 32` bytes required when non-debug/production). |
+| `AUTH_KEY_PEPPER` | `auth.guards.api_key.pepper` | `None` | Server pepper for API key HMAC-SHA256 verification (`>= 32` bytes required when non-debug/production). |
+| `FILESYSTEM_DISK` | `filesystems.default` | `"local"` | Default disk driver (`"local"`, `"public"`, `"s3"`). |
+| `MAIL_MAILER` | `mail.default` | `"smtp"` | Default mail transport (`"smtp"`, `"sendmail"`, `"resend"`, `"sendgrid"`, `"mailgun"`, `"console"`, `"array"`). Templates resolve under `views/`. |
+| — | `http.max_body_size` | `2097152` (2 MiB) | Maximum allowed HTTP request body size in bytes (configured via `Config` or `Application(...)` / route). Returns 413 when exceeded. |
+| — | `http.max_content_length` | `None` | Optional strict `Content-Length` ceiling in bytes before buffering chunks (configured via `Config`, `Application(...)`, or per-route). |
+| — | `http.max_json_depth` | `32` | Maximum allowed JSON nesting depth before rejecting with HTTP 400 (configured via `Config`, `Application(...)`, or per-route). |
+| — | `websockets.allowed_origins` | `None` | Allowed WebSocket origins (`Config` or `Application(allowed_origins=...)`). When unset, enforces strict same-origin policy against `Host` (D-14). |
+| — | `websockets.max_message_size` | `1048576` (1 MiB) | Maximum incoming WebSocket message size in bytes (`Config`); exceeding closes connection with code 1009. |
+| `DB_CONNECTION` | `database.default` | `"postgresql"` | Default database connection key (`"postgresql"`). |
+| `DB_SSL` | `database.connections.postgresql.ssl` | `"disable"` | PostgreSQL SSL mode (`"disable"`, `"require"`, `"verify-ca"`, `"verify-full"`). |
+| `DB_SSL_CA_FILE` | `database.connections.postgresql.ssl_ca_file` | `""` | Filepath to CA certificate when `DB_SSL` is `"verify-ca"` or `"verify-full"`. |
+| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | `[]` | Comma-separated list of allowed CORS origins (never pair `"*"` with `CORS_ALLOW_CREDENTIALS=true`). |
 | `CORS_ALLOW_CREDENTIALS` | `cors.allow_credentials` | `False` | Whether cross-origin requests may include credentials/cookies. |
 
 ---
@@ -443,7 +454,7 @@ Background jobs run with **at-least-once** delivery guarantees:
 
 ## Breaking Changes & Migration Guide
 
-Across the hardening phases, all architectural decisions were aligned with the specifications in `docs/code_review_fix_plan.md`:
+Across the hardening and audit remediation phases, architectural decisions (`D-1`–`D-14` and approval gates `G-1`–`G-16`, summarized in [`CHANGELOG.md`](./CHANGELOG.md)) enforce secure, fail-closed contracts:
 
 - **D-1 (JWT Secret Enforcement)**: Weak or missing JWT secrets (< 32 bytes) raise `ConfigurationError` in production environments; hardcoded fallback secret removed from `config/auth.py`.
 - **D-2 (API Key Format & Server Pepper)**: API keys follow `<prefix>.<secret>` (e.g. `sk_live_<hex>.<secret>`), look up single row by indexed prefix, and verify constant-time HMAC-SHA256 requiring `AUTH_KEY_PEPPER` (min 32 bytes) in production.
@@ -455,7 +466,8 @@ Across the hardening phases, all architectural decisions were aligned with the s
 - **D-8 (Config Environment Variable Coercion)**: Coercion preserves strings unless the default type is known (e.g. `"0012"` is not silently cast to integer `12`).
 - **D-9 (`FormRequest` Fail-Closed Validation)**: If `rules()` raises `TypeError` or any exception, the request fails closed with `ConfigurationError` (HTTP 500) rather than falling back to unvalidated `{}`.
 - **D-10 (`update()`/`delete()` Without `WHERE`)**: Mass write/delete queries without a `WHERE` clause raise `QueryError` unless `.allow_all()` is explicitly chained.
-- **D-11 (Placeholder Module Deprecation)**: Unimplemented placeholder modules (`swiftpy/ai/**`, `config/ai.py`, `config/logging.py`, etc.) are documented with `"""Not implemented."""` and excluded from wheel distributions.
+- **G-1 (`swiftpy/ai` & Wheel Packaging)**: `swiftpy/ai` (LLM clients, embeddings, vector stores, RAG pipelines, agents, tools, prompt templates, observability), `swiftpy/admin`, `swiftpy/mail`, `swiftpy/filesystem`, and `swiftpy/validation` are fully implemented and distributed in the main `swiftpy-framework` wheel (dev test utilities remain in `swiftpy/testing`). `swiftpy/__init__.py` uses PEP 562 lazy exports so lightweight CLI/app imports avoid heavy optional subpackages until accessed.
+- **G-16 (`dict` Auto-JSON & Cache Cleanup)**: Route handlers returning plain `dict` or `list` values are automatically serialized to JSON; legacy unbootstrapped `RouteCache` was removed (`swiftpy cache:build` compiles `config.json` and `prompts.json`); `/docs/` and `AGENTS.md` remain gitignored.
 - **D-12 (Repository Hygiene)**: `.coverage` and cache artifacts untracked from git; `docs/`, `AGENTS.md`, and `DEVLOG.md` maintained untracked at repo root.
 - **D-13 (Default `max_body_size`)**: Default 2 MiB request body limit (`413 Payload Too Large`) enforced across all buffered and streaming HTTP requests, configurable per app and per route.
 - **D-14 (WebSocket Origin Validation)**: Defaults to strict same-origin checking against the `Host` header unless `WEBSOCKETS_ALLOWED_ORIGINS` is explicitly configured.
@@ -477,22 +489,39 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   │   └── database_service_provider.py
 │   └── services/           # Domain business logic
 ├── config/                 # Environment & framework configuration
+│   ├── ai.py
 │   ├── app.py
-│   └── database.py
+│   ├── auth.py
+│   ├── cache.py
+│   ├── cors.py
+│   ├── database.py
+│   ├── events.py
+│   ├── filesystems.py
+│   ├── logging.py
+│   ├── mail.py
+│   └── queue.py
 ├── database/
 │   └── migrations/         # Timestamped database migrations
+├── views/                  # Sandboxed Jinja2 HTML templates (admin/, mail/)
 ├── swiftpy/                # SwiftPY framework core
+│   ├── admin/              # Auto-introspecting admin site, RBAC & session auth
+│   ├── ai/                 # AI client, embeddings, vectorstores, RAG, agents, tools, prompts
 │   ├── auth/               # JWT issuer, API key guards, token blacklist
 │   ├── cache/              # Redis and memory cache drivers
-│   ├── console/            # CLI commands, argument parsing, app loader
+│   ├── console/            # CLI commands, scaffolding (new/make:*), app loader
 │   ├── core/               # Application kernel, DI container, config repository
-│   ├── database/           # Pool, query builder, ORM, migrations, advisory lock
+│   ├── database/           # Pool, query builder, ORM, migrations, seeders, advisory lock
 │   ├── events/             # Signed Redis event bus and local dispatcher
+│   ├── filesystem/         # Multi-disk Storage (local, public, s3) and uploads
 │   ├── helpers/            # Inflection (pluralize/snake_case), global helpers
 │   ├── http/               # Router, request/response, middleware pipeline
+│   ├── mail/               # Mailables, SMTP/Sendmail/API transports, templates
 │   ├── queue/              # At-least-once queue workers, job serialization
+│   ├── support/            # Shared identifiers, keys, Redis config, string inflection
+│   ├── testing/            # TestClient, AIFake, MailFake, StorageFake, DB fixtures
+│   ├── validation/         # FormRequest, fail-closed Validator, builtin & DB rules
 │   └── websockets/         # WebSocket manager, connections, broadcast
-├── tests/                  # Pytest test suites (600+ tests)
+├── tests/                  # Automated pytest suite
 ├── docker-compose.yml      # Hardened local PostgreSQL & Redis environment
 ├── Dockerfile              # Multi-stage production container
 ├── main.py                 # Application entrypoint
@@ -504,13 +533,14 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 ## Development Setup
 
 ### Prerequisites
-- Python 3.12+
+- Python 3.12+ (`uv` recommended)
 - Docker and Docker Compose
 
 ### 1. Clone & Start Containers
 ```bash
-git clone https://github.com/your-org/swiftpy.git
+git clone https://github.com/obrainwave/swiftpy.git
 cd swiftpy
+cp .env.example .env  # set strong APP_KEY, DB_PASSWORD, REDIS_PASSWORD, JWT_SECRET, AUTH_KEY_PEPPER
 docker compose up -d
 ```
 
@@ -521,15 +551,15 @@ docker compose exec app swiftpy migrate
 
 ### 3. Run Test Suites & Quality Checks
 ```bash
-# Run full pytest test suite (600+ tests)
-docker compose exec app pytest -q -p no:cacheprovider
+# Run full pytest test suite (requires PostgreSQL + Redis running)
+uv run pytest -vv -ra --timeout=120 --timeout-method=thread
 
 # Static type checking with Mypy in strict mode
-docker compose exec app mypy .
+uv run --with jinja2 --with aiosmtplib mypy swiftpy
+uv run mypy --explicit-package-bases .
 
-# Linting and formatting with Ruff
-docker compose exec app ruff check .
-docker compose exec app ruff format --check .
+# Linting with Ruff
+uv run ruff check .
 ```
 
 ---

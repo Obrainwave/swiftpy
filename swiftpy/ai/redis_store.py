@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import time
+from collections import OrderedDict
+from collections.abc import Awaitable
+from typing import Protocol
 
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
@@ -10,6 +13,16 @@ from swiftpy.ai.conversation import Conversation
 from swiftpy.ai.exceptions import AIConnectionError
 from swiftpy.core.config import Config
 from swiftpy.support.redis_config import resolve_redis_params
+
+
+class _ConversationRedisClient(Protocol):
+    def get(self, name: str, /) -> Awaitable[bytes | str | None]: ...
+    def set(
+        self, name: str, value: str, /, ex: int | None = None
+    ) -> Awaitable[bool | str | bytes | None]: ...
+    def delete(self, name: str, /) -> Awaitable[int]: ...
+    def exists(self, name: str, /) -> Awaitable[int]: ...
+    def aclose(self) -> Awaitable[None]: ...
 
 
 class ConversationStore:
@@ -34,11 +47,29 @@ class ConversationStore:
 
 
 class InMemoryConversationStore(ConversationStore):
-    """In-memory conversation store for testing and single-instance deployments."""
+    """Bounded LRU + TTL-aware in-memory conversation store."""
 
-    def __init__(self) -> None:
-        self._data: dict[str, str] = {}
-        self._ttls: dict[str, int | None] = {}
+    def __init__(
+        self,
+        max_entries: int = 1000,
+        default_ttl: int | None = None,
+    ) -> None:
+        if max_entries <= 0:
+            raise ValueError(f"max_entries must be greater than 0, got {max_entries}")
+        self.max_entries = max_entries
+        self.default_ttl = default_ttl
+        self._data: OrderedDict[str, tuple[str, float | None]] = OrderedDict()
+
+    def _get_valid_payload(self, session_id: str) -> str | None:
+        entry = self._data.get(session_id)
+        if entry is None:
+            return None
+        raw, expires_at = entry
+        if expires_at is not None and time.monotonic() >= expires_at:
+            del self._data[session_id]
+            return None
+        self._data.move_to_end(session_id)
+        return raw
 
     async def save(
         self,
@@ -46,11 +77,23 @@ class InMemoryConversationStore(ConversationStore):
         conversation: Conversation,
         ttl: int | None = None,
     ) -> None:
-        self._data[session_id] = conversation.to_json()
-        self._ttls[session_id] = ttl
+        effective_ttl = self.default_ttl if ttl is None else ttl
+        if effective_ttl is not None and effective_ttl < 0:
+            self._data.pop(session_id, None)
+            return
+
+        expires_at = (
+            time.monotonic() + effective_ttl
+            if effective_ttl is not None and effective_ttl > 0
+            else None
+        )
+        self._data[session_id] = (conversation.to_json(), expires_at)
+        self._data.move_to_end(session_id)
+        while len(self._data) > self.max_entries:
+            self._data.popitem(last=False)
 
     async def load(self, session_id: str) -> Conversation:
-        raw = self._data.get(session_id)
+        raw = self._get_valid_payload(session_id)
         if raw is None:
             return Conversation()
         try:
@@ -59,14 +102,10 @@ class InMemoryConversationStore(ConversationStore):
             raise ValueError(f"Corrupted in-memory conversation data: {exc}") from exc
 
     async def delete(self, session_id: str) -> bool:
-        if session_id in self._data:
-            del self._data[session_id]
-            self._ttls.pop(session_id, None)
-            return True
-        return False
+        return self._data.pop(session_id, None) is not None
 
     async def exists(self, session_id: str) -> bool:
-        return session_id in self._data
+        return self._get_valid_payload(session_id) is not None
 
 
 class RedisConversationStore(ConversationStore):
@@ -76,12 +115,12 @@ class RedisConversationStore(ConversationStore):
 
     def __init__(
         self,
-        redis_client: aioredis.Redis | None = None,
+        redis_client: _ConversationRedisClient | None = None,
         config: Config | None = None,
         key_prefix: str = "ai:conversation",
         default_ttl: int = 86400,
     ) -> None:
-        self._client = redis_client
+        self._client: _ConversationRedisClient | None = redis_client
         self._config = config
         self._key_prefix = key_prefix
         self.default_ttl = default_ttl
@@ -92,22 +131,16 @@ class RedisConversationStore(ConversationStore):
         clean_id = session_id.strip()
         return f"{self._key_prefix}:{clean_id}"
 
-    async def get_client(self) -> aioredis.Redis:
+    async def get_client(self) -> _ConversationRedisClient:
         """Lazily initialize Redis client if not explicitly provided."""
         if self._client is None:
             cfg = self._config or Config.get_instance()
             params = resolve_redis_params(cfg, section="ai")
-            connection_kwargs: dict[str, Any] = {
-                "host": params["host"],
-                "port": params["port"],
-                "decode_responses": True,
-            }
-            if params.get("password"):
-                connection_kwargs["password"] = params["password"]
-            if params.get("db") is not None:
-                connection_kwargs["db"] = params["db"]
-
-            self._client = aioredis.Redis(**connection_kwargs)
+            client: _ConversationRedisClient = aioredis.from_url(
+                params["url"], decode_responses=True
+            )
+            self._client = client
+            return client
         return self._client
 
     async def save(
@@ -121,6 +154,7 @@ class RedisConversationStore(ConversationStore):
 
         If ttl is None, self.default_ttl is used.
         If ttl == 0, the key is saved with no expiration.
+        If ttl < 0, any existing key is removed immediately.
         """
         client = await self.get_client()
         key = self._format_key(session_id)
@@ -128,7 +162,9 @@ class RedisConversationStore(ConversationStore):
         payload = conversation.to_json()
 
         try:
-            if effective_ttl > 0:
+            if effective_ttl < 0:
+                await client.delete(key)
+            elif effective_ttl > 0:
                 await client.set(key, payload, ex=effective_ttl)
             else:
                 await client.set(key, payload)

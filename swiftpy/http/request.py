@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any, cast
 from urllib.parse import parse_qs
 
+from swiftpy.core.config import Config
+from swiftpy.core.container import get_container
 from swiftpy.filesystem.uploads.handlers import FormData, MultipartParser
 from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
 from swiftpy.http.exceptions import (
@@ -23,20 +25,25 @@ def _validate_json_depth(
     current_depth: int = 1,
     max_depth: int = DEFAULT_MAX_JSON_DEPTH,
 ) -> None:
-    """Validate that nested JSON structures do not exceed maximum nesting depth."""
-    if current_depth > max_depth:
-        raise HttpException(
-            f"JSON payload exceeds maximum allowed depth of {max_depth}",
-            status_code=400,
-        )
-    if isinstance(obj, dict):
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                _validate_json_depth(v, current_depth + 1, max_depth)
-    elif isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, (dict, list)):
-                _validate_json_depth(item, current_depth + 1, max_depth)
+    """Validate iteratively that nested JSON structures do not exceed maximum nesting depth."""
+    stack: list[tuple[Any, int]] = [(obj, current_depth)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            raise HttpException(
+                f"JSON payload exceeds maximum allowed depth of {max_depth}",
+                status_code=400,
+            )
+        if isinstance(node, dict):
+            next_depth = depth + 1
+            for val in node.values():
+                if isinstance(val, (dict, list)):
+                    stack.append((val, next_depth))
+        elif isinstance(node, list):
+            next_depth = depth + 1
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    stack.append((item, next_depth))
 
 
 class RequestHeaders(Mapping[str, str]):
@@ -160,18 +167,29 @@ class Request:
     async def body(self, *, max_size: int | None = None) -> bytes:
         limit = max_size if max_size is not None else self.max_body_size
 
-        content_length_raw = self.headers.get("content-length")
-        if content_length_raw is not None:
-            try:
-                content_length = int(content_length_raw)
-            except ValueError:
+        content_length_values = self.headers.getlist("content-length")
+        if content_length_values:
+            parsed_lengths: list[int] = []
+            for raw_cl in content_length_values:
+                try:
+                    parsed_cl = int(raw_cl)
+                except ValueError:
+                    raise HttpException(
+                        "Invalid Content-Length header", status_code=400
+                    ) from None
+                if parsed_cl < 0:
+                    raise HttpException(
+                        "Invalid Content-Length header", status_code=400
+                    )
+                parsed_lengths.append(parsed_cl)
+            if len(content_length_values) > 1 and (
+                len(set(parsed_lengths)) > 1
+                or len({val.strip() for val in content_length_values}) > 1
+            ):
                 raise HttpException(
-                    "Invalid Content-Length header", status_code=400
-                ) from None
-            if content_length < 0:
-                raise HttpException(
-                    "Invalid Content-Length header", status_code=400
+                    "Conflicting Content-Length headers", status_code=400
                 )
+            content_length = parsed_lengths[0]
             cl_limit = (
                 self.max_content_length
                 if self.max_content_length is not None
@@ -242,15 +260,81 @@ class Request:
 
         return self._json
 
+    def _resolve_upload_limits(self) -> tuple[int, int, int, int, str | None]:
+        """Resolve upload parser limits from filesystems.uploads config and Request overrides."""
+        default_max_file = 100 * 1024 * 1024
+        default_max_req = 200 * 1024 * 1024
+        default_mem_limit = 1024 * 1024
+
+        uploads_cfg: Mapping[str, Any] | None = None
+        try:
+            container = get_container()
+            if container.has(Config):
+                cfg = container.resolve(Config)
+                raw_cfg = cfg.get("filesystems.uploads")
+                if isinstance(raw_cfg, Mapping):
+                    uploads_cfg = raw_cfg
+        except RuntimeError:
+            uploads_cfg = None
+
+        max_file_size = default_max_file
+        memory_limit = default_mem_limit
+        max_field_size = default_mem_limit
+        temp_dir: str | None = None
+        cfg_max_request: int | None = None
+
+        if uploads_cfg is not None:
+            raw_file_limit = uploads_cfg.get("max_file_size")
+            if isinstance(raw_file_limit, int) and not isinstance(raw_file_limit, bool) and raw_file_limit > 0:
+                max_file_size = raw_file_limit
+            raw_mem = uploads_cfg.get("memory_limit")
+            if isinstance(raw_mem, int) and not isinstance(raw_mem, bool) and raw_mem > 0:
+                memory_limit = raw_mem
+                max_field_size = memory_limit
+            raw_field_limit = uploads_cfg.get("max_field_size")
+            if isinstance(raw_field_limit, int) and not isinstance(raw_field_limit, bool) and raw_field_limit > 0:
+                max_field_size = raw_field_limit
+            raw_req_limit = uploads_cfg.get("max_request_size")
+            if isinstance(raw_req_limit, int) and not isinstance(raw_req_limit, bool) and raw_req_limit > 0:
+                cfg_max_request = raw_req_limit
+            raw_temp_dir = uploads_cfg.get("temp_dir")
+            if isinstance(raw_temp_dir, str) and raw_temp_dir.strip():
+                temp_dir = raw_temp_dir
+
+        if self.max_body_size != DEFAULT_MAX_BODY_SIZE and self.max_body_size is not None:
+            max_request_size = (
+                min(self.max_body_size, cfg_max_request)
+                if cfg_max_request is not None
+                else self.max_body_size
+            )
+        elif cfg_max_request is not None:
+            max_request_size = cfg_max_request
+        else:
+            max_request_size = (
+                self.max_body_size if self.max_body_size is not None else default_max_req
+            )
+
+        return max_file_size, max_request_size, memory_limit, max_field_size, temp_dir
+
     async def form(self) -> FormData:
         if self._form is None:
             content_type = self.headers.get("content-type", "")
             if "multipart/form-data" in content_type.lower():
                 boundary = MultipartParser.extract_boundary(content_type)
-                limit = self.max_body_size
+                (
+                    max_file_size,
+                    max_request_size,
+                    memory_limit,
+                    max_field_size,
+                    temp_dir,
+                ) = self._resolve_upload_limits()
                 parser = MultipartParser(
                     boundary,
-                    max_request_size=limit if limit is not None else 200 * 1024 * 1024,
+                    max_file_size=max_file_size,
+                    max_request_size=max_request_size,
+                    memory_limit=memory_limit,
+                    max_field_size=max_field_size,
+                    temp_dir=temp_dir,
                 )
                 if self._body is not None:
                     async def _body_stream(raw: bytes) -> AsyncIterator[bytes]:

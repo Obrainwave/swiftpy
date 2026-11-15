@@ -7,8 +7,7 @@ from pathlib import Path
 
 from swiftpy.ai.prompts.loader import PromptLoader
 from swiftpy.console.loader import load_application
-from swiftpy.core.config import Config
-from swiftpy.http.route_cache import RouteCache
+from swiftpy.core.config import Config, ConfigurationError
 
 
 def _paint(text: str, code: str) -> str:
@@ -94,7 +93,6 @@ class CacheCommand:
 
         # Clean prior cache to ensure clean compilation
         for f in (
-            cache_dir / "routes.json",
             cache_dir / "config.json",
             cache_dir / "prompts.json",
         ):
@@ -108,27 +106,29 @@ class CacheCommand:
         # 1. Load application instance
         try:
             app = load_application(target_app)
-        except Exception as exc:
+        except (
+            ImportError,
+            AttributeError,
+            TypeError,
+            ConfigurationError,
+            OSError,
+            ValueError,
+            RuntimeError,
+            SyntaxError,
+        ) as exc:
             sys.stderr.write(
                 _paint(f"Error loading application '{target_app}': {exc}\n", "1;31")
             )
             raise SystemExit(1) from exc
 
-        # 2. Precompile Routes
-        routes_cache_file = cache_dir / "routes.json"
-        route_data = RouteCache.build(app, cache_path=routes_cache_file)
-        sys.stdout.write(
-            f"  {_paint('✓', '1;32')} Routes precompiled: {_paint(str(route_data['count']), '1;33')} routes -> {routes_cache_file}\n"
-        )
-
-        # 3. Precompile Config
+        # 2. Precompile Config
         config_cache_file = cache_dir / "config.json"
         app.config.dump_cache(cache_path=config_cache_file)
         sys.stdout.write(
             f"  {_paint('✓', '1;32')} Configuration precompiled -> {config_cache_file}\n"
         )
 
-        # 4. Precompile Prompts
+        # 3. Precompile Prompts
         prompts_cache_file = cache_dir / "prompts.json"
         prompt_loader = PromptLoader.get_instance()
         prompt_loader.dump_cache(cache_path=prompts_cache_file)
@@ -147,11 +147,9 @@ class CacheCommand:
     def handle_clear(args: argparse.Namespace) -> None:
         cache_dir = Path(getattr(args, "cache_dir", "bootstrap/cache"))
 
-        routes_file = cache_dir / "routes.json"
         config_file = cache_dir / "config.json"
         prompts_file = cache_dir / "prompts.json"
 
-        RouteCache.clear(routes_file)
         Config.clear_cache(config_file)
         PromptLoader.clear_compiled_cache(prompts_file)
 

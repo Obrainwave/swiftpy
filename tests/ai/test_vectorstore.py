@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
@@ -103,7 +104,7 @@ async def test_in_memory_vectorstore_validations() -> None:
 
     # Non-numeric elements
     with pytest.raises(TypeError, match="must be a float"):
-        await store.upsert("doc1", [1.0, "two", 3.0])  # type: ignore[list-item]
+        await store.upsert("doc1", json.loads('[1.0, "two", 3.0]'))
 
     # Rejection of NaN and Inf
     with pytest.raises(ValueError, match="NaN or Infinite"):

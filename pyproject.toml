@@ -49,8 +49,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/obrainwave/swiftpy"
 Repository = "https://github.com/obrainwave/swiftpy"
-Documentation = "https://YOUR_DOCUMENTATION_URL"
-Issues = "https://github.com/YOUR_USERNAME/swiftpy/issues"
+Documentation = "https://github.com/obrainwave/swiftpy#readme"
+Issues = "https://github.com/obrainwave/swiftpy/issues"
 
 [tool.mypy]
 strict = true
@@ -61,26 +61,12 @@ module = ["asyncpg"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["httpx", "httpx.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = ["aiosmtplib", "aiosmtplib.*", "jinja2", "jinja2.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["redis.*"]
 disallow_untyped_calls = false
-
-[[tool.mypy.overrides]]
-module = [
-    "swiftpy.ai.pool",
-    "swiftpy.ai.vectorstore.*",
-    "swiftpy.ai.rag.*",
-    "swiftpy.ai.providers.*",
-    "swiftpy.ai.embeddings",
-]
-disable_error_code = ["assignment"]
 
 [project.scripts]
 swiftpy = "swiftpy.console.cli:main"
@@ -91,9 +77,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["swiftpy"]
-exclude = [
-    "swiftpy/ai",
-]
 
 [tool.uv]
 package = true
