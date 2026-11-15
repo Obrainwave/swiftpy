@@ -144,4 +144,50 @@ jobs:
           asyncio.run(main())
           '
                     )
+          /tmp/swiftpy-wheel-smoke/bin/python -c '
+          import pathlib, signal, socket, subprocess, tempfile, time, urllib.request
+          with tempfile.TemporaryDirectory() as d:
+              proj = pathlib.Path(d) / "smoke_app"
+              proj.mkdir()
+              (proj / "main.py").write_text(
+                  "from swiftpy import Application, Request, json_response\n"
+                  "app = Application(auto_discover_providers=False)\n"
+                  "@app.get(\"/smoke\")\n"
+                  "async def smoke(req: Request):\n"
+                  "    return json_response({\"ok\": True})\n",
+                  encoding="utf-8",
+              )
+              with socket.socket() as s:
+                  s.bind(("127.0.0.1", 0))
+                  port = s.getsockname()[1]
+              proc = subprocess.Popen(
+                  ["/tmp/swiftpy-wheel-smoke/bin/swiftpy", "start", "--host", "127.0.0.1", "--port", str(port), "--reload"],
+                  cwd=proj,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              ok = False
+              try:
+                  deadline = time.monotonic() + 10.0
+                  while time.monotonic() < deadline and proc.poll() is None:
+                      try:
+                          with urllib.request.urlopen(f"http://127.0.0.1:{port}/smoke", timeout=0.5) as resp:
+                              if resp.status == 200:
+                                  ok = True
+                                  break
+                      except Exception:
+                          time.sleep(0.1)
+              finally:
+                  if proc.poll() is None:
+                      proc.send_signal(signal.SIGINT)
+                      try:
+                          out, _ = proc.communicate(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          proc.kill()
+                          out, _ = proc.communicate(timeout=5)
+                  else:
+                      out, _ = proc.communicate(timeout=5)
+              assert ok, out
+          '
           rm -rf /tmp/swiftpy-wheel-smoke

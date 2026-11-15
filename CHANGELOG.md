@@ -4,6 +4,12 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-15
+
+### Fixed
+- **CLI (`swiftpy start`):** Added `ensure_project_in_sys_path()` in `swiftpy.console.loader` and invoked it in `StartCommand.handle()` so `Path.cwd()` is placed at `sys.path[0]` before launching Uvicorn. Fixes `Error loading ASGI app. Could not import module "main".` when running `swiftpy start`, `swiftpy start --reload`, or `swiftpy start --workers <N>` from a wheel-installed `swiftpy` console entrypoint.
+- **Scaffolding (`swiftpy new`):** Updated generated `pyproject.toml` dependency floor to `swiftpy-framework>=0.1.1`.
+
 ### Audit Remediation & Approved Breaking Changes (`G-1`–`G-16`)
 - **Packaging, Core, & HTTP (`G-1`, `G-2`, `G-16`):**
   - **Policy Update (`G-1`):** `swiftpy/ai` (LLM clients, embeddings, vector stores, RAG pipelines, agents, tools, prompts, and observability) is fully implemented and included in the main `swiftpy-framework` v0.1.0 wheel (superseding the earlier `P10-L7` wheel exclusion); `swiftpy/__init__.py` uses PEP 562 lazy exports so lightweight imports do not pull heavy optional submodules eagerly, and `swiftpy.testing` remains documented as a dev-only test utility.

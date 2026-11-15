@@ -164,7 +164,7 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-The generated `pyproject.toml` already declares `"swiftpy-framework>=0.1.0"` along with `[build-system]` (`setuptools`), `[tool.setuptools.packages.find]`, and `[tool.mypy]`.
+The generated `pyproject.toml` already declares `"swiftpy-framework>=0.1.1"` along with `[build-system]` (`setuptools`), `[tool.setuptools.packages.find]`, and `[tool.mypy]`.
 
 ### Configure Environment & Backing Services
 
