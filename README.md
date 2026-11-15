@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./red-black.png" alt="SwiftPY Logo" width="420" />
+</p>
+
 # SwiftPY
 
 **An ASGI-native, Eloquent-style Python web framework combining the developer experience of FastAPI with the elegance and structure of Laravel.**
