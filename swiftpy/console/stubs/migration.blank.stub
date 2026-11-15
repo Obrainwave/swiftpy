@@ -1,0 +1,11 @@
+from __future__ import annotations
+
+from swiftpy.database.migrations import Migration
+
+
+class {class_name}(Migration):
+    async def up(self) -> None:
+        pass
+
+    async def down(self) -> None:
+        pass

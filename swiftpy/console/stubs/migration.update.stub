@@ -1,0 +1,17 @@
+from __future__ import annotations
+
+from swiftpy.database.migrations import Blueprint, Migration, Schema
+
+
+class {class_name}(Migration):
+    async def up(self) -> None:
+        def define(table: Blueprint) -> None:
+            pass  # table.string("column_name").nullable()
+
+        await Schema.table("{table_name}", define)
+
+    async def down(self) -> None:
+        def define(table: Blueprint) -> None:
+            pass  # table.drop_column("column_name")
+
+        await Schema.table("{table_name}", define)

@@ -1,0 +1,89 @@
+name: swiftpy
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+    container_name: swiftpy_app
+    user: "${UID:-1000}:${GID:-1000}"
+    command: ["swiftpy", "start", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--log-level", "warning"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: "${APP_ENV:-local}"
+      APP_DEBUG: "${APP_DEBUG:-true}"
+      APP_KEY: "${APP_KEY:?APP_KEY must be set}"
+      PATH: "/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+      DB_CONNECTION: postgresql
+      DATABASE_DEFAULT: postgresql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: swiftpy
+      DB_USERNAME: postgres
+      DB_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD must be set}"
+      DB_POOL_MIN_SIZE: 10
+      DB_POOL_MAX_SIZE: 50
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET must be set}"
+      AUTH_KEY_PEPPER: "${AUTH_KEY_PEPPER:?AUTH_KEY_PEPPER must be set}"
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+
+    volumes:
+      - .:/app
+      - /app/.venv
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: swiftpy_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: swiftpy
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD must be set}"
+
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d swiftpy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: swiftpy_redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"]
+
+    ports:
+      - "127.0.0.1:6379:6379"
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:

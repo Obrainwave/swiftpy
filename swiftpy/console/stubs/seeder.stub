@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+from swiftpy.database.seeder import Seeder
+
+
+class {class_name}(Seeder):
+    """
+    Database seeder for generating and seeding records.
+    """
+
+    async def run(self) -> None:
+        """Execute the database seed operations."""
+        pass
+

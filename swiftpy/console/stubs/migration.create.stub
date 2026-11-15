@@ -1,0 +1,15 @@
+from __future__ import annotations
+
+from swiftpy.database.migrations import Blueprint, Migration, Schema
+
+
+class {class_name}(Migration):
+    async def up(self) -> None:
+        def define(table: Blueprint) -> None:
+            table.id()
+            table.timestamps()
+
+        await Schema.create("{table_name}", define)
+
+    async def down(self) -> None:
+        await Schema.drop_if_exists("{table_name}")

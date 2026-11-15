@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: Test, lint, type-check, and package validation
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: swiftpy
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d swiftpy"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        command: "redis-server --requirepass secret"
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli -a secret ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      APP_ENV: testing
+      APP_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      JWT_SECRET: "very-long-and-secure-test-jwt-secret-key-32bytes!"
+      AUTH_KEY_PEPPER: "very-long-and-secure-test-auth-pepper-32bytes!"
+      DB_CONNECTION: postgresql
+      DATABASE_DEFAULT: postgresql
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_DATABASE: swiftpy
+      DB_USERNAME: postgres
+      DB_PASSWORD: secret
+      DB_POOL_MAX_SIZE: 20
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: secret
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install SwiftPY development dependencies
+        run: uv sync --group dev --frozen || uv sync --group dev
+
+      - name: Run pytest with coverage gate
+        run: COVERAGE_FILE=/tmp/.coverage uv run pytest -vv -ra --durations=30 --timeout=120 --timeout-method=thread --cov=swiftpy --cov-report=term-missing --cov-fail-under=80
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Run strict mypy
+        run: |
+          uv run --no-sync --with jinja2 --with aiosmtplib mypy swiftpy
+          uv run mypy swiftpy
+          uv run mypy .
+          uv run mypy --explicit-package-bases .
+
+      - name: Dependency security audit
+        run: uv run --no-sync --with pip-audit pip-audit --desc on
+
+      - name: Build and validate distributions
+        run: |
+          uv build
+          uv run --with twine twine check dist/*
+
+      - name: Smoke-test built wheel in isolated clean venv
+        run: |
+          uv venv /tmp/swiftpy-wheel-smoke --python 3.12 --clear
+          uv pip install --python /tmp/swiftpy-wheel-smoke/bin/python dist/*.whl
+          /tmp/swiftpy-wheel-smoke/bin/swiftpy --help
+          (
+            cd /tmp && /tmp/swiftpy-wheel-smoke/bin/python -c '
+          import asyncio
+          import swiftpy
+          import swiftpy.admin
+          import swiftpy.testing
+          from swiftpy import Application, Request, json_response
+          from swiftpy.ai.client import AI, AIClient
+          from swiftpy.ai.embeddings import EmbeddingsClient, generate_deterministic_embedding
+
+          assert hasattr(swiftpy, "ai")
+          app = Application(auto_discover_providers=False)
+
+          @app.get("/smoke")
+          async def smoke(req: Request):
+              return json_response({"ok": True})
+
+          sent = []
+          async def receive():
+              return {"type": "http.request", "body": b"", "more_body": False}
+
+          async def send(msg):
+              sent.append(msg)
+
+          async def main():
+              scope = {
+                  "type": "http",
+                  "asgi": {"version": "3.0"},
+                  "method": "GET",
+                  "path": "/smoke",
+                  "raw_path": b"/smoke",
+                  "query_string": b"",
+                  "headers": [],
+              }
+              await app(scope, receive, send)
+              assert sent[0]["status"] == 200
+              fake = AI.fake("smoke-ok")
+              resp = await AI.chat().user("hello").send()
+              assert resp.content == "smoke-ok"
+              fake.restore()
+              vec = generate_deterministic_embedding("hello", dimensions=8)
+              assert len(vec) == 8
+
+          asyncio.run(main())
+          '
+                    )
+          rm -rf /tmp/swiftpy-wheel-smoke

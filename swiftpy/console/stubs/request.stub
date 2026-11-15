@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+from typing import Any
+
+from swiftpy.validation.form_request import FormRequest
+
+
+class {class_name}(FormRequest):
+    """{class_name} validation request."""
+
+    def rules(self) -> dict[str, Any]:
+        """Define validation rules for the incoming request."""
+        return {
+            # "email": "required|email",
+            # "password": "required|min:8",
+        }

@@ -1,0 +1,20 @@
+from __future__ import annotations
+
+from typing import Any
+
+from swiftpy.mail import Mailable, MailMessage
+
+
+class {class_name}(Mailable):
+    """{class_name} mailable definition."""
+
+    def __init__(self) -> None:
+        pass
+
+    def build(self) -> MailMessage:
+        return MailMessage(
+            subject="{class_name}",
+            to=[],
+            text_body="Hello from {class_name}!",
+        )
+
