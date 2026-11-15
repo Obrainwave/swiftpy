@@ -6,6 +6,7 @@ from typing import Any
 
 import uvicorn
 
+from swiftpy.console.loader import ensure_project_in_sys_path
 from swiftpy.core.config import Config, ConfigurationError
 
 
@@ -165,6 +166,7 @@ class StartCommand:
         if log_level_opt:
             uvicorn_kwargs["log_level"] = str(log_level_opt).lower()
 
+        ensure_project_in_sys_path()
         uvicorn.run(target, **uvicorn_kwargs)
 
 
