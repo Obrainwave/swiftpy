@@ -14,7 +14,7 @@ This guide covers two ways to get started with SwiftPY:
 - **Distribution vs. import vs. CLI name:** On PyPI, install **`swiftpy-framework`**. In Python code, import **`swiftpy`**. In the terminal, run **`swiftpy`**.
 - **For Quick Start Without Scaffolding (Minimal App):** Python `>= 3.12` only. PostgreSQL, Redis, and Docker are **not** required.
 - **For Full Project Scaffolding:**
-  - **Option A (Fully Dockerized):** Docker Engine / Docker Desktop with Compose v2, plus Python `>= 3.12` (or a one-off CLI env) only to run `swiftpy new`.
+  - **Option A (Fully Dockerized):** Docker Engine / Docker Desktop with Compose v2, plus `uv` (`uvx`) or Python `>= 3.12` only to run `swiftpy new`.
   - **Option B (Without Docker at All):** Python `>= 3.12`, **PostgreSQL 16** (with `pgvector` if using AI vector stores), and **Redis 7** running natively on your machine.
 - Optional extras if needed later: `jinja2` (HTML mail/admin templates) and `aiosmtplib` (`smtp` mail transport).
 
@@ -98,15 +98,31 @@ Use this path for full-stack APIs with config files, migrations, ORM models, sto
 
 ### 1. Scaffold the Project
 
-From the workspace parent directory where you want your project folder created, install or activate `swiftpy` once and generate the project:
+Do **not** run `python -m pip install swiftpy-framework` globally outside a virtual environment — user-site installs can clash with global packages (such as `pyopenssl` / `cryptography`) and, on Windows, leave `swiftpy.exe` in `AppData\...\Scripts` off `PATH`.
 
-```bash
-# If swiftpy is not already installed in your current shell environment:
-python -m pip install swiftpy-framework
+From the workspace parent directory where you want your `my_api` folder created, generate the project with **one** of these isolated options:
 
-swiftpy new my_api
-cd my_api
-```
+- **With `uvx` (recommended — no `.venv` clutter or global installs):**
+
+  ```bash
+  uvx --from swiftpy-framework swiftpy new my_api
+  cd my_api
+  ```
+
+- **With `python -m venv` + `pip`:**
+
+  ```bash
+  python -m venv .cli-venv
+  source .cli-venv/bin/activate   # Windows PowerShell: .cli-venv\Scripts\Activate.ps1
+  python -m pip install --upgrade pip
+  python -m pip install swiftpy-framework
+  swiftpy --version
+  swiftpy new my_api
+  deactivate
+  cd my_api
+  ```
+
+  *(In Option A you can delete `.cli-venv` afterward; in Option B you create `my_api/.venv` next, or you can keep one parent `.venv` active instead. If `swiftpy` was already installed in user site-packages without `Scripts` on `PATH`, invoke `python -m swiftpy.console.cli new my_api`.)*
 
 Pass `--force` only if overwriting an existing non-empty directory (existing `.env` files are preserved when `--force` is used).
 
@@ -219,7 +235,7 @@ Use this mode if you have PostgreSQL 16+ and Redis 7 installed locally on your m
      python -m pip install -e .
      ```
 
-   *(Skip creating `my_api/.venv` only if you intentionally installed `swiftpy-framework` in a parent workspace `.venv` that is already activated.)*
+   *(Skip creating `my_api/.venv` only if you intentionally installed `swiftpy-framework` in an activated parent workspace `.venv` — in that case, just run `python -m pip install -e .` inside `my_api`.)*
 
 2. Ensure local **PostgreSQL** (`127.0.0.1:5432`) and **Redis** (`127.0.0.1:6379`) services are running on your machine.
 3. Make sure your local PostgreSQL database exists and `.env` matches your local Postgres credentials:
