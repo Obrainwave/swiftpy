@@ -1,69 +1,55 @@
 # SwiftPY Installation and Quick Start
 
-This guide covers installing SwiftPY, running a minimal ASGI application, and creating and starting a full scaffolded project with the `swiftpy` CLI.
+This guide covers two ways to get started with SwiftPY:
+
+1. **Quick Start Without Scaffolding** — run a minimal single-file app with no database, Redis, or Docker.
+2. **Full Project Scaffolding (`swiftpy new`)** — scaffold a full API application, then choose **either** the **Fully Dockerized** workflow **or** the **Without Docker at All** workflow.
+
+> **Avoid duplicate commands:** Pick **one** track (and inside Full Project Scaffolding, pick **either** Option A or Option B). You never need to create two `.venv` folders or run both Docker and local `swiftpy start` at the same time.
 
 ---
 
 ## Requirements
 
-- **Python `>= 3.12`** (per [`pyproject.toml`](../pyproject.toml))
-- **`uv`** (recommended) or **`pip`** (`python -m venv` + `pip`)
-- **PostgreSQL 16** and **Redis 7** when running a full `swiftpy new` project scaffold (the scaffolded `docker-compose.yml` uses `pgvector/pgvector:pg16` and `redis:7-alpine`)
-- Optional packages depending on features you enable:
-  - `jinja2` for rendering HTML mail templates (`MailTemplateRenderer`) and admin views (`views/`)
-  - `aiosmtplib` for sending email over the `smtp` transport
-
-A minimal single-file SwiftPY application without `config/database.py` does **not** initialize `DatabasePool` and runs without PostgreSQL or Redis.
+- **Distribution vs. import vs. CLI name:** On PyPI, install **`swiftpy-framework`**. In Python code, import **`swiftpy`**. In the terminal, run **`swiftpy`**.
+- **For Quick Start Without Scaffolding (Minimal App):** Python `>= 3.12` only. PostgreSQL, Redis, and Docker are **not** required.
+- **For Full Project Scaffolding:**
+  - **Option A (Fully Dockerized):** Docker Engine / Docker Desktop with Compose v2, plus Python `>= 3.12` (or a one-off CLI env) only to run `swiftpy new`.
+  - **Option B (Without Docker at All):** Python `>= 3.12`, **PostgreSQL 16** (with `pgvector` if using AI vector stores), and **Redis 7** running natively on your machine.
+- Optional extras if needed later: `jinja2` (HTML mail/admin templates) and `aiosmtplib` (`smtp` mail transport).
 
 ---
 
-## Install SwiftPY
+## Track 1: Quick Start Without Scaffolding (Minimal Single-File App)
 
-> **Distribution vs. import name:** On PyPI, the package distribution is named **`swiftpy-framework`**. In Python code, you import **`swiftpy`**, and the CLI executable is **`swiftpy`**.
+Use this path when you want to test SwiftPY or build a lightweight service without a database or Redis. A single-file app with no `config/database.py` does **not** initialize `DatabasePool`.
 
-Create and activate a virtual environment:
+### 1. Create a Folder and Install `swiftpy-framework`
+
+Create a project directory, set up **one** virtual environment, and install `swiftpy-framework`:
 
 ```bash
+mkdir swiftpy-minimal
+cd swiftpy-minimal
 python -m venv .venv
 ```
 
-On macOS or Linux:
+Activate the virtual environment:
 
-```bash
-source .venv/bin/activate
-```
+- **macOS / Linux:** `source .venv/bin/activate`
+- **Windows PowerShell:** `.venv\Scripts\Activate.ps1`
 
-On Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Install `swiftpy-framework` with `pip`:
+Install `swiftpy-framework` and verify the CLI:
 
 ```bash
 python -m pip install --upgrade pip
 python -m pip install swiftpy-framework
-```
-
-Or add it in a `uv`-managed project:
-
-```bash
-uv add swiftpy-framework
-```
-
-Verify the CLI is available:
-
-```bash
 swiftpy --version
-swiftpy --help
 ```
 
----
+> **Using `uv` instead of `venv` + `pip`:** Run `uv init --python 3.12 && uv add swiftpy-framework` inside `swiftpy-minimal`, then prefix commands with `uv run` (or activate `.venv`).
 
-## Run a Minimal Application
-
-In an empty directory (no `config/` directory), create `main.py`:
+### 2. Create `main.py`
 
 ```python
 from __future__ import annotations
@@ -75,7 +61,13 @@ app = Application()
 
 @app.get("/")
 async def home(request: Request) -> Response:
-    return json_response({"message": "Hello from SwiftPY"})
+    return json_response(
+        {
+            "status": "ok",
+            "message": "Hello from SwiftPY",
+            "app": "SwiftPY",
+        }
+    )
 
 
 @app.get("/health")
@@ -83,36 +75,42 @@ async def health(request: Request) -> dict[str, str]:
     return {"status": "ok"}
 ```
 
-Plain `dict` and `list` return values (such as `/health`) are automatically serialized to JSON responses alongside explicit `json_response(...)` returns.
+Route handlers may return an explicit `Response` (such as `json_response(...)`) or a plain `dict` / `list` (automatically serialized to JSON).
 
-Start the development server with auto-reload:
+### 3. Start and Verify
 
 ```bash
 swiftpy start --reload
 ```
 
-By default, `swiftpy start` binds to `127.0.0.1:8000` and loads `main:app`. Visit <http://127.0.0.1:8000/> or <http://127.0.0.1:8000/health>.
+(Or directly with Uvicorn: `uvicorn main:app --reload`.)
 
-You can also run the ASGI target directly with Uvicorn:
+Visit:
 
-```bash
-uvicorn main:app --reload
-```
+- `http://127.0.0.1:8000/` -> `{"status": "ok", "message": "Hello from SwiftPY", "app": "SwiftPY"}`
+- `http://127.0.0.1:8000/health` -> `{"status": "ok"}`
 
 ---
 
-## Create a Full Project Scaffold
+## Track 2: Full Project Scaffolding (`swiftpy new`)
 
-For full-stack APIs and background workers, scaffold a complete project layout with `swiftpy new`:
+Use this path for full-stack APIs with config files, migrations, ORM models, storage, queues, and Docker support.
+
+### 1. Scaffold the Project
+
+From the workspace parent directory where you want your project folder created, install or activate `swiftpy` once and generate the project:
 
 ```bash
+# If swiftpy is not already installed in your current shell environment:
+python -m pip install swiftpy-framework
+
 swiftpy new my_api
 cd my_api
 ```
 
-Pass `--force` to overwrite an existing non-empty directory cleanly (existing `.env` files are preserved when `--force` is used).
+Pass `--force` only if overwriting an existing non-empty directory (existing `.env` files are preserved when `--force` is used).
 
-### Generated Project Structure
+### 2. Generated Project Structure
 
 ```text
 my_api/
@@ -140,70 +138,115 @@ my_api/
 ├── storage/                # Private, public, framework cache, and log directories
 ├── views/                  # Jinja2 HTML templates (admin/, mail/)
 ├── tests/                  # pytest conftest.py & starter API test
-├── .env                    # Pre-initialized with generated APP_KEY & JWT_SECRET
+├── .env                    # Generated APP_KEY & JWT_SECRET, DB_DATABASE=my_api
 ├── .env.example
-├── docker-compose.yml      # app, postgres (pgvector/pgvector:pg16), and redis services
+├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
-├── main.py                 # Entrypoint: Application(), register_exception_handlers(app), /api router
-└── pyproject.toml          # Configured with swiftpy-framework, setuptools build-system, & mypy strict settings
+├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
+└── pyproject.toml          # Configured with swiftpy-framework>=0.1.3, setuptools, & mypy strict settings
 ```
 
-### Install Dependencies in the Scaffolded Project
+What `swiftpy new my_api` configures automatically:
 
-With `uv` (recommended):
+- **`.env` and `.env.example`:** Generates random `APP_KEY` and `JWT_SECRET` in `.env`, sets `DB_DATABASE=my_api`, `DB_HOST=127.0.0.1`, `DB_PORT=5432`, `DB_USERNAME=postgres`, `DB_PASSWORD=secret`, and `REDIS_HOST=127.0.0.1`.
+- **`docker-compose.yml`:** Sets `name: my_api`, reads `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` directly from `.env` (`${DB_DATABASE}`, `${DB_USERNAME}`, `${DB_PASSWORD}`), and sets `DB_HOST: postgres` and `REDIS_HOST: redis` for the `app` container so container networking works without editing `.env`.
+- **Important:** When `Application` boots, `Config.load()` reads `.env` into SwiftPY's active env context without mutating `os.environ` (existing process environment variables still override `.env`).
+
+Now choose **ONE** of the two run modes below (Option A **or** Option B).
+
+---
+
+### Option A: Fully Dockerized (App + PostgreSQL + Redis in Docker)
+
+Use this mode if you want Docker to run everything — **you do not need to create a `.venv`, install Python packages locally, or install Postgres/Redis on your host.**
+
+1. Inside `my_api`, review `.env` (optional — defaults already work out of the box with Compose).
+2. Build and start `app`, `postgres`, and `redis`:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+3. Run database migrations and link public storage **inside the running `app` container**:
+
+   ```bash
+   docker compose exec app swiftpy migrate
+   docker compose exec app swiftpy storage:link
+   ```
+
+4. Verify the starter endpoints from your browser or `curl`:
+
+   - `GET http://127.0.0.1:8000/` -> `{"status": "ok", "message": "Hello from SwiftPY", "app": "SwiftPY"}`
+   - `GET http://127.0.0.1:8000/api/health` -> `{"status": "ok", "app": "SwiftPY"}`
+   - `GET http://127.0.0.1:8000/api/users` -> `[{"id": 1, "name": "Alice Doe", "email": "alice@example.com"}]`
+
+Common Docker lifecycle commands:
 
 ```bash
-uv sync
-source .venv/bin/activate
+# View live application logs
+docker compose logs -f app
+
+# Stop containers (keeps database data)
+docker compose down
+
+# Stop containers AND delete database/redis volumes (use this if an old volume with different credentials existed)
+docker compose down -v
 ```
 
-Or with standard `venv` + `pip`:
+> **Troubleshooting `InvalidPasswordError` in Docker:** PostgreSQL only initializes `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` when its data volume is brand new. If a Docker volume named `my_api_postgres_data` already existed from another project or earlier setup with different credentials, run `docker compose down -v` and then `docker compose up -d --build`.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-```
+---
 
-The generated `pyproject.toml` already declares `"swiftpy-framework>=0.1.2"` along with `[build-system]` (`setuptools`), `[tool.setuptools.packages.find]`, and `[tool.mypy]`.
+### Option B: Without Docker at All (Local Python + Native PostgreSQL & Redis)
 
-### Configure Environment & Backing Services
+Use this mode if you have PostgreSQL 16+ and Redis 7 installed locally on your machine and do **not** want to use Docker at all.
 
-`swiftpy new` initializes `.env` with freshly generated `APP_KEY` and `JWT_SECRET` values, sets `DB_DATABASE` in `.env` and `.env.example` to your project name, and sets `name: <project_name>` in `docker-compose.yml` (referencing `${DB_DATABASE}`, `${DB_USERNAME}`, and `${DB_PASSWORD}` directly from `.env`). Review `.env` and adjust PostgreSQL (`DB_*`) and Redis (`REDIS_*`) settings as needed.
+1. Inside `my_api`, install project dependencies into **one** virtual environment:
 
-> **Important:** All generated `config/*.py` files use `swiftpy.helpers.helper.env()` and `env_bool()`. When `Application` boots, `Config.load()` reads `.env` into SwiftPY's active env context without mutating `os.environ`.
+   - **With `uv` (recommended):**
 
-If you want Docker Compose to run PostgreSQL and Redis for local development while running the app from your Python virtualenv:
+     ```bash
+     uv sync
+     source .venv/bin/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
+     ```
 
-```bash
-docker compose up -d postgres redis
-```
+   - **Or with `python -m venv` + `pip`:**
 
-### Migrate, Link Storage, and Run
+     ```bash
+     python -m venv .venv
+     source .venv/bin/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
+     python -m pip install --upgrade pip
+     python -m pip install -e .
+     ```
 
-Run database migrations, link `public/storage`, and start the server:
+   *(Skip creating `my_api/.venv` only if you intentionally installed `swiftpy-framework` in a parent workspace `.venv` that is already activated.)*
 
-```bash
-swiftpy migrate
-swiftpy storage:link
-swiftpy start --reload
-```
+2. Ensure local **PostgreSQL** (`127.0.0.1:5432`) and **Redis** (`127.0.0.1:6379`) services are running on your machine.
+3. Make sure your local PostgreSQL database exists and `.env` matches your local Postgres credentials:
+   - Default `.env` expects database `my_api`, user `postgres`, password `secret`.
+   - Update `DB_USERNAME`, `DB_PASSWORD`, `DB_PORT`, or `REDIS_PASSWORD` in `.env` if your local services use different values, then create the database if it does not exist yet:
 
-Verify the starter endpoints:
+     ```bash
+     createdb -U postgres my_api
+     ```
 
-- `GET http://127.0.0.1:8000/api/health` -> `{"status": "ok", "app": "SwiftPY"}`
-- `GET http://127.0.0.1:8000/api/users` -> starter JSON list from `routes/api.py`
+     *(Or in `psql`: `CREATE DATABASE my_api;`.)*
 
-### Run the Docker Stack Instead
+4. Run migrations, link public storage, and start the dev server **once**:
 
-To run all three containers (`app`, `postgres`, and `redis`) via Docker Compose:
+   ```bash
+   swiftpy migrate
+   swiftpy storage:link
+   swiftpy start --reload
+   ```
 
-```bash
-docker compose up -d
-docker compose exec app swiftpy migrate
-```
+5. Verify the endpoints:
 
-Ports in the scaffolded `docker-compose.yml` bind to `127.0.0.1` (`8000`, `5432`, `6379`).
+   - `GET http://127.0.0.1:8000/` -> `{"status": "ok", "message": "Hello from SwiftPY", "app": "SwiftPY"}`
+   - `GET http://127.0.0.1:8000/api/health` -> `{"status": "ok", "app": "SwiftPY"}`
+   - `GET http://127.0.0.1:8000/api/users` -> `[{"id": 1, "name": "Alice Doe", "email": "alice@example.com"}]`
+
+> **Hybrid alternative (Docker only for PostgreSQL + Redis, local Python for the app):** Instead of Option A or installing Postgres/Redis natively in Option B, you can start only the backing containers with `docker compose up -d postgres redis`, keep `.env` pointing to `127.0.0.1`, and run steps 1, 4, and 5 above on your host. Do **not** run `docker compose up -d` (all services) at the same time as a local `swiftpy start` process, or port `8000` will conflict.
 
 ---
 

@@ -49,6 +49,9 @@ DOCKER_COMPOSE_CONTENT = """services:
       - "127.0.0.1:8000:8000"
     env_file:
       - .env
+    environment:
+      DB_HOST: postgres
+      REDIS_HOST: redis
     volumes:
       - .:/app
     depends_on:
@@ -237,7 +240,7 @@ ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
 
 MAIN_PY_CONTENT = """from __future__ import annotations
 
-from swiftpy.core.application import Application
+from swiftpy import Application, Request, Response, json_response
 
 from app.http.handler.exceptions import register_exception_handlers
 from routes.api import router as api_router
@@ -245,16 +248,19 @@ from routes.api import router as api_router
 app = Application()
 register_exception_handlers(app)
 
-# Enable opt-in CORS middleware (configured in config/cors.py):
-# from swiftpy.http.middleware import CORSMiddleware
-# app.middleware([CORSMiddleware])
-
 # Mount default API routes under /api
 app.include_router(api_router, prefix="/api")
 
-# Mount custom modular route files as the project expands:
-# from routes.auth import router as auth_router
-# app.include_router(auth_router, prefix="/api/auth")
+
+@app.get("/")
+async def home(request: Request) -> Response:
+    return json_response(
+        {
+            "status": "ok",
+            "message": "Hello from SwiftPY",
+            "app": "SwiftPY",
+        }
+    )
 """
 
 ROUTES_API_PY_CONTENT = """from __future__ import annotations
@@ -1527,7 +1533,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.1.2",
+    "swiftpy-framework>=0.1.3",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",

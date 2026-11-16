@@ -407,6 +407,8 @@ def test_scaffolded_packaging_and_plain_mypy_config(
     compose = (app_dir / "docker-compose.yml").read_text(encoding="utf-8")
     assert compose.startswith("name: pkg_app\n")
     assert "image: pgvector/pgvector:pg16" in compose
+    assert "DB_HOST: postgres" in compose
+    assert "REDIS_HOST: redis" in compose
     assert "POSTGRES_DB: ${DB_DATABASE}" in compose
     assert "POSTGRES_USER: ${DB_USERNAME}" in compose
     assert "POSTGRES_PASSWORD: ${DB_PASSWORD}" in compose
@@ -474,6 +476,14 @@ async def test_scaffolded_main_wires_exception_handlers(
             monkeypatch.setattr(pool, "close", AsyncMock())
 
         async with TestClient(loaded_app) as client:
+            home_resp = await client.get("/")
+            assert home_resp.status_code == 200
+            assert home_resp.json() == {
+                "status": "ok",
+                "message": "Hello from SwiftPY",
+                "app": "SwiftPY",
+            }
+
             resp = await client.get("/conflict-test")
             assert resp.status_code == 409
             assert resp.json() == {"error": "conflict", "detail": "duplicate entry"}
