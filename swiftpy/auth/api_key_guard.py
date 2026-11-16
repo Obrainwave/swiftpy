@@ -26,20 +26,14 @@ from swiftpy.database.transaction import get_active_connection
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response, unauthorized
+from swiftpy.support.hashing import prepare_bcrypt_secret
 
 logger = logging.getLogger("swiftpy.auth.api_key")
 
 _EPHEMERAL_PEPPERS: WeakKeyDictionary[Config, bytes] = WeakKeyDictionary()
 _DUMMY_HASH: str = "0" * 64
 MIN_PEPPER_BYTES: int = 32
-
-
-def _prepare_bcrypt_secret(raw_key_or_secret: str) -> bytes:
-    """Encode API secret for bcrypt, SHA-256 pre-hashing secrets over bcrypt's 72-byte cap."""
-    raw_bytes = raw_key_or_secret.encode("utf-8")
-    if len(raw_bytes) > 72:
-        return hashlib.sha256(raw_bytes).hexdigest().encode("ascii")
-    return raw_bytes
+_prepare_bcrypt_secret = prepare_bcrypt_secret
 
 
 def _validate_pepper_bytes(pepper: str | bytes, *, source: str = "AUTH_KEY_PEPPER") -> bytes:

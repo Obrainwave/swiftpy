@@ -662,6 +662,7 @@ AUTH_SERVICE_PROVIDER_CONTENT = """from __future__ import annotations
 from swiftpy.auth import (
     AuthManager,
     CurrentUser,
+    Hash,
     JWTIssuer,
     TokenBlacklist,
     get_server_pepper,
@@ -690,6 +691,7 @@ class AuthServiceProvider(ServiceProvider):
             ),
         )
         self.container.singleton(AuthManager)
+        self.container.singleton(Hash)
         self.container.scoped(
             CurrentUser,
             lambda _: CurrentUser(),
@@ -938,6 +940,9 @@ from swiftpy.helpers.helper import env, env_bool
 CONFIG = {
     "defaults": {
         "guard": env("AUTH_GUARD", "jwt"),
+    },
+    "hash": {
+        "rounds": int(env("BCRYPT_ROUNDS", "12") or "12"),
     },
     "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
     "guards": {
@@ -1533,7 +1538,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.1.3",
+    "swiftpy-framework>=0.1.4",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",

@@ -4,7 +4,17 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-16
+
+### Added
+- **Password Hashing (`swiftpy.support.hashing` / `Hash`):**
+  - Added the Laravel-style `Hash` support class with sync-first class methods (`Hash.make()`, `Hash.check()`, `Hash.needs_rehash()`) and non-blocking async methods (`Hash.make_async()`, `Hash.check_async()` via `asyncio.to_thread`).
+  - Added convenience helpers `hash_password()`, `verify_password()`, `hash_password_async()`, and `verify_password_async()` exported from `swiftpy`, `swiftpy.auth`, `swiftpy.support`, and `swiftpy.helpers`.
+  - Standardized bcrypt secret preparation in `prepare_bcrypt_secret()` (shared with `ApiKeyGuard`) to preserve raw UTF-8 `$2b$` compatibility up to 72 bytes and SHA-256 pre-hash secrets exceeding 72 bytes.
+  - Added configurable `auth.hash.rounds` (`BCRYPT_ROUNDS`, default `12`) in `config/auth.py` and `swiftpy new` config templates, and registered `Hash` as a singleton in `AuthServiceProvider`.
+
 ### Changed
+- **Scaffolding (`swiftpy new`):** Updated generated `pyproject.toml` dependency floor to `swiftpy-framework>=0.1.4`, updated generated `config/auth.py` and `app/providers/auth_service_provider.py` with bcrypt rounds config and `Hash` singleton binding, and updated `documentations/2026-11-14-installation-quick-start.md`.
 - **Documentation (`documentations/2026-11-14-installation-quick-start.md`):** Updated Track 2 scaffolding instructions to use `uvx` or an isolated virtual environment (with `python -m swiftpy.console.cli` fallback) so global/user site-packages are not polluted and Windows `Scripts` `PATH` errors are avoided.
 
 ## [0.1.3] - 2026-11-16

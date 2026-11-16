@@ -11,6 +11,12 @@ from swiftpy.filesystem.manager import FilesystemManager
 from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
+from swiftpy.support.hashing import (
+    hash_password,
+    hash_password_async,
+    verify_password,
+    verify_password_async,
+)
 from swiftpy.support.strings import pluralize, snake_case
 from swiftpy.websockets.manager import WebSocketManager
 
@@ -170,11 +176,15 @@ __all__ = [
     "env",
     "env_bool",
     "event",
+    "hash_password",
+    "hash_password_async",
     "mail",
     "pluralize",
     "queue",
     "resolve",
     "snake_case",
+    "verify_password",
+    "verify_password_async",
     "websocket_manager",
     "ws_manager",
 ]

@@ -159,7 +159,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.1.3, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.1.4, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -295,6 +295,57 @@ Supported `swiftpy start` options:
 | `--env-file` | `None` | Environment file path passed to Uvicorn (`server.env_file`) |
 | `--access-log` / `--no-access-log` | `None` | Override Uvicorn HTTP access logging (`server.access_log`) |
 | `--log-level` | `None` | `critical`, `error`, `warning`, `info`, `debug`, or `trace` (`server.log_level`) |
+
+---
+
+## Upgrading `swiftpy-framework` in an Existing Project
+
+### Dockerized Projects (Option A)
+
+The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `pyproject.toml` and builds wheels from PyPI (`pip wheel ...`):
+
+1. **Update `dependencies` — not `project.version`:** Bump the `swiftpy-framework` constraint inside `[project].dependencies` in your app's `pyproject.toml` (changing the top-level `[project].version` only changes your own application's package metadata):
+
+   ```toml
+   [project]
+   name = "my_api"
+   version = "0.1.0"
+   dependencies = [
+       "swiftpy-framework>=0.1.4",
+       # ...
+   ]
+   ```
+
+2. **Rebuild and recreate the container:** Re-run Compose with `--build` so Docker rebuilds the wheel layer and restarts `app`:
+
+   ```bash
+   docker compose up -d --build
+   docker compose exec app swiftpy --version
+   ```
+
+   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.3` to pull a newly published `0.1.4` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
+
+     ```bash
+     docker compose build --no-cache app
+     docker compose up -d
+     ```
+
+### Local Virtual Environment Projects (Option B / Minimal App)
+
+If running without Docker, upgrade inside your activated `.venv`:
+
+```bash
+# With uv (updates uv.lock and .venv)
+uv sync --upgrade-package swiftpy-framework
+
+# Or with pip
+python -m pip install --upgrade "swiftpy-framework>=0.1.4"
+swiftpy --version
+```
+
+### App Files Are Never Overwritten
+
+Upgrading `swiftpy-framework` updates the installed framework library only—your project files under `app/`, `config/`, `routes/`, and `.env` are untouched. Check [`CHANGELOG.md`](../CHANGELOG.md) when upgrading if a release introduces optional new configuration keys (such as `auth.hash.rounds` / `BCRYPT_ROUNDS` in `config/auth.py` and `Hash` registration in `app/providers/auth_service_provider.py`).
 
 ---
 
