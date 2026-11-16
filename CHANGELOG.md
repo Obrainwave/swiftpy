@@ -4,6 +4,9 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Documentation (`documentations/2026-11-14-installation-quick-start.md`):** Updated Track 2 scaffolding instructions to use `uvx` or an isolated virtual environment (with `python -m swiftpy.console.cli` fallback) so global/user site-packages are not polluted and Windows `Scripts` `PATH` errors are avoided.
+
 ## [0.1.3] - 2026-11-16
 
 ### Changed
