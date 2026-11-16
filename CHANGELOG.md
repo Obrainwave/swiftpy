@@ -4,6 +4,17 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-16
+
+### Fixed
+- **CLI (`swiftpy storage:link`):** Fixed `StorageCommand.handle_link` (`swiftpy/console/commands/storage.py`) to compute a relative symlink target (`../storage/app/public` with absolute fallback across drives) and resolve `link_path` without dereferencing an existing `public/storage` symlink (preventing `--force` from deleting target files in `storage/app/public`).
+
+### Changed
+- **Scaffolding (`swiftpy new`):**
+  - Added `public/storage` to generated `.dockerignore` and `.gitignore` templates (and repository root `.dockerignore`/`.gitignore`) to prevent Windows Docker Desktop BuildKit context failures (`invalid file request public/storage`) when bind-mounting `.:/app`.
+  - Updated generated `pyproject.toml` dependency floor to `swiftpy-framework>=0.1.5`.
+- **Documentation (`documentations/2026-11-14-installation-quick-start.md`):** Added project upgrade instructions for Dockerized and local virtual environments, including Windows Docker Desktop `public/storage` bind-mount troubleshooting.
+
 ## [0.1.4] - 2026-11-16
 
 ### Added

@@ -159,7 +159,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.1.4, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.1.5, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -210,6 +210,8 @@ docker compose down -v
 ```
 
 > **Troubleshooting `InvalidPasswordError` in Docker:** PostgreSQL only initializes `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` when its data volume is brand new. If a Docker volume named `my_api_postgres_data` already existed from another project or earlier setup with different credentials, run `docker compose down -v` and then `docker compose up -d --build`.
+
+> **Troubleshooting `invalid file request public/storage` on Windows Docker Desktop:** Because `docker-compose.yml` bind-mounts `.:/app`, running `swiftpy storage:link` inside the Linux container creates a symlink at `public/storage`. Projects generated with older templates without `public/storage` in `.dockerignore` can hit a BuildKit error on Windows NTFS during `docker compose up -d --build`. Remove the symlink (`rm -f public/storage` or delete `public\storage`), add `public/storage` to `.dockerignore` and `.gitignore`, rebuild (`docker compose up -d --build`), and re-run `docker compose exec app swiftpy storage:link --force`.
 
 ---
 
@@ -311,7 +313,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.1.4",
+       "swiftpy-framework>=0.1.5",
        # ...
    ]
    ```
@@ -323,12 +325,14 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    docker compose exec app swiftpy --version
    ```
 
-   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.3` to pull a newly published `0.1.4` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
+   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.4` to pull a newly published `0.1.5` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
 
      ```bash
      docker compose build --no-cache app
      docker compose up -d
      ```
+
+   - The target version of `swiftpy-framework` must already be published on PyPI before running `docker compose build`. To test an unreleased local framework build in Docker, build a wheel (`uv build --wheel`), copy the `.whl` into your project's build context, and `pip install` that wheel in `Dockerfile`.
 
 ### Local Virtual Environment Projects (Option B / Minimal App)
 
@@ -339,7 +343,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.1.4"
+python -m pip install --upgrade "swiftpy-framework>=0.1.5"
 swiftpy --version
 ```
 
