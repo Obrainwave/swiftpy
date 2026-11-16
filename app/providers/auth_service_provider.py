@@ -3,6 +3,7 @@ from __future__ import annotations
 from swiftpy.auth import (
     AuthManager,
     CurrentUser,
+    Hash,
     JWTIssuer,
     TokenBlacklist,
     get_server_pepper,
@@ -31,6 +32,7 @@ class AuthServiceProvider(ServiceProvider):
             ),
         )
         self.container.singleton(AuthManager)
+        self.container.singleton(Hash)
         self.container.scoped(
             CurrentUser,
             lambda _: CurrentUser(),

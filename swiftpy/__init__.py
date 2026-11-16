@@ -145,6 +145,13 @@ if TYPE_CHECKING:
         QueueWorker,
         push,
     )
+    from swiftpy.support.hashing import (
+        Hash,
+        hash_password,
+        hash_password_async,
+        verify_password,
+        verify_password_async,
+    )
     from swiftpy.testing import (
         TestCase,
         TestClient,
@@ -241,6 +248,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'FormRequest': ('swiftpy.validation', 'FormRequest'),
     'HasMany': ('swiftpy.database.orm', 'HasMany'),
     'HasOne': ('swiftpy.database.orm', 'HasOne'),
+    'Hash': ('swiftpy.support.hashing', 'Hash'),
     'HttpException': ('swiftpy.core.exceptions', 'HttpException'),
     'InRule': ('swiftpy.validation', 'InRule'),
     'IntRule': ('swiftpy.validation', 'IntRule'),
@@ -336,6 +344,8 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'float_': ('swiftpy.validation', 'float_'),
     'forbidden': ('swiftpy.http.response', 'forbidden'),
     'hash_api_key': ('swiftpy.auth', 'hash_api_key'),
+    'hash_password': ('swiftpy.support.hashing', 'hash_password'),
+    'hash_password_async': ('swiftpy.support.hashing', 'hash_password_async'),
     'in_': ('swiftpy.validation', 'in_'),
     'int_': ('swiftpy.validation', 'int_'),
     'json_response': ('swiftpy.http.response', 'json_response'),
@@ -361,6 +371,8 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'url': ('swiftpy.validation', 'url'),
     'validate': ('swiftpy.validation', 'validate'),
     'verify_api_key_hash': ('swiftpy.auth', 'verify_api_key_hash'),
+    'verify_password': ('swiftpy.support.hashing', 'verify_password'),
+    'verify_password_async': ('swiftpy.support.hashing', 'verify_password_async'),
     'websocket_manager': ('swiftpy.helpers.helper', 'websocket_manager'),
     'ws_manager': ('swiftpy.helpers.helper', 'ws_manager'),
 }
@@ -447,6 +459,7 @@ __all__ = [
     'FormRequest',
     'HasMany',
     'HasOne',
+    'Hash',
     'HttpException',
     'InRule',
     'IntRule',
@@ -542,6 +555,8 @@ __all__ = [
     'float_',
     'forbidden',
     'hash_api_key',
+    'hash_password',
+    'hash_password_async',
     'in_',
     'int_',
     'json_response',
@@ -567,6 +582,8 @@ __all__ = [
     'url',
     'validate',
     'verify_api_key_hash',
+    'verify_password',
+    'verify_password_async',
     'websocket_manager',
     'ws_manager',
 ]

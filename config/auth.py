@@ -5,6 +5,9 @@ CONFIG: dict[str, object] = {
     "defaults": {
         "guard": env("AUTH_GUARD", "jwt"),
     },
+    "hash": {
+        "rounds": int(env("BCRYPT_ROUNDS", "12")),
+    },
     "guards": {
         "jwt": {
             "driver": "jwt",
