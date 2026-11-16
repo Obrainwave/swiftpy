@@ -11,6 +11,7 @@ __pycache__/
 
 storage/cache/
 storage/logs/
+public/storage
 bootstrap/cache/*.json
 !bootstrap/cache/.gitkeep
 .venv/

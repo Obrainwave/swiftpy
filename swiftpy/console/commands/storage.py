@@ -63,7 +63,9 @@ class StorageCommand:
         except (RuntimeError, ValueError, KeyError):
             target_path = Path("storage/app/public").resolve()
 
-        link_path = Path("public/storage").resolve()
+        cwd = Path.cwd().resolve()
+        link_path = (cwd / "public" / "storage")
+        rel_link = link_path.relative_to(cwd) if link_path.is_relative_to(cwd) else link_path
 
         target_path.mkdir(parents=True, exist_ok=True)
         link_path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,20 +79,21 @@ class StorageCommand:
                 else:
                     link_path.unlink()
             else:
-                msg = _paint(f"The [{link_path.relative_to(Path.cwd())}] link already exists.", "33")
+                msg = _paint(f"The [{rel_link}] link already exists.", "33")
                 print(msg)
                 return
 
         try:
-            os.symlink(target_path, link_path, target_is_directory=True)
-            rel_link = (
-                link_path.relative_to(Path.cwd())
-                if link_path.is_relative_to(Path.cwd())
-                else link_path
-            )
+            try:
+                symlink_target: str | Path = os.path.relpath(
+                    target_path, start=link_path.parent
+                )
+            except ValueError:
+                symlink_target = target_path
+            os.symlink(symlink_target, link_path, target_is_directory=True)
             rel_target = (
-                target_path.relative_to(Path.cwd())
-                if target_path.is_relative_to(Path.cwd())
+                target_path.relative_to(cwd)
+                if target_path.is_relative_to(cwd)
                 else target_path
             )
             msg = _paint(

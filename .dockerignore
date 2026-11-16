@@ -21,6 +21,7 @@ Dockerfile*
 storage/cache/*
 storage/logs/*
 storage/app/public/*
+public/storage
 bootstrap/cache/*.json
 docs
 AGENTS.md

@@ -106,6 +106,7 @@ dist
 build
 storage/logs/*
 storage/app/public/*
+public/storage
 tests
 """
 
@@ -127,6 +128,7 @@ htmlcov/
 storage/logs/*.log
 storage/app/public/*
 !storage/app/public/.gitkeep
+public/storage
 """
 
 ENV_EXAMPLE_CONTENT = """# Application Configuration
@@ -1538,7 +1540,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.1.4",
+    "swiftpy-framework>=0.1.5",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
