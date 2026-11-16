@@ -4,6 +4,15 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-16
+
+### Changed
+- **Scaffolding (`swiftpy new`):**
+  - Updated generated `main.py` with a root `GET /` handler returning JSON status alongside `register_exception_handlers(app)` and `/api` routing.
+  - Added `DB_HOST: postgres` and `REDIS_HOST: redis` under the `app` service in generated `docker-compose.yml` so containerized runs connect to Compose services automatically without modifying `.env`.
+  - Updated generated `pyproject.toml` dependency floor to `swiftpy-framework>=0.1.3`.
+- **Documentation (`documentations/2026-11-14-installation-quick-start.md`):** Reorganized quick start into clear tracks: minimal app without scaffolding first, followed by scaffolded setup with separate fully Dockerized and Docker-free instructions.
+
 ## [0.1.2] - 2026-11-16
 
 ### Added
