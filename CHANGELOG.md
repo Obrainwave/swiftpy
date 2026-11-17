@@ -4,6 +4,20 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-17
+
+### Added
+- **Authentication Proxy (`swiftpy.auth_manager` / `auth()`):**
+  - Added Laravel-style `auth()` / `auth(guard)` request-scoped proxy importable via `from swiftpy.auth_manager import auth` in any file and re-exported from `swiftpy.auth`.
+  - Added `auth().check() -> bool` returning whether the current request task has an authenticated user.
+  - Added `auth().guest() -> bool` returning whether the current request task is unauthenticated.
+  - Added `auth().id() -> Any | None` returning the primary key identifier of the authenticated user.
+  - Added `auth().user() -> AuthUser | None` returning an entity with all declared `User` model fields present and all `__hidden__` fields strictly excluded. Supports both attribute access (`user.id`, `user.name`, `user.email`, `user.is_admin`) and dict access (`user["id"]`), `dict(user)`, `json.dumps(user)`, and `user.to_dict()`.
+  - Added guard-type selection via `auth("jwt")`, `auth("api_key")`, etc., enforcing guard isolation when a specific guard is requested.
+  - Added `set_user_model(model, guard=None)` and `current_user_model()` helpers to bind authenticated ORM Model instances into task-scoped Context.
+  - Enhanced `CurrentUser` DI container binding with `__getattr__` attribute access support across declared user attributes.
+  - Exported `AuthProxy`, `AuthUser`, `auth`, `set_user_model`, and `current_user_model` across `swiftpy.auth_manager`, `swiftpy.auth`, and top-level `swiftpy`.
+
 ## [0.1.5] - 2026-11-16
 
 ### Fixed
