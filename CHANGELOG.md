@@ -4,7 +4,6 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ## [0.1.6] - 2026-11-17
 
 ### Added
@@ -19,8 +18,6 @@ All notable changes to SwiftPY will be documented in this file.
   - Enhanced `CurrentUser` DI container binding with `__getattr__` attribute access support across declared user attributes.
   - Exported `AuthProxy`, `AuthUser`, `auth`, `set_user_model`, and `current_user_model` across `swiftpy.auth_manager`, `swiftpy.auth`, and top-level `swiftpy`.
 
-=======
->>>>>>> main
 ## [0.1.5] - 2026-11-16
 
 ### Fixed
