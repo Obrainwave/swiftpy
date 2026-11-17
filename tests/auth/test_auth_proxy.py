@@ -176,8 +176,9 @@ def test_auth_guard_isolation() -> None:
 
     # Asking for "api_key" guard matches
     assert auth("api_key").check() is True
-    assert auth("api_key").user() is not None
-    assert auth("api_key").user().id == 7
+    api_user = auth("api_key").user()
+    assert api_user is not None
+    assert api_user.id == 7
 
     # Asking for "jwt" guard must fail because active guard is "api_key"
     assert auth("jwt").check() is False
@@ -230,7 +231,9 @@ async def test_auth_proxy_authenticate_delegates_to_guard() -> None:
     # After authenticate, auth() and auth("custom") reflect the user
     assert auth().check() is True
     assert auth("custom").check() is True
-    assert auth("custom").user().name == "Eve"
+    custom_user = auth("custom").user()
+    assert custom_user is not None
+    assert custom_user.name == "Eve"
     assert auth("jwt").check() is False
 
 
