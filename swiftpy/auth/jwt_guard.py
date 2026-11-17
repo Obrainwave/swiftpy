@@ -185,6 +185,7 @@ async def require_jwt(
     req.state["user"] = payload
     req.state["auth_guard"] = "jwt"
     Context.set("__swiftpy_current_user__", payload)
+    Context.set("__swiftpy_auth_guard__", "jwt")
 
     return payload
 

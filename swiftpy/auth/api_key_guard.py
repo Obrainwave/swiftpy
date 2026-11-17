@@ -307,6 +307,7 @@ async def require_api_key(
         req.state["user"] = record_dict
         req.state["auth_guard"] = "api_key"
         Context.set("__swiftpy_current_user__", record_dict)
+        Context.set("__swiftpy_auth_guard__", "api_key")
         return record_dict
 
     # 4. Validate table and column identifiers to prevent SQL injection
@@ -418,6 +419,7 @@ async def require_api_key(
     req.state["user"] = safe_record
     req.state["auth_guard"] = "api_key"
     Context.set("__swiftpy_current_user__", safe_record)
+    Context.set("__swiftpy_auth_guard__", "api_key")
 
     return safe_record
 
