@@ -924,11 +924,7 @@ wheels = [
 
 [[package]]
 name = "swiftpy-framework"
-<<<<<<< HEAD
 version = "0.1.6"
-=======
-version = "0.1.5"
->>>>>>> main
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
