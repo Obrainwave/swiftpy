@@ -10,7 +10,11 @@ dev = [
 
 [project]
 name = "swiftpy-framework"
+<<<<<<< HEAD
 version = "0.1.6"
+=======
+version = "0.1.5"
+>>>>>>> main
 description = "SwiftPY is a new generation async-first Python framework purpose built for the modern API and AI economy."
 requires-python = ">=3.12"
 dependencies = [
