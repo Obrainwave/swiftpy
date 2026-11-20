@@ -77,7 +77,12 @@ def test_new_command_scaffolds_complete_structure(
     assert (app_dir / "app" / "http" / "requests" / "create_user_request.py").is_file()
 
     # 5. Verify sample domain files
-    assert (app_dir / "app" / "models" / "user.py").is_file()
+    user_model_file = app_dir / "app" / "models" / "user.py"
+    assert user_model_file.is_file()
+    user_model_src = user_model_file.read_text(encoding="utf-8")
+    assert '__fillable__ = ["name", "email", "password", "is_admin"]' in user_model_src
+    assert '__hidden__ = ["password"]' in user_model_src
+    assert "ClassVar" not in user_model_src
     assert (app_dir / "app" / "schemas" / "user_schema.py").is_file()
     assert (app_dir / "app" / "services" / "user_service.py").is_file()
     assert (app_dir / "app" / "repositories" / "user_repository.py").is_file()
@@ -287,6 +292,11 @@ def test_generated_project_passes_ruff_and_mypy(
     bin_dir = Path(sys.executable).parent
     repo_root = Path(__file__).resolve().parents[2]
 
+    # Generated CLI models (flat and nested) inside the project must also pass ruff and strict mypy
+    monkeypatch.chdir(app_dir)
+    CLI().run(["make:model", "Article", "-m"])
+    CLI().run(["make:model", "Billing/Invoice"])
+
     ruff = subprocess.run(
         [str(bin_dir / "ruff"), "check", "."],
         cwd=app_dir,
@@ -403,6 +413,8 @@ def test_scaffolded_packaging_and_plain_mypy_config(
     assert "[build-system]" in pyproject
     assert "[tool.setuptools.packages.find]" in pyproject
     assert "[tool.mypy]" in pyproject
+    assert "[tool.ruff.lint.per-file-ignores]" in pyproject
+    assert '"app/models/**/*.py" = ["RUF012"]' in pyproject
 
     compose = (app_dir / "docker-compose.yml").read_text(encoding="utf-8")
     assert compose.startswith("name: pkg_app\n")
@@ -470,6 +482,10 @@ async def test_scaffolded_main_wires_exception_handlers(
         async def conflict_endpoint() -> dict[str, str]:
             raise conflict_cls("duplicate entry")
 
+        @loaded_app.get("/conflict-default")
+        async def conflict_default_endpoint() -> dict[str, str]:
+            raise conflict_cls()
+
         if loaded_app.container.has(DatabasePool):
             pool = loaded_app.container.resolve(DatabasePool)
             monkeypatch.setattr(pool, "init", AsyncMock())
@@ -486,7 +502,11 @@ async def test_scaffolded_main_wires_exception_handlers(
 
             resp = await client.get("/conflict-test")
             assert resp.status_code == 409
-            assert resp.json() == {"error": "conflict", "detail": "duplicate entry"}
+            assert resp.json() == {"detail": "duplicate entry"}
+
+            resp_default = await client.get("/conflict-default")
+            assert resp_default.status_code == 409
+            assert resp_default.json() == {"detail": "Resource conflict"}
     finally:
         for name in list(sys.modules):
             if name in prefixes or name.startswith(("app.", "routes.")):

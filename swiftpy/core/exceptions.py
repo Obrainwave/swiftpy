@@ -12,6 +12,7 @@ from swiftpy.http.exceptions import (
     ClientDisconnect,
     HttpException,
     PayloadTooLargeError,
+    abort,
 )
 from swiftpy.http.response import Response, json_response, unprocessable
 from swiftpy.validation.exceptions import ValidationException
@@ -279,7 +280,10 @@ class ExceptionHandler:
                 exc.message,
             )
             headers = exc.headers or {}
-            resp = unprocessable(exc.errors)
+            if isinstance(exc, ValidationException) and exc.is_single:
+                resp = json_response(exc.to_dict(), status_code=422)
+            else:
+                resp = unprocessable(exc.errors)
             if headers:
                 resp.headers.update(headers)
             return resp
@@ -349,4 +353,5 @@ __all__ = [
     "PayloadTooLargeError",
     "UnauthorizedError",
     "ValidationError",
+    "abort",
 ]

@@ -19,6 +19,7 @@ from swiftpy.database.migrations.blueprint import (
     DefaultRaw,
     _validate_column_length,
     _validate_decimal_params,
+    _validate_enum_values,
     raw,
 )
 from swiftpy.database.pool import DatabasePool
@@ -37,7 +38,7 @@ class SchemaGrammar:
 
         # 1. Compile columns
         for col in blueprint.columns:
-            col_sql = cls._compile_column(col)
+            col_sql = cls._compile_column(col, table=table)
             columns_sql.append(col_sql)
 
             # Standalone index on column
@@ -139,7 +140,7 @@ class SchemaGrammar:
         # 3. Adds
         for col in blueprint.columns:
             statements.append(
-                f'ALTER TABLE "{table}" ADD COLUMN {cls._compile_column(col)};'
+                f'ALTER TABLE "{table}" ADD COLUMN {cls._compile_column(col, table=table)};'
             )
             if col.is_index:
                 idx_name = validate_identifier(
@@ -188,13 +189,20 @@ class SchemaGrammar:
     def compile_drop_if_exists(cls, table: str) -> str:
         return f'DROP TABLE IF EXISTS "{validate_identifier(table)}";'
 
+    @staticmethod
+    def _quote_sql_literal(value: str) -> str:
+        """Quote and escape a single-quoted PostgreSQL string literal."""
+        return "'" + value.replace("'", "''") + "'"
+
     @classmethod
-    def _compile_column(cls, col: ColumnDefinition) -> str:
+    def _compile_column(cls, col: ColumnDefinition, table: str | None = None) -> str:
         col_name = validate_identifier(col.name)
         parts: list[str] = [f'"{col_name}"']
         t = col.type_name.strip().lower() if isinstance(col.type_name, str) else ""
         if t not in ALLOWED_COLUMN_TYPES:
             raise ValueError(f"Unsupported column type: {col.type_name!r}")
+
+        enum_values: tuple[str, ...] | None = None
 
         # Type mapping
         if t == "id" or t == "big_increments":
@@ -212,8 +220,26 @@ class SchemaGrammar:
                 if validated_length is not None
                 else "VARCHAR"
             )
-        elif t == "text":
+        elif t in {"text", "medium_text", "long_text"}:
             parts.append("TEXT")
+        elif t == "enum":
+            enum_values = _validate_enum_values(col.enum_values or ())
+            if col.default_val is not _UNSET:
+                if col.default_val is None:
+                    if not col.is_nullable:
+                        raise ValueError(
+                            f"Non-nullable enum column '{col_name}' cannot default to None."
+                        )
+                elif not isinstance(col.default_val, DefaultRaw) and (
+                    not isinstance(col.default_val, str)
+                    or col.default_val not in enum_values
+                ):
+                    raise ValueError(
+                        f"Default value {col.default_val!r} for enum column '{col_name}' "
+                        f"must be one of the enum values {list(enum_values)!r}."
+                    )
+            varchar_len = max(255, max((len(v) for v in enum_values), default=255))
+            parts.append(f"VARCHAR({varchar_len})")
         elif t == "integer":
             parts.append("INTEGER")
         elif t == "big_integer":
@@ -262,7 +288,10 @@ class SchemaGrammar:
 
         # Default value
         if col.default_val is not _UNSET:
-            default_expr = cls._format_default_value(col.default_val)
+            if t == "enum" and isinstance(col.default_val, str):
+                default_expr = cls._quote_sql_literal(col.default_val)
+            else:
+                default_expr = cls._format_default_value(col.default_val)
             parts.append(f"DEFAULT {default_expr}")
 
         # Unique (if not named; named unique is emitted in constraints_sql)
@@ -273,14 +302,25 @@ class SchemaGrammar:
         if col.is_unsigned:
             parts.append(f'CHECK ("{col_name}" >= 0)')
 
+        # Enum CHECK constraint
+        if enum_values is not None:
+            literals = ", ".join(cls._quote_sql_literal(v) for v in enum_values)
+            if table is not None:
+                chk_name = validate_identifier(f"{table}_{col_name}_check")
+                parts.append(
+                    f'CONSTRAINT "{chk_name}" CHECK ("{col_name}" IN ({literals}))'
+                )
+            else:
+                parts.append(f'CHECK ("{col_name}" IN ({literals}))')
+
         return " ".join(parts)
 
     @staticmethod
     def _compile_comment(table: str, col: ColumnDefinition) -> list[str]:
         if col.comment_text is None:
             return []
-        escaped = col.comment_text.replace("'", "''")
-        return [f'COMMENT ON COLUMN "{table}"."{col.name}" IS \'{escaped}\';']
+        literal = SchemaGrammar._quote_sql_literal(col.comment_text)
+        return [f'COMMENT ON COLUMN "{table}"."{col.name}" IS {literal};']
 
     @classmethod
     def _format_default_value(cls, val: Any) -> str:

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+import pytest
+
 from swiftpy.database.orm.fields import Field
-from swiftpy.database.orm.model import Model
+from swiftpy.database.orm.model import MassAssignmentError, Model
 from swiftpy.database.orm.relationships import (
     BelongsTo,
     BelongsToMany,
     HasMany,
     HasOne,
 )
+from swiftpy.http.response import json_response
 
 
 class Role(Model):
@@ -108,3 +111,71 @@ async def test_static_typing_contracts() -> None:
     for r in user.roles:
         r_name: str = r.name
         assert r_name == "Editor"
+
+
+class AuthorNoClassVar(Model):
+    __table__ = "typing_authors_nocv"
+    __fillable__ = ["name"]  # noqa: RUF012
+    id: int
+    name: str
+    articles = HasMany("ArticleNoClassVar", foreign_key="author_id")
+
+
+class ArticleNoClassVar(Model):
+    __table__ = "typing_articles_nocv"
+    __primary_key__ = "id"
+    __fillable__ = ["author_id", "title"]  # noqa: RUF012
+    __hidden__ = ["internal_note"]  # noqa: RUF012
+    strict_events = True
+    prevent_lazy_loading = False
+
+    id: int
+    author_id: int
+    title: str
+    internal_note: str
+    author = BelongsTo("AuthorNoClassVar", foreign_key="author_id")
+
+
+class OpenArticleNoClassVar(Model):
+    __table__ = "typing_open_articles_nocv"
+    __guarded__ = []  # noqa: RUF012
+    id: int
+    title: str
+
+
+def test_models_without_classvar_hydrate_and_typecheck() -> None:
+    """Models declaring __fillable__/__hidden__/__guarded__ without ClassVar behave identically."""
+    assert set(ArticleNoClassVar.__fields__) == {
+        "id",
+        "author_id",
+        "title",
+        "internal_note",
+    }
+    assert ArticleNoClassVar.__fillable__ == ["author_id", "title"]
+    assert ArticleNoClassVar.__hidden__ == ["internal_note"]
+    assert ArticleNoClassVar.strict_events is True
+
+    # Unlisted field 'internal_note' is ignored during mass assignment
+    article = ArticleNoClassVar(
+        id=7,
+        author_id=1,
+        title="No ClassVar Needed",
+        internal_note="should-not-mass-assign",
+    )
+    title: str = article.title
+    assert title == "No ClassVar Needed"
+    assert article.internal_note is None
+
+    # Undeclared fields still raise MassAssignmentError
+    with pytest.raises(MassAssignmentError, match="Unknown attribute"):
+        ArticleNoClassVar(unknown_col="nope")
+
+    # __hidden__ excludes secret attributes during serialization and HTTP response encoding
+    article.force_fill(internal_note="secret-draft")
+    assert "internal_note" not in article.to_dict()
+    assert article.to_dict(include_hidden=True)["internal_note"] == "secret-draft"
+    assert b"secret-draft" not in json_response(article).content
+
+    # __guarded__ = [] also works without ClassVar
+    open_article = OpenArticleNoClassVar(id=1, title="Open")
+    assert open_article.title == "Open"

@@ -135,6 +135,8 @@ def test_make_model_scaffolding_and_migration_flag(tmp_path: Path, monkeypatch: 
     content = model_path.read_text(encoding="utf-8")
     assert "class Post(Model):" in content
     assert '__table__ = "posts"' in content
+    assert "__fillable__ = []" in content
+    assert "ClassVar" not in content
 
     # 2. Model with -m flag creates model AND migration
     cli.run(["make:model", "User", "-m"])
@@ -143,6 +145,8 @@ def test_make_model_scaffolding_and_migration_flag(tmp_path: Path, monkeypatch: 
     user_content = user_model.read_text(encoding="utf-8")
     assert "class User(Model):" in user_content
     assert '__table__ = "users"' in user_content
+    assert "__fillable__ = []" in user_content
+    assert "ClassVar" not in user_content
 
     migration_files = list((tmp_path / "database" / "migrations").glob("*_create_users_table.py"))
     assert len(migration_files) == 1

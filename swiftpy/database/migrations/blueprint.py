@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Self
 
 from swiftpy.database.identifiers import validate_identifier
@@ -25,6 +26,9 @@ ALLOWED_COLUMN_TYPES: frozenset[str] = frozenset(
         "uuid",
         "string",
         "text",
+        "medium_text",
+        "long_text",
+        "enum",
         "integer",
         "big_integer",
         "small_integer",
@@ -79,6 +83,30 @@ def _validate_decimal_params(precision: int, scale: int) -> tuple[int, int]:
     return precision, scale
 
 
+def _validate_enum_values(values: Sequence[str]) -> tuple[str, ...]:
+    """Validate enum choices as a non-empty sequence of unique, NUL-safe strings."""
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError(
+            "Enum values must be a non-empty sequence of strings, not a bare string."
+        )
+    if len(values) == 0:
+        raise ValueError("Enum values must be a non-empty sequence of strings.")
+    seen: set[str] = set()
+    validated: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise TypeError(
+                f"Enum values must be strings, got {type(item).__name__}: {item!r}"
+            )
+        if "\x00" in item:
+            raise ValueError("Enum values must not contain NUL bytes.")
+        if item in seen:
+            raise ValueError(f"Duplicate enum value {item!r} is not allowed.")
+        seen.add(item)
+        validated.append(item)
+    return tuple(validated)
+
+
 class DefaultRaw:
     """Explicit marker for raw SQL default expressions in migrations (e.g. raw('now()'))."""
 
@@ -114,6 +142,7 @@ class ColumnDefinition:
         self.is_index: bool = False
         self.index_name: str | None = None
         self.dimensions: int | None = None
+        self.enum_values: tuple[str, ...] | None = None
         self.comment_text: str | None = None
         self.is_unsigned: bool = False
 
@@ -124,6 +153,17 @@ class ColumnDefinition:
 
     def default(self, value: Any) -> Self:
         """Specify the default value for the column."""
+        if (
+            self.type_name == "enum"
+            and self.enum_values is not None
+            and value is not None
+            and not isinstance(value, DefaultRaw)
+            and (not isinstance(value, str) or value not in self.enum_values)
+        ):
+            raise ValueError(
+                f"Default value {value!r} for enum column '{self.name}' "
+                f"must be one of the enum values {list(self.enum_values)!r}."
+            )
         self.default_val = value
         return self
 
@@ -280,8 +320,23 @@ class Blueprint:
         return col
 
     def text(self, name: str) -> ColumnDefinition:
-        """Create a TEXT column."""
+        """Create an unbounded TEXT column (up to ~1 GB in PostgreSQL)."""
         return self._add_column(name, "text")
+
+    def medium_text(self, name: str) -> ColumnDefinition:
+        """Alias for text(); PostgreSQL TEXT is unbounded (up to ~1 GB)."""
+        return self.text(name)
+
+    def long_text(self, name: str) -> ColumnDefinition:
+        """Alias for text(); PostgreSQL TEXT is unbounded (up to ~1 GB)."""
+        return self.text(name)
+
+    def enum(self, name: str, values: Sequence[str]) -> ColumnDefinition:
+        """Create a VARCHAR column constrained by a CHECK (col IN (...)) constraint."""
+        validated_values = _validate_enum_values(values)
+        col = self._add_column(name, "enum")
+        col.enum_values = validated_values
+        return col
 
     def integer(self, name: str) -> ColumnDefinition:
         """Create a standard 32-bit INTEGER column."""

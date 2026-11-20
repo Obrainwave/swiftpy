@@ -69,16 +69,15 @@ When a `Model` subclass is defined, SwiftPY derives its table name and primary k
 
 ```python
 from datetime import datetime
-from typing import ClassVar
 
-from swiftpy.database.orm import Field, Model
+from swiftpy.database.orm import Model
 
 
 class User(Model):
-    __table__: ClassVar[str] = "users"
-    __primary_key__: ClassVar[str] = "id"
-    __hidden__: ClassVar[list[str]] = ["password"]
-    __fillable__: ClassVar[list[str]] = ["name", "email", "password"]
+    __table__ = "users"
+    __primary_key__ = "id"
+    __hidden__ = ["password"]
+    __fillable__ = ["name", "email", "password"]
 
     id: int | None = None
     name: str = ""
@@ -89,7 +88,9 @@ class User(Model):
     updated_at: datetime | None = None
 ```
 
-Your application template ships a starter `User` model in `app/models/user.py` that already sets `__primary_key__ = "id"` and `__hidden__ = ["password"]`.
+You do **not** need `typing.ClassVar` on model configuration attributes (`__table__`, `__primary_key__`, `__fillable__`, `__guarded__`, `__hidden__`, `strict_events`, `prevent_lazy_loading`) or relationship descriptors—the `Model` base class already supplies those metadata declarations for static type checkers, and new projects (`swiftpy new`) configure Ruff's `per-file-ignores` for `app/models/**/*.py` (`RUF012`) automatically. Existing models that still annotate with `ClassVar` continue to work identically.
+
+Your application template ships a starter `User` model in `app/models/user.py` that already sets `__primary_key__ = "id"`, `__fillable__ = ["name", "email", "password", "is_admin"]`, and `__hidden__ = ["password"]`.
 
 ---
 
@@ -97,20 +98,20 @@ Your application template ships a starter `User` model in `app/models/user.py` t
 
 ### 1. Typed Fields, `Field()`, Mutable Defaults & `Vector`
 
-SwiftPY inspects type annotations on your model class (supporting forward references registered in the model registry, while ignoring `ClassVar` class attributes). Subclasses inherit `__fields__`, defaults, factories, vector definitions, and relationship descriptors from parent models.
+SwiftPY inspects type annotations on your model class (supporting forward references registered in the model registry, while skipping dunder configuration attributes and `ClassVar` annotations if present). Subclasses inherit `__fields__`, defaults, factories, vector definitions, and relationship descriptors from parent models.
 
 Use `Field()` when you need a dynamic per-instance default factory or explicit primary-key metadata:
 
 ```python
 import uuid
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any
 
 from swiftpy.database.orm import Field, Model
 
 
 class Document(Model):
-    __fillable__: ClassVar[list[str]] = ["title", "tags", "metadata"]
+    __fillable__ = ["title", "tags", "metadata"]
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     title: str = ""
@@ -129,14 +130,12 @@ Key field behaviors:
 For `pgvector` embedding columns, declare fields with `Vector(dimensions, metric=...)`:
 
 ```python
-from typing import ClassVar
-
 from swiftpy.database.orm import Model, Vector
 
 
 class KnowledgeChunk(Model):
-    __table__: ClassVar[str] = "knowledge_chunks"
-    __fillable__: ClassVar[list[str]] = ["content", "embedding"]
+    __table__ = "knowledge_chunks"
+    __fillable__ = ["content", "embedding"]
 
     id: int | None = None
     content: str = ""
@@ -155,15 +154,13 @@ By default, **both `__fillable__` and `__guarded__` are `None`**, which puts eve
 Choose one strategy per model:
 
 ```python
-from typing import ClassVar
-
 from swiftpy.database.orm import Model
 
 
 # Strategy A: Allowlist (recommended for user-facing payloads)
 class ProfileUpdateModel(Model):
-    __table__: ClassVar[str] = "users"
-    __fillable__: ClassVar[list[str]] = ["name", "email"]
+    __table__ = "users"
+    __fillable__ = ["name", "email"]
 
     id: int | None = None
     name: str = ""
@@ -173,7 +170,7 @@ class ProfileUpdateModel(Model):
 
 # Strategy B: Blocklist (explicitly forbid privileged columns; [] allows all declared fields)
 class Article(Model):
-    __guarded__: ClassVar[list[str]] = ["published_by_admin"]
+    __guarded__ = ["published_by_admin"]
 
     id: int | None = None
     title: str = ""
@@ -345,52 +342,60 @@ Lifecycle event behavior:
 Declare relationships directly on the model class using `HasOne`, `HasMany`, `BelongsTo`, and `BelongsToMany`. Use string model names (such as `"Post"` or `"Tag"`) to prevent circular imports between modules:
 
 ```python
-from typing import ClassVar
-
 from swiftpy.database.orm import BelongsTo, BelongsToMany, HasMany, HasOne, Model
 
 
 class User(Model):
-    __fillable__: ClassVar[list[str]] = ["name", "email"]
+    __fillable__ = ["name", "email"]
 
     id: int | None = None
     name: str = ""
     email: str = ""
 
-    profile: ClassVar[HasOne] = HasOne("Profile")
-    posts: ClassVar[HasMany] = HasMany("Post")
+    profile = HasOne("Profile")
+    posts = HasMany("Post")
 
 
 class Profile(Model):
-    __fillable__: ClassVar[list[str]] = ["user_id", "bio"]
+    __fillable__ = ["user_id", "bio"]
 
     id: int | None = None
     user_id: int | None = None
     bio: str = ""
 
-    user: ClassVar[BelongsTo] = BelongsTo("User")
+    user = BelongsTo("User")
 
 
 class Post(Model):
-    __fillable__: ClassVar[list[str]] = ["user_id", "title", "body"]
+    __fillable__ = ["user_id", "title", "body"]
 
     id: int | None = None
     user_id: int | None = None
     title: str = ""
     body: str = ""
 
-    author: ClassVar[BelongsTo] = BelongsTo("User", foreign_key="user_id")
-    tags: ClassVar[BelongsToMany] = BelongsToMany("Tag")
+    author = BelongsTo("User", foreign_key="user_id")
+    tags = BelongsToMany("Tag")
 
 
 class Tag(Model):
-    __fillable__: ClassVar[list[str]] = ["name"]
+    __fillable__ = ["name"]
 
     id: int | None = None
     name: str = ""
 
-    posts: ClassVar[BelongsToMany] = BelongsToMany("Post")
+    posts = BelongsToMany("Post")
 ```
+
+> **Important — Import Related Models First (`RuntimeError` on Unregistered Targets):**
+> String relationship names (such as `HasMany("Post")` or `.with_("posts.tags")`) are resolved lazily through SwiftPY's global model registry when a relationship query or eager load runs. Defining a relationship with a string does **not** import the target module for you:
+>
+> - If the related model class has **not** been imported before `user.posts`, `User.with_("posts")`, or `.attach()` runs, SwiftPY raises:
+>   `RuntimeError: Model 'Post' has not been registered.`
+> - **Recommended pattern:** Export and import all your domain models together in `app/models/__init__.py` (or import the related model modules at the top of `main.py` / your service module before executing queries).
+> - If two different modules define models with the **same class name** (for example `billing.models.Item` and `inventory.models.Item`), string lookup raises:
+>   `RuntimeError: Model name 'Item' is ambiguous: ... Pass the class itself instead of a string.`
+>   In that case (or whenever imports are not circular), import and pass the target model class directly: `items = HasMany(BillingItem)`.
 
 > **Note on relationship keys & pivot tables:** `HasOne`, `HasMany`, and `BelongsTo` all accept `(related_model, foreign_key=None, local_key=None)`. When `foreign_key` is omitted on `BelongsTo`, SwiftPY infers `<relation_attribute_name>_id` (so `user = BelongsTo("User")` uses `"user_id"`, whereas `author = BelongsTo("User", foreign_key="user_id")` explicitly maps `author` to `user_id`). `BelongsToMany` accepts `(related_model, pivot_table=None, foreign_pivot_key=None, related_pivot_key=None, parent_key=None, related_key=None)`; when `pivot_table` is omitted, SwiftPY sorts the two snake-case model names alphabetically and joins them with `_` (e.g. `"post_tag"`).
 
@@ -433,11 +438,11 @@ In endpoints or tests where any accidental lazy query must fail fast, set `preve
 
 ```python
 class StrictUser(Model):
-    __table__: ClassVar[str] = "users"
-    prevent_lazy_loading: ClassVar[bool] = True
+    __table__ = "users"
+    prevent_lazy_loading = True
 
     id: int | None = None
-    posts: ClassVar[HasMany] = HasMany("Post", foreign_key="user_id")
+    posts = HasMany("Post", foreign_key="user_id")
 
 
 user = await StrictUser.first_or_fail()
@@ -472,7 +477,18 @@ await post.tags.sync([tag_a.id, tag_b])
 - **Hide credentials and tokens with `__hidden__`**: Declare password hashes, API secrets, and internal tokens in `__hidden__` so `.to_dict()` and `json_response()` omit them by default.
 - **Never share models with unloaded relations into sync templates/serializers**: Either eager-load with `.with_()` upfront or catch missing eager loads early in development/CI with `prevent_lazy_loading = True` so `LazyLoadingDisabledError` surfaces N+1 paths before production.
 - **Bulk deletes/updates vs single-record saves**: `model.save()` and `model.delete()` execute targeted single-row operations wrapped in dirty checks and lifecycle hooks. Never loop `await row.save()` inside a handler when a single batched query or `Model.upsert()` / `Query` update is appropriate, and remember `Query` bulk updates/deletes require `.allow_all()` if called intentionally without a `WHERE` clause.
-- **Database migrations remain the source of truth**: `Field(...)`, `Vector(...)`, and relationship descriptors describe application-level behavior; always create corresponding tables, foreign keys, indexes, and `vector(...)` columns in `database/migrations/` using `Schema` and `Blueprint`.
+- **Database migrations remain the source of truth**: `Field(...)`, `Vector(...)`, and relationship descriptors describe application-level behavior; always create corresponding tables, foreign keys, indexes, and `vector(...)` columns in `database/migrations/` using `Schema` and `Blueprint` (see [Database Schema, `Blueprint` & Migrations](2026-11-19-database-schema-and-blueprint.md)).
+- **Combine models cleanly with schemas**: Return domain `Model` records from repositories and transform responses with `.to_dict()`, `Resource` classes, or `@dataclass` schemas in [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md).
+
+---
+
+## Understanding PostgreSQL Primary Key Sequence Gaps
+
+SwiftPY's `table.id()` creates PostgreSQL `BIGSERIAL` (or `GENERATED ... AS IDENTITY`) primary keys backed by PostgreSQL `SEQUENCE` objects. Because PostgreSQL sequences advance outside transaction rollback (`nextval()` is non-transactional for concurrency performance):
+
+- **Failed inserts leave harmless ID gaps:** If `await User.create(...)` fails with `asyncpg.UniqueViolationError` or exits early from a rolled-back `async with db.transaction():` block, the allocated primary key (`2`, `3`, ...) is consumed and never reused. The next successful insert receives the next sequence value (`4`).
+- **No data loss occurs:** All committed rows remain intact; gaps are normal PostgreSQL behavior, not missing records.
+- **Need gapless business numbers (e.g., invoice numbers)?** Keep surrogate primary keys (`id`) on `BIGSERIAL`, and generate sequential legal/accounting numbers separately using an explicit locked sequence table row (`SELECT ... FOR UPDATE`) or transactional numbering strategy only where gap-free numbering is legally required.
 
 ---
 

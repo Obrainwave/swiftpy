@@ -297,7 +297,6 @@ async def list_users(request: Request) -> Response:
 USER_MODEL_CONTENT = """from __future__ import annotations
 
 from datetime import datetime
-from typing import ClassVar
 
 from swiftpy.database.orm import Model
 
@@ -310,8 +309,8 @@ class User(Model):
 
     __table__ = "users"
     __primary_key__ = "id"
-    __fillable__: ClassVar[list[str]] = ["name", "email", "password", "is_admin"]
-    __hidden__: ClassVar[list[str]] = ["password"]
+    __fillable__ = ["name", "email", "password", "is_admin"]
+    __hidden__ = ["password"]
 
     id: int
     name: str
@@ -505,27 +504,18 @@ EXCEPTIONS_CONTENT = """from __future__ import annotations
 
 from swiftpy.core.application import Application
 from swiftpy.core.exceptions import HttpException
-from swiftpy.http.request import Request
-from swiftpy.http.response import Response, json_response
 
 
 class ResourceConflictException(HttpException):
     \"\"\"Raised when an operation conflicts with existing server state (HTTP 409).\"\"\"
 
-    def __init__(self, message: str = "Resource conflict") -> None:
-        super().__init__(status_code=409, message=message)
+    status_code = 409
+    message = "Resource conflict"
 
 
 def register_exception_handlers(app: Application) -> None:
-    \"\"\"Register custom application error renderers onto the application.\"\"\"
-
-    @app.exception_handler(ResourceConflictException)
-    async def handle_conflict(
-        request: Request, exc: ResourceConflictException
-    ) -> Response:
-        return json_response(
-            {"error": "conflict", "detail": exc.message}, status_code=409
-        )
+    \"\"\"Register custom exception renderers onto `app` when non-default JSON shapes are needed.\"\"\"
+    _ = app
 """
 
 AUTH_MIDDLEWARE_CONTENT = """from __future__ import annotations
@@ -1126,6 +1116,10 @@ CONFIG = {
             "level": env("LOG_LEVEL", "info"),
             "days": 14,
         },
+        "stderr": {
+            "driver": "stderr",
+            "level": env("LOG_LEVEL", "info"),
+        },
     },
 }
 """
@@ -1540,7 +1534,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.1.5",
+    "swiftpy-framework>=0.2.0",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
@@ -1569,6 +1563,9 @@ strict = true
 explicit_package_bases = true
 follow_imports = "silent"
 ignore_missing_imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"app/models/**/*.py" = ["RUF012"]
 """
 
 

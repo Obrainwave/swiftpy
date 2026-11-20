@@ -398,6 +398,8 @@ class CreateUsersTable(Migration):
 
 ### Defining Tables & Columns (`Blueprint` & `Schema`)
 
+For the complete reference of every `Schema` method (`create`, `table`, `drop`, `drop_if_exists`, `has_table`, `has_column`), `Blueprint` column type (including `enum`, `medium_text`, `long_text`, `jsonb`, `vector`, and `soft_deletes`), fluent modifiers, foreign keys, and PostgreSQL caveats (no `.after()` or `Schema.rename`), see [Database Schema, `Blueprint` & Migrations](2026-11-19-database-schema-and-blueprint.md).
+
 ```python
 from __future__ import annotations
 
@@ -435,8 +437,8 @@ class CreateArticlesAndTags(Migration):
 Supported `Blueprint` methods:
 
 - **Primary keys & IDs:** `id(name="id")` (`BIGSERIAL PRIMARY KEY`), `increments(name="id")` (`SERIAL PRIMARY KEY`), `big_increments(name="id")` (`BIGSERIAL PRIMARY KEY`), or table-level composite `table.primary(["user_id", "role_id"], name=...)`.
-- **Column types:** `uuid()`, `string(name, length=255)`, `text()`, `integer()`, `big_integer()`, `small_integer()`, `boolean()`, `decimal(name, precision=8, scale=2)`, `float()`, `json()`, `jsonb()`, `date()`, `time()`, `timestamp(name, tz=True)`, `timestamps(tz=True)`, `soft_deletes(name="deleted_at", tz=True)`, `vector(name, dimensions=1536)` (for `pgvector`).
-- **Column modifiers:** `.nullable(True)`, `.default(value)` (use `raw("CURRENT_TIMESTAMP")` or `raw("gen_random_uuid()")` for SQL expressions; passing raw SQL keyword strings emits a `DeprecationWarning`), `.unique(name=None)`, `.index(name=None)`, `.primary()`, `.comment("text")`, `.unsigned()` (`CHECK ("col" >= 0)`).
+- **Column types:** `uuid()`, `string(name, length=255)`, `text()` (unbounded `TEXT`, up to ~1 GB in PostgreSQL), `medium_text()` and `long_text()` (aliases for `text()` since PostgreSQL has no separate size variants), `enum(name, values)` (`VARCHAR(255)` with a named `{table}_{col}_check` `CHECK` constraint), `integer()`, `big_integer()`, `small_integer()`, `boolean()`, `decimal(name, precision=8, scale=2)`, `float()`, `json()`, `jsonb()`, `date()`, `time()`, `timestamp(name, tz=True)`, `timestamps(tz=True)`, `soft_deletes(name="deleted_at", tz=True)`, `vector(name, dimensions=1536)` (for `pgvector`).
+- **Column modifiers:** `.nullable(True)`, `.default(value)` (use `raw("CURRENT_TIMESTAMP")` or `raw("gen_random_uuid()")` for SQL expressions; passing raw SQL keyword strings emits a `DeprecationWarning`), `.unique(name=None)`, `.index(name=None)`, `.primary()`, `.comment("text")`, `.unsigned()` (`CHECK ("col" >= 0)`). Column positioning via `.after()` is intentionally not implemented because PostgreSQL only appends added columns to the end of a table.
 - **Indexes & Foreign Keys:** `table.unique(cols, name=None)`, `table.index(cols, name=None)`, `table.foreign(col, name=None).references("id").on("users").cascade_on_delete()` (also `.null_on_delete()`, `.cascade_on_update()`, `.on_delete(...)`, `.on_update(...)`), or one-call `table.foreign_key(column, references, on, on_delete=..., on_update=..., name=None)`.
 - **Altering & Inspecting Tables:** `await Schema.table("articles", fn)` supports `drop_column(*names)`, `rename_column(old, new)`, `drop_index(name)`, `drop_unique(name)`, and `drop_foreign(name)` alongside adding new columns/indexes/foreign keys. Drops always execute before renames and adds, so a single `Schema.table` call can drop and re-add a constraint or column cleanly. You can also check `await Schema.has_table("articles")` and `await Schema.has_column("articles", "title")`.
 
@@ -547,4 +549,4 @@ Options: `--class` (defaults to `DatabaseSeeder`), `--no-transaction`, `--app` (
 
 ## Next Step
 
-Continue with **#6 — Active Record ORM & Relationships**: [`docs/2026-11-14_documentation_plan.md`](../docs/2026-11-14_documentation_plan.md).
+Continue to [Database Schema, `Blueprint` & Migrations](2026-11-19-database-schema-and-blueprint.md) for the complete column type, foreign key, and alteration reference (or jump ahead to [Active Record ORM & Relationships](2026-11-15-orm-models-and-relationships.md)).

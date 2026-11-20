@@ -29,11 +29,13 @@ When `Application()` initializes, it automatically:
 
 1. Loads `.env` and every Python config file in `config/`.
 2. Auto-discovers and registers every `ServiceProvider` inside `app/providers/`.
-3. Wires built-in framework services (`Config`, `Cache`, database pool when configured, mail, queues, events, authentication, and WebSockets).
+3. Wires built-in framework services (`Config`, `LogManager`, `Cache`, database pool when configured, mail, queues, events, authentication, and WebSockets).
+
+During ASGI lifespan startup, `FrameworkServiceProvider` starts `LogManager` **first** (rolling back started listeners cleanly on startup failure), and during shutdown flushes and stops `LogManager` **last** so every shutdown log is captured safely. See [Structured Asynchronous Logging](2026-11-20-logging.md).
 
 ### Customizing `Application` Settings
 
-You can configure app metadata, request size limits, or explicit inline config/providers directly in `Application(...)` — useful for single-file services or isolated tests:
+You can configure app metadata, request size limits, input pre-loading, or explicit inline config/providers directly in `Application(...)` — useful for single-file services or isolated tests:
 
 ```python
 from __future__ import annotations
@@ -43,10 +45,14 @@ from swiftpy import Application
 app = Application(
     title="Orders API",
     version="1.2.0",
-    max_body_size=5 * 1024 * 1024,  # Allow up to 5 MiB request bodies (default: 2 MiB)
-    max_json_depth=32,              # Max JSON nesting depth (default: 32)
+    max_body_size=5 * 1024 * 1024,   # Allow up to 5 MiB request bodies (default: 2 MiB)
+    max_json_depth=32,               # Max JSON nesting depth (default: 32)
+    auto_load_request_input=True,    # Pre-load JSON/form fields for request.input()/request.<field> (default: True)
 )
 ```
+
+> [!TIP]
+> Pass `auto_load_request_input=False` when building raw streaming proxy or webhook signature routes that inspect `await request.body()` directly and do not want non-multipart write payloads pre-parsed into `Request` input caches.
 
 If you want to control provider loading explicitly (for instance, in a standalone script or custom entrypoint), pass `auto_discover_providers=False` and `providers=[...]`:
 
@@ -458,4 +464,4 @@ Other handy `Context` helpers:
 
 ## Next Step
 
-Continue with **#3 — HTTP Routing, Request/Response, Middleware & Exceptions**: [`docs/2026-11-14_documentation_plan.md`](../docs/2026-11-14_documentation_plan.md).
+Continue to [HTTP Routing, Middleware & Controllers](2026-11-15-http-routing-middleware-and-exceptions.md) to define `Router` modules, typed path parameters, controllers, resources, and middleware pipelines.

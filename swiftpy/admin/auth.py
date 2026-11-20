@@ -205,6 +205,7 @@ class AdminSessionStore:
         self._ephemeral_secret: str | None = None
         self._max_revoked_sessions = max(1, max_revoked_sessions)
         self._revoked_sessions: dict[str, float] = {}
+        self._flush_epoch: int = 0
 
     def get_secret_key(self) -> str:
         if self._secret_key and self._secret_key.strip():
@@ -242,6 +243,7 @@ class AdminSessionStore:
             "user": user.to_dict(),
             "exp": now + max_age,
             "iat": now,
+            "epoch": self._flush_epoch,
         }
         payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         payload_b64 = _b64encode(payload_bytes)
@@ -299,11 +301,25 @@ class AdminSessionStore:
             return None
 
         user = AdminUser.from_dict(user_data)
+        if self._flush_epoch > 0:
+            token_epoch = data.get("epoch")
+            if (
+                isinstance(token_epoch, bool)
+                or not isinstance(token_epoch, int)
+                or token_epoch < self._flush_epoch
+            ):
+                return None
+
         self._prune_revoked_sessions()
         if user.session_id in self._revoked_sessions:
             return None
 
         return user
+
+    def flush(self) -> None:
+        """Invalidate all previously issued admin sessions in this store instance."""
+        self._flush_epoch += 1
+        self._revoked_sessions.clear()
 
     def revoke_session(self, session_id: str, ttl: int | None = None) -> None:
         """Revoke an active admin session ID with TTL pruning and bounded retention."""

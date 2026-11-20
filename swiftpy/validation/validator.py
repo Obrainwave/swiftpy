@@ -3,12 +3,18 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Self
 from weakref import WeakKeyDictionary
 
 from swiftpy.database.transaction import get_active_connection
+from swiftpy.http.request import Request
+from swiftpy.validation.exceptions import (
+    ValidationException,
+    _extract_first_error,
+    _extract_first_errors,
+)
 from swiftpy.validation.rules.builtin import (
     BailRule,
     BetweenRule,
@@ -113,6 +119,55 @@ def _rule_sort_key(rule: Any) -> tuple[int, int]:
     return (2, 0)
 
 
+def _to_validated_value(value: Any) -> Any:
+    if isinstance(value, dict) and not isinstance(value, ValidatedData):
+        return ValidatedData(value)
+    if isinstance(value, list):
+        return [_to_validated_value(item) for item in value]
+    return value
+
+
+class ValidatedData(dict[str, Any]):
+    """Dictionary subclass supporting attribute access (`data.field`) for validated payloads."""
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        mapping: Mapping[str, Any] | Iterable[tuple[str, Any]] = (),
+        **kwargs: Any,
+    ) -> None:
+        raw = dict(mapping)
+        if kwargs:
+            raw.update(kwargs)
+        super().__init__({k: _to_validated_value(v) for k, v in raw.items()})
+
+    def __getattr__(self, name: str) -> Any:
+        if not name.startswith("_") and name in self:
+            return self[name]
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+        self[name] = _to_validated_value(value)
+
+    def __delattr__(self, name: str) -> None:
+        if not name.startswith("_") and name in self:
+            del self[name]
+            return
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def copy(self) -> ValidatedData:
+        return ValidatedData(self)
+
+
 @dataclass(slots=True)
 class ValidationResult:
     """
@@ -122,6 +177,7 @@ class ValidationResult:
     is_valid: bool
     errors: dict[str, list[str]] = field(default_factory=dict)
     validated_data: dict[str, Any] = field(default_factory=dict)
+    _single_error: bool = field(default=False, repr=False)
 
     def passes(self) -> bool:
         """Return True if all validation rules passed."""
@@ -139,14 +195,11 @@ class ValidationResult:
         """
         Return the first error message for a specific field or across all fields.
         """
-        if field_name is not None:
-            field_errors = self.errors.get(field_name)
-            return field_errors[0] if field_errors else None
+        return _extract_first_error(self.errors, field_name)
 
-        for field_errors in self.errors.values():
-            if field_errors:
-                return field_errors[0]
-        return None
+    def first_errors(self) -> dict[str, str]:
+        """Return a mapping of each failing field to its first error message."""
+        return _extract_first_errors(self.errors)
 
     def errors_for(self, field_name: str) -> list[str]:
         """Return all error messages for a specific field."""
@@ -159,9 +212,18 @@ class ValidationResult:
             flattened.extend(field_errors)
         return flattened
 
-    def validated(self) -> dict[str, Any]:
-        """Return a copy of the cleaned/coerced validated data."""
-        return dict(self.validated_data)
+    def validated(self) -> ValidatedData:
+        """Return a ValidatedData copy supporting both dict and attribute access."""
+        return ValidatedData(self.validated_data)
+
+    def raise_if_failed(self) -> Self:
+        """Raise ValidationException if validation failed, or return self for chaining."""
+        if self.fails():
+            raise ValidationException(
+                self.errors,
+                single_error=self._single_error,
+            )
+        return self
 
 
 _UNSET = object()
@@ -298,12 +360,15 @@ class Validator:
         schema: dict[str, Any],
         registry: RuleRegistry | None = None,
         messages: dict[str, str] | None = None,
+        *,
+        stop_on_first_error: bool = False,
     ) -> None:
         self.is_payload_dict = isinstance(data, dict)
         self.data: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
         self.schema = schema
         self.registry = registry or default_registry
         self.messages: dict[str, str] = dict(messages) if messages else {}
+        self.stop_on_first_error = bool(stop_on_first_error)
         self._db_rule_lock = asyncio.Lock()
 
     async def validate(self) -> ValidationResult:
@@ -317,6 +382,7 @@ class Validator:
                 is_valid=False,
                 errors={"body": ["The request body must be a JSON object."]},
                 validated_data={},
+                _single_error=self.stop_on_first_error,
             )
 
         direct_fields: list[tuple[str, list[Any]]] = []
@@ -363,7 +429,33 @@ class Validator:
 
         all_targets = [*direct_targets, *wildcard_targets]
 
-        if get_active_connection() is not None:
+        if self.stop_on_first_error:
+            if errors:
+                first_k = next(iter(errors))
+                return ValidationResult(
+                    is_valid=False,
+                    errors={first_k: [errors[first_k][0]]},
+                    validated_data={},
+                    _single_error=True,
+                )
+            results: list[tuple[tuple[str | int, ...], tuple[str, list[str], Any]]] = []
+            for field_name, path_keys, rules, present, raw_val, template_field in all_targets:
+                res = await self._validate_field(
+                    field_name,
+                    rules,
+                    field_present=present,
+                    raw_value=raw_val,
+                    template_field=template_field,
+                )
+                if res[1]:
+                    return ValidationResult(
+                        is_valid=False,
+                        errors={res[0]: [res[1][0]]},
+                        validated_data={},
+                        _single_error=True,
+                    )
+                results.append((path_keys, res))
+        elif get_active_connection() is not None:
             results = [
                 (
                     path_keys,
@@ -424,9 +516,12 @@ class Validator:
             for r in rules
         )
         is_required = any(isinstance(r, RequiredRule) for r in rules)
-        should_bail = any(
-            isinstance(r, BailRule) or getattr(r, "is_bail_rule", False)
-            for r in rules
+        should_bail = (
+            any(
+                isinstance(r, BailRule) or getattr(r, "is_bail_rule", False)
+                for r in rules
+            )
+            or self.stop_on_first_error
         )
 
         if field_present is None:
@@ -592,21 +687,30 @@ class Validator:
 
 
 async def validate(
-    data: dict[str, Any] | Any,
+    data: dict[str, Any] | Request | Any,
     schema: dict[str, Any],
     registry: RuleRegistry | None = None,
     messages: dict[str, str] | None = None,
+    *,
+    stop_on_first_error: bool = False,
 ) -> ValidationResult:
     """
-    Validate data against a schema non-blockingly, returning a typed ValidationResult.
+    Validate a mapping or incoming Request against a schema non-blockingly,
+    returning a typed ValidationResult.
     """
+    payload: Any = data
+    if isinstance(data, Request):
+        loaded = await data.input()
+        payload = None if getattr(data, "_non_dict_payload", False) else loaded
+
     validator = Validator(
-        data=data,
+        data=payload,
         schema=schema,
         registry=registry,
         messages=messages,
+        stop_on_first_error=stop_on_first_error,
     )
     return await validator.validate()
 
 
-__all__ = ["ValidationResult", "Validator", "validate"]
+__all__ = ["ValidatedData", "ValidationResult", "Validator", "validate"]

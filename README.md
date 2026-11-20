@@ -20,11 +20,14 @@
 
 SwiftPY brings the joy and productivity of Laravel to the modern asynchronous Python ecosystem. It eliminates boilerplate and fragmented third-party glue code by providing a unified, cohesive framework built natively on Python 3.12+ and high-performance [`asyncpg`](https://github.com/MagicStack/asyncpg).
 
-- **FastAPI-Grade Simplicity**: Clean, intuitive entrypoint (`app = Application()`), async-first request/response cycle, automatic path parameter type coercion, and scoped route groups with middleware pipelines.
-- **Eloquent-Caliber Active Record ORM**: Typed models declaring class attributes via standard Python type hints, automatic irregular-aware table pluralization, dirty-tracking `save()`, expressive relationships (`HasMany`, `BelongsTo`, `HasOne`, `BelongsToMany`), and eager loading with strict N+1 query prevention (via model-level `prevent_lazy_loading = True`, raising `LazyLoadingDisabledError` on un-eager-loaded accesses).
+- **FastAPI-Grade Simplicity**: Clean, intuitive entrypoint (`app = Application()`), async-first request/response cycle (`Request.input()`, `request.<field>`, `abort()`, declarative `HttpException`), constructor-configured `Router(prefix=..., middleware=...)`, automatic path parameter type coercion, and scoped route groups with middleware pipelines.
+- **Eloquent-Caliber Active Record ORM**: Typed models declaring class attributes via standard Python type hints (no `ClassVar` boilerplate), automatic irregular-aware table pluralization, dirty-tracking `save()`, expressive relationships (`HasMany`, `BelongsTo`, `HasOne`, `BelongsToMany`), and eager loading with strict N+1 query prevention (via model-level `prevent_lazy_loading = True`, raising `LazyLoadingDisabledError` on un-eager-loaded accesses).
 - **Query Builder, GROUP BY & Dynamic Pagination**: Full length-aware `paginate()` and lightweight `simple_paginate()`, `limit()`/`offset()` (with `take()`/`skip()`), group-aware subquery counting, and aggregate selectors (`select_count`, `select_sum`, etc.) with `having` and `or_having` logical filtering.
 - **Multi-Disk Storage & Streaming Engine**: Flysystem-inspired `Storage` abstraction supporting local and S3 disks, high-throughput streaming uploads/downloads, magic-byte validation, and `storage:link`.
-- **Form Request & Input Hardening**: Automatic 422 JSON errors, configurable body streaming limits, Content-Length checks, and JSON recursion depth caps.
+- **Validation Ergonomics & Input Hardening**: `FormRequest` and `await validate(request, rules)` returning `ValidatedData` (supporting both dict and dot attribute access), `stop_on_first_error`, `ValidationException.single()`, automatic 422 JSON errors, configurable body streaming limits, Content-Length checks, and JSON recursion depth caps.
+- **Authentication, Refresh Rotation & Session Revocation**: `JWTIssuer` with `refresh_token_pair()` rotation and reuse rejection, `auth().logout()` / `auth().logout_all()`, `TokenBlacklist`, `ApiKeyGuard`, and `AdminSessionStore.flush()`.
+- **Structured Asynchronous Logging**: Non-blocking `Log` facade and `LogManager` (`single`, `daily`, `stderr`, `stack`) backed by bounded `QueueHandler` / `QueueListener` with clean ASGI startup/shutdown flushing and per-application isolation.
+- **Native AI Subsystem (`swiftpy.ai`)**: Fluent async `AI` client across OpenAI and Anthropic providers with shared `AIHttpPool` pooling and SSE streaming, batched `EmbeddingsClient`, unified `VectorStore` adapters (`PgVectorAdapter` for PostgreSQL `pgvector`, `InMemoryVectorStore`, Qdrant, Pinecone, Chroma, LanceDB), nonce-bounded RAG pipelines (`rag()`, `Retriever`, Cohere/CrossEncoder rerankers), autonomous `@tool` / `Agent` loops with session memory, prompt templates (`prompts/`), moderation/rate-limit/budget middlewares, observability telemetry, and `AIFake` / `VectorStoreFake` test doubles.
 - **Database Engine & Native Transactions**: Connection pool management, automatic transaction propagation across context variables, nested transaction savepoints, and strict SQL injection prevention with full identifier quoting for reserved words.
 - **Fluent Migration DSL & Schema Builder**: Laravel-inspired `Blueprint` table definitions, safe statement ordering (drops executed before adds), column comments, unsigned checks, composite keys, and distributed PostgreSQL advisory locks.
 - **At-Least-Once Queues & Signed Bus**: Robust background jobs with Redis visibility timeout leases, HMAC-SHA256 envelope signing, dead-letter routing, and a cryptographically protected cross-worker event bus.
@@ -52,10 +55,12 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Phase 8: Validation DSL Hardening** | Fail-closed FormRequest validation, hardened rule composition, input sanitization | ✅ Completed |
 | **Phase 9: Real-time WebSockets** | Handshake validation, same-origin protection (D-14), bounded broadcast fan-out, lifecycle hooks | ✅ Completed |
 | **Phase 10: Infra, CI & Hygiene** | Multi-stage Docker, pinned CI workflow, hardened compose, repo hygiene, CLI options | ✅ Completed |
+| **Phases 11–13: Native AI Subsystem** | Multi-provider `AI` client, SSE streaming, `EmbeddingsClient`, `PgVectorAdapter` & vector stores, `rag()`, `Agent` / `@tool`, prompts, guardrails & `AIFake` | ✅ Completed |
 | **Week 26: Security Audit & Hardening** | SQL injection audit, JWT & bcrypt API keys, JSON depth & streaming limits, traceback suppression | ✅ Completed |
 | **Week 26: Pagination & Aggregation Subsystem** | Limit/offset parameterized SQL, length-aware `paginate()`, `simple_paginate()`, `group_by()` & `having()` | ✅ Completed |
+| **Release v0.2.0: DX, Logging, Auth Refresh & Docs** | `ValidatedData` & `validate(request)`, `Request.input()` & `abort()`, `Router(prefix, middleware)`, `Blueprint.enum`/`medium_text`/`long_text`, `swiftpy.logging` (`Log`), `refresh_token_pair()` & `auth().logout()`, 17 user guides in `documentations/` | ✅ Completed |
 
-*See [`DEVLOG.md`](./DEVLOG.md) for detailed test reports and verified architectural guarantees.*
+*See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md) for the complete step-by-step documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
 ---
 
@@ -345,6 +350,87 @@ await SendWelcomeEmail(user_id=42, email="alice@example.com").dispatch()
 await SendWelcomeEmail(user_id=42, email="alice@example.com").dispatch(delay=60.0)
 ```
 
+### 8. Native AI Subsystem (LLM Client, Streaming, RAG & Agents)
+
+Use `swiftpy.ai` to call OpenAI or Anthropic models through one shared connection pool, stream SSE chunks cleanly, query PostgreSQL `pgvector` or cloud vector stores, build grounded `rag()` pipelines, run tool-calling `Agent` sessions, and test deterministically offline with `AIFake`:
+
+```python
+# routes/assistant.py
+from swiftpy.http.response import StreamingResponse
+from swiftpy.ai import (
+    AI,
+    Agent,
+    AgentMemory,
+    EmbeddingsClient,
+    InMemoryMemoryBackend,
+    InMemoryVectorStore,
+    Retriever,
+    XMLBlocksFormatter,
+    rag,
+    tool,
+)
+from swiftpy.testing import AIFake
+
+# 1. Fluent chat & SSE streaming with provider auto-inference
+response = await (
+    AI.chat(model="gpt-4o-mini")
+    .system("Answer concisely in one paragraph.")
+    .user("Summarize SwiftPY's transaction model.")
+    .temperature(0.2)
+    .max_tokens(300)
+    .send()
+)
+
+
+@app.get("/ai/stream")
+async def stream_answer(question: str = "Explain asyncpg pooling") -> StreamingResponse:
+    async def chunks():
+        client = AI.chat(model="claude-3-5-sonnet-20241022").user(question)
+        async for token in client.stream():
+            yield token.encode("utf-8")
+
+    return StreamingResponse(
+        chunks(), headers={"content-type": "text/plain; charset=utf-8"}
+    )
+
+
+# 2. Embeddings, Vector Stores (swap InMemoryVectorStore -> AI.vectorstore(adapter="pgvector", ...) for PostgreSQL) & RAG
+store = InMemoryVectorStore(dimensions=1536, metric="cosine")
+await store.create_collection("handbook", dimensions=1536, metric="cosine")
+retriever = Retriever(vectorstore=store, embeddings=EmbeddingsClient(), provider="deterministic")
+await retriever.add_documents(["SwiftPY manages asyncpg connections via DatabasePool."])
+
+rag_result = await (
+    rag()
+    .retriever(retriever)
+    .top_k(4)
+    .formatter(XMLBlocksFormatter())
+    .generator(AI.chat(model="gpt-4o-mini"))
+    .run("How does SwiftPY manage PostgreSQL connections?")
+)
+
+
+# 3. Typed @tool + Stateful Agent with session memory (testable via AIFake)
+@tool
+async def lookup_order_status(order_id: int) -> dict[str, object]:
+    """Look up fulfillment status for a customer order ID."""
+    return {"order_id": order_id, "status": "shipped"}
+
+
+with AIFake("Order #42 is shipped.") as fake:
+    agent = Agent(
+        name="SupportAssistant",
+        system_prompt="Help customers track orders accurately.",
+        tools=[lookup_order_status],
+        memory=AgentMemory(backend=InMemoryMemoryBackend(), session_id="user-7"),
+        model="gpt-4o-mini",
+    )
+    reply = await agent.run("Where is order #42?", session_id="user-7")
+    fake.assert_called_once()
+```
+
+See the full [AI Subsystem Guide](./documentations/2026-11-15-ai-subsystem.md) for `PgVectorAdapter` setups, `prompts/` templates + `cache:build` precompilation, rerankers, rate-limit/budget middlewares, observability telemetry, and `VectorStoreFake`.
+
 ---
 
 ## Command Line Interface (`swiftpy`)
@@ -374,12 +460,13 @@ swiftpy migrate:rollback
 swiftpy migrate:reset
 swiftpy db:seed
 
-# Scaffold migrations, models, requests, API keys, mailables, and more
+# Scaffold migrations, models, requests, schemas, API keys, mailables, and more
 swiftpy make:migration create_posts_table
 swiftpy make:model Post --migration
 swiftpy make:request RegisterRequest
+swiftpy make:schema OrderSchema
 swiftpy make:mail WelcomeEmail
-swiftpy make:api-key --name billing-client
+swiftpy make:api-key --prefix sk_live_
 
 # Create symbolic links from public/storage to storage/app/public
 swiftpy storage:link
@@ -416,6 +503,11 @@ SwiftPY reads environment variables and YAML/Python configuration files with str
 | `DB_SSL_CA_FILE` | `database.connections.postgresql.ssl_ca_file` | `""` | Filepath to CA certificate when `DB_SSL` is `"verify-ca"` or `"verify-full"`. |
 | `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | `[]` | Comma-separated list of allowed CORS origins (never pair `"*"` with `CORS_ALLOW_CREDENTIALS=true`). |
 | `CORS_ALLOW_CREDENTIALS` | `cors.allow_credentials` | `False` | Whether cross-origin requests may include credentials/cookies. |
+| `AI_ENABLED` | `ai.enabled` | `True` | Master toggle for `swiftpy.ai` requests (raises `AIModuleDisabledError` when disabled). |
+| `AI_DEFAULT_PROVIDER` | `ai.default` | `"openai"` | Default LLM provider (`"openai"` or `"anthropic"`) when not inferred from model name. |
+| `OPENAI_API_KEY` | `ai.providers.openai.api_key` | `""` | OpenAI API key for chat, streaming, and embeddings. |
+| `OPENAI_MODEL` | `ai.providers.openai.model` | `"gpt-4o"` | Default OpenAI chat model (`ANTHROPIC_MODEL` defaults to `"claude-3-5-sonnet-20241022"`). |
+| `AI_VECTORSTORE_DEFAULT` | `ai.vectorstores.default` | `"in_memory"` | Default vector store adapter (`"in_memory"`, `"pgvector"`, `"qdrant"`, `"pinecone"`, `"chroma"`, `"lancedb"`). |
 
 ---
 
@@ -491,6 +583,7 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   ├── providers/          # Service providers (auto-discovered on boot)
 │   │   ├── app_service_provider.py
 │   │   └── database_service_provider.py
+│   ├── schemas/            # Typed dataclasses & request/response DTOs
 │   └── services/           # Domain business logic
 ├── config/                 # Environment & framework configuration
 │   ├── ai.py
@@ -519,10 +612,11 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   ├── filesystem/         # Multi-disk Storage (local, public, s3) and uploads
 │   ├── helpers/            # Inflection (pluralize/snake_case), global helpers
 │   ├── http/               # Router, request/response, middleware pipeline
+│   ├── logging/            # Log facade, LogManager, async QueueHandler/QueueListener drivers
 │   ├── mail/               # Mailables, SMTP/Sendmail/API transports, templates
 │   ├── queue/              # At-least-once queue workers, job serialization
 │   ├── support/            # Shared identifiers, keys, Redis config, string inflection
-│   ├── testing/            # TestClient, AIFake, MailFake, StorageFake, DB fixtures
+│   ├── testing/            # TestClient, TestCase, AIFake, MailFake, VectorStoreFake, DB fixtures
 │   ├── validation/         # FormRequest, fail-closed Validator, builtin & DB rules
 │   └── websockets/         # WebSocket manager, connections, broadcast
 ├── tests/                  # Automated pytest suite

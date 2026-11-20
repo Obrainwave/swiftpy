@@ -142,7 +142,7 @@ my_api/
 │   ├── models/             # Active Record ORM models (User)
 │   ├── providers/          # Auto-discovered service providers
 │   ├── repositories/       # Data access layer
-│   ├── schemas/            # Typed dataclasses/schemas
+│   ├── schemas/            # Typed dataclasses/schemas (see Application Schemas guide)
 │   └── services/           # Business logic services
 ├── config/                 # Configuration files loading .env via env() / env_bool()
 ├── database/
@@ -159,7 +159,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.1.5, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.2.0, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -313,7 +313,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.1.5",
+       "swiftpy-framework>=0.2.0",
        # ...
    ]
    ```
@@ -325,7 +325,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    docker compose exec app swiftpy --version
    ```
 
-   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.4` to pull a newly published `0.1.5` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
+   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.6` to pull a newly published `0.2.0` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
 
      ```bash
      docker compose build --no-cache app
@@ -343,7 +343,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.1.5"
+python -m pip install --upgrade "swiftpy-framework>=0.2.0"
 swiftpy --version
 ```
 
@@ -355,4 +355,4 @@ Upgrading `swiftpy-framework` updates the installed framework library only—you
 
 ## Next Step
 
-Continue with the documentation sequence in [`docs/2026-11-14_documentation_plan.md`](../docs/2026-11-14_documentation_plan.md) (next guide: `documentations/2026-11-15-core-application-di-and-config.md`).
+Continue to [Application Lifecycle, Configuration & Dependency Injection](2026-11-15-core-application-di-and-config.md) to configure `Application`, `.env` / `config/`, service providers, scoped DI, and `Context`.

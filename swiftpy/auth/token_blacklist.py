@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import Awaitable, Sequence
-from typing import Any, Protocol
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, Protocol, cast
 
 import redis.asyncio as aioredis
 
+from swiftpy.auth.exceptions import BaseTokenBlacklist, is_token_blacklist_enabled
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.core.config import Config
 from swiftpy.core.container import Container, get_container
@@ -44,31 +45,7 @@ def _validate_positive_ttl(ttl: int | None) -> int | None:
     return ttl
 
 
-def is_token_blacklist_enabled(config: Config | None = None) -> bool:
-    """Return whether JWT token blacklist revocation checking is enabled."""
-    cfg = config
-    if cfg is None:
-        try:
-            cfg = Config.get_instance()
-        except (RuntimeError, ValueError):
-            return True
-
-    for key in (
-        "auth.guards.jwt.blacklist_enabled",
-        "auth.jwt.blacklist_enabled",
-        "auth.blacklist_enabled",
-    ):
-        val = cfg.get(key)
-        if val is not None:
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, str):
-                return val.strip().lower() not in ("false", "0", "no", "off")
-            return bool(val)
-    return True
-
-
-class TokenBlacklist:
+class TokenBlacklist(BaseTokenBlacklist):
     """
     Redis-backed token revocation list for JWT logout and invalidation (Decision D-1, P2-A3).
 
@@ -140,6 +117,35 @@ class TokenBlacklist:
 
         self._local_cache.clear()
         await client.set(key, "revoked", ex=expiration)
+
+    async def revoke_if_not_revoked(
+        self,
+        jti: str,
+        ttl: int | None = None,
+    ) -> bool:
+        """
+        Atomically revoke `jti` using Redis `SET ... NX`.
+        Returns True if newly revoked (first claim), or False if already revoked.
+        """
+        if not jti:
+            raise ValueError("JWT ID (jti) cannot be empty")
+
+        validated_ttl = _validate_positive_ttl(ttl)
+        client = await self.get_client()
+        key = f"{self.prefix}{jti}"
+        raw_ttl = validated_ttl if validated_ttl is not None else self.default_ttl
+        expiration = min(raw_ttl, self.max_token_lifetime)
+
+        self._local_cache.clear()
+        set_fn = cast(Callable[..., Awaitable[Any]], client.set)
+        try:
+            res = await set_fn(key, "revoked", ex=expiration, nx=True)
+        except TypeError:
+            if await self.is_revoked(jti):
+                return False
+            await client.set(key, "revoked", ex=expiration)
+            return True
+        return bool(res)
 
     async def revoke_token(
         self,
@@ -298,3 +304,6 @@ class TokenBlacklist:
         if self._client is not None and self._owns_client:
             await self._client.aclose()
             self._client = None
+
+
+__all__ = ["TokenBlacklist", "is_token_blacklist_enabled"]
