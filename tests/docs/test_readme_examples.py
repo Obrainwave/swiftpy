@@ -19,6 +19,18 @@ from swiftpy import (
     SecurityHeaders,
     json_response,
 )
+from swiftpy.ai import (
+    Agent,
+    AgentMemory,
+    EmbeddingsClient,
+    InMemoryMemoryBackend,
+    InMemoryVectorStore,
+    Retriever,
+    XMLBlocksFormatter,
+    rag,
+    tool,
+)
+from swiftpy.ai.client import AI
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.core.config import Config
 from swiftpy.database.migrations import Blueprint, Migration, Schema, SchemaGrammar
@@ -27,10 +39,12 @@ from swiftpy.database.pagination import Paginator, SimplePaginator
 from swiftpy.database.pool import DatabasePool
 from swiftpy.database.query_builder import Query
 from swiftpy.filesystem import Storage
+from swiftpy.http.response import StreamingResponse
 from swiftpy.mail.templates.renderer import MailTemplateRenderer
 from swiftpy.queue import Job
 from swiftpy.queue import job as queue_job
 from swiftpy.queue.job import set_dispatch_handler
+from swiftpy.testing import AIFake
 from swiftpy.testing.http_client import TestClient
 from swiftpy.validation import FormRequest
 from swiftpy.validation.rules import email, min_, required, string, unique
@@ -481,3 +495,95 @@ def test_readme_documented_config_and_env_keys() -> None:
     assert (repo_root / "views" / "mail").is_dir()
     renderer = MailTemplateRenderer()
     assert renderer.template_dir.name == "views"
+
+
+# ==============================================================================
+# 6. Native AI Subsystem (README Example 8)
+# ==============================================================================
+
+
+@tool
+async def readme_lookup_order_status(order_id: int) -> dict[str, object]:
+    """Look up fulfillment status for a customer order ID."""
+    return {"order_id": order_id, "status": "shipped"}
+
+
+@pytest.mark.asyncio
+async def test_readme_ai_client_rag_and_agent_example() -> None:
+    app = Application(
+        config={"app": {"name": "SwiftPY AI Docs", "env": "testing", "debug": True}},
+        auto_discover_providers=False,
+    )
+
+    @app.get("/ai/stream")
+    async def stream_answer(request: Request) -> StreamingResponse:
+        question = request.query_params.get("question", "Explain asyncpg pooling")
+
+        async def chunks() -> Any:
+            client = AI.chat(model="claude-3-5-sonnet-20241022").user(question)
+            async for token in client.stream():
+                yield token.encode("utf-8")
+
+        return StreamingResponse(
+            chunks(), headers={"content-type": "text/plain; charset=utf-8"}
+        )
+
+    # 1. Fluent chat + SSE streaming under AIFake
+    with AIFake("DatabasePool manages asyncpg connections.") as fake:
+        response = await (
+            AI.chat(model="gpt-4o-mini")
+            .system("Answer concisely in one paragraph.")
+            .user("Summarize SwiftPY's transaction model.")
+            .temperature(0.2)
+            .max_tokens(300)
+            .send()
+        )
+        assert response.content == "DatabasePool manages asyncpg connections."
+        fake.assert_called_once()
+
+        client = TestClient(app)
+        stream_resp = await client.get("/ai/stream", query={"question": "pool?"})
+        assert stream_resp.status_code == 200
+        assert "DatabasePool manages asyncpg connections." in stream_resp.text
+
+    # 2. Embeddings, InMemoryVectorStore & RAG pipeline
+    store = InMemoryVectorStore(dimensions=1536, metric="cosine")
+    await store.create_collection("handbook", dimensions=1536, metric="cosine")
+    retriever = Retriever(
+        vectorstore=store,
+        embeddings=EmbeddingsClient(),
+        provider="deterministic",
+    )
+    await retriever.add_documents(
+        ["SwiftPY manages asyncpg connections via DatabasePool."]
+    )
+
+    with AIFake("SwiftPY manages PostgreSQL connections with DatabasePool."):
+        rag_result = await (
+            rag()
+            .retriever(retriever)
+            .top_k(4)
+            .formatter(XMLBlocksFormatter())
+            .generator(AI.chat(model="gpt-4o-mini"))
+            .run("How does SwiftPY manage PostgreSQL connections?")
+        )
+        assert (
+            rag_result.text
+            == "SwiftPY manages PostgreSQL connections with DatabasePool."
+        )
+        assert len(rag_result.sources) == 1
+
+    # 3. @tool + Stateful Agent with session memory
+    with AIFake("Order #42 is shipped.") as fake:
+        agent = Agent(
+            name="SupportAssistant",
+            system_prompt="Help customers track orders accurately.",
+            tools=[readme_lookup_order_status],
+            memory=AgentMemory(
+                backend=InMemoryMemoryBackend(), session_id="user-7"
+            ),
+            model="gpt-4o-mini",
+        )
+        reply = await agent.run("Where is order #42?", session_id="user-7")
+        assert reply.content == "Order #42 is shipped."
+        fake.assert_called_once()

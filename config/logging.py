@@ -21,5 +21,9 @@ CONFIG = {
             "level": env("LOG_LEVEL", "info"),
             "days": 14,
         },
+        "stderr": {
+            "driver": "stderr",
+            "level": env("LOG_LEVEL", "info"),
+        },
     },
 }

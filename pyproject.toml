@@ -10,7 +10,7 @@ dev = [
 
 [project]
 name = "swiftpy-framework"
-version = "0.1.6"
+version = "0.2.0"
 description = "SwiftPY is a new generation async-first Python framework purpose built for the modern API and AI economy."
 requires-python = ">=3.12"
 dependencies = [
@@ -86,3 +86,6 @@ asyncio_mode = "auto"
 addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/models/**/*.py" = ["RUF012"]

@@ -16,8 +16,6 @@ from swiftpy.ai import (
     AI,
     Agent,
     AgentMemory,
-    AgentTracker,
-    AIFake,
     AIObservabilityManager,
     AIRateLimitMiddleware,
     CalculatorTool,
@@ -42,13 +40,15 @@ from swiftpy.ai import (
     WebSearchTool,
     XMLBlocksFormatter,
     ai,
-    aload_prompt,
     calculate_token_cost,
     load_prompt,
     rag,
     register_model_pricing,
     tool,
 )
+from swiftpy.ai.agents import AgentTracker
+from swiftpy.ai.prompts import aload_prompt
+from swiftpy.testing import AIFake
 ```
 
 ---
@@ -234,8 +234,9 @@ AIClient.register_provider("local_echo", LocalEchoProvider)
 Both `OpenAIProvider.stream()` and `AnthropicProvider.stream()` share `AIHttpPool`, decode chunks with `split_chunk_lines` (safe across multi-byte UTF-8 boundaries split across network frames), parse SSE events with `parse_sse_events`, record **time-to-first-token (`ttft_ms`)** and total `duration_ms` inside `AIObservabilityManager`, execute pre-flight safety middlewares, and close the underlying `httpx.Response` even if the consumer disconnects early (`CancelledError` / `GeneratorExit`):
 
 ```python
-from swiftpy import Application, StreamingResponse
+from swiftpy import Application
 from swiftpy.ai import AI
+from swiftpy.http.response import StreamingResponse
 
 app = Application()
 
@@ -252,7 +253,9 @@ async def stream_answer(question: str = "Explain asyncpg connection pools"):
         async for token in client.stream():
             yield token.encode("utf-8")
 
-    return StreamingResponse(event_chunks(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(
+        event_chunks(), headers={"content-type": "text/plain; charset=utf-8"}
+    )
 ```
 
 Notice how `AIClient.stream()` behaves cleanly with observability and HTTP connections:
@@ -291,7 +294,8 @@ Customer message:
 Use `aload_prompt` / `.aprompt(...)` inside `async def` request handlers so filesystem reads run via `asyncio.to_thread` rather than blocking the event loop:
 
 ```python
-from swiftpy.ai import AI, PromptLoader, aload_prompt
+from swiftpy.ai import AI, PromptLoader
+from swiftpy.ai.prompts import aload_prompt
 
 
 async def draft_triage_reply(ticket_id: int, plan: str, body: str) -> str:
@@ -509,14 +513,14 @@ def score_pairs(query: str, docs: list[str]) -> list[float]:
 
 
 async def answer_with_rag(question: str, handbook_markdown: str) -> dict[str, object]:
-    store = InMemoryVectorStore(dimensions=32, metric="cosine")
-    await store.create_collection("handbook", dimensions=32, metric="cosine")
+    store = InMemoryVectorStore(dimensions=1536, metric="cosine")
+    await store.create_collection("handbook", dimensions=1536, metric="cosine")
 
     embeddings = EmbeddingsClient()
     retriever = Retriever(
         vectorstore=store,
         embeddings=embeddings,
-        provider="deterministic",  # swap to "openai" with matching dimensions (e.g. 1536) in prod
+        provider="deterministic",  # swap to "openai" in production
         top_k=8,
         min_score=0.0,
     )
@@ -644,11 +648,11 @@ Key safeguards built into `ToolLoop`:
 from swiftpy.ai import (
     Agent,
     AgentMemory,
-    AgentTracker,
     CalculatorTool,
     DatabaseMemoryBackend,
     RedisMemoryBackend,
 )
+from swiftpy.ai.agents import AgentTracker
 
 
 def build_finance_agent(session_id: str, storage: str = "database") -> Agent:
@@ -799,7 +803,8 @@ async def bootstrap_ai_observability() -> dict[str, object]:
 Use `AIFake` to intercept every LLM and embedding call without hitting external vendor APIs. `AIFake` uses a task-local `ContextVar` stack (`async with AIFake(...) as fake:`), making parallel async tests isolated from one another while still exercising middlewares and `AIObservabilityManager` telemetry:
 
 ```python
-from swiftpy.ai import AI, AIFake, CalculatorTool
+from swiftpy.ai import AI, CalculatorTool
+from swiftpy.testing import AIFake
 
 
 async def test_ai_workflows_with_fake() -> None:
@@ -854,4 +859,4 @@ You can also pass a sequence queue (each call pops the next fixture, ideal for m
 
 ## Next Step
 
-Continue to [Developer CLI & Testing Utilities](2026-11-15-cli-and-testing.md) for the complete `swiftpy` console command reference (`new`, `start`, `make:*`, `migrate*`, `cache:*`, `queue:*`, `storage:link`) and SwiftPY's test harness (`TestClient`, `TestResponse`, `TestCase`, `db_transaction`, `Mail.fake()`, `StorageFake`, `AIFake`).
+Continue to [Developer CLI & Testing Utilities](2026-11-19-cli-and-testing.md) for the complete `swiftpy` console command reference (`new`, `start`, `make:*`, `migrate*`, `cache:*`, `queue:*`, `storage:link`) and SwiftPY's test harness (`TestClient`, `TestResponse`, `TestCase`, `db_transaction`, `Mail.fake()`, `AIFake`, `VectorStoreFake`).

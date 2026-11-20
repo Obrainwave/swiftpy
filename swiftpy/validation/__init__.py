@@ -45,7 +45,12 @@ from swiftpy.validation.rules import (
     unique,
     url,
 )
-from swiftpy.validation.validator import ValidationResult, Validator, validate
+from swiftpy.validation.validator import (
+    ValidatedData,
+    ValidationResult,
+    Validator,
+    validate,
+)
 
 __all__ = [
     "BailRule",
@@ -67,6 +72,7 @@ __all__ = [
     "StrRule",
     "UniqueRule",
     "UrlRule",
+    "ValidatedData",
     "ValidationException",
     "ValidationResult",
     "Validator",

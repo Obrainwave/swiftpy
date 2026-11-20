@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Iterator, Mapping
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from urllib.parse import parse_qs
 
 from swiftpy.core.config import Config
@@ -99,6 +99,23 @@ class RequestHeaders(Mapping[str, str]):
 
 
 class Request:
+    _RESERVED_INPUT_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "admin_user",
+            "asgi",
+            "auth",
+            "client",
+            "cookies",
+            "http_version",
+            "is_admin",
+            "is_authenticated",
+            "root_path",
+            "server",
+            "session",
+            "user",
+        }
+    )
+
     def __init__(
         self,
         scope: dict[str, Any],
@@ -121,6 +138,9 @@ class Request:
         self._json: Any = None
         self._json_parsed: bool = False
         self._form: FormData | None = None
+        self._input_loaded: bool = False
+        self._input_cache: dict[str, Any] = {}
+        self._non_dict_payload: bool = False
 
         self.state: dict[str, Any] = {}
 
@@ -131,6 +151,13 @@ class Request:
     @property
     def path(self) -> str:
         return cast(str, self.scope["path"])
+
+    @property
+    def scheme(self) -> str:
+        raw_scheme = self.scope.get("scheme")
+        if isinstance(raw_scheme, str) and raw_scheme:
+            return raw_scheme
+        return "http"
 
     @property
     def headers(self) -> RequestHeaders:
@@ -368,6 +395,87 @@ class Request:
         if name is not None:
             return form_data.get_files(name)
         return dict(form_data.files_list)
+
+    async def input(
+        self,
+        key: str | None = None,
+        default: Any = None,
+        *,
+        _preload: bool = False,
+    ) -> Any:
+        """Load (and cache) merged query parameters and request body fields, or return one field."""
+        if not self._input_loaded:
+            merged: dict[str, Any] = dict(self.query_params)
+            content_type = self.headers.get("content-type", "")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+
+            if media_type in (
+                "application/x-www-form-urlencoded",
+                "multipart/form-data",
+            ):
+                try:
+                    form_data = await self.form()
+                except (HttpException, ValueError, UnicodeDecodeError) as exc:
+                    if isinstance(exc, (PayloadTooLargeError, ClientDisconnect)) or not _preload:
+                        raise
+                    if key is not None:
+                        return merged.get(key, default)
+                    return dict(merged)
+                for k, vals in form_data.fields_list.items():
+                    merged[k] = vals[0] if len(vals) == 1 else list(vals)
+                for k, flist in form_data.files_list.items():
+                    if k not in merged:
+                        merged[k] = flist[0] if len(flist) == 1 else list(flist)
+            elif (
+                media_type == "application/json"
+                or media_type.endswith("+json")
+                or not media_type
+            ):
+                raw_bytes = await self.body()
+                if raw_bytes.strip():
+                    try:
+                        parsed = await self.json()
+                    except (HttpException, ValueError, UnicodeDecodeError) as exc:
+                        if isinstance(exc, (PayloadTooLargeError, ClientDisconnect)) or not _preload:
+                            raise
+                        if key is not None:
+                            return merged.get(key, default)
+                        return dict(merged)
+                    if isinstance(parsed, dict):
+                        merged.update(parsed)
+                    else:
+                        self._non_dict_payload = True
+
+            self._input_cache = merged
+            self._input_loaded = True
+
+        if key is not None:
+            return self._input_cache.get(key, default)
+        return dict(self._input_cache)
+
+    def _current_input_mapping(self) -> dict[str, Any]:
+        return self._input_cache if self._input_loaded else self.query_params
+
+    def all(self) -> dict[str, Any]:
+        """Return all loaded input parameters (or query parameters if body has not been loaded)."""
+        return dict(self._current_input_mapping())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return an input parameter by key, or `default` when absent."""
+        return self._current_input_mapping().get(key, default)
+
+    def has(self, key: str) -> bool:
+        """Return True if an input parameter exists in the current request input."""
+        return key in self._current_input_mapping()
+
+    def __getattr__(self, name: str) -> Any:
+        if not name.startswith("_") and name not in self._RESERVED_INPUT_ATTRS:
+            mapping = self._current_input_mapping()
+            if name in mapping:
+                return mapping[name]
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
 
     async def close(self) -> None:
         if self._form is not None:

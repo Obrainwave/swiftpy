@@ -149,50 +149,56 @@ Before your handler runs, SwiftPY inspects `Content-Type` and parses the request
 - **`application/x-www-form-urlencoded`**: parses URL-encoded fields via `await request.form()`. Single field values stay scalar `str`; repeated keys become `list[str]`. Empty bodies return `422`.
 - **`multipart/form-data`**: parses both form fields and uploaded files (`UploadedFile` / `list[UploadedFile]`; form fields take precedence if a field and file share the same key). Completely empty multipart payloads return `422`.
 
-### Mass-Assignment Protection & Data Accessors
+### Mass-Assignment Protection & `ValidatedData` Accessors
 
 If a client submits extra unvalidated keys such as `{"name": "Jane", "is_admin": true, "role": "superuser"}`, only fields declared in your rules appear in validated data:
 
-- `form.validated()` — returns a `dict[str, Any]` copy of **validated and coerced fields only** (never includes `"is_admin"` or `"role"` unless declared in your rules).
+- `form.validated()` — returns a `ValidatedData` (`dict[str, Any]` subclass) copy of **validated and coerced fields only** (never includes `"is_admin"` or `"role"` unless declared in your rules). Because `ValidatedData` subclasses `dict`, it works seamlessly with `**data`, `data["email"]`, `data.get(...)`, and nested dot access like `data.profile.handle` (keys that match `dict` method names such as `"items"` still resolve via bracket lookup `data["items"]`).
 - `form.all()` — returns a `dict[str, Any]` copy of all raw parsed input fields.
 - `form.get(key, default=None)` / `form[key]` / `key in form` — reads from validated fields.
 - `form.<field>` (attribute access, e.g. `form.email`) — reads from validated fields and raises `AttributeError` for unvalidated attributes.
 - `form.request` — the active `Request` instance (or `None` outside HTTP dispatch).
 - `form.validation_result` — the underlying `ValidationResult` (or `None` if instantiated manually).
+- `stop_on_first_error: ClassVar[bool] = True` — set on a `FormRequest` subclass to stop rule evaluation as soon as the first error occurs (also combine with `"bail"` for single-error payloads).
 
 > [!TIP]
-> Always pass `form.validated()` — not `form.all()` or `await request.json()` — into ORM `create()` / `update()` methods so untrusted clients cannot smuggle unexpected attributes.
+> Always pass `form.validated()` — not `form.all()` or `await request.json()` — into ORM `create()` / `update()` methods so untrusted clients cannot smuggle unexpected attributes. See [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md) for structuring request/response DTOs alongside `FormRequest`.
 
 ---
 
 ## Standalone Validation with `validate()` & `Validator`
 
-Use `await validate(data, schema, ...)` (or `Validator(data, schema, ...).validate()`) in services, WebSocket handlers, background jobs, or routes where you inspect dictionaries manually:
+Use `await validate(data_or_request, schema, ...)` (or `Validator(data, schema, ...).validate()`) in services, WebSocket handlers, background jobs, or routes. Passing a `Request` instance directly reads JSON, form, or query input automatically based on HTTP method and `Content-Type`:
 
 ```python
 from __future__ import annotations
 
+from swiftpy.http.request import Request
+from swiftpy.http.response import Response, json_response
 from swiftpy.validation import ValidationException, validate
 
 
-async def update_profile(payload: dict[str, object]) -> dict[str, object]:
-    result = await validate(
-        payload,
-        {
-            "display_name": "required|str|min:2|max:80",
-            "age": "nullable|int|between:13,120",
-            "website": "nullable|url",
-        },
-        messages={
-            "display_name.min": "Display name must be at least 2 characters.",
-        },
-    )
+async def register_account(request: Request) -> Response:
+    data = (
+        await validate(
+            request,
+            {
+                "display_name": "required|str|min:2|max:80",
+                "age": "nullable|int|between:13,120",
+                "website": "nullable|url",
+            },
+            messages={
+                "display_name.min": "Display name must be at least 2 characters.",
+            },
+            stop_on_first_error=False,
+        )
+    ).raise_if_failed().validated()
 
-    if result.fails():
-        raise ValidationException(result.errors)
-
-    return result.validated()
+    # ValidatedData works both as a dict and with attribute access (data.display_name)
+    return json_response({"display_name": data.display_name, "age": data.get("age")})
 ```
+
+To return single-error JSON payloads (`{"message": "...", "field": "..."}`) on failure, catch `ValidationException as exc` and return/raise `exc.single()`, which exposes `.first_field()`, `.first_error(field_name=None)`, and `.first_errors()` without mutating the original exception.
 
 ### `ValidationResult` API
 
@@ -202,15 +208,17 @@ async def update_profile(payload: dict[str, object]) -> dict[str, object]:
 |---|---|---|
 | `is_valid` | `bool` | `True` when `errors` is empty (`bool(result)` matches `is_valid`) |
 | `passes()` / `fails()` | `bool` | Explicit validity helpers |
+| `raise_if_failed()` | `Self` | Raises `ValidationException(self.errors)` if `fails()`, otherwise returns `self` for fluent chaining (`.raise_if_failed().validated()`) |
 | `errors` | `dict[str, list[str]]` | Field-keyed lists of validation error messages |
-| `validated_data` | `dict[str, Any]` | Dict of validated and type-coerced/normalized values |
-| `validated()` | `dict[str, Any]` | Returns a shallow copy of `validated_data` |
+| `validated_data` | `ValidatedData` | Dict subclass of validated and coerced values supporting dot and bracket access |
+| `validated()` | `ValidatedData` | Returns a fresh `ValidatedData` copy of `validated_data` |
 | `first_error(field_name=None)` | `str \| None` | First error for `field_name`, or first error across all fields |
+| `first_errors()` | `dict[str, str]` | Mapping of each invalid field name to its first error message |
 | `errors_for(field_name)` | `list[str]` | Copy of all error messages for `field_name` |
 | `all_errors()` | `list[str]` | Flattened list of every error message across all fields |
 
 > [!NOTE]
-> If `data` passed to `validate()` is not a `dict` (for instance `[]` or a string), `validate()` returns `ValidationResult(is_valid=False, errors={"body": ["The request body must be a JSON object."]})`.
+> If `data` passed to `validate()` is not a `dict` or `Request` (for instance `[]` or a string), `validate()` returns `ValidationResult(is_valid=False, errors={"body": ["The request body must be a JSON object."]})`.
 
 ---
 
@@ -564,4 +572,4 @@ def register_validation_renderer(app: Application) -> None:
 
 ## Next Step
 
-Continue with **#5 — Database Pool, Query Builder, Transactions & Migrations**: [`docs/2026-11-14_documentation_plan.md`](../docs/2026-11-14_documentation_plan.md).
+Continue to [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md) to organize typed `@dataclass(slots=True)` input/output DTOs and `make:schema` validation rule classes across services, repositories, and routes.

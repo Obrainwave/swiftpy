@@ -4,7 +4,11 @@ from typing import Any, ClassVar
 
 import pytest
 
-from swiftpy.database.orm.model import Model
+from swiftpy.database.orm.model import (
+    Model,
+    restore_model_registry,
+    snapshot_model_registry,
+)
 from swiftpy.database.orm.relationships import (
     BelongsTo,
     BelongsToMany,
@@ -189,3 +193,32 @@ def test_symmetric_equality_and_hash() -> None:
     # Different class types must not be equal (symmetric check)
     assert author != sub_author
     assert sub_author != author
+
+
+def test_string_relationship_target_requires_import_before_resolution() -> None:
+    """String relationship targets resolve via _MODEL_REGISTRY once imported."""
+    snap = snapshot_model_registry()
+    try:
+
+        class OrderOwner(Model):
+            __table__ = "test_order_owners"
+            __fillable__ = ["name"]  # noqa: RUF012
+            id: int
+            name: str
+            items = HasMany("LateImportedItem", foreign_key="owner_id")
+
+        owner = OrderOwner(id=1, name="Alice")
+        with pytest.raises(RuntimeError, match="LateImportedItem.*has not been registered"):
+            _ = owner.items
+
+        class LateImportedItem(Model):
+            __table__ = "test_late_imported_items"
+            __fillable__ = ["owner_id", "label"]  # noqa: RUF012
+            id: int
+            owner_id: int
+            label: str
+
+        builder = owner.items
+        assert builder is not None
+    finally:
+        restore_model_registry(snap)

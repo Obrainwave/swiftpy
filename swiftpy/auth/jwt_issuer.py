@@ -9,8 +9,9 @@ import math
 import secrets
 import time
 import uuid
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol, TypeGuard
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -20,29 +21,34 @@ from cryptography.hazmat.primitives.asymmetric.rsa import (
     RSAPublicKey,
 )
 
+from swiftpy.auth.exceptions import (
+    AuthenticationServiceUnavailableError,
+    BaseTokenBlacklist,
+    InvalidAlgorithmError,
+    InvalidSignatureError,
+    InvalidTokenError,
+    JWTError,
+    TokenExpiredError,
+    TokenRevokedError,
+    is_token_blacklist_enabled,
+)
 from swiftpy.core.config import Config, ConfigurationError
+from swiftpy.core.container import Container, get_container
 
 logger = logging.getLogger("swiftpy.auth.jwt")
 
 
-class JWTError(Exception):
-    """Base exception for all JWT-related errors."""
+class RefreshTokenBlacklist(Protocol):
+    """Structural protocol for token blacklist implementations used during refresh."""
 
+    async def is_revoked(
+        self,
+        jti: str,
+        subject: str | int | None = None,
+        issued_at: int | None = None,
+    ) -> bool: ...
 
-class InvalidTokenError(JWTError):
-    """Raised when a token is structurally malformed or invalid."""
-
-
-class TokenExpiredError(JWTError):
-    """Raised when a token's exp claim is in the past."""
-
-
-class InvalidSignatureError(InvalidTokenError):
-    """Raised when a token's signature cannot be verified."""
-
-
-class InvalidAlgorithmError(InvalidTokenError):
-    """Raised when an algorithm is disallowed, missing, or mismatched."""
+    async def revoke(self, jti: str, ttl: int | None = None) -> None: ...
 
 
 def _base64url_encode(data: bytes) -> str:
@@ -66,7 +72,7 @@ def _base64url_decode(data: str) -> bytes:
     return decoded
 
 
-def _is_valid_timestamp(value: Any) -> bool:
+def _is_valid_timestamp(value: Any) -> TypeGuard[int | float]:
     """Return True if value is a finite int or float (excluding bool)."""
     return (
         not isinstance(value, bool)
@@ -106,6 +112,8 @@ class JWTIssuer:
         issuer: str | None = None,
         audience: str | list[str] | set[str] | tuple[str, ...] | None = None,
         leeway: int = 0,
+        blacklist: RefreshTokenBlacklist | None = None,
+        blacklist_resolver: Callable[[], RefreshTokenBlacklist | None] | None = None,
     ) -> None:
         if not isinstance(algorithm, str) or algorithm not in self.SUPPORTED_ALGORITHMS:
             raise InvalidAlgorithmError(
@@ -121,6 +129,8 @@ class JWTIssuer:
         self.issuer = issuer
         self.audience = audience
         self.leeway = int(leeway)
+        self._blacklist = blacklist
+        self._blacklist_resolver = blacklist_resolver
 
         # Symmetric key setup
         self._secret: bytes | None = None
@@ -182,7 +192,13 @@ class JWTIssuer:
             )
 
     @classmethod
-    def from_config(cls, config: Config | None = None) -> JWTIssuer:
+    def from_config(
+        cls,
+        config: Config | None = None,
+        *,
+        blacklist: RefreshTokenBlacklist | None = None,
+        blacklist_resolver: Callable[[], RefreshTokenBlacklist | None] | None = None,
+    ) -> JWTIssuer:
         """
         Build and configure a JWTIssuer from application Config.
 
@@ -263,6 +279,8 @@ class JWTIssuer:
             issuer=str(issuer) if issuer else None,
             audience=audience,
             leeway=leeway,
+            blacklist=blacklist,
+            blacklist_resolver=blacklist_resolver,
         )
 
     @classmethod
@@ -444,6 +462,151 @@ class JWTIssuer:
             "token_type": "Bearer",
             "expires_in": ttl_seconds,
         }
+
+    def _resolve_refresh_blacklist(
+        self,
+        explicit: RefreshTokenBlacklist | None,
+    ) -> RefreshTokenBlacklist | None:
+        """Resolve an active token blacklist for refresh rotation and reuse checks."""
+        if explicit is not None:
+            return explicit
+
+        container: Container | None
+        try:
+            container = get_container()
+        except RuntimeError:
+            container = None
+
+        if container is not None:
+            cfg = container.resolve(Config) if container.has(Config) else None
+            if not is_token_blacklist_enabled(cfg):
+                return None
+
+        if self._blacklist is not None:
+            return self._blacklist
+
+        if self._blacklist_resolver is not None:
+            resolved = self._blacklist_resolver()
+            if resolved is not None:
+                return resolved
+
+        if container is not None:
+            if container.has(BaseTokenBlacklist):
+                return container.resolve(BaseTokenBlacklist)
+            for binding_cls in tuple(container._bindings):
+                if isinstance(binding_cls, type) and issubclass(
+                    binding_cls, BaseTokenBlacklist
+                ):
+                    return container.resolve(binding_cls)
+
+        return None
+
+    async def refresh_token_pair(
+        self,
+        refresh_token: str,
+        *,
+        blacklist: RefreshTokenBlacklist | None = None,
+        claims: dict[str, Any] | None = None,
+        refresh_claims: dict[str, Any] | None = None,
+        access_expires_in: int | timedelta | None = None,
+        refresh_expires_in: int | timedelta | None = None,
+        rotate: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Verify a refresh token, reject blacklisted/reused tokens, optionally rotate
+        (revoke old refresh `jti`), and issue a fresh access/refresh token pair.
+        """
+        payload = self.decode_token(
+            refresh_token,
+            verify_exp=True,
+            expected_type="refresh",
+        )
+        subject = str(payload["sub"])
+        jti = payload.get("jti")
+        raw_iat = payload.get("iat")
+        iat = (
+            int(raw_iat)
+            if isinstance(raw_iat, (int, float)) and not isinstance(raw_iat, bool)
+            else None
+        )
+
+        active_blacklist = self._resolve_refresh_blacklist(blacklist)
+        if active_blacklist is not None:
+            if not isinstance(jti, str) or not jti:
+                raise InvalidTokenError("Refresh token is missing required 'jti' claim")
+
+            try:
+                is_rev = await active_blacklist.is_revoked(
+                    jti,
+                    subject=subject,
+                    issued_at=iat,
+                )
+            except Exception as exc:
+                logger.exception("Refresh token revocation check failed")
+                raise AuthenticationServiceUnavailableError(
+                    "Authentication service unavailable"
+                ) from exc
+
+            if is_rev:
+                logger.warning(
+                    "Rejected revoked or reused refresh token (jti=%s, sub=%s)",
+                    jti,
+                    subject,
+                )
+                raise TokenRevokedError("Refresh token has been revoked")
+
+            if rotate:
+                raw_exp = payload.get("exp")
+                remaining = (
+                    max(1, int(raw_exp - time.time()))
+                    if _is_valid_timestamp(raw_exp)
+                    else max(1, self.refresh_token_ttl)
+                )
+                claimed = True
+                try:
+                    atomic_fn = getattr(
+                        active_blacklist, "revoke_if_not_revoked", None
+                    )
+                    if callable(atomic_fn):
+                        claimed = bool(await atomic_fn(jti, ttl=remaining))
+                    else:
+                        await active_blacklist.revoke(jti, ttl=remaining)
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to revoke rotated refresh token (jti=%s, sub=%s)",
+                        jti,
+                        subject,
+                    )
+                    raise AuthenticationServiceUnavailableError(
+                        "Authentication service unavailable"
+                    ) from exc
+
+                if not claimed:
+                    logger.warning(
+                        "Rejected concurrently reused refresh token (jti=%s, sub=%s)",
+                        jti,
+                        subject,
+                    )
+                    raise TokenRevokedError("Refresh token has been revoked")
+
+        inherited_refresh_claims = {
+            key: value
+            for key, value in payload.items()
+            if key not in self.RESERVED_CLAIMS
+        }
+        resolved_refresh_claims = (
+            refresh_claims
+            if refresh_claims is not None
+            else (inherited_refresh_claims or None)
+        )
+
+        return self.issue_token_pair(
+            subject=subject,
+            claims=claims,
+            access_expires_in=access_expires_in,
+            refresh_expires_in=refresh_expires_in,
+            refresh_claims=resolved_refresh_claims,
+        )
 
     def decode_token(
         self,
@@ -656,3 +819,14 @@ class JWTIssuer:
             return
 
         raise InvalidAlgorithmError(f"Unsupported algorithm '{algorithm}'")
+
+
+__all__ = [
+    "InvalidAlgorithmError",
+    "InvalidSignatureError",
+    "InvalidTokenError",
+    "JWTError",
+    "JWTIssuer",
+    "RefreshTokenBlacklist",
+    "TokenExpiredError",
+]

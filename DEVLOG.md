@@ -2384,5 +2384,25 @@ Implemented a first-class Filesystem and Storage subsystem inspired by Laravel's
   - Clean error handlers in `app/http/handler/exceptions.py`.
   - Clean HTML views in `views/mail/` and `views/admin/`.
 
+---
+
+## Release v0.2.0 - Developer Ergonomics, Structured Logging, Auth Refresh & Complete Documentation
+
+### Status: PASSED — FULL CI SUITE (`1,500 PASSED, 7 SKIPPED, 85.80% COVERAGE`), RUFF, 4x MYPY STRICT, BUILD & CLEAN-VENV WHEEL SMOKE TEST VERIFIED
+
+- **Release Scope (Phases 1–9):**
+  1. **Models & Ruff Ergonomics:** Removed `ClassVar` boilerplate from `app/models/user.py`, `swiftpy/console/stubs/model.stub`, and generated project model templates; added per-file `"app/models/**/*.py" = ["RUF012"]` ignore in `pyproject.toml` and `swiftpy new` templates.
+  2. **Migrations & Schema Types:** Added `Blueprint.enum()`, `Blueprint.medium_text()`, and `Blueprint.long_text()` with SQL literal escaping and named `CHECK` constraints (documenting PostgreSQL's intentional omission of `.after()` and `Schema.rename`).
+  3. **Validation Ergonomics:** Added `ValidatedData` (recursive dot attribute + dict access), `validate(request, rules)` direct `Request` extraction, `ValidationResult.raise_if_failed()` / `first_errors()`, `FormRequest.stop_on_first_error`, and `ValidationException.first_field()` / `first_error()` / `first_errors()` / `single()`.
+  4. **HTTP Request, Router & Exceptions:** Added `Request.scheme`, `Request.input()`, `all()`, `get()`, `has()`, `request.<field>` dynamic lookup (with `_RESERVED_INPUT_ATTRS` protection against attribute spoofing and safe `_preload=True` fallback for non-JSON raw webhook bodies), `auto_load_request_input=True` toggle on `Application`, `Router(prefix=..., middleware=...)`, declarative `HttpException` defaults (`status_code`, `message`), and `abort()`.
+  5. **Structured Asynchronous Logging (`swiftpy.logging` / `Log`):** Implemented non-blocking `QueueHandler`/`QueueListener` (`queue_size=10_000`) channels (`single`, `daily`, `stderr`, recursive `stack`) with automatic recursive sensitive-key redaction (`[REDACTED]`), wired into `FrameworkServiceProvider` (started first with rollback, stopped/flushed last; measured `LogManager.astart()` at `7.56 ms` vs `DatabasePool.init()` at `1077.24 ms` opening `min_size=5` PostgreSQL connections) with per-`Application` isolation.
+  6. **Auth Token Refresh & Session Revocation:** Added `JWTIssuer.refresh_token_pair()` with atomic Redis `SET ... NX` rotation (`TokenBlacklist.revoke_if_not_revoked()`) and reuse rejection (`TokenRevokedError` inheriting from `AuthenticationError` and `JWTError`), `AuthProxy.logout()` / `logout_all()`, and `AdminSessionStore.flush()`.
+  7. **Database Sequence Verification:** Added `tests/database/test_sequence_gaps.py` verifying PostgreSQL `BIGSERIAL` / identity sequence gap behavior on unique violations and rolled-back transactions with zero data loss.
+  8. **Documentation Overhaul & Release `0.2.0`:** Authored 6 new guides in `documentations/`, updated existing guides and `README.md` (including AI subsystem showcase & `app/schemas/` guide), bumped `pyproject.toml` and `swiftpy new` template floor (`>=0.2.0`), refreshed `uv.lock`, updated `CHANGELOG.md`, built `dist/swiftpy_framework-0.2.0*`, passed `twine check` and clean-venv `swiftpy new` + `swiftpy start` smoke verification.
+- **Full Suite Execution (`task-3489` against Docker PostgreSQL `127.0.0.1:25432` & Redis `127.0.0.1:26379`):**
+  - `pytest -vv -ra --durations=30 --timeout=120 --timeout-method=thread --cov=swiftpy --cov-report=term-missing --cov-fail-under=80` -> **`1500 passed, 7 skipped in 1950.28s (0:32:30)`**, **`85.80%` coverage** (`25,495` statements, `3,620` missed; 7 skips are live external Chroma/LanceDB/Pinecone/Qdrant/OpenAI/Cohere/pgvector RAG API tests missing live credentials).
+  - `uv run ruff check .` -> **`All checks passed!`**
+  - `uv run --no-sync --with jinja2 --with aiosmtplib mypy swiftpy`, `uv run mypy swiftpy`, `uv run mypy .`, `uv run mypy --explicit-package-bases .` -> **zero errors** across `191` / `426` files.
+
 
 

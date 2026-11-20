@@ -3,14 +3,22 @@ from __future__ import annotations
 import copy
 import importlib
 import inspect
+import logging
+import math
+import time
 import weakref
 from collections.abc import Callable, Iterator
 from typing import Any
 
 from swiftpy.auth.api_key_guard import ApiKeyGuard
+from swiftpy.auth.exceptions import (
+    AuthenticationError,
+    AuthenticationServiceUnavailableError,
+    JWTError,
+)
 from swiftpy.auth.jwt_guard import JWTGuard
 from swiftpy.auth.jwt_issuer import JWTIssuer
-from swiftpy.auth.token_blacklist import TokenBlacklist
+from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
 from swiftpy.core.config import Config
 from swiftpy.core.container import Container, get_container
 from swiftpy.core.context import Context
@@ -18,6 +26,8 @@ from swiftpy.database.orm.model import Model
 from swiftpy.database.orm.registry import _MODEL_REGISTRY
 from swiftpy.database.pool import DatabasePool
 from swiftpy.http.request import Request
+
+logger = logging.getLogger("swiftpy.auth.manager")
 
 _CONTEXT_USER_KEY = "__swiftpy_current_user__"
 _CONTEXT_USER_MODEL_KEY = "__swiftpy_current_user_model__"
@@ -317,6 +327,203 @@ class AuthProxy:
         if inspect.isawaitable(res):
             return await res
         return res
+
+    @staticmethod
+    def _extract_bearer_token(request: Request | None) -> str | None:
+        if request is None:
+            return None
+        auth_header = request.headers.get("authorization")
+        if not auth_header:
+            return None
+        parts = auth_header.strip().split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return None
+        token = parts[1].strip()
+        return token or None
+
+    @staticmethod
+    def _resolve_blacklist_and_issuer(
+        *,
+        blacklist: TokenBlacklist | None = None,
+        issuer: JWTIssuer | None = None,
+    ) -> tuple[TokenBlacklist | None, JWTIssuer | None]:
+        active_blacklist = blacklist
+        active_issuer = issuer
+        try:
+            container = get_container()
+        except RuntimeError:
+            container = None
+
+        if container is not None:
+            cfg = container.resolve(Config) if container.has(Config) else None
+            if (
+                active_blacklist is None
+                and is_token_blacklist_enabled(cfg)
+                and container.has(TokenBlacklist)
+            ):
+                active_blacklist = container.resolve(TokenBlacklist)
+            if active_issuer is None and container.has(JWTIssuer):
+                active_issuer = container.resolve(JWTIssuer)
+            elif active_issuer is None and cfg is not None:
+                active_issuer = JWTIssuer.from_config(cfg)
+
+        return active_blacklist, active_issuer
+
+    @staticmethod
+    def _clear_auth_context(request: Request | None = None) -> None:
+        Context.set(_CONTEXT_USER_KEY, None)
+        Context.set(_CONTEXT_USER_MODEL_KEY, None)
+        Context.set(_CONTEXT_AUTH_GUARD_KEY, None)
+        req = request if isinstance(request, Request) else Context.get("request")
+        if isinstance(req, Request) and hasattr(req, "state"):
+            req.state.pop("user", None)
+            req.state.pop("auth_guard", None)
+
+    @staticmethod
+    async def _revoke_raw_token(
+        blacklist: TokenBlacklist,
+        raw_token: str,
+        *,
+        issuer: JWTIssuer | None,
+        token_label: str,
+    ) -> None:
+        try:
+            await blacklist.revoke_token(raw_token, issuer=issuer)
+        except JWTError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to revoke %s token during logout", token_label)
+            raise AuthenticationServiceUnavailableError(
+                "Authentication service unavailable"
+            ) from exc
+
+    async def logout(
+        self,
+        request: Request | None = None,
+        *,
+        token: str | None = None,
+        refresh_token: str | None = None,
+        blacklist: TokenBlacklist | None = None,
+        issuer: JWTIssuer | None = None,
+        clear_context: bool = True,
+    ) -> None:
+        """
+        Revoke the current session's JWT token(s) in `TokenBlacklist` and clear request auth context.
+        """
+        raw_req = request if request is not None else Context.get("request")
+        req = raw_req if isinstance(raw_req, Request) else None
+        target_token = (
+            token if token is not None else self._extract_bearer_token(req)
+        )
+        active_blacklist, active_issuer = self._resolve_blacklist_and_issuer(
+            blacklist=blacklist,
+            issuer=issuer,
+        )
+
+        if active_blacklist is not None:
+            if target_token is not None:
+                await self._revoke_raw_token(
+                    active_blacklist,
+                    target_token,
+                    issuer=active_issuer,
+                    token_label="access",
+                )
+            else:
+                ctx_payload = Context.get(_CONTEXT_USER_KEY)
+                if (
+                    not isinstance(ctx_payload, dict)
+                    and req is not None
+                    and isinstance(req.state.get("user"), dict)
+                ):
+                    ctx_payload = req.state.get("user")
+                if isinstance(ctx_payload, dict) and ctx_payload.get("jti"):
+                    raw_exp = ctx_payload.get("exp")
+                    ttl: int | None = None
+                    should_revoke = True
+                    if (
+                        raw_exp is not None
+                        and not isinstance(raw_exp, bool)
+                        and isinstance(raw_exp, (int, float))
+                        and math.isfinite(raw_exp)
+                    ):
+                        remaining = int(raw_exp - time.time())
+                        if remaining <= 0:
+                            should_revoke = False
+                        else:
+                            ttl = remaining
+                    if should_revoke:
+                        try:
+                            await active_blacklist.revoke(
+                                str(ctx_payload["jti"]),
+                                ttl=ttl,
+                            )
+                        except Exception as exc:
+                            logger.exception("Failed to revoke context JTI during logout")
+                            raise AuthenticationServiceUnavailableError(
+                                "Authentication service unavailable"
+                            ) from exc
+
+            if refresh_token is not None:
+                await self._revoke_raw_token(
+                    active_blacklist,
+                    refresh_token,
+                    issuer=active_issuer,
+                    token_label="refresh",
+                )
+
+        if clear_context:
+            self._clear_auth_context(req)
+
+    async def logout_all(
+        self,
+        subject: str | int | None = None,
+        *,
+        blacklist: TokenBlacklist | None = None,
+        ttl: int | None = None,
+        clear_context: bool = True,
+    ) -> None:
+        """
+        Revoke all tokens issued for `subject` (or the currently authenticated user)
+        via `TokenBlacklist.revoke_all_for_subject()`.
+        """
+        current_subject = self.id()
+        if current_subject is None:
+            raw_user = Context.get(_CONTEXT_USER_KEY)
+            if isinstance(raw_user, dict):
+                current_subject = raw_user.get("sub") or raw_user.get("id")
+
+        target_subject = current_subject if subject is None else subject
+        if target_subject is None or str(target_subject) == "":
+            raise AuthenticationError(
+                "No authenticated user or subject provided for logout_all()."
+            )
+
+        active_blacklist, _ = self._resolve_blacklist_and_issuer(blacklist=blacklist)
+        if active_blacklist is not None:
+            try:
+                await active_blacklist.revoke_all_for_subject(
+                    target_subject,
+                    ttl=ttl,
+                )
+            except ValueError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Failed to revoke all tokens for subject %s",
+                    target_subject,
+                )
+                raise AuthenticationServiceUnavailableError(
+                    "Authentication service unavailable"
+                ) from exc
+
+        if clear_context and (
+            subject is None
+            or (
+                current_subject is not None
+                and str(target_subject) == str(current_subject)
+            )
+        ):
+            self._clear_auth_context()
 
 
 def auth(guard: str | None = None) -> AuthProxy:

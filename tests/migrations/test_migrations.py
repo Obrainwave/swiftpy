@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -758,6 +759,136 @@ def test_blueprint_validation_and_raw_defaults() -> None:
 
     with pytest.raises(ValueError, match="finite"):
         SchemaGrammar._format_default_value(float("nan"))
+
+
+def test_enum_long_text_and_no_after_sql_compilation() -> None:
+    """Verify Blueprint.enum(), long_text()/medium_text() TEXT compilation, validation, and no .after()."""
+    # 1. PostgreSQL does not support column placement via .after() (G-1 decision: not implemented)
+    assert not hasattr(Blueprint("orders"), "after")
+    assert not hasattr(ColumnDefinition("status", "string"), "after")
+
+    # 2. long_text and medium_text compile identically to PostgreSQL TEXT
+    bp_text = Blueprint("articles", is_create=True)
+    bp_text.text("summary")
+    bp_text.medium_text("excerpt").nullable()
+    bp_text.long_text("content")
+    text_sql = SchemaGrammar.compile_create(bp_text)[0]
+    assert '"summary" TEXT NOT NULL' in text_sql
+    assert '"excerpt" TEXT NULL' in text_sql
+    assert '"content" TEXT NOT NULL' in text_sql
+
+    # 3. enum() compiles to VARCHAR(255) + named CHECK constraint + literal escaping
+    bp_enum = Blueprint("orders", is_create=True)
+    bp_enum.id()
+    bp_enum.enum("status", ["pending", "paid", "failed"]).default("pending")
+    bp_enum.enum("label", ["draft", "owner's", "TRUE"]).default("owner's")
+    bp_enum.enum("note_kind", ["a", "b"]).default(None).nullable()
+    enum_sql = SchemaGrammar.compile_create(bp_enum)[0]
+
+    assert (
+        '"status" VARCHAR(255) NOT NULL DEFAULT \'pending\' '
+        'CONSTRAINT "orders_status_check" CHECK ("status" IN (\'pending\', \'paid\', \'failed\'))'
+    ) in enum_sql
+    assert (
+        '"label" VARCHAR(255) NOT NULL DEFAULT \'owner\'\'s\' '
+        'CONSTRAINT "orders_label_check" CHECK ("label" IN (\'draft\', \'owner\'\'s\', \'TRUE\'))'
+    ) in enum_sql
+    assert (
+        '"note_kind" VARCHAR(255) NULL DEFAULT NULL '
+        'CONSTRAINT "orders_note_kind_check" CHECK ("note_kind" IN (\'a\', \'b\'))'
+    ) in enum_sql
+
+    # 4. Keyword-like enum default stays a quoted SQL literal instead of a bare keyword
+    bp_kw = Blueprint("kw_table", is_create=True)
+    bp_kw.enum("flag", ["TRUE", "FALSE", "NULL"]).default("TRUE")
+    kw_sql = SchemaGrammar.compile_create(bp_kw)[0]
+    assert '"flag" VARCHAR(255) NOT NULL DEFAULT \'TRUE\'' in kw_sql
+
+    # 5. Enum validation rejections
+    bad_bp = Blueprint("bad_enums", is_create=True)
+    with pytest.raises(ValueError, match="non-empty"):
+        bad_bp.enum("empty", [])
+    with pytest.raises(TypeError, match="bare string"):
+        bad_bp.enum("bare_str", "active")
+    with pytest.raises(ValueError, match="Duplicate"):
+        bad_bp.enum("dups", ["a", "b", "a"])
+    with pytest.raises(TypeError, match="strings"):
+        bad_bp.enum("non_str", json.loads('["ok", 42]'))
+    with pytest.raises(ValueError, match="enum values"):
+        bad_bp.enum("status", ["pending", "paid"]).default("archived")
+
+    # Non-nullable enum with default(None) fails during compilation
+    non_null_bp = Blueprint("bad_null_default", is_create=True)
+    non_null_bp.enum("status", ["pending", "paid"]).default(None)
+    with pytest.raises(ValueError, match="Non-nullable"):
+        SchemaGrammar.compile_create(non_null_bp)
+
+    # ColumnDefinition("x", "enum") without enum_values fails on compile
+    with pytest.raises(ValueError, match="non-empty"):
+        SchemaGrammar._compile_column(ColumnDefinition("orphan_enum", "enum"))
+
+    # ALTER TABLE ADD COLUMN emits named CHECK constraint on enum
+    alter_bp = Blueprint("orders", is_create=False)
+    alter_bp.enum("priority", ["low", "high"]).default("low")
+    alter_sql = SchemaGrammar.compile_table(alter_bp)
+    assert (
+        'ALTER TABLE "orders" ADD COLUMN "priority" VARCHAR(255) NOT NULL '
+        "DEFAULT 'low' CONSTRAINT \"orders_priority_check\" CHECK (\"priority\" IN ('low', 'high'));"
+    ) in alter_sql
+
+
+@pytest.mark.asyncio
+async def test_enum_and_long_text_pg_integration(
+    ensure_db_pool: DatabasePool,
+) -> None:
+    """Verify enum CHECK constraints, long_text storage, and ALTER TABLE enum against PostgreSQL."""
+    assert ensure_db_pool is not None
+    table_name = "test_enum_items"
+    await Schema.drop_if_exists(table_name)
+
+    def create_def(t: Blueprint) -> None:
+        t.id()
+        t.enum("status", ["draft", "published"]).default("draft")
+        t.medium_text("excerpt").nullable()
+        t.long_text("content")
+        t.timestamps()
+
+    await Schema.create(table_name, create_def)
+
+    try:
+        # 1. Valid default and explicit enum + large payload (> 65KB TEXT)
+        large_content = "x" * 100_000
+        await Query.table(table_name).insert({"content": large_content})
+        await Query.table(table_name).insert(
+            {"status": "published", "excerpt": "Short", "content": "Body"}
+        )
+
+        rows = await Query.table(table_name).order_by("id", "ASC").get()
+        assert len(rows) == 2
+        assert rows[0]["status"] == "draft"
+        assert len(rows[0]["content"]) == 100_000
+        assert rows[1]["status"] == "published"
+
+        # 2. Invalid enum value violates PostgreSQL CHECK constraint
+        with pytest.raises(asyncpg.CheckViolationError):
+            await Query.table(table_name).insert(
+                {"status": "archived", "content": "Rejected"}
+            )
+
+        # 3. Alter table adding an enum column enforces its named CHECK constraint
+        def alter_def(t: Blueprint) -> None:
+            t.enum("priority", ["low", "high"]).default("low")
+
+        await Schema.table(table_name, alter_def)
+        await Query.table(table_name).insert(
+            {"status": "draft", "priority": "high", "content": "Urgent"}
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await Query.table(table_name).insert(
+                {"status": "draft", "priority": "critical", "content": "Rejected"}
+            )
+    finally:
+        await Schema.drop_if_exists(table_name)
 
 
 @pytest.mark.asyncio

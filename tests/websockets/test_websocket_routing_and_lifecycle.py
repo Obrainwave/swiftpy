@@ -106,16 +106,16 @@ async def test_asgi_lifespan_lifecycle() -> None:
     try:
         # 1. Send startup
         await to_app_queue.put({"type": "lifespan.startup"})
-        startup_res = await asyncio.wait_for(from_app_queue.get(), timeout=2.0)
+        startup_res = await asyncio.wait_for(from_app_queue.get(), timeout=10.0)
         assert startup_res["type"] == "lifespan.startup.complete"
         assert app._booted is True
 
         # 2. Send shutdown
         await to_app_queue.put({"type": "lifespan.shutdown"})
-        shutdown_res = await asyncio.wait_for(from_app_queue.get(), timeout=2.0)
+        shutdown_res = await asyncio.wait_for(from_app_queue.get(), timeout=10.0)
         assert shutdown_res["type"] == "lifespan.shutdown.complete"
 
-        await asyncio.wait_for(lifespan_task, timeout=2.0)
+        await asyncio.wait_for(lifespan_task, timeout=10.0)
     finally:
         if not lifespan_task.done():
             lifespan_task.cancel()

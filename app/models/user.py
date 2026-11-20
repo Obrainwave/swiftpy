@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import ClassVar
 
 from swiftpy.database.orm import Model
 
@@ -14,8 +13,8 @@ class User(Model):
 
     __table__ = "users"
     __primary_key__ = "id"
-    __fillable__: ClassVar[list[str]] = ["name", "email", "password", "is_admin"]
-    __hidden__: ClassVar[list[str]] = ["password"]
+    __fillable__ = ["name", "email", "password", "is_admin"]
+    __hidden__ = ["password"]
 
     id: int
     name: str

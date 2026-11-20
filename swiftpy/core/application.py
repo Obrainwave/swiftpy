@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from swiftpy.ai.pool import AIHttpPool
 from swiftpy.auth.auth_manager import AuthManager, CurrentUser
-from swiftpy.auth.exceptions import AuthenticationError
+from swiftpy.auth.exceptions import AuthenticationError, BaseTokenBlacklist
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
 from swiftpy.cache.cache import Cache
@@ -39,6 +39,7 @@ from swiftpy.http.response import (
     not_found,
 )
 from swiftpy.http.router import PathParamCoercionError, Route, RouteGroup, Router
+from swiftpy.logging.manager import LogManager
 from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.support.keys import (
@@ -60,15 +61,46 @@ logger = logging.getLogger("swiftpy")
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def _should_auto_load_request_input(request: Request) -> bool:
+    """Return True for JSON or urlencoded write requests that can safely preload input."""
+    if request.method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    transfer_encoding = request.headers.get("transfer-encoding", "").lower()
+    if "chunked" in transfer_encoding:
+        return False
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    return (
+        media_type == "application/json"
+        or media_type.endswith("+json")
+        or media_type == "application/x-www-form-urlencoded"
+    )
+
+
 class FrameworkServiceProvider(ServiceProvider):
     """
     Built-in framework service provider managing core infrastructure lifecycle:
+    - Configures and starts/stops asynchronous queue-backed logging (`LogManager`).
     - Initializes and closes `DatabasePool` (when database configuration is present).
     - Stops `RedisEventBus` and closes Redis clients (`Cache`, `QueueDispatcher`, `TokenBlacklist`).
     - Closes active WebSocket connections with code 1001 (`Going Away`) on shutdown.
     """
 
     def register(self) -> None:
+        if not self.container.has(LogManager):
+
+            def _build_log_manager(c: Container) -> LogManager:
+                app_inst = c.get_singleton(Application)
+                return LogManager(
+                    config=c.resolve(Config) if c.has(Config) else None,
+                    base_path=(
+                        app_inst.project_root
+                        if isinstance(app_inst, Application)
+                        else None
+                    ),
+                )
+
+            self.container.singleton(LogManager, _build_log_manager)
+
         if self.container.has(Config):
             cfg = self.container.resolve(Config)
             db_cfg = cfg.get("database")
@@ -83,7 +115,17 @@ class FrameworkServiceProvider(ServiceProvider):
             self.container.singleton(
                 JWTIssuer,
                 lambda c: JWTIssuer.from_config(
-                    c.resolve(Config) if c.has(Config) else None
+                    c.resolve(Config) if c.has(Config) else None,
+                    blacklist_resolver=(
+                        lambda: c.resolve(TokenBlacklist)
+                        if (
+                            is_token_blacklist_enabled(
+                                c.resolve(Config) if c.has(Config) else None
+                            )
+                            and c.has(TokenBlacklist)
+                        )
+                        else None
+                    ),
                 ),
             )
         auth_cfg: Config | None = (
@@ -99,6 +141,11 @@ class FrameworkServiceProvider(ServiceProvider):
                     container=c,
                 ),
             )
+            if not self.container.has(BaseTokenBlacklist):
+                self.container.bind(
+                    BaseTokenBlacklist,
+                    lambda c: c.resolve(TokenBlacklist),
+                )
         if not self.container.has(AuthManager):
             self.container.singleton(AuthManager, lambda c: AuthManager(c))
         if not self.container.has(QueueDispatcher):
@@ -128,19 +175,32 @@ class FrameworkServiceProvider(ServiceProvider):
             )
 
     async def startup(self) -> None:
-        if self.container.has(Config) and self.container.has(DatabasePool):
-            cfg = self.container.resolve(Config)
-            db_cfg = cfg.get("database")
-            if isinstance(db_cfg, dict) and (
-                db_cfg.get("connections") or db_cfg.get("default")
-            ):
-                pool = self.container.resolve(DatabasePool)
-                await pool.init()
+        log_manager = (
+            self.container.resolve(LogManager)
+            if self.container.has(LogManager)
+            else None
+        )
+        if isinstance(log_manager, LogManager):
+            await log_manager.astart()
 
-        if self.container.has(RedisEventBus) and self.container.has(WebSocketManager):
-            bus = self.container.resolve(RedisEventBus)
-            ws_manager = self.container.resolve(WebSocketManager)
-            ws_manager.subscribe_to_bus(bus)
+        try:
+            if self.container.has(Config) and self.container.has(DatabasePool):
+                cfg = self.container.resolve(Config)
+                db_cfg = cfg.get("database")
+                if isinstance(db_cfg, dict) and (
+                    db_cfg.get("connections") or db_cfg.get("default")
+                ):
+                    pool = self.container.resolve(DatabasePool)
+                    await pool.init()
+
+            if self.container.has(RedisEventBus) and self.container.has(WebSocketManager):
+                bus = self.container.resolve(RedisEventBus)
+                ws_manager = self.container.resolve(WebSocketManager)
+                ws_manager.subscribe_to_bus(bus)
+        except Exception:
+            if isinstance(log_manager, LogManager):
+                await log_manager.astop()
+            raise
 
     async def shutdown(self) -> None:
         # 1. Close active WebSocket connections with 1001 (Going Away)
@@ -209,6 +269,14 @@ class FrameworkServiceProvider(ServiceProvider):
                 await pool.close()
             except Exception:
                 logger.exception("Error closing DatabasePool during shutdown")
+
+        # 6. Flush queued log records and stop LogManager listeners last
+        log_manager = self.container.get_singleton(LogManager)
+        if isinstance(log_manager, LogManager):
+            try:
+                await log_manager.astop()
+            except Exception:
+                logger.exception("Error stopping LogManager during shutdown")
 
 
 def _deep_merge_config(target: dict[str, Any], updates: Mapping[str, Any]) -> None:
@@ -360,11 +428,16 @@ class Application:
         allowed_origins: Sequence[str] | set[str] | None = None,
         max_ws_message_size: int | None = None,
         ws_idle_timeout: float | None = None,
+        auto_load_request_input: bool = True,
         **kwargs: Any,
     ) -> None:
         self.title = title
         self.version = version
         self.debug = debug
+        self.auto_load_request_input = bool(auto_load_request_input)
+        self.project_root: Path | None = (
+            Path(project_root).resolve() if project_root is not None else None
+        )
         self.extra = kwargs
 
         self.container = Container()
@@ -601,6 +674,7 @@ class Application:
     def _wrap_handler(self, route: Route) -> Any:
         handler = route.handler
         param_specs = self.router.ensure_route_analyzed(route)
+        has_request_param = any(spec.kind == "request" for spec in param_specs)
         has_var_keyword = route.has_var_keyword
         is_coro = inspect.iscoroutinefunction(handler)
 
@@ -616,6 +690,7 @@ class Application:
                         call_kwargs[spec.name] = params[spec.name]
                     elif spec.kind == "form":
                         ann: type[FormRequest] = spec.annotation
+                        stop_first = bool(getattr(ann, "stop_on_first_error", False))
                         content_type = request.headers.get("content-type", "")
                         media_type = content_type.split(";", 1)[0].strip().lower()
 
@@ -627,19 +702,22 @@ class Application:
                                 raw_body = await request.body()
                                 if not raw_body.strip():
                                     raise ValidationException(
-                                        {"body": ["Request body is required."]}
+                                        {"body": ["Request body is required."]},
+                                        single_error=stop_first,
                                     )
                             try:
                                 form_data = await request.form()
                             except HttpException as exc:
                                 if exc.status_code == 400:
                                     raise ValidationException(
-                                        {"body": [exc.message]}
+                                        {"body": [exc.message]},
+                                        single_error=stop_first,
                                     ) from None
                                 raise
                             except (ValueError, UnicodeDecodeError) as exc:
                                 raise ValidationException(
-                                    {"body": [str(exc)]}
+                                    {"body": [str(exc)]},
+                                    single_error=stop_first,
                                 ) from None
 
                             if (
@@ -648,7 +726,8 @@ class Application:
                                 and not form_data.files_list
                             ):
                                 raise ValidationException(
-                                    {"body": ["Request body is required."]}
+                                    {"body": ["Request body is required."]},
+                                    single_error=stop_first,
                                 )
 
                             data: dict[str, Any] = {}
@@ -661,7 +740,8 @@ class Application:
                             raw_body = await request.body()
                             if not raw_body.strip():
                                 raise ValidationException(
-                                    {"body": ["Request body is required."]}
+                                    {"body": ["Request body is required."]},
+                                    single_error=stop_first,
                                 )
                             try:
                                 raw_data = await request.json()
@@ -671,7 +751,8 @@ class Application:
                                             "body": [
                                                 "The request payload must be a JSON object."
                                             ]
-                                        }
+                                        },
+                                        single_error=stop_first,
                                     )
                                 data = raw_data
                             except (
@@ -680,7 +761,8 @@ class Application:
                                 ValueError,
                             ):
                                 raise ValidationException(
-                                    {"body": ["Invalid JSON payload"]}
+                                    {"body": ["Invalid JSON payload"]},
+                                    single_error=stop_first,
                                 ) from None
                             except HttpException as exc:
                                 if (
@@ -688,16 +770,28 @@ class Application:
                                     and exc.message == "Invalid JSON payload"
                                 ):
                                     raise ValidationException(
-                                        {"body": ["Invalid JSON payload"]}
+                                        {"body": ["Invalid JSON payload"]},
+                                        single_error=stop_first,
                                     ) from None
                                 raise
 
                         form_instance, rules, messages = ann.prepare_validation(
                             request=request, container=self.container
                         )
-                        result = await validate(data, rules, messages=messages)
+                        instance_stop_first = bool(
+                            getattr(form_instance, "stop_on_first_error", False)
+                        )
+                        result = await validate(
+                            data,
+                            rules,
+                            messages=messages,
+                            stop_on_first_error=instance_stop_first,
+                        )
                         if result.fails():
-                            raise ValidationException(result.errors)
+                            raise ValidationException(
+                                result.errors,
+                                single_error=instance_stop_first,
+                            )
 
                         form_instance.data = result.validated_data
                         form_instance.raw_data = data
@@ -712,6 +806,14 @@ class Application:
                         call_kwargs[spec.name] = await request.files(spec.name)
                     elif spec.kind == "default" and spec.name in params:
                         call_kwargs[spec.name] = params[spec.name]
+
+                if (
+                    has_request_param
+                    and self.auto_load_request_input
+                    and not request._input_loaded
+                    and _should_auto_load_request_input(request)
+                ):
+                    await request.input(_preload=True)
 
                 if has_var_keyword:
                     for k, v in params.items():

@@ -52,6 +52,7 @@ if TYPE_CHECKING:
         PayloadTooLargeError,
         UnauthorizedError,
         ValidationError,
+        abort,
     )
     from swiftpy.core.providers.base import ServiceProvider
     from swiftpy.database import (
@@ -128,6 +129,7 @@ if TYPE_CHECKING:
         unauthorized,
     )
     from swiftpy.http.router import RouteGroup, Router
+    from swiftpy.logging import Log
     from swiftpy.mail import (
         Attachment,
         Mail,
@@ -177,6 +179,7 @@ if TYPE_CHECKING:
         StrRule,
         UniqueRule,
         UrlRule,
+        ValidatedData,
         ValidationException,
         ValidationResult,
         Validator,
@@ -260,6 +263,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'JobSerializationError': ('swiftpy.queue', 'JobSerializationError'),
     'LazyLoadingDisabledError': ('swiftpy.database.orm', 'LazyLoadingDisabledError'),
     'LocalStorageDriver': ('swiftpy.filesystem', 'LocalStorageDriver'),
+    'Log': ('swiftpy.logging', 'Log'),
     'Mail': ('swiftpy.mail', 'Mail'),
     'MailFake': ('swiftpy.mail', 'MailFake'),
     'MailManager': ('swiftpy.mail', 'MailManager'),
@@ -313,6 +317,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'UniqueRule': ('swiftpy.validation', 'UniqueRule'),
     'UploadedFile': ('swiftpy.filesystem', 'UploadedFile'),
     'UrlRule': ('swiftpy.validation', 'UrlRule'),
+    'ValidatedData': ('swiftpy.validation', 'ValidatedData'),
     'ValidationError': ('swiftpy.core.exceptions', 'ValidationError'),
     'ValidationException': ('swiftpy.validation', 'ValidationException'),
     'ValidationResult': ('swiftpy.validation', 'ValidationResult'),
@@ -326,6 +331,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'WebSocketException': ('swiftpy.websockets', 'WebSocketException'),
     'WebSocketManager': ('swiftpy.websockets', 'WebSocketManager'),
     'WebSocketState': ('swiftpy.websockets', 'WebSocketState'),
+    'abort': ('swiftpy.core.exceptions', 'abort'),
     'admin': ('swiftpy.admin', 'admin'),
     'app': ('swiftpy.helpers.helper', 'app'),
     'between': ('swiftpy.validation', 'between'),
@@ -393,6 +399,7 @@ _SUBMODULE_EXPORTS: frozenset[str] = frozenset({
     'filesystem',
     'helpers',
     'http',
+    'logging',
     'mail',
     'queue',
     'support',
@@ -474,6 +481,7 @@ __all__ = [
     'JobSerializationError',
     'LazyLoadingDisabledError',
     'LocalStorageDriver',
+    'Log',
     'Mail',
     'MailFake',
     'MailManager',
@@ -527,6 +535,7 @@ __all__ = [
     'UniqueRule',
     'UploadedFile',
     'UrlRule',
+    'ValidatedData',
     'ValidationError',
     'ValidationException',
     'ValidationResult',
@@ -540,6 +549,7 @@ __all__ = [
     'WebSocketException',
     'WebSocketManager',
     'WebSocketState',
+    'abort',
     'admin',
     'app',
     'between',

@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, get_args, get_origin, get_type_hints
 
@@ -499,8 +499,21 @@ class Router:
     Trailing-slash policy: redirect-free exact match (no silent normalization).
     """
 
-    def __init__(self, container: Container | None = None) -> None:
+    def __init__(
+        self,
+        container: Container | None = None,
+        *,
+        prefix: str = "",
+        middleware: Sequence[type[Any]] | None = None,
+    ) -> None:
+        if isinstance(container, str):
+            raise TypeError(
+                "Router prefix must be passed as a keyword argument: Router(prefix=...)"
+            )
         self.container = container
+        self._normalized_prefix: str = _normalize_route_prefix(prefix)
+        self.prefix: str = self._normalized_prefix or "/"
+        self.middleware: list[type[Any]] = list(middleware or [])
         self.routes: list[Route] = []
         self._http_routes: list[Route] = []
         self._routes_by_method: dict[str, list[Route]] = {}
@@ -684,11 +697,13 @@ class Router:
         effective_locals = (
             localns if localns is not None else _collect_caller_locals(handler)
         )
+        full_path = _join_route_path(self._normalized_prefix, path)
+        combined_middleware = [*self.middleware, *(middleware or ())]
         route = Route(
             method="WEBSOCKET" if is_websocket else norm_method,
-            path=path,
+            path=full_path,
             handler=handler,
-            middleware=middleware or [],
+            middleware=combined_middleware,
             is_websocket=is_websocket,
             order=self._counter,
             max_body_size=max_body_size,
@@ -700,7 +715,7 @@ class Router:
         key = (route.method, route.normalized_path)
         if key in self._registered_keys:
             raise RouteRegistrationError(
-                f"Duplicate route registered for {route.method} {path}"
+                f"Duplicate route registered for {route.method} {full_path}"
             )
 
         if self.container is None:

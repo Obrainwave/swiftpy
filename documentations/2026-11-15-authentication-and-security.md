@@ -272,49 +272,63 @@ def admin_routes(group: RouteGroup) -> None:
         return json_response({"admin_id": user.id})
 ```
 
-For token refresh endpoints, validate the incoming token with `token_type="refresh"` so access tokens cannot be exchanged at the refresh endpoint:
+For token refresh endpoints, use `await jwt.refresh_token_pair(refresh_token)` rather than calling `issue_token_pair()` manually. It verifies the incoming token with `expected_type="refresh"`, checks `TokenBlacklist`, revokes the previous refresh token's `jti` automatically (`rotate=True` by default) so reused refresh tokens fail with `TokenRevokedError` (`401`), and issues a fresh access/refresh pair:
 
 ```python
-from swiftpy.auth import JWTIssuer, require_jwt
+from swiftpy.auth import JWTIssuer
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
+from swiftpy.validation.form_request import FormRequest
+
+
+class RefreshRequest(FormRequest):
+    def rules(self) -> dict[str, str]:
+        return {"refresh_token": "required|string"}
 
 
 @router.post("/auth/refresh")
-async def refresh(request: Request, jwt: JWTIssuer) -> Response:
-    payload = await require_jwt(request, issuer=jwt, token_type="refresh")
-    tokens = jwt.issue_token_pair(subject=payload["sub"])
+async def refresh(payload: RefreshRequest, jwt: JWTIssuer) -> Response:
+    # Verifies refresh token, rejects blacklisted/reused tokens (401 TokenRevokedError),
+    # rotates by blacklisting the previous refresh JTI, and returns a new token pair.
+    tokens = await jwt.refresh_token_pair(payload.refresh_token, rotate=True)
     return json_response(tokens)
 ```
 
 > **WebSocket JWT support:** `require_jwt()` also extracts Bearer tokens from `Sec-WebSocket-Protocol` (`["bearer", "<jwt>"]` or `"bearer.<jwt>"`) or `?token=` / `?access_token=` query parameters on WebSocket handshakes (avoid query-string tokens in production where access logs record URLs).
 
-### 5. Token Revocation & Logout (`TokenBlacklist`)
+### 5. Token Revocation, `auth().logout()` & `AdminSessionStore.flush()`
 
-`TokenBlacklist` uses Redis to track revoked `jti` IDs and subject-wide cutoffs with automatic TTL expiration (`min(exp - now, max_token_lifetime)`, capped at 7 days by default):
+`TokenBlacklist` uses Redis to track revoked `jti` IDs and subject-wide cutoffs with automatic TTL expiration (`min(exp - now, max_token_lifetime)`, capped at 7 days by default).
+
+The ergonomic `auth().logout(...)` and `auth().logout_all(...)` helpers handle bearer extraction, optional refresh-token revocation, `TokenBlacklist` lookups, and per-request auth context cleanup together:
 
 ```python
-from swiftpy.auth import JWTGuard, JWTIssuer, TokenBlacklist
+from swiftpy.auth import JWTGuard, JWTIssuer, TokenBlacklist, auth
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
 
 
 @router.post("/auth/logout", middleware=[JWTGuard])
-async def logout(request: Request, blacklist: TokenBlacklist, jwt: JWTIssuer) -> Response:
-    auth_header = request.headers.get("authorization", "")
-    token = auth_header.split(" ", 1)[1].strip()
+async def logout(request: Request) -> Response:
+    data = await request.json() if await request.body() else {}
+    refresh_token = data.get("refresh_token") if isinstance(data, dict) else None
 
-    # Verifies signature first (prevents unauthenticated Redis TTL DoS), then stores jti until exp
-    await blacklist.revoke_token(token, issuer=jwt)
+    # Extracts Bearer access token, revokes access + optional refresh token in TokenBlacklist,
+    # and clears per-request Context/request.state auth state
+    await auth().logout(request, refresh_token=refresh_token)
     return json_response({"logged_out": True})
 
 
-# Revoke all existing tokens for a compromised account or password change
-async def revoke_all_sessions(blacklist: TokenBlacklist, user_id: int) -> None:
-    await blacklist.revoke_all_for_subject(user_id)
+@router.post("/auth/logout-all", middleware=[JWTGuard])
+async def logout_all(request: Request) -> Response:
+    # Revokes all active access & refresh tokens issued before now for the current user
+    await auth().logout_all()
+    return json_response({"logged_out_all": True})
 ```
 
-`require_jwt()` and `JWTGuard` automatically consult `TokenBlacklist` whenever `AUTH_BLACKLIST_ENABLED=true` (the default). If Redis becomes unavailable during a check, SwiftPY **fails closed** with HTTP `503 AuthenticationServiceUnavailableError` rather than letting potentially revoked tokens through. Set `AUTH_BLACKLIST_ENABLED=false` if your application runs stateless JWTs without Redis.
+You can also interact with `TokenBlacklist` (`await blacklist.revoke_token(token, issuer=jwt)`, `await blacklist.revoke_if_not_revoked(jti, ttl=...)`, `await blacklist.revoke_all_for_subject(user_id)`) or invalidate active admin panel cookie sessions in the current worker process with `AdminSessionStore.flush()` (increments the in-memory `_flush_epoch` counter so tokens issued under an older epoch are rejected immediately; for multi-worker or cross-restart invalidation, rotate `admin.secret_key` / `APP_KEY`).
+
+`require_jwt()`, `JWTGuard`, and `JWTIssuer.refresh_token_pair()` automatically consult `TokenBlacklist` whenever `AUTH_BLACKLIST_ENABLED=true` (the default). If Redis becomes unavailable during a check, SwiftPY **fails closed** with HTTP `503 AuthenticationServiceUnavailableError` rather than letting potentially revoked tokens through. Set `AUTH_BLACKLIST_ENABLED=false` if your application runs stateless JWTs without Redis.
 
 ### 6. API Key Authentication (`ApiKeyGuard` & `require_api_key`)
 
@@ -400,4 +414,4 @@ Elsewhere in the framework (queued jobs, signed URLs, Redis event bus), [keys.py
 
 ## Next Step
 
-Continue to [Cache, Events & Background Queues](2026-11-15-cache-events-and-queues.md) to configure `Cache` (`RedisDriver` / `MemoryDriver`), `EventDispatcher` / `RedisEventBus`, and signed background `Job` queues.
+Continue to [Structured Asynchronous Logging](2026-11-20-logging.md) to configure `config/logging.py` (`single`, `daily`, `stderr`, `stack`) and write structured non-blocking logs with `Log` and `LogManager`.

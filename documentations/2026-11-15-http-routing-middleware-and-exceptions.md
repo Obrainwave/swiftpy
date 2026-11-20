@@ -110,7 +110,13 @@ app.include_router(api_router, prefix="/api")
 app.include_router(orders_router, prefix="/api/orders")
 ```
 
-You can also compose routers inside other routers with `parent_router.include_router(child_router, prefix="/sub", middleware=[...])`. When mounted, middleware attached to the parent prefix runs before middleware declared on child routes.
+You can also attach a base `prefix` and default `middleware` list directly on a `Router(...)` constructor, and compose routers inside other routers with `parent_router.include_router(child_router, prefix="/sub", middleware=[...])`:
+
+```python
+api = Router(prefix="/v1", middleware=[AuthMiddleware])
+```
+
+Constructor prefixes are validated eagerly against dynamic `{...}` segments (`RouteRegistrationError`), and outer `prefix`/`middleware` layers wrap child routes cleanly in declaration order.
 
 ### Route Groups (`app.group` / `router.group`)
 
@@ -391,6 +397,7 @@ Common `Request` APIs:
 - `await request.body(max_size=...)` — raw `bytes` body (cached after first read).
 - `await request.json()` — parsed JSON payload (`BadRequestError` on invalid JSON).
 - `await request.form()` — parsed URL-encoded or multipart text fields as `dict[str, Any]`.
+- `request.input(key, default=None)` / `request.all()` / `request.<field>` — read pre-loaded JSON/form/query fields synchronously (see [Requests & Responses](2026-11-20-request-and-responses.md) for full details on pre-loading and `StreamingResponse`).
 - `request.state` — per-request dictionary (`dict[str, Any]`) for passing values from middleware to handlers.
 
 ### Handling Multipart File Uploads
@@ -801,6 +808,11 @@ SwiftPY prevents sensitive internal details from leaking in production:
 
 ---
 
+> [!TIP]
+> For the dedicated deep-dive on `request.input()` / `request.<field>` semantics and `StreamingResponse`, see [Requests & Responses](2026-11-20-request-and-responses.md). For declarative `HttpException` subclasses (`status_code = 409`, `message = ...`) and `abort(...)`, continue to [Error Handling & Exceptions](2026-11-20-error-handling.md).
+
+---
+
 ## Next Step
 
-Continue with **#4 — Validation DSL & Form Requests**: [`docs/2026-11-14_documentation_plan.md`](../docs/2026-11-14_documentation_plan.md).
+Continue to [Requests & Responses](2026-11-20-request-and-responses.md) to explore `Request` input accessors (`request.input()`, `request.all()`, `request.<field>`), JSON/redirect/file responses, and `StreamingResponse`.

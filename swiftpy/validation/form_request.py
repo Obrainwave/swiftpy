@@ -8,7 +8,7 @@ from swiftpy.core.config import ConfigurationError
 from swiftpy.core.container import Container, get_container
 from swiftpy.http.request import Request
 from swiftpy.validation.rules.registry import RuleRegistry, default_registry
-from swiftpy.validation.validator import ValidationResult
+from swiftpy.validation.validator import ValidatedData, ValidationResult
 
 
 class FormRequest:
@@ -19,6 +19,7 @@ class FormRequest:
     """
 
     schema: ClassVar[dict[str, Any]] = {}
+    stop_on_first_error: ClassVar[bool] = False
     _cached_parsed_rules: ClassVar[dict[str, list[Any]] | None] = None
     _cached_parsed_by_registry: ClassVar[
         WeakKeyDictionary[RuleRegistry, dict[str, list[Any]]] | None
@@ -274,9 +275,9 @@ class FormRequest:
         if cls._cached_parsed_by_registry is not None:
             cls._cached_parsed_by_registry.clear()
 
-    def validated(self) -> dict[str, Any]:
-        """Return the dictionary of validated, cleaned parameters."""
-        return dict(self.data)
+    def validated(self) -> ValidatedData:
+        """Return the validated, cleaned parameters with dot and dict access."""
+        return ValidatedData(self.data)
 
     def all(self) -> dict[str, Any]:
         """Return all raw input parameters."""
