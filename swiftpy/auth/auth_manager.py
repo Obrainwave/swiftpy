@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import importlib
 import inspect
 import logging
 import math
@@ -19,27 +18,28 @@ from swiftpy.auth.exceptions import (
 from swiftpy.auth.jwt_guard import JWTGuard
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
+from swiftpy.auth.user_context import (
+    CONTEXT_AUTH_GUARD_KEY,
+    CONTEXT_LOGGED_OUT_KEY,
+    CONTEXT_USER_KEY,
+    CONTEXT_USER_MODEL_KEY,
+    SENSITIVE_USER_KEYS,
+    resolve_user_model_class,
+)
 from swiftpy.core.config import Config
 from swiftpy.core.container import Container, get_container
 from swiftpy.core.context import Context
 from swiftpy.database.orm.model import Model
-from swiftpy.database.orm.registry import _MODEL_REGISTRY
 from swiftpy.database.pool import DatabasePool
 from swiftpy.http.request import Request
 
 logger = logging.getLogger("swiftpy.auth.manager")
 
-_CONTEXT_USER_KEY = "__swiftpy_current_user__"
-_CONTEXT_USER_MODEL_KEY = "__swiftpy_current_user_model__"
-_CONTEXT_AUTH_GUARD_KEY = "__swiftpy_auth_guard__"
+_CONTEXT_USER_KEY = CONTEXT_USER_KEY
+_CONTEXT_USER_MODEL_KEY = CONTEXT_USER_MODEL_KEY
+_CONTEXT_AUTH_GUARD_KEY = CONTEXT_AUTH_GUARD_KEY
 
-_SENSITIVE_KEYS: frozenset[str] = frozenset({
-    "password",
-    "password_hash",
-    "key_hash",
-    "secret",
-    "token",
-})
+_SENSITIVE_KEYS: frozenset[str] = SENSITIVE_USER_KEYS
 
 
 class AuthUser(dict[str, Any]):
@@ -102,61 +102,28 @@ class AuthUser(dict[str, Any]):
         return f"AuthUser({super().__repr__()})"
 
 
-def resolve_user_model_class() -> type[Model] | None:
+def _adopt_request_state_user() -> Any:
     """
-    Resolve the application's User model class.
-
-    Checks:
-    1. Container Config for 'auth.model', 'auth.user_model', or 'auth.providers.users.model'.
-    2. Global _MODEL_REGISTRY for a model named 'User' or ending with 'User'.
-    3. Import fallback for 'app.models.user.User'.
+    Adopt a user already stored in `request.state` (for example by a guard that ran in a
+    different task) into `Context`. Never decodes credentials: authentication stays with
+    guards (`JWTGuard`, `require_jwt`), which also enforce token revocation.
     """
-    try:
-        container = get_container()
-        if container.has(Config):
-            cfg = container.resolve(Config)
-            model_setting = (
-                cfg.get("auth.model")
-                or cfg.get("auth.user_model")
-                or cfg.get("auth.providers.users.model")
-            )
-            if isinstance(model_setting, type) and issubclass(model_setting, Model):
-                return model_setting
-            if isinstance(model_setting, str) and model_setting:
-                if "." in model_setting:
-                    mod_name, cls_name = model_setting.rsplit(".", 1)
-                    mod = importlib.import_module(mod_name)
-                    target = getattr(mod, cls_name, None)
-                    if isinstance(target, type) and issubclass(target, Model):
-                        return target
-                elif model_setting in _MODEL_REGISTRY:
-                    variants = _MODEL_REGISTRY[model_setting]
-                    if variants:
-                        return next(iter(variants.values()))
-    except (RuntimeError, KeyError, AttributeError, ImportError, ValueError):
-        pass
+    existing = Context.get(_CONTEXT_USER_KEY)
+    if existing is not None or Context.get(CONTEXT_LOGGED_OUT_KEY):
+        return existing
 
-    if "User" in _MODEL_REGISTRY:
-        candidates = _MODEL_REGISTRY["User"]
-        if candidates:
-            for qname, cls in candidates.items():
-                if "app.models" in qname:
-                    return cls
-            return next(iter(candidates.values()))
-
-    for model_name, candidates in _MODEL_REGISTRY.items():
-        if model_name.lower().endswith("user") and candidates:
-            return next(iter(candidates.values()))
-
-    try:
-        mod = importlib.import_module("app.models.user")
-        target = getattr(mod, "User", None)
-        if isinstance(target, type) and issubclass(target, Model):
-            return target
-    except (ImportError, AttributeError):
-        pass
-
-    return None
+    req = Context.get("request")
+    if not isinstance(req, Request) or not isinstance(req.state, dict):
+        return None
+    if req.state.get(CONTEXT_LOGGED_OUT_KEY):
+        return None
+    state_user = req.state.get("user")
+    if state_user is None:
+        return None
+    Context.set(_CONTEXT_USER_KEY, state_user)
+    if "auth_guard" in req.state:
+        Context.set(_CONTEXT_AUTH_GUARD_KEY, req.state["auth_guard"])
+    return state_user
 
 
 def _build_auth_user_from_dict(raw: dict[str, Any]) -> AuthUser:
@@ -227,6 +194,12 @@ def _build_auth_user_from_model(model: Any) -> AuthUser:
         if f not in hidden_fields and f not in data:
             data[f] = getattr(model, f, None)
 
+    ctx_payload = Context.get(_CONTEXT_USER_KEY)
+    if isinstance(ctx_payload, dict):
+        for k, v in ctx_payload.items():
+            if k not in hidden_fields and k not in _SENSITIVE_KEYS and k not in data:
+                data[k] = v
+
     return AuthUser(data, model=model_inst)
 
 
@@ -237,13 +210,25 @@ def set_user_model(model: Any, guard: str | None = None) -> None:
     Call this from your authentication middleware after fetching the user from the
     database. ``auth().user()`` reads from this key.
     """
+    Context.set(CONTEXT_LOGGED_OUT_KEY, False)
     Context.set(_CONTEXT_USER_MODEL_KEY, model)
     if guard is not None:
         Context.set(_CONTEXT_AUTH_GUARD_KEY, guard)
+    user_dict: dict[str, Any] | None = None
     if hasattr(model, "to_dict") and callable(model.to_dict):
-        Context.set(_CONTEXT_USER_KEY, model.to_dict())
+        user_dict = model.to_dict()
+        Context.set(_CONTEXT_USER_KEY, user_dict)
     elif isinstance(model, dict):
-        Context.set(_CONTEXT_USER_KEY, model)
+        user_dict = model
+        Context.set(_CONTEXT_USER_KEY, user_dict)
+
+    req = Context.get("request")
+    if isinstance(req, Request) and isinstance(req.state, dict):
+        req.state.pop(CONTEXT_LOGGED_OUT_KEY, None)
+        if user_dict is not None:
+            req.state["user"] = user_dict
+        if guard is not None:
+            req.state["auth_guard"] = guard
 
 
 def current_user_model() -> Any | None:
@@ -251,6 +236,10 @@ def current_user_model() -> Any | None:
     Retrieve the authenticated ORM Model instance for the current request task.
     Returns None if no model has been stored via set_user_model().
     """
+    model = Context.get(_CONTEXT_USER_MODEL_KEY)
+    if model is not None:
+        return model
+    _adopt_request_state_user()
     return Context.get(_CONTEXT_USER_MODEL_KEY)
 
 
@@ -273,6 +262,9 @@ class AuthProxy:
         with all `__hidden__` fields excluded. Returns `None` if unauthenticated
         or if the active guard does not match the requested guard.
         """
+        if Context.get(_CONTEXT_USER_KEY) is None and Context.get(_CONTEXT_USER_MODEL_KEY) is None:
+            _adopt_request_state_user()
+
         if self._guard is not None:
             active_guard = Context.get(_CONTEXT_AUTH_GUARD_KEY)
             if active_guard is None:
@@ -371,6 +363,7 @@ class AuthProxy:
 
     @staticmethod
     def _clear_auth_context(request: Request | None = None) -> None:
+        Context.set(CONTEXT_LOGGED_OUT_KEY, True)
         Context.set(_CONTEXT_USER_KEY, None)
         Context.set(_CONTEXT_USER_MODEL_KEY, None)
         Context.set(_CONTEXT_AUTH_GUARD_KEY, None)
@@ -378,6 +371,7 @@ class AuthProxy:
         if isinstance(req, Request) and hasattr(req, "state"):
             req.state.pop("user", None)
             req.state.pop("auth_guard", None)
+            req.state[CONTEXT_LOGGED_OUT_KEY] = True
 
     @staticmethod
     async def _revoke_raw_token(
@@ -566,6 +560,8 @@ class CurrentUser(dict[str, Any]):
         self._last_synced: dict[str, Any] = {}
         if data is None:
             ctx_user = Context.get("__swiftpy_current_user__")
+            if ctx_user is None:
+                ctx_user = _adopt_request_state_user()
             initial = dict(ctx_user) if isinstance(ctx_user, dict) else {}
             super().__init__(initial)
             self._last_synced = dict(initial)
@@ -589,6 +585,8 @@ class CurrentUser(dict[str, Any]):
         if not self._lazy:
             return
         ctx_user = Context.get("__swiftpy_current_user__")
+        if ctx_user is None:
+            ctx_user = _adopt_request_state_user()
         target = ctx_user if isinstance(ctx_user, dict) else {}
         if target != self._last_synced:
             self._apply_context_payload(target)
@@ -687,7 +685,10 @@ def current_user() -> Any:
     Retrieve the authenticated user payload/record for the current request task.
     Returns None if unauthenticated.
     """
-    return Context.get("__swiftpy_current_user__")
+    user = Context.get("__swiftpy_current_user__")
+    if user is None:
+        user = _adopt_request_state_user()
+    return user
 
 
 class AuthManager:

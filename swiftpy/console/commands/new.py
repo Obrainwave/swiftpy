@@ -215,6 +215,8 @@ MAILGUN_DOMAIN=
 # Authentication & Security
 AUTH_GUARD=jwt
 AUTH_BLACKLIST_ENABLED=true
+AUTH_HYDRATE_USER=false
+AUTH_PASSIVE_RESOLUTION=false
 JWT_SECRET=
 JWT_ALGORITHM=HS256
 JWT_ACCESS_TTL=900
@@ -937,6 +939,8 @@ CONFIG = {
         "rounds": int(env("BCRYPT_ROUNDS", "12") or "12"),
     },
     "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
+    "hydrate_user": env_bool("AUTH_HYDRATE_USER", False),
+    "passive_resolution": env_bool("AUTH_PASSIVE_RESOLUTION", False),
     "guards": {
         "jwt": {
             "secret": env("JWT_SECRET", ""),
@@ -1534,7 +1538,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.2.0",
+    "swiftpy-framework>=0.2.1",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",

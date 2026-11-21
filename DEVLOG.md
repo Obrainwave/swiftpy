@@ -2404,5 +2404,27 @@ Implemented a first-class Filesystem and Storage subsystem inspired by Laravel's
   - `uv run ruff check .` -> **`All checks passed!`**
   - `uv run --no-sync --with jinja2 --with aiosmtplib mypy swiftpy`, `uv run mypy swiftpy`, `uv run mypy .`, `uv run mypy --explicit-package-bases .` -> **zero errors** across `191` / `426` files.
 
+---
+
+## Release v0.2.1 - Immediate Auth Context on Access Token Issuance & Review Hardening
+
+### Status: PASSED — ALL 8 REVIEW FINDINGS FIXED, AUTH/CONSOLE/DOCS/QUEUE/EVENTS/AI SUITES GREEN, RUFF, 4x MYPY STRICT & WHEEL BUILD VERIFIED
+
+- **Release Scope (`0.2.1`):**
+  1. **Immediate `CurrentUser` & `auth()` Availability on Access Token Issuance (`swiftpy.auth.user_context` / `swiftpy.auth.jwt_issuer`):**
+     - `JWTIssuer.issue_token(token_type="access")`, `issue_access_token()`, `issue_token_pair()`, and `await refresh_token_pair()` immediately bind the authenticated user into task-scoped `Context` (`__swiftpy_current_user__`, `__swiftpy_current_user_model__`, `__swiftpy_auth_guard__ = "jwt"`) and active `request.state["user"]`, updating already-injected `CurrentUser` instances live via `Context.watch()` and making `auth().check()`, `auth().id()`, and `auth().user()` available in the same request (e.g., `/login` or `/refresh`).
+     - Added `TokenSubject` (`str | int | Model | Mapping[str, Any]`) and optional `user=` (`Model | Mapping[str, Any] | None`) support across `JWTIssuer` issuance methods, validating that `user` matches `subject` (`ValueError` on mismatch or missing primary key) and preserving any already-authenticated user with a different subject (`preserve_different_subject=True`).
+  2. **Post-Review Hardening (All 8 Review Findings Resolved):**
+     - Removed synchronous header-decoding fallback from `auth_manager` (`_adopt_request_state_user()` only adopts an already-authenticated `request.state["user"]`), preventing revoked tokens from authenticating on unguarded routes.
+     - Reverted the implicit ORM identity map from `Model` so unrelated models sharing a primary key can never collide with the authenticated user.
+     - Extracted shared `swiftpy.auth.user_context` module eliminating duplication between `jwt_issuer`, `jwt_guard`, and `auth_manager`.
+     - Made database user hydration on `sub`-only tokens opt-in via `auth.hydrate_user` (`AUTH_HYDRATE_USER=false` default, costing 1 query when enabled and logging a warning on database errors instead of bare `except Exception`).
+     - Made unguarded route Bearer resolution opt-in via `auth.passive_resolution` (`AUTH_PASSIVE_RESOLUTION=false` default, active only when default guard is `jwt` and enforcing `TokenBlacklist`).
+     - Registered `CurrentUser` as a scoped binding in `FrameworkServiceProvider.register()` so `CurrentUser` DI works even when `auto_discover_providers=False`.
+  3. **Release Packaging & Documentation (`0.2.1`):**
+     - Updated `pyproject.toml`, `uv.lock`, `swiftpy/console/commands/new.py` (`swiftpy-framework>=0.2.1`), `config/auth.py`, `CHANGELOG.md`, `README.md`, and `documentations/2026-11-15-authentication-and-security.md`.
+     - Added 11 targeted regression tests in `tests/auth/test_auth_context_on_issue.py` alongside `tests/auth/test_auth_proxy.py`.
+
+
 
 

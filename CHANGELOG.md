@@ -4,6 +4,25 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-20
+
+### Fixed
+- **`CurrentUser` and `auth()` after an access token is issued (`swiftpy.auth`):** `JWTIssuer.issue_token(token_type="access")`, `issue_access_token()`, `issue_token_pair()` and `refresh_token_pair()` now bind the user into the request `Context` and `request.state`, so an already-injected `CurrentUser` and `auth().check()` / `id()` / `user()` work immediately (for example inside `/login` or `/refresh`). Refresh tokens never bind a user, and issuing a token for a different subject never replaces an already-authenticated user.
+- `FrameworkServiceProvider` now registers `CurrentUser` as a scoped binding, so injecting `CurrentUser` works with `auto_discover_providers=False`.
+
+### Added
+- `JWTIssuer` token methods accept a saved `Model`, a mapping with `id`/`sub`, or a plain id as `subject`, plus an optional `user=` keyword (`Model` or mapping). A `user=` that does not match the subject, or a model without a primary key, raises `ValueError`. Sensitive keys and `__hidden__` fields are never bound.
+- Opt-in `auth.hydrate_user` (`AUTH_HYDRATE_USER`, default `false`): `require_jwt()` / `JWTGuard` load the User model by `sub` (one query per request, degrading to token claims with a warning on database errors) so sub-only tokens expose every non-hidden field.
+- Opt-in `auth.passive_resolution` (`AUTH_PASSIVE_RESOLUTION`, default `false`): routes without a guard resolve a valid Bearer access token into `CurrentUser` / `auth()` when the default guard is `jwt`. Revoked, expired or invalid tokens stay guests.
+- New internal module `swiftpy.auth.user_context` shared by `JWTIssuer`, `require_jwt()` and `AuthManager`; `resolve_user_model_class` is still exported from `swiftpy.auth`, `swiftpy.auth.auth_manager` and `swiftpy.auth_manager`.
+
+### Changed
+- `require_jwt()` now returns the bound user dictionary (token claims plus model fields when hydrated) instead of the raw claims dictionary.
+- Generated projects (`swiftpy new`) include `hydrate_user` / `passive_resolution` in `config/auth.py`, matching `.env` keys, and depend on `swiftpy-framework>=0.2.1`.
+
+### Documentation
+- Updated [`documentations/2026-11-15-authentication-and-security.md`](documentations/2026-11-15-authentication-and-security.md) with issuing-time context binding, `hydrate_user`, `passive_resolution`, and the `CurrentUser.id` vs `auth().id()` typing note.
+
 ## [0.2.0] - 2026-11-19
 
 ### Added

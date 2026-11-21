@@ -79,6 +79,10 @@ swiftpy make:service AuthService
 APP_KEY=base64:<32-byte-base64-key>
 AUTH_GUARD=jwt
 AUTH_BLACKLIST_ENABLED=true
+# Opt-in (default false): load the User model by `sub` on verified tokens (one query per request)
+AUTH_HYDRATE_USER=false
+# Opt-in (default false): resolve a valid Bearer token on routes without JWTGuard
+AUTH_PASSIVE_RESOLUTION=false
 BCRYPT_ROUNDS=12
 
 # JWT (HS256 requires at least 32 UTF-8 bytes)
@@ -185,6 +189,9 @@ Important `JWTIssuer` rules:
 
 - **Reserved claims cannot be overridden:** Passing `sub`, `iat`, `exp`, `jti`, `type`, `token_type`, `typ`, `iss`, `aud`, or `nbf` inside `claims` raises `ValueError`.
 - **Isolated refresh claims:** `issue_token_pair()` attaches `claims` to the access token **only**; pass `refresh_claims={...}` if you explicitly want custom claims on the refresh token.
+- **`CurrentUser` and `auth()` are available as soon as an access token is issued:** `issue_token()`, `issue_access_token()`, `issue_token_pair()` and `await refresh_token_pair()` bind the user into the request `Context`, so an already-injected `CurrentUser` and `auth().check()` / `auth().id()` / `auth().user()` work in the same request (for example inside `/login`). Refresh tokens never bind a user.
+- **What gets bound:** pass the subject as `user.id`, a saved `Model` instance, or a mapping with an `id`/`sub` key. Pass `user=` (a `Model` or mapping) to attach more fields to a plain id. Sensitive keys (`password`, `password_hash`, `key_hash`, `secret`, `token`) and `__hidden__` model fields are never bound. A `user=` whose id does not match the subject raises `ValueError`, and a model without a primary key cannot be used as a subject.
+- **Existing sessions win:** issuing a token for a *different* subject while another user is authenticated (for example an admin minting a token) leaves the authenticated user untouched.
 - **Strict algorithm enforcement:** `alg="none"` (in any case) and algorithm mismatches (`"hs256"`, HS256 token submitted to an RS256 verifier) raise `InvalidAlgorithmError`.
 
 ### 3. Complete Login Endpoint & Service Example
@@ -271,6 +278,24 @@ def admin_routes(group: RouteGroup) -> None:
         # AdminMiddleware requires user["is_admin"] is True (else HTTP 403)
         return json_response({"admin_id": user.id})
 ```
+
+```python
+@router.post("/auth/login")
+async def login(payload: LoginRequest, jwt: JWTIssuer, current: CurrentUser) -> Response:
+    user = await authenticate(payload)            # your own lookup/password check
+    tokens = jwt.issue_token_pair(user)           # or jwt.issue_token_pair(user.id, user=user)
+
+    # Available immediately, without waiting for the next request:
+    assert auth().check() and auth().id() == user.id
+    assert current.is_authenticated and current.email == user.email
+    return json_response(tokens)
+```
+
+**Tokens that carry only `sub`.** `require_jwt()` / `JWTGuard` bind the verified claims. Set `AUTH_HYDRATE_USER=true` (`auth.hydrate_user`) and, when a `DatabasePool` is initialized, they also load the User model by primary key so `CurrentUser` and `auth().user()` expose every non-hidden field. This costs one query per authenticated request and is off by default; if the lookup fails the request continues with the token claims and a warning is logged. `require_jwt()` returns the bound user dictionary (token claims plus model fields) rather than the raw claims.
+
+**Routes without `JWTGuard`.** By default only guards authenticate. Set `AUTH_PASSIVE_RESOLUTION=true` (`auth.passive_resolution`, default guard `jwt`) to let routes without a guard resolve a valid `Authorization: Bearer <access_token>` into `CurrentUser` / `auth()`. Invalid, expired or revoked tokens are ignored and the request stays a guest; use `JWTGuard` when you need a `401`.
+
+> `CurrentUser.id` returns the raw token `sub` (a string) when no model is bound, while `auth().id()` coerces it to the User model's primary key type. Compare with `str(...)` or use `auth().id()` consistently.
 
 For token refresh endpoints, use `await jwt.refresh_token_pair(refresh_token)` rather than calling `issue_token_pair()` manually. It verifies the incoming token with `expected_type="refresh"`, checks `TokenBlacklist`, revokes the previous refresh token's `jti` automatically (`rotate=True` by default) so reused refresh tokens fail with `TokenRevokedError` (`401`), and issues a fresh access/refresh pair:
 
