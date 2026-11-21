@@ -15,6 +15,7 @@ from swiftpy.auth.exceptions import (
 )
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
+from swiftpy.auth.user_context import hydrate_jwt_user_context
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
 from swiftpy.core.context import Context
@@ -181,13 +182,12 @@ async def require_jwt(
                 "Authentication service unavailable"
             ) from exc
 
-    # 7. Attach authenticated user payload to request state and task context
-    req.state["user"] = payload
+    # 7. Hydrate user context (from DatabasePool when available) and attach to request state & Context
+    user_ctx = await hydrate_jwt_user_context(payload)
+    req.state["user"] = user_ctx
     req.state["auth_guard"] = "jwt"
-    Context.set("__swiftpy_current_user__", payload)
-    Context.set("__swiftpy_auth_guard__", "jwt")
 
-    return payload
+    return user_ctx
 
 
 class JWTGuard(Middleware):

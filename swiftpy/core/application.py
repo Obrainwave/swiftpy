@@ -13,9 +13,15 @@ from urllib.parse import urlsplit
 
 from swiftpy.ai.pool import AIHttpPool
 from swiftpy.auth.auth_manager import AuthManager, CurrentUser
-from swiftpy.auth.exceptions import AuthenticationError, BaseTokenBlacklist
+from swiftpy.auth.exceptions import (
+    AuthenticationError,
+    AuthenticationServiceUnavailableError,
+    BaseTokenBlacklist,
+)
+from swiftpy.auth.jwt_guard import require_jwt
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
+from swiftpy.auth.user_context import auth_option_enabled
 from swiftpy.cache.cache import Cache
 from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, bind_container, set_container
@@ -148,6 +154,8 @@ class FrameworkServiceProvider(ServiceProvider):
                 )
         if not self.container.has(AuthManager):
             self.container.singleton(AuthManager, lambda c: AuthManager(c))
+        if not self.container.has(CurrentUser):
+            self.container.scoped(CurrentUser, lambda _: CurrentUser())
         if not self.container.has(QueueDispatcher):
             self.container.singleton(QueueDispatcher, lambda _: QueueDispatcher())
         if not self.container.has(EventDispatcher):
@@ -671,6 +679,36 @@ class Application:
                         "Error during shutdown of provider %s", type(provider).__name__
                     )
 
+    def _should_passively_resolve_jwt(self, request: Request) -> bool:
+        """
+        Return True when opt-in passive resolution (`auth.passive_resolution`) is enabled,
+        the default guard is `jwt`, no guard has authenticated this request yet and it
+        carries a single `Authorization: Bearer <jwt>` header.
+        """
+        if not auth_option_enabled(self.config, "passive_resolution"):
+            return False
+        default_guard = self.config.get("auth.defaults.guard") or self.config.get(
+            "auth.default"
+        )
+        if default_guard not in (None, "jwt"):
+            return False
+        if Context.get("__swiftpy_current_user__") is not None:
+            return False
+        if Context.get("__swiftpy_logged_out__"):
+            return False
+        raw_auth_headers = [
+            v.decode("latin1")
+            for k, v in request.scope.get("headers", [])
+            if k.lower() == b"authorization"
+        ]
+        if len(raw_auth_headers) != 1:
+            return False
+        parts = raw_auth_headers[0].strip().split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return False
+        token = parts[1].strip()
+        return bool(token) and token.count(".") == 2
+
     def _wrap_handler(self, route: Route) -> Any:
         handler = route.handler
         param_specs = self.router.ensure_route_analyzed(route)
@@ -682,6 +720,18 @@ class Application:
             request: Request, *args: Any, **params: Any
         ) -> Response:
             try:
+                if self._should_passively_resolve_jwt(request):
+                    try:
+                        await require_jwt(request)
+                    except (
+                        AuthenticationError,
+                        AuthenticationServiceUnavailableError,
+                        ConfigurationError,
+                        RuntimeError,
+                        ValueError,
+                    ):
+                        pass
+
                 call_kwargs: dict[str, Any] = {}
                 for spec in param_specs:
                     if spec.kind == "request":

@@ -59,6 +59,7 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Week 26: Security Audit & Hardening** | SQL injection audit, JWT & bcrypt API keys, JSON depth & streaming limits, traceback suppression | ✅ Completed |
 | **Week 26: Pagination & Aggregation Subsystem** | Limit/offset parameterized SQL, length-aware `paginate()`, `simple_paginate()`, `group_by()` & `having()` | ✅ Completed |
 | **Release v0.2.0: DX, Logging, Auth Refresh & Docs** | `ValidatedData` & `validate(request)`, `Request.input()` & `abort()`, `Router(prefix, middleware)`, `Blueprint.enum`/`medium_text`/`long_text`, `swiftpy.logging` (`Log`), `refresh_token_pair()` & `auth().logout()`, 17 user guides in `documentations/` | ✅ Completed |
+| **Release v0.2.1: Auth Context on Token Issue** | `CurrentUser` / `auth()` available when an access token is issued, `user=` / `Model` subjects, opt-in `auth.hydrate_user` & `auth.passive_resolution` | ✅ Completed |
 
 *See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md) for the complete step-by-step documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 

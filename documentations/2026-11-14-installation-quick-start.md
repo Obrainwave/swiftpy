@@ -159,7 +159,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.2.0, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.2.1, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -313,7 +313,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.2.0",
+       "swiftpy-framework>=0.2.1",
        # ...
    ]
    ```
@@ -325,7 +325,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    docker compose exec app swiftpy --version
    ```
 
-   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.6` to pull a newly published `0.2.0` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
+   - If you did **not** edit `pyproject.toml` (for example, keeping `swiftpy-framework>=0.1.6` to pull a newly published `0.2.1` release from PyPI), Docker's `COPY pyproject.toml .` layer stays cached unless you force a rebuild:
 
      ```bash
      docker compose build --no-cache app
@@ -343,7 +343,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.2.0"
+python -m pip install --upgrade "swiftpy-framework>=0.2.1"
 swiftpy --version
 ```
 

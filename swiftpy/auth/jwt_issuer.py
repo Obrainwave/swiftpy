@@ -9,7 +9,7 @@ import math
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from typing import Any, ClassVar, Protocol, TypeGuard
 
@@ -32,11 +32,17 @@ from swiftpy.auth.exceptions import (
     TokenRevokedError,
     is_token_blacklist_enabled,
 )
+from swiftpy.auth.user_context import (
+    TokenSubject,
+    bind_jwt_user_context,
+    extract_subject_and_user,
+    hydrate_jwt_user_context,
+)
 from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, get_container
+from swiftpy.database.orm.model import Model
 
 logger = logging.getLogger("swiftpy.auth.jwt")
-
 
 class RefreshTokenBlacklist(Protocol):
     """Structural protocol for token blacklist implementations used during refresh."""
@@ -311,15 +317,19 @@ class JWTIssuer:
 
     def issue_token(
         self,
-        subject: str | int,
+        subject: TokenSubject,
         token_type: str = "access",
         claims: dict[str, Any] | None = None,
         expires_in: int | timedelta | None = None,
         algorithm: str | None = None,
         not_before: int | timedelta | None = None,
+        *,
+        user: Model | Mapping[str, Any] | None = None,
     ) -> str:
         """
         Issue a signed JSON Web Token with standard and custom claims.
+        When `token_type == "access"`, binds the authenticated user context into
+        task-scoped `Context` so `CurrentUser` and `auth()` are available immediately.
         """
         alg = self.algorithm if algorithm is None else algorithm
         if not isinstance(alg, str) or alg not in self.SUPPORTED_ALGORITHMS:
@@ -331,6 +341,11 @@ class JWTIssuer:
                 raise ValueError(
                     f"Cannot override reserved JWT claim(s): {', '.join(sorted(conflicting))}"
                 )
+
+        sub_str, user_model, extra_fields = extract_subject_and_user(
+            subject,
+            user=user,
+        )
 
         now = int(time.time())
         ttl_seconds: int
@@ -352,7 +367,7 @@ class JWTIssuer:
             )
 
         payload: dict[str, Any] = {
-            "sub": str(subject),
+            "sub": sub_str,
             "type": token_type,
             "token_type": token_type,
             "typ": token_type,
@@ -400,27 +415,40 @@ class JWTIssuer:
         signature_bytes = self._sign(signing_input, alg)
         signature_b64 = _base64url_encode(signature_bytes)
 
+        if token_type == "access":
+            bind_jwt_user_context(
+                payload,
+                user_model=user_model,
+                extra_fields=extra_fields,
+                preserve_different_subject=True,
+            )
+
         return f"{header_b64}.{payload_b64}.{signature_b64}"
 
     def issue_access_token(
         self,
-        subject: str | int,
+        subject: TokenSubject,
         claims: dict[str, Any] | None = None,
         expires_in: int | timedelta | None = None,
+        *,
+        user: Model | Mapping[str, Any] | None = None,
     ) -> str:
-        """Issue a short-lived access token."""
+        """Issue a short-lived access token and bind active user context."""
         return self.issue_token(
             subject=subject,
             token_type="access",
             claims=claims,
             expires_in=self.access_token_ttl if expires_in is None else expires_in,
+            user=user,
         )
 
     def issue_refresh_token(
         self,
-        subject: str | int,
+        subject: TokenSubject,
         claims: dict[str, Any] | None = None,
         expires_in: int | timedelta | None = None,
+        *,
+        user: Model | Mapping[str, Any] | None = None,
     ) -> str:
         """Issue a long-lived refresh token."""
         return self.issue_token(
@@ -428,15 +456,18 @@ class JWTIssuer:
             token_type="refresh",
             claims=claims,
             expires_in=self.refresh_token_ttl if expires_in is None else expires_in,
+            user=user,
         )
 
     def issue_token_pair(
         self,
-        subject: str | int,
+        subject: TokenSubject,
         claims: dict[str, Any] | None = None,
         access_expires_in: int | timedelta | None = None,
         refresh_expires_in: int | timedelta | None = None,
         refresh_claims: dict[str, Any] | None = None,
+        *,
+        user: Model | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Issue both an access token and a refresh token.
@@ -447,11 +478,13 @@ class JWTIssuer:
             subject=subject,
             claims=claims,
             expires_in=access_expires_in,
+            user=user,
         )
         refresh_token = self.issue_refresh_token(
             subject=subject,
             claims=refresh_claims,
             expires_in=refresh_expires_in,
+            user=user,
         )
         ttl = self.access_token_ttl if access_expires_in is None else access_expires_in
         ttl_seconds = int(ttl.total_seconds() if isinstance(ttl, timedelta) else ttl)
@@ -600,13 +633,23 @@ class JWTIssuer:
             else (inherited_refresh_claims or None)
         )
 
-        return self.issue_token_pair(
+        pair = self.issue_token_pair(
             subject=subject,
             claims=claims,
             access_expires_in=access_expires_in,
             refresh_expires_in=refresh_expires_in,
             refresh_claims=resolved_refresh_claims,
         )
+        access_payload = self.decode_token(
+            pair["access_token"],
+            verify_exp=False,
+            verify_nbf=False,
+        )
+        await hydrate_jwt_user_context(
+            access_payload,
+            preserve_different_subject=True,
+        )
+        return pair
 
     def decode_token(
         self,

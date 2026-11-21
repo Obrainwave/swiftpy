@@ -2,6 +2,8 @@ from swiftpy.helpers.helper import env, env_bool
 
 CONFIG: dict[str, object] = {
     "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
+    "hydrate_user": env_bool("AUTH_HYDRATE_USER", False),
+    "passive_resolution": env_bool("AUTH_PASSIVE_RESOLUTION", False),
     "defaults": {
         "guard": env("AUTH_GUARD", "jwt"),
     },
