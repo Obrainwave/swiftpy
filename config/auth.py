@@ -15,7 +15,7 @@ CONFIG: dict[str, object] = {
             "driver": "jwt",
             "algorithm": env("JWT_ALGORITHM", "HS256"),
             "secret": env("JWT_SECRET", None),
-            "access_token_ttl": int(env("JWT_ACCESS_TTL", "900")),
+            "access_token_ttl": int(env("JWT_ACCESS_TTL", "3600")),
             "refresh_token_ttl": int(env("JWT_REFRESH_TTL", "604800")),
             "issuer": env("JWT_ISSUER", None),
             "audience": env("JWT_AUDIENCE", None),

@@ -88,7 +88,7 @@ BCRYPT_ROUNDS=12
 # JWT (HS256 requires at least 32 UTF-8 bytes)
 JWT_ALGORITHM=HS256
 JWT_SECRET=replace-with-at-least-32-bytes-of-random-entropy
-JWT_ACCESS_TTL=900
+JWT_ACCESS_TTL=3600
 JWT_REFRESH_TTL=604800
 # Optional strict claim validation
 # JWT_ISSUER=https://api.example.com
@@ -153,7 +153,7 @@ from swiftpy.auth import JWTIssuer
 issuer = JWTIssuer(
     secret="at-least-32-bytes-of-secret-material!",
     algorithm="HS256",
-    access_token_ttl=900,      # 15 minutes (default)
+    access_token_ttl=3600,     # 60 minutes (default)
     refresh_token_ttl=604800,  # 7 days (default)
     issuer="https://api.example.com",
     audience="web-client",

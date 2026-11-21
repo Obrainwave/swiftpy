@@ -417,6 +417,23 @@ async def run_batch_job() -> None:
 
 ---
 
+## Helper Functions (`isset`, `env`, `config`, ...)
+
+SwiftPY exports convenience helpers from `swiftpy.helpers` and the top-level `swiftpy` package:
+
+```python
+from swiftpy import isset
+
+if isset(payload, "user.profile.email"):
+    ...
+
+# Require multiple keys/paths at once (missing or None -> False; 0 / False / "" / [] -> True)
+if isset(request, "title", "category_id"):
+    ...
+```
+
+`isset(data, *keys)` works across dictionaries (including dot-notation nested lookups, preferring literal keys first), lists/tuples (integer or digit-string indices), sets, `Request`, `FormData`, `FormRequest`, `ValidatedData`, `Config`, loaded attributes/relations on `Model` instances (without triggering lazy-load errors on unloaded relations), dataclasses, and standard Python objects. If omitted keys are not passed (`isset(value)`), it returns `value is not None`.
+
 ## Storing Request-Local Data with `Context`
 
 Because an async ASGI server runs many requests concurrently inside the same Python process, **never** store per-request values (current tenant, correlation ID, locale) in module-level global variables or mutable class attributes.

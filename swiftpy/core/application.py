@@ -82,6 +82,41 @@ def _should_auto_load_request_input(request: Request) -> bool:
     )
 
 
+def _is_multipart_write_request(request: Request) -> bool:
+    """Return True for non-chunked multipart write requests."""
+    if request.method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    transfer_encoding = request.headers.get("transfer-encoding", "").lower()
+    if "chunked" in transfer_encoding:
+        return False
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    return media_type == "multipart/form-data"
+
+
+def _handler_uses_attr(handler: Any, attr_name: str) -> bool:
+    """Return True when handler bytecode (including nested code objects) references `attr_name`."""
+    target = inspect.unwrap(handler)
+    seen_codes: set[Any] = set()
+    stack: list[Any] = []
+    for candidate in (handler, target):
+        code = getattr(candidate, "__code__", None)
+        if code is None and callable(candidate):
+            code = getattr(candidate.__call__, "__code__", None)
+        if code is not None:
+            stack.append(code)
+    while stack:
+        code = stack.pop()
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+        if attr_name in getattr(code, "co_names", ()):
+            return True
+        for const in getattr(code, "co_consts", ()):
+            if inspect.iscode(const):
+                stack.append(const)
+    return False
+
+
 class FrameworkServiceProvider(ServiceProvider):
     """
     Built-in framework service provider managing core infrastructure lifecycle:
@@ -714,6 +749,7 @@ class Application:
         param_specs = self.router.ensure_route_analyzed(route)
         has_request_param = any(spec.kind == "request" for spec in param_specs)
         has_var_keyword = route.has_var_keyword
+        uses_has_file = has_request_param and _handler_uses_attr(handler, "has_file")
         is_coro = inspect.iscoroutinefunction(handler)
 
         async def dispatched_handler(
@@ -861,7 +897,10 @@ class Application:
                     has_request_param
                     and self.auto_load_request_input
                     and not request._input_loaded
-                    and _should_auto_load_request_input(request)
+                    and (
+                        _should_auto_load_request_input(request)
+                        or (uses_has_file and _is_multipart_write_request(request))
+                    )
                 ):
                     await request.input(_preload=True)
 

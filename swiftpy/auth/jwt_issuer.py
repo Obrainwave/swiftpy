@@ -87,6 +87,15 @@ def _is_valid_timestamp(value: Any) -> TypeGuard[int | float]:
     )
 
 
+def _validate_positive_int_ttl(value: Any, name: str) -> int:
+    """Validate that a JWT TTL is a strictly positive integer (excluding booleans)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigurationError(
+            f"JWT {name} must be a positive integer, got {value!r}."
+        )
+    return value
+
+
 class JWTIssuer:
     """
     High-performance, secure JWT engine supporting RS256 and HS256 algorithms
@@ -113,7 +122,7 @@ class JWTIssuer:
         private_key: str | bytes | RSAPrivateKey | None = None,
         public_key: str | bytes | RSAPublicKey | None = None,
         algorithm: str = "HS256",
-        access_token_ttl: int = 900,  # 15 minutes
+        access_token_ttl: int = 3600,  # 60 minutes
         refresh_token_ttl: int = 604800,  # 7 days
         issuer: str | None = None,
         audience: str | list[str] | set[str] | tuple[str, ...] | None = None,
@@ -130,8 +139,12 @@ class JWTIssuer:
         if isinstance(leeway, bool) or not isinstance(leeway, (int, float)) or not math.isfinite(leeway) or leeway < 0:
             raise ConfigurationError("JWT leeway must be a non-negative number.")
 
-        self.access_token_ttl = access_token_ttl
-        self.refresh_token_ttl = refresh_token_ttl
+        self.access_token_ttl = _validate_positive_int_ttl(
+            access_token_ttl, "access_token_ttl"
+        )
+        self.refresh_token_ttl = _validate_positive_int_ttl(
+            refresh_token_ttl, "refresh_token_ttl"
+        )
         self.issuer = issuer
         self.audience = audience
         self.leeway = int(leeway)
@@ -258,8 +271,26 @@ class JWTIssuer:
                     "JWT_SECRET is not configured. A secret of at least 32 bytes is required in production."
                 )
 
-        access_ttl = int(jwt_cfg.get("access_token_ttl") or cfg.get("auth.jwt.access_token_ttl") or 900)
-        refresh_ttl = int(jwt_cfg.get("refresh_token_ttl") or cfg.get("auth.jwt.refresh_token_ttl") or 604800)
+        raw_access_ttl = (
+            jwt_cfg.get("access_token_ttl")
+            if "access_token_ttl" in jwt_cfg
+            else cfg.get("auth.jwt.access_token_ttl")
+        )
+        raw_refresh_ttl = (
+            jwt_cfg.get("refresh_token_ttl")
+            if "refresh_token_ttl" in jwt_cfg
+            else cfg.get("auth.jwt.refresh_token_ttl")
+        )
+        access_ttl = (
+            3600
+            if raw_access_ttl is None
+            else _validate_positive_int_ttl(raw_access_ttl, "access_token_ttl")
+        )
+        refresh_ttl = (
+            604800
+            if raw_refresh_ttl is None
+            else _validate_positive_int_ttl(raw_refresh_ttl, "refresh_token_ttl")
+        )
         raw_leeway = jwt_cfg.get("leeway") if "leeway" in jwt_cfg else cfg.get("auth.jwt.leeway")
         leeway = int(raw_leeway) if raw_leeway is not None else 0
         issuer = jwt_cfg.get("issuer") or cfg.get("auth.jwt.issuer")

@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 import math
-from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import (
     Any,
@@ -42,6 +42,13 @@ from swiftpy.support.strings import pluralize, snake_case
 T = TypeVar("T", bound="Model")
 _TRelModel = TypeVar("_TRelModel", bound="Model")
 _MISSING = object()
+
+
+class _UnsetType:
+    """Sentinel type for omitted optional update payloads."""
+
+
+_UNSET = _UnsetType()
 logger = logging.getLogger(__name__)
 
 
@@ -1721,6 +1728,81 @@ class Model:
         await self.__class__._dispatch_lifecycle_event(
             "created", self, is_after_event=True
         )
+
+    @staticmethod
+    def _extract_update_mapping(
+        data: Mapping[str, Any] | _UnsetType,
+        attributes: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize positional mapping and keyword arguments for instance updates."""
+        payload: dict[str, Any] = {}
+        if not isinstance(data, _UnsetType):
+            if not isinstance(data, Mapping):
+                raise TypeError(
+                    f"update() expects a mapping of attributes, got {type(data).__name__}."
+                )
+            for key, value in data.items():
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"update() attribute keys must be str, got {type(key).__name__}."
+                    )
+                payload[key] = value
+        payload.update(attributes)
+        return payload
+
+    async def _update_with_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        force: bool,
+    ) -> Self:
+        """Apply attribute updates to a persisted model instance and save changes."""
+        pk_name = self.__primary_key__
+        pk = getattr(self, pk_name, None)
+        if not self._exists or pk is None:
+            raise PrimaryKeyError(
+                f"Cannot update unsaved {self.__class__.__name__} without primary key '{pk_name}'."
+            )
+        if force:
+            self.force_fill(**payload)
+        else:
+            self.fill(**payload)
+        await self.save()
+        return self
+
+    @overload
+    async def update(self, data: Mapping[str, Any], /, **attributes: Any) -> Self: ...
+
+    @overload
+    async def update(self, /, **attributes: Any) -> Self: ...
+
+    async def update(
+        self,
+        data: Mapping[str, Any] | _UnsetType = _UNSET,
+        /,
+        **attributes: Any,
+    ) -> Self:
+        """Mass-assign attributes respecting fillable/guarded rules and save changes."""
+        payload = self._extract_update_mapping(data, attributes)
+        return await self._update_with_payload(payload, force=False)
+
+    @overload
+    async def force_update(
+        self, data: Mapping[str, Any], /, **attributes: Any
+    ) -> Self: ...
+
+    @overload
+    async def force_update(self, /, **attributes: Any) -> Self: ...
+
+    async def force_update(
+        self,
+        data: Mapping[str, Any] | _UnsetType = _UNSET,
+        /,
+        **attributes: Any,
+    ) -> Self:
+        """Mass-assign attributes bypassing fillable/guarded rules and save changes."""
+        payload = self._extract_update_mapping(data, attributes)
+        return await self._update_with_payload(payload, force=True)
 
     async def delete(self) -> None:
         """Delete this model instance from the database."""

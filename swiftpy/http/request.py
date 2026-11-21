@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Generator, Iterator, Mapping
 from typing import Any, ClassVar, cast
 from urllib.parse import parse_qs
 
@@ -96,6 +96,45 @@ class RequestHeaders(Mapping[str, str]):
     def raw_items(self) -> list[tuple[str, str]]:
         """Return all `(name, value)` header pairs in arrival order."""
         return list(self._items)
+
+
+class _HasFileResult:
+    """Boolean result for ``Request.has_file()`` supporting sync truthiness and ``await``."""
+
+    __slots__ = ("_name", "_request")
+    _is_has_file_result: ClassVar[bool] = True
+
+    def __init__(self, request: Request, name: str) -> None:
+        self._request = request
+        self._name = name
+
+    def __bool__(self) -> bool:
+        return self._request._check_has_file_sync(self._name)
+
+    async def _resolve(self) -> bool:
+        if self._request._form is None and not self._request._input_loaded:
+            media_type = (
+                self._request.headers.get("content-type", "")
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
+            if media_type == "multipart/form-data":
+                await self._request.form()
+        return bool(self)
+
+    def __await__(self) -> Generator[Any, None, bool]:
+        return self._resolve().__await__()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, bool):
+            return bool(self) is other
+        if isinstance(other, _HasFileResult):
+            return self._request is other._request and self._name == other._name
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"_HasFileResult({bool(self)!r})"
 
 
 class Request:
@@ -395,6 +434,24 @@ class Request:
         if name is not None:
             return form_data.get_files(name)
         return dict(form_data.files_list)
+
+    def _check_has_file_sync(self, name: str) -> bool:
+        if self._form is not None:
+            return any(bool(uploaded.filename) for uploaded in self._form.get_files(name))
+        if self._input_loaded:
+            value = self._input_cache.get(name)
+            if isinstance(value, UploadedFile):
+                return bool(value.filename)
+            if isinstance(value, list):
+                return any(
+                    isinstance(item, UploadedFile) and bool(item.filename)
+                    for item in value
+                )
+        return False
+
+    def has_file(self, name: str) -> _HasFileResult:
+        """Return whether a non-empty uploaded file is present for `name` (sync or awaitable)."""
+        return _HasFileResult(self, name)
 
     async def input(
         self,

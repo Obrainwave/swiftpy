@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import inspect
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from typing import Any
 
 from swiftpy.cache.cache import Cache
 from swiftpy.core.config import Config, env, env_bool
 from swiftpy.core.container import get_container
 from swiftpy.core.container_exceptions import BindingNotFoundError, ResolutionError
+from swiftpy.database.orm.model import Model
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.filesystem.manager import FilesystemManager
+from swiftpy.filesystem.uploads.handlers import FormData
+from swiftpy.http.request import Request
 from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
@@ -18,7 +24,10 @@ from swiftpy.support.hashing import (
     verify_password_async,
 )
 from swiftpy.support.strings import pluralize, snake_case
+from swiftpy.validation.form_request import FormRequest
 from swiftpy.websockets.manager import WebSocketManager
+
+_MISSING = object()
 
 
 def app() -> Any:
@@ -166,6 +175,145 @@ def ws_manager() -> WebSocketManager:
     return websocket_manager()
 
 
+def _resolve_isset_step(target: Any, key: Any) -> Any:
+    """Resolve one lookup step for ``isset()``, returning ``_MISSING`` if absent."""
+    if target is None or isinstance(
+        target, (str, bytes, bytearray, memoryview, int, float, bool, complex)
+    ):
+        return _MISSING
+
+    if isinstance(target, Config):
+        if not isinstance(key, str):
+            return _MISSING
+        return target.get(key, _MISSING)
+
+    if isinstance(target, FormData):
+        if not isinstance(key, str):
+            return _MISSING
+        if key in target.fields_list:
+            field_vals = target.fields_list[key]
+            if not field_vals:
+                return _MISSING
+            return field_vals[0] if len(field_vals) == 1 else field_vals
+        if key in target.files_list:
+            file_vals = target.files_list[key]
+            if not file_vals:
+                return _MISSING
+            return file_vals[0] if len(file_vals) == 1 else file_vals
+        return _MISSING
+
+    if isinstance(target, Request):
+        if not isinstance(key, str):
+            return _MISSING
+        mapping = target._current_input_mapping()
+        if key in mapping:
+            return mapping[key]
+        if target._form is not None:
+            return _resolve_isset_step(target._form, key)
+        return _MISSING
+
+    if isinstance(target, FormRequest):
+        if not isinstance(key, str):
+            return _MISSING
+        payload = (
+            target.data
+            if target.validation_result is not None or target.data
+            else target.raw_data
+        )
+        if isinstance(payload, Mapping):
+            return _resolve_isset_step(payload, key)
+        return _MISSING
+
+    if isinstance(target, Model):
+        if not isinstance(key, str) or key.startswith("_"):
+            return _MISSING
+        loaded = getattr(target, "_loaded_relations", None)
+        if isinstance(loaded, dict) and key in loaded:
+            return loaded[key]
+        static_attr = inspect.getattr_static(type(target), key, _MISSING)
+        if (
+            key in getattr(target, "__relations_config__", {})
+            and static_attr is not _MISSING
+        ):
+            return _MISSING
+        instance_dict = getattr(target, "__dict__", None)
+        if isinstance(instance_dict, dict) and key in instance_dict:
+            return instance_dict[key]
+        if key in getattr(target, "__fields__", {}):
+            return getattr(target, key, _MISSING)
+        if isinstance(static_attr, property):
+            return getattr(target, key, _MISSING)
+        return _MISSING
+
+    if isinstance(target, Mapping):
+        try:
+            if key in target:
+                return target[key]
+        except (KeyError, TypeError):
+            return _MISSING
+        return _MISSING
+
+    if isinstance(target, AbstractSet):
+        try:
+            if key in target:
+                return key
+        except TypeError:
+            return _MISSING
+        return _MISSING
+
+    if isinstance(target, Sequence):
+        index: int | None = None
+        if isinstance(key, int) and not isinstance(key, bool):
+            index = key
+        elif isinstance(key, str) and key.isascii() and key.isdigit():
+            index = int(key)
+        if index is not None and -len(target) <= index < len(target):
+            return target[index]
+        return _MISSING
+
+    if not isinstance(key, str) or key.startswith("_"):
+        return _MISSING
+    instance_dict = getattr(target, "__dict__", None)
+    if isinstance(instance_dict, dict) and key in instance_dict:
+        return instance_dict[key]
+    val = getattr(target, key, _MISSING)
+    if val is _MISSING:
+        return _MISSING
+    if inspect.ismethod(val) or inspect.isbuiltin(val) or inspect.isfunction(val):
+        return _MISSING
+    return val
+
+
+def _isset_single(data: Any, key: Any) -> bool:
+    """Return True if a single key/path resolves in ``data`` to a non-None value."""
+    direct = _resolve_isset_step(data, key)
+    if direct is not _MISSING:
+        return direct is not None
+
+    if not isinstance(key, str) or "." not in key:
+        return False
+
+    segments = key.split(".")
+    if any(seg == "" for seg in segments):
+        return False
+
+    current: Any = data
+    for seg in segments:
+        current = _resolve_isset_step(current, seg)
+        if current is _MISSING:
+            return False
+    return current is not None
+
+
+def isset(data: Any, *keys: Any) -> bool:
+    """Determine if ``data`` (or every given key/index/attribute/dot-path) exists and is not None."""
+    if data is None:
+        return False
+    if not keys:
+        return True
+    return all(_isset_single(data, key) for key in keys)
+
+
 __all__ = [
     "app",
     "cache",
@@ -178,6 +326,7 @@ __all__ = [
     "event",
     "hash_password",
     "hash_password_async",
+    "isset",
     "mail",
     "pluralize",
     "queue",

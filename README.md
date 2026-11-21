@@ -60,6 +60,7 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Week 26: Pagination & Aggregation Subsystem** | Limit/offset parameterized SQL, length-aware `paginate()`, `simple_paginate()`, `group_by()` & `having()` | ✅ Completed |
 | **Release v0.2.0: DX, Logging, Auth Refresh & Docs** | `ValidatedData` & `validate(request)`, `Request.input()` & `abort()`, `Router(prefix, middleware)`, `Blueprint.enum`/`medium_text`/`long_text`, `swiftpy.logging` (`Log`), `refresh_token_pair()` & `auth().logout()`, 17 user guides in `documentations/` | ✅ Completed |
 | **Release v0.2.1: Auth Context on Token Issue** | `CurrentUser` / `auth()` available when an access token is issued, `user=` / `Model` subjects, opt-in `auth.hydrate_user` & `auth.passive_resolution` | ✅ Completed |
+| **Release v0.2.2: Model `.update()`, `isset()`, `has_file()`, & Auth TTL** | `Model.update()` / `force_update()`, `JWT_ACCESS_TTL=3600`, 405 `"for route"` detail, `isset()` helper, `request.has_file()` (sync & `await`), CORS guide | ✅ Completed |
 
 *See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md) for the complete step-by-step documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
@@ -502,8 +503,9 @@ SwiftPY reads environment variables and YAML/Python configuration files with str
 | `DB_CONNECTION` | `database.default` | `"postgresql"` | Default database connection key (`"postgresql"`). |
 | `DB_SSL` | `database.connections.postgresql.ssl` | `"disable"` | PostgreSQL SSL mode (`"disable"`, `"require"`, `"verify-ca"`, `"verify-full"`). |
 | `DB_SSL_CA_FILE` | `database.connections.postgresql.ssl_ca_file` | `""` | Filepath to CA certificate when `DB_SSL` is `"verify-ca"` or `"verify-full"`. |
-| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | `[]` | Comma-separated list of allowed CORS origins (never pair `"*"` with `CORS_ALLOW_CREDENTIALS=true`). |
+| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | `[]` | Comma-separated list of exact allowed CORS origins (never pair `"*"` with `CORS_ALLOW_CREDENTIALS=true`). See the [CORS Guide](./documentations/2026-11-21-cors.md). |
 | `CORS_ALLOW_CREDENTIALS` | `cors.allow_credentials` | `False` | Whether cross-origin requests may include credentials/cookies. |
+| `CORS_MAX_AGE` | `cors.max_age` | `600` | Preflight `OPTIONS` cache duration (`Access-Control-Max-Age`) in seconds. |
 | `AI_ENABLED` | `ai.enabled` | `True` | Master toggle for `swiftpy.ai` requests (raises `AIModuleDisabledError` when disabled). |
 | `AI_DEFAULT_PROVIDER` | `ai.default` | `"openai"` | Default LLM provider (`"openai"` or `"anthropic"`) when not inferred from model name. |
 | `OPENAI_API_KEY` | `ai.providers.openai.api_key` | `""` | OpenAI API key for chat, streaming, and embeddings. |

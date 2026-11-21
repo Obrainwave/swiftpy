@@ -172,6 +172,8 @@ class ResponseHeaders(MutableMapping[str, str]):
 
 def _json_default(obj: Any) -> Any:
     """Default JSON serializer for framework response payloads."""
+    if getattr(type(obj), "_is_has_file_result", False) is True:
+        return bool(obj)
     if isinstance(obj, (bytes, bytearray, memoryview)):
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
     if isinstance(obj, (datetime, date, time)):

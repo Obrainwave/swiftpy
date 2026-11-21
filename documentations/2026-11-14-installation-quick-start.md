@@ -159,7 +159,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.2.1, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.2.2, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -313,7 +313,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.2.1",
+       "swiftpy-framework>=0.2.2",
        # ...
    ]
    ```
@@ -343,7 +343,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.2.1"
+python -m pip install --upgrade "swiftpy-framework>=0.2.2"
 swiftpy --version
 ```
 

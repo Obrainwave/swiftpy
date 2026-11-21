@@ -66,6 +66,7 @@ Request bodies arrive over the ASGI `receive` channel and are cached on the `Req
 - **`await request.json() -> Any`:** Parses UTF-8 JSON (empty body returns `{}`) and validates JSON nesting depth (`max_json_depth`). Malformed JSON or exceeded depth raises `HttpException(status_code=400)`.
 - **`await request.form() -> FormData`:** Parses `application/x-www-form-urlencoded` and streaming `multipart/form-data` submissions (`fields_list` / `files_list`).
 - **`await request.file(name) -> UploadedFile | None`:** Retrieves the first uploaded file for `name`.
+- **`request.has_file(name)`:** Checks whether a non-empty uploaded file with a filename was submitted for field `name`. Inside `Application` routes (with `auto_load_request_input=True`), you can call either `if request.has_file("image"):` synchronously or `if await request.has_file("image"):` asynchronously (`empty` browser file inputs with `filename=""`, text fields, and JSON payloads return `False`).
 - **`await request.files(name=None) -> list[UploadedFile] | dict[str, list[UploadedFile]]`:** Retrieves all uploaded files for `name`, or the full mapping of uploaded files when `name` is `None`.
 
 Call `await request.close()` only when working outside the ASGI pipeline; `Application` automatically closes parsed `FormData` temporary files in a `finally` block at the end of every HTTP request.
@@ -88,7 +89,7 @@ When your route handler declares a `Request` parameter, `Application` automatica
 3. `Transfer-Encoding` is **not** `chunked`.
 4. `Content-Type` media type is `application/json`, `*+json` (such as `application/problem+json`), or `application/x-www-form-urlencoded`.
 
-`multipart/form-data` uploads, arbitrary binary payloads, and chunked streams are **never** auto-read before your handler runs—your handler keeps full control over streaming multipart parsing and file size validation. Furthermore, if an auto-preloaded request body is not valid JSON (for example, a raw webhook payload sent with an `application/json` header), preload buffers the raw bytes (still enforcing `max_body_size` / `413`) and defers any `400 Invalid JSON payload` error until your handler explicitly calls `await request.json()` or `await request.input()`—so handlers that only inspect `await request.body()` continue to run normally.
+`multipart/form-data` uploads are automatically preloaded **only when** `has_request_param` and `auto_load_request_input=True` and the handler calls `request.has_file(...)`; otherwise `multipart/form-data`, arbitrary binary payloads, and chunked streams are **never** auto-read before your handler runs—your handler keeps full control over streaming multipart parsing and file size validation. Furthermore, if an auto-preloaded request body is not valid JSON (for example, a raw webhook payload sent with an `application/json` header), preload buffers the raw bytes (still enforcing `max_body_size` / `413`) and defers any `400 Invalid JSON payload` error until your handler explicitly calls `await request.json()` or `await request.input()`—so handlers that only inspect `await request.body()` continue to run normally.
 
 ```python
 from swiftpy import Request, Response, json_response, validate
