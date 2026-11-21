@@ -4,6 +4,22 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-21
+
+### Added
+- **ORM (`Model.update` & `Model.force_update`):** Added async `update()` and `force_update()` methods on `Model` instances accepting either a mapping (`await user.update({"name": "Alice"})`) or keyword attributes (`await user.update(name="Alice")`). Respects `__fillable__` / `__guarded__`, updates `updated_at`, short-circuits cleanly on unchanged attributes, fires `updating` / `updated` events, and raises `PrimaryKeyError` on unsaved instances. Existing query-builder `Model.where(...).update(...)` remains unchanged.
+- **Helpers (`isset()`):** Added `isset(data, *keys)` in `swiftpy.helpers` (and re-exported from top-level `swiftpy`) to test non-`None` key, index, dot-path, and attribute existence across mappings, sequences, sets, `Request`, `FormData`, `FormRequest` (inspecting only actual form input), `ValidatedData`, `Config`, loaded `Model` fields/relations (without triggering lazy loads on unloaded relations or exposing `_`-prefixed private attributes), and generic Python objects.
+- **HTTP (`Request.has_file`):** Added `request.has_file(name)` returning a dual sync/awaitable result (`if request.has_file("image"):` and `if await request.has_file("image"):`, plus direct boolean serialization in `encode_json` / `json_response`) with targeted multipart pre-loading when `Application` detects `has_file` usage on a route, while keeping non-`has_file` multipart routes lazy (`multipart_body_calls == 0`).
+
+### Changed
+- **Auth (`JWTIssuer` / Config / Scaffolding):** Increased default `JWT_ACCESS_TTL` / `access_token_ttl` from `900` (15 minutes) to `3600` seconds (60 minutes) across `JWTIssuer`, `config/auth.py`, `.env.example`, and `swiftpy new` templates while retaining `JWT_REFRESH_TTL=604800` (7 days), and added strict positive-integer validation for `access_token_ttl` and `refresh_token_ttl`.
+- **Routing (`MethodNotAllowedError`):** Updated 405 error detail wording in `Router` from `"Method '...' not allowed for path '...'"` to `"Method '...' not allowed for route '...'"` to match framework routing terminology.
+- **Packaging & Scaffolding:** Bumped `swiftpy-framework` package version and `swiftpy new` dependency floor to `0.2.2`.
+
+### Documentation
+- Added dedicated CORS guide [`documentations/2026-11-21-cors.md`](documentations/2026-11-21-cors.md) covering `CORSMiddleware` / `CORS`, `config/cors.py` and `.env` / `CORS__*` configuration, global vs. `Router`/`RouteGroup` attachment (including ordering ahead of `JWTGuard`), preflight `OPTIONS` handling, `Vary: Origin`, exact origin matching, wildcard + credentials (`G-3`) enforcement, and `TestClient` verification; cross-linked from [the HTTP routing guide](documentations/2026-11-15-http-routing-middleware-and-exceptions.md) and [README.md](README.md).
+- Updated ORM, Auth, Core Helpers, HTTP Routing, Request/Response, Filesystem Upload, and Installation guides for `v0.2.2`.
+
 ## [0.2.1] - 2026-11-20
 
 ### Fixed

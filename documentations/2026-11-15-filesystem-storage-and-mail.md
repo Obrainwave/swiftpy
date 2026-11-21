@@ -257,7 +257,7 @@ async def upload_avatar(request: Request) -> Response:
 
 Key `UploadedFile` & `FileValidator` rules:
 
-- **Route parameter injection:** Besides `await request.file("avatar")` / `await request.files("attachments")`, handlers can inject uploads directly by parameter name using `avatar: UploadedFile` or `attachments: list[UploadedFile]`.
+- **Route parameter & upload existence checks:** Besides `await request.file("avatar")` / `await request.files("attachments")`, handlers can inject uploads directly by parameter name using `avatar: UploadedFile` or `attachments: list[UploadedFile]`, or check whether an upload was provided via `if request.has_file("avatar"):` (or `if await request.has_file("avatar"):`).
 - **Rules mapping (`dict` required):** Supported keys are `"max_size"`, `"min_size"` (integers or units like `"500B"`, `"10KB"`, `"5MB"`, `"1GB"`), `"extensions"`, `"mimes"`, and `"magic_bytes"`. Passing a list instead of a mapping raises `TypeError`.
 - **Fail-closed magic-byte verification:** `magic_bytes=True` reads the file's leading header bytes (`32` bytes) and verifies them against signatures derived from your server policy (`extensions` / `mimes`), supporting `image/jpeg`, `image/png`, `image/gif`, `image/webp`, `application/pdf`, and `application/zip`. Unknown types without registered magic signatures fail closed rather than passing.
 - **Anti-spoofing & HTTP exceptions:** `FileValidator` checks `await file.get_real_size()` against actual spooled bytes alongside declared size. Size violations raise `FileTooLargeError` (HTTP `413`); extension, MIME, and magic-byte failures raise `InvalidFileExtensionError` / `InvalidMimeTypeError` / `FileValidationError` (HTTP `422` when handled by SwiftPY's exception handler).

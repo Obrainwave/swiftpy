@@ -250,6 +250,8 @@ await draft.delete()
 Dirty-tracking safeguards:
 
 - If an existing persisted model has **no dirty non-PK attributes**, calling `await model.save()` performs **0 SQL queries** and emits no `updated` event.
+
+- **Direct instance updates (`update()` & `force_update()`):** On a persisted model instance, call `await model.update({"name": "New Name"})` or `await model.update(name="New Name")` to apply attributes via `.fill()`, respect `__fillable__` / `__guarded__` rules, update `updated_at`, run dirty checks (0 SQL queries if nothing changed), emit `updating` / `updated` events, and persist via `.save()` (returning `self`). For trusted internal writes bypassing mass-assignment rules, use `await model.force_update(...)`. Calling `update()` or `force_update()` on an unsaved model raises `PrimaryKeyError`.
 - If the model defines `updated_at`, saving a dirty existing record refreshes `updated_at` to `datetime.now(UTC)` automatically.
 - If you load a partial subset of columns with `.select("id", "title")`, SwiftPY records only the selected columns in its original snapshot. Calling `await post.save()` after modifying `post.title` updates only `title` and never clobbers unselected database columns.
 

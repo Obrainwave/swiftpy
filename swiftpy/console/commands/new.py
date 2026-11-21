@@ -219,7 +219,7 @@ AUTH_HYDRATE_USER=false
 AUTH_PASSIVE_RESOLUTION=false
 JWT_SECRET=
 JWT_ALGORITHM=HS256
-JWT_ACCESS_TTL=900
+JWT_ACCESS_TTL=3600
 JWT_REFRESH_TTL=604800
 AUTH_KEY_PEPPER=
 
@@ -945,7 +945,7 @@ CONFIG = {
         "jwt": {
             "secret": env("JWT_SECRET", ""),
             "algorithm": env("JWT_ALGORITHM", "HS256"),
-            "access_token_ttl": int(env("JWT_ACCESS_TTL", "900") or "900"),
+            "access_token_ttl": int(env("JWT_ACCESS_TTL", "3600") or "3600"),
             "refresh_token_ttl": int(env("JWT_REFRESH_TTL", "604800") or "604800"),
             "leeway": int(env("JWT_LEEWAY", "0") or "0"),
             "issuer": env("JWT_ISSUER") or None,
@@ -1538,7 +1538,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.2.1",
+    "swiftpy-framework>=0.2.2",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",

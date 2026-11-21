@@ -2428,3 +2428,19 @@ Implemented a first-class Filesystem and Storage subsystem inspired by Laravel's
 
 
 
+
+## 2026-11-21 — Release v0.2.2 Implementation & Verification
+
+### Implemented Features & Changes
+- **ORM instance `.update()` & `.force_update()` (`swiftpy/database/orm/model.py`):** Added `_UnsetType`/`_UNSET` sentinel, `_extract_update_mapping()`, `_update_with_payload()`, and overloaded async `Model.update()` / `Model.force_update()` methods supporting both mapping arguments (`await user.update({"name": ...})`) and keyword arguments (`await user.update(name=...)`). Enforces `__fillable__` / `__guarded__` rules (and bypasses them on `force_update()`), updates `updated_at`, preserves dirty-tracking 0-query short-circuiting, dispatches `updating` / `updated` events, raises `PrimaryKeyError` on unsaved/deleted models, and leaves `ModelQueryBuilder.update()` intact.
+- **Default JWT Access TTL (`swiftpy/auth/jwt_issuer.py`, `config/auth.py`, `.env.example`, `swiftpy/console/commands/new.py`):** Increased default `JWT_ACCESS_TTL` / `access_token_ttl` from `900` (15 minutes) to `3600` seconds (60 minutes) while retaining `JWT_REFRESH_TTL=604800` (7 days).
+- **HTTP `405 Method Not Allowed` Detail (`swiftpy/http/router.py`):** Updated `MethodNotAllowedError` message wording from `"for path '{path}'"` to `"for route '{path}'"`.
+- **`isset()` Helper (`swiftpy/helpers/helper.py`, `swiftpy/helpers/__init__.py`, `swiftpy/__init__.py`):** Implemented and exported `isset(data, *keys)` supporting variadic multi-key checks, dot-notation nested lookups (preferring literal keys first), mappings (`dict`, `ValidatedData`, `RequestHeaders`), non-string sequences (`list`, `tuple`), sets, `Request`, `FormData`, `FormRequest`, `Config`, `Model` (inspecting columns, `@property`, and loaded relations without triggering lazy loads on unloaded relations), dataclasses, slotted objects, and plain objects.
+- **`Request.has_file()` (`swiftpy/http/request.py`, `swiftpy/core/application.py`):** Added `_HasFileResult` (supporting synchronous truthiness `if request.has_file("image"):` and `await request.has_file("image")`) and `Request.has_file()`. Extended `Application._wrap_handler` with route-compile-time `_handler_uses_attr(handler, "has_file")` detection so non-chunked multipart write requests preload only when handlers use `has_file`, preserving lazy multipart reads when unused or when `auto_load_request_input=False`.
+- **Release `0.2.2`, Tests & Documentation:** Bumped `pyproject.toml`, `uv.lock`, and `swiftpy new` template dependency floor (`>=0.2.2`); added targeted suites (`tests/orm/test_instance_update.py`, `tests/core/test_helpers.py`, `tests/http/test_router_405_and_has_file.py`, `tests/auth/test_jwt_defaults.py`, and scaffolding assertions); updated user guides, `README.md`, and `CHANGELOG.md` (`[0.2.2] - 2026-11-21`).
+
+### Verification Results
+- **Full pytest suite (isolated Docker PG `25432` & Redis `26379`):** `1532 passed, 7 skipped` (live external vector-store/API key skips in `tests/ai/integration/`), total coverage `85.84%` (`>= 80%` threshold passed).
+- **Ruff:** `uv run ruff check .` — `All checks passed!`.
+- **Mypy:** `uv run mypy swiftpy` (`192` files), `uv run mypy .` (`432` files), `uv run mypy --explicit-package-bases .` (`432` files), and `uv run mypy --strict swiftpy/core swiftpy/http swiftpy/validation swiftpy/events swiftpy/auth swiftpy/ai` (`79` files) — `0` issues across all runs.
+- **Packaging, Wheel Smoke Test & Docs:** Built `dist/swiftpy_framework-0.2.2.tar.gz` and `dist/swiftpy_framework-0.2.2-py3-none-any.whl`; `twine check dist/*` passed; isolated clean venv install verified `swiftpy 0.2.2`, `isset`, `Model.update`/`force_update`, `JWTIssuer` 3600s default, 405 `"for route"`, and sync `request.has_file("image")` (`WHEEL_SMOKE_OK`); relative markdown link check across `20` files reported `0` broken links.

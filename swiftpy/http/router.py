@@ -1010,7 +1010,7 @@ class Router:
             unique_methods = sorted(matched_methods)
             allow_header = ", ".join(unique_methods)
             raise MethodNotAllowedError(
-                f"Method '{method}' not allowed for path '{path}'. Allowed: {allow_header}",
+                f"Method '{method}' not allowed for route '{path}'. Allowed: {allow_header}",
                 headers={"Allow": allow_header},
             )
 

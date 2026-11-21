@@ -154,7 +154,7 @@ SwiftPY enforces strict, predictable routing rules:
 - **Exact trailing-slash matching**: `/items` and `/items/` are distinct paths. Requesting `/items/` when only `/items` is registered returns `404 Not Found`.
 - **Duplicate detection**: Registering two routes with the same HTTP method and normalized path raises `RouteRegistrationError` at startup.
 - **Automatic `HEAD` & `OPTIONS`**: Any `GET` route automatically supports `HEAD` (returning headers with an empty body). `OPTIONS` requests on any matched path automatically return `204 No Content` with an `Allow` header listing supported methods.
-- **Method Not Allowed (`405`)**: Sending an unsupported HTTP method to an existing path returns `405` JSON (`{"detail": "Method '...' not allowed for path '...'. Allowed: ..."}`) along with the `Allow` header.
+- **Method Not Allowed (`405`)**: Sending an unsupported HTTP method to an existing route returns `405` JSON (`{"detail": "Method '...' not allowed for route '...'. Allowed: ..."}`) along with the `Allow` header.
 
 ---
 
@@ -716,7 +716,7 @@ CORS_ALLOW_CREDENTIALS=true
 CORS_MAX_AGE=600
 ```
 
-`CORSMiddleware` handles preflight `OPTIONS` requests (`Access-Control-Request-Method`) with `204 No Content` and attaches `Vary: Origin` when specific origins or credentials are enabled. Never pair `"*"` in `allowed_origins` with `CORS_ALLOW_CREDENTIALS=true`.
+`CORSMiddleware` handles preflight `OPTIONS` requests (`Access-Control-Request-Method`) with `204 No Content` and attaches `Vary: Origin` when specific origins or credentials are enabled. Never pair `"*"` in `allowed_origins` with `CORS_ALLOW_CREDENTIALS=true`. See the dedicated [CORS Configuration & Middleware](2026-11-21-cors.md) guide for full preflight, credential, header exposure, and SPA integration details.
 
 ---
 

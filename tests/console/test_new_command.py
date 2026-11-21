@@ -429,8 +429,15 @@ def test_scaffolded_packaging_and_plain_mypy_config(
 
     env_active = (app_dir / ".env").read_text(encoding="utf-8")
     assert "\nDB_DATABASE=pkg_app\n" in env_active
+    assert "\nJWT_ACCESS_TTL=3600\n" in env_active
+    assert "\nJWT_REFRESH_TTL=604800\n" in env_active
     env_example = (app_dir / ".env.example").read_text(encoding="utf-8")
     assert "\nDB_DATABASE=pkg_app\n" in env_example
+    assert "\nJWT_ACCESS_TTL=3600\n" in env_example
+    assert "\nJWT_REFRESH_TTL=604800\n" in env_example
+    auth_cfg = (app_dir / "config" / "auth.py").read_text(encoding="utf-8")
+    assert 'env("JWT_ACCESS_TTL", "3600")' in auth_cfg
+    assert 'env("JWT_REFRESH_TTL", "604800")' in auth_cfg
     db_cfg = (app_dir / "config" / "database.py").read_text(encoding="utf-8")
     assert '"database": env("DB_DATABASE", "pkg_app")' in db_cfg
 
