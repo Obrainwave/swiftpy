@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import importlib
 import logging
+import types
 from collections.abc import Mapping
-from typing import Any
+from typing import Annotated, Any, Union, get_args, get_origin
 
 import asyncpg
 
@@ -248,6 +249,28 @@ def bind_jwt_user_context(
     return user_ctx
 
 
+def _expects_int_pk(pk_type: Any) -> bool:
+    """Return True if a primary key field hint represents an integer (including Optional[int])."""
+    if pk_type is None or pk_type is int:
+        return True
+    if isinstance(pk_type, str):
+        cleaned = pk_type.strip()
+        if cleaned in {"int", "int | None", "None | int", "Optional[int]"}:
+            return True
+        if "|" in cleaned:
+            parts = {p.strip() for p in cleaned.split("|")}
+            return "int" in parts and parts <= {"int", "None", "NoneType"}
+        return False
+    origin = get_origin(pk_type)
+    if origin is Annotated:
+        args = get_args(pk_type)
+        return _expects_int_pk(args[0]) if args else False
+    if origin in (Union, types.UnionType):
+        non_none_args = [a for a in get_args(pk_type) if a is not type(None)]
+        return len(non_none_args) == 1 and _expects_int_pk(non_none_args[0])
+    return False
+
+
 async def _load_user_model(sub: str) -> Model | None:
     """Load the user model for ``sub`` when a DB pool is ready; degrade to None on DB errors."""
     try:
@@ -264,7 +287,7 @@ async def _load_user_model(sub: str) -> Model | None:
 
     pk_name = getattr(user_cls, "__primary_key__", "id")
     pk_type = getattr(user_cls, "__fields__", {}).get(pk_name)
-    lookup: Any = int(sub) if sub.isdigit() and pk_type in (int, "int", None) else sub
+    lookup: Any = int(sub) if sub.isdigit() and _expects_int_pk(pk_type) else sub
     try:
         return await user_cls.find(lookup)
     except (QueryError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError, RuntimeError):

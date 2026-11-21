@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Iterator
 from typing import Any, ClassVar
@@ -98,7 +99,11 @@ def _app(*, auth_options: dict[str, Any] | None = None, blacklist: bool = False)
                 "guards": {"jwt": {"secret": SECRET, "algorithm": "HS256"}},
                 **(auth_options or {}),
             },
-            "redis": {"host": "127.0.0.1", "port": 26379, "password": "secret"},
+            "redis": {
+                "host": os.getenv("REDIS_HOST", "127.0.0.1"),
+                "port": int(os.getenv("REDIS_PORT", "6379")),
+                "password": os.getenv("REDIS_PASSWORD") or "secret",
+            },
         },
         auto_discover_providers=False,
     )
