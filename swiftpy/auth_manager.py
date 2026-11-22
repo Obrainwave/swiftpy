@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from swiftpy.auth.auth_manager import (
+    Auth,
     AuthManager,
     AuthProxy,
     AuthUser,
+    Callback,
     CurrentUser,
     auth,
     current_user,
@@ -13,9 +15,11 @@ from swiftpy.auth.auth_manager import (
 )
 
 __all__ = [
+    "Auth",
     "AuthManager",
     "AuthProxy",
     "AuthUser",
+    "Callback",
     "CurrentUser",
     "auth",
     "current_user",

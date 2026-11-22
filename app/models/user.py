@@ -14,12 +14,13 @@ class User(Model):
     __table__ = "users"
     __primary_key__ = "id"
     __fillable__ = ["name", "email", "password", "is_admin"]
-    __hidden__ = ["password"]
+    __hidden__ = ["password", "remember_token"]
 
     id: int
     name: str
     email: str
     password: str
     is_admin: bool
+    remember_token: str | None = None
     created_at: datetime
     updated_at: datetime

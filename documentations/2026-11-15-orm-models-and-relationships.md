@@ -417,6 +417,30 @@ for user in users:
 
 Eager-loaded to-many relationships return a `LoadedList` (a `list` subclass that also works if awaited with `await user.posts`), while eager-loaded to-one relationships resolve to `Model | None`.
 
+#### Filtering by Relationship Existence (`has`, `doesnt_have`, `where_has`)
+
+Query parent models based on whether related records exist or match additional constraints—across `HasOne`, `HasMany`, `BelongsTo`, `BelongsToMany`, and nested dot-paths:
+
+```python
+# Users with at least one subscription / post (supports camelCase or snake_case relation names)
+subscribed = await User.has("activeSubscription").get()
+active_authors = await User.has("posts", ">=", 2).get()
+
+# Users without any posts (NULL-safe NOT IN)
+no_posts = await User.doesnt_have("posts").get()
+
+# Constrain the related query inside the subquery
+published_authors = await User.where_has(
+    "posts", lambda q: q.where("published", True)
+).get()
+
+# Nested relationships + OR combinators
+approved_commenters = await User.where_has(
+    "posts.comments", lambda q: q.where("approved", True)
+).get()
+mixed = await User.where("is_admin", True).or_where_doesnt_have("posts").get()
+```
+
 #### Async Lazy Queries vs `RelationNotLoadedError`
 
 By default (`prevent_lazy_loading = False`), accessing an **unloaded** relationship attribute returns a `RelationshipQueryBuilder` (for `HasMany`/`BelongsToMany`) or `SingleRelationshipQueryBuilder` (for `HasOne`/`BelongsTo`):

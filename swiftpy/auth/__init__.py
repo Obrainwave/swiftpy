@@ -9,9 +9,11 @@ from swiftpy.auth.api_key_guard import (
     verify_api_key_hash,
 )
 from swiftpy.auth.auth_manager import (
+    Auth,
     AuthManager,
     AuthProxy,
     AuthUser,
+    Callback,
     CurrentUser,
     auth,
     current_user,
@@ -19,10 +21,20 @@ from swiftpy.auth.auth_manager import (
     resolve_user_model_class,
     set_user_model,
 )
+from swiftpy.auth.events import (
+    Attempting,
+    Authenticated,
+    Failed,
+    Lockout,
+    Login,
+    Logout,
+    dispatch_auth_event,
+)
 from swiftpy.auth.exceptions import (
     AuthenticationError,
     InvalidApiKeyError,
     TokenRevokedError,
+    TooManyRequestsError,
 )
 from swiftpy.auth.jwt_guard import JWTGuard, require_jwt
 from swiftpy.auth.jwt_issuer import (
@@ -33,6 +45,7 @@ from swiftpy.auth.jwt_issuer import (
     JWTIssuer,
     TokenExpiredError,
 )
+from swiftpy.auth.throttle import LoginThrottle
 from swiftpy.auth.token_blacklist import TokenBlacklist
 from swiftpy.support.hashing import (
     Hash,
@@ -44,11 +57,16 @@ from swiftpy.support.hashing import (
 
 __all__ = [
     "ApiKeyGuard",
+    "Attempting",
+    "Auth",
     "AuthManager",
     "AuthProxy",
     "AuthUser",
+    "Authenticated",
     "AuthenticationError",
+    "Callback",
     "CurrentUser",
+    "Failed",
     "Hash",
     "InvalidAlgorithmError",
     "InvalidApiKeyError",
@@ -57,12 +75,18 @@ __all__ = [
     "JWTError",
     "JWTGuard",
     "JWTIssuer",
+    "Lockout",
+    "Login",
+    "LoginThrottle",
+    "Logout",
     "TokenBlacklist",
     "TokenExpiredError",
     "TokenRevokedError",
+    "TooManyRequestsError",
     "auth",
     "current_user",
     "current_user_model",
+    "dispatch_auth_event",
     "generate_api_key",
     "get_server_pepper",
     "hash_api_key",

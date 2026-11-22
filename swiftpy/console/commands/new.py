@@ -222,6 +222,12 @@ JWT_ALGORITHM=HS256
 JWT_ACCESS_TTL=3600
 JWT_REFRESH_TTL=604800
 AUTH_KEY_PEPPER=
+AUTH_REMEMBER_COOKIE=swiftpy_remember
+AUTH_REMEMBER_TTL=2592000
+AUTH_THROTTLE_ENABLED=true
+AUTH_THROTTLE_MAX_ATTEMPTS=5
+AUTH_THROTTLE_DECAY_SECONDS=60
+AUTH_THROTTLE_LOCKOUT_SECONDS=60
 
 # CORS (opt-in explicit comma-separated origins, e.g. http://localhost:3000,http://localhost:8000)
 # Never pair '*' with CORS_ALLOW_CREDENTIALS=true
@@ -305,13 +311,14 @@ class User(Model):
     __table__ = "users"
     __primary_key__ = "id"
     __fillable__ = ["name", "email", "password", "is_admin"]
-    __hidden__ = ["password"]
+    __hidden__ = ["password", "remember_token"]
 
     id: int
     name: str
     email: str
     password: str
     is_admin: bool
+    remember_token: str | None = None
     created_at: datetime
     updated_at: datetime
 """
@@ -1094,6 +1101,7 @@ class CreateUsersTable(Migration):
             table.string("email").unique()
             table.string("password")
             table.boolean("is_admin").default(False)
+            table.remember_token()
             table.timestamps()
 
         await Schema.create("users", define)
@@ -1174,6 +1182,17 @@ CONFIG = {
     },
     "hash": {
         "rounds": int(env("BCRYPT_ROUNDS", "12") or "12"),
+    },
+    "remember": {
+        "cookie_name": env("AUTH_REMEMBER_COOKIE", "swiftpy_remember"),
+        "ttl": int(env("AUTH_REMEMBER_TTL", "2592000") or "2592000"),
+    },
+    "throttle": {
+        "enabled": env_bool("AUTH_THROTTLE_ENABLED", True),
+        "max_attempts": int(env("AUTH_THROTTLE_MAX_ATTEMPTS", "5") or "5"),
+        "decay_seconds": int(env("AUTH_THROTTLE_DECAY_SECONDS", "60") or "60"),
+        "lockout_seconds": int(env("AUTH_THROTTLE_LOCKOUT_SECONDS", "60") or "60"),
+        "prefix": env("AUTH_THROTTLE_PREFIX", "auth:throttle"),
     },
     "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
     "hydrate_user": env_bool("AUTH_HYDRATE_USER", False),
@@ -1584,7 +1603,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.3.0",
+    "swiftpy-framework>=0.3.1",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",

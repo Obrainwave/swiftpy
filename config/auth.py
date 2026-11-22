@@ -10,6 +10,17 @@ CONFIG: dict[str, object] = {
     "hash": {
         "rounds": int(env("BCRYPT_ROUNDS", "12")),
     },
+    "remember": {
+        "cookie_name": env("AUTH_REMEMBER_COOKIE", "swiftpy_remember"),
+        "ttl": int(env("AUTH_REMEMBER_TTL", "2592000")),
+    },
+    "throttle": {
+        "enabled": env_bool("AUTH_THROTTLE_ENABLED", True),
+        "max_attempts": int(env("AUTH_THROTTLE_MAX_ATTEMPTS", "5")),
+        "decay_seconds": int(env("AUTH_THROTTLE_DECAY_SECONDS", "60")),
+        "lockout_seconds": int(env("AUTH_THROTTLE_LOCKOUT_SECONDS", "60")),
+        "prefix": env("AUTH_THROTTLE_PREFIX", "auth:throttle"),
+    },
     "guards": {
         "jwt": {
             "driver": "jwt",

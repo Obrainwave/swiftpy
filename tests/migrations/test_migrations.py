@@ -51,6 +51,7 @@ async def test_blueprint_dsl_and_schema_grammar() -> None:
     blueprint.float("rating").default(0.0)
     blueprint.jsonb("metadata").default("{}")
     blueprint.date("release_date").nullable()
+    blueprint.remember_token()
     blueprint.timestamps()
     blueprint.soft_deletes()
     blueprint.index(["name", "is_active"], name="idx_catalog_name_active")
@@ -68,6 +69,7 @@ async def test_blueprint_dsl_and_schema_grammar() -> None:
     assert '"quantity" INTEGER NOT NULL DEFAULT 0 CHECK ("quantity" >= 0)' in create_sql
     assert '"is_active" BOOLEAN NOT NULL DEFAULT TRUE' in create_sql
     assert '"price" NUMERIC(10, 2) NOT NULL DEFAULT 9.99' in create_sql
+    assert '"remember_token" VARCHAR(100) NULL' in create_sql
     assert '"created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP' in create_sql
     assert '"deleted_at" TIMESTAMPTZ NULL' in create_sql
     assert (

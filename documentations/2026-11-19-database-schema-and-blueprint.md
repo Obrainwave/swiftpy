@@ -116,6 +116,7 @@ Every column name and identifier passes through `validate_identifier()` before S
 | `table.medium_text(name)` | `TEXT` | Mapped cleanly to PostgreSQL `TEXT`. |
 | `table.long_text(name)` | `TEXT` | Mapped cleanly to PostgreSQL `TEXT`. |
 | `table.enum(name, values)` | `VARCHAR(<N>)` + value check | Validates allowed non-empty string `values`; validates `.default(...)` against `values` (unless nullable `None` or `raw(...)`). |
+| `table.remember_token(name="remember_token", length=100)` | `VARCHAR(length) NULL` | Nullable persistent token column used by `Auth.attempt(..., remember=True)`. |
 
 ### Numeric & Boolean Types
 

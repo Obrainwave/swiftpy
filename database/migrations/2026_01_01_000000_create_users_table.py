@@ -11,6 +11,7 @@ class CreateUsersTable(Migration):
             table.string("email").unique()
             table.string("password")
             table.boolean("is_admin").default(False)
+            table.remember_token()
             table.timestamps()
 
         await Schema.create("users", define)

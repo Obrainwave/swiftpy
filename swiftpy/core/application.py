@@ -21,7 +21,12 @@ from swiftpy.auth.exceptions import (
 from swiftpy.auth.jwt_guard import require_jwt
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
-from swiftpy.auth.user_context import auth_option_enabled
+from swiftpy.auth.user_context import (
+    auth_option_enabled,
+    authenticate_remember_cookie,
+    extract_remember_cookie_from_request,
+    pop_queued_auth_cookies,
+)
 from swiftpy.cache.cache import Cache
 from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, bind_container, set_container
@@ -744,6 +749,42 @@ class Application:
         token = parts[1].strip()
         return bool(token) and token.count(".") == 2
 
+    @staticmethod
+    def _attach_queued_auth_cookies(response: Response, request: Request | None) -> None:
+        for cookie_hdr in pop_queued_auth_cookies(request):
+            response.set_cookie(cookie_hdr)
+
+    async def _maybe_resolve_remember_cookie(self, request: Request) -> None:
+        if Context.get("__swiftpy_current_user__") is not None:
+            return
+        if Context.get("__swiftpy_logged_out__"):
+            return
+        has_auth_header = any(
+            k.lower() == b"authorization" for k, _ in request.scope.get("headers", [])
+        )
+        if has_auth_header:
+            return
+        if extract_remember_cookie_from_request(request, config=self.config) is None:
+            return
+        raw_guard = self.config.get("auth.defaults.guard") or self.config.get(
+            "auth.default"
+        )
+        guard_name = str(raw_guard) if isinstance(raw_guard, str) and raw_guard else "jwt"
+        try:
+            await authenticate_remember_cookie(
+                request,
+                config=self.config,
+                guard=guard_name,
+            )
+        except (
+            AuthenticationError,
+            AuthenticationServiceUnavailableError,
+            ConfigurationError,
+            RuntimeError,
+            ValueError,
+        ):
+            pass
+
     def _wrap_handler(self, route: Route) -> Any:
         handler = route.handler
         param_specs = self.router.ensure_route_analyzed(route)
@@ -767,6 +808,7 @@ class Application:
                         ValueError,
                     ):
                         pass
+                await self._maybe_resolve_remember_cookie(request)
 
                 controller_instance: Any = None
                 has_controller = False
@@ -1756,6 +1798,7 @@ class Application:
                         response = await self._dispatch_http(request)
 
                     try:
+                        self._attach_queued_auth_cookies(response, request)
                         await response.send(tracked_send, send_body=send_body)
                     except ClientDisconnect:
                         raise
@@ -1788,6 +1831,7 @@ class Application:
                                 if request is not None
                                 else True
                             )
+                            self._attach_queued_auth_cookies(fallback, request)
                             await fallback.send(
                                 tracked_send, send_body=fallback_send_body
                             )

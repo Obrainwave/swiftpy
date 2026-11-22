@@ -4,34 +4,59 @@ import copy
 import inspect
 import logging
 import math
+import os
+import secrets
 import time
+import types
 import weakref
-from collections.abc import Callable, Iterator
-from typing import Any
+from collections.abc import Callable, Iterator, Mapping
+from typing import Annotated, Any, Union, get_args, get_origin
 
 from swiftpy.auth.api_key_guard import ApiKeyGuard
+from swiftpy.auth.events import (
+    Attempting,
+    Authenticated,
+    Failed,
+    Lockout,
+    Login,
+    Logout,
+    dispatch_auth_event,
+)
 from swiftpy.auth.exceptions import (
     AuthenticationError,
     AuthenticationServiceUnavailableError,
     JWTError,
+    TooManyRequestsError,
 )
 from swiftpy.auth.jwt_guard import JWTGuard
 from swiftpy.auth.jwt_issuer import JWTIssuer
+from swiftpy.auth.throttle import LoginThrottle
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
 from swiftpy.auth.user_context import (
     CONTEXT_AUTH_GUARD_KEY,
+    CONTEXT_AUTH_REMEMBER_TOKEN_KEY,
+    CONTEXT_AUTH_TOKENS_KEY,
+    CONTEXT_AUTH_VIA_REMEMBER_KEY,
     CONTEXT_LOGGED_OUT_KEY,
     CONTEXT_USER_KEY,
     CONTEXT_USER_MODEL_KEY,
     SENSITIVE_USER_KEYS,
+    _expects_int_pk,
+    extract_remember_cookie_from_request,
+    format_forget_remember_cookie,
+    format_remember_set_cookie,
+    is_sensitive_key,
+    queue_auth_cookie,
     resolve_user_model_class,
 )
-from swiftpy.core.config import Config
+from swiftpy.core.config import Config, ConfigurationError
 from swiftpy.core.container import Container, get_container
 from swiftpy.core.context import Context
-from swiftpy.database.orm.model import Model
+from swiftpy.database.identifiers import validate_identifier
+from swiftpy.database.orm.model import Model, ModelQueryBuilder
 from swiftpy.database.pool import DatabasePool
 from swiftpy.http.request import Request
+from swiftpy.support.hashing import Hash
 
 logger = logging.getLogger("swiftpy.auth.manager")
 
@@ -40,6 +65,178 @@ _CONTEXT_USER_MODEL_KEY = CONTEXT_USER_MODEL_KEY
 _CONTEXT_AUTH_GUARD_KEY = CONTEXT_AUTH_GUARD_KEY
 
 _SENSITIVE_KEYS: frozenset[str] = SENSITIVE_USER_KEYS
+_DUMMY_BCRYPT_HASH = (
+    "$2b$12$Tu7.0HFP3JgZtjcyhyh./uyjQ9LLnxaFCE1QjeBapJm7sD/cAYdl6"
+)
+_THROTTLE_PRIORITY_KEYS: tuple[str, ...] = ("email", "username", "login", "phone")
+
+
+class Callback:
+    """
+    Hashable wrapper allowing closures to be supplied inside credential dictionaries
+    (as either key or value) or passed to :meth:`Auth.attempt_when`.
+    """
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        if not callable(fn):
+            raise TypeError("Callback requires a callable function or lambda.")
+        self.fn = fn
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.fn(*args, **kwargs)
+
+
+def _is_bool_field_hint(hint: Any) -> bool:
+    if hint is bool:
+        return True
+    if isinstance(hint, str):
+        cleaned = hint.replace("Optional[", "").rstrip("]").strip()
+        parts = {p.strip() for p in cleaned.split("|")}
+        return "bool" in parts and parts <= {"bool", "None", "NoneType"}
+    origin = get_origin(hint)
+    if origin is Annotated:
+        args = get_args(hint)
+        return _is_bool_field_hint(args[0]) if args else False
+    if origin in (Union, types.UnionType):
+        non_none = [a for a in get_args(hint) if a is not type(None)]
+        return len(non_none) == 1 and _is_bool_field_hint(non_none[0])
+    return False
+
+
+def _coerce_credential_value(user_cls: type[Model], column: str, value: Any) -> Any:
+    fields = getattr(user_cls, "__fields__", {})
+    hint = fields.get(column)
+    if (
+        _is_bool_field_hint(hint)
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value in (0, 1)
+    ):
+        return bool(value)
+    return value
+
+
+def _partition_credentials(
+    credentials: Mapping[Any, Any],
+    user_cls: type[Model],
+) -> tuple[list[tuple[str, Any]], list[Callable[..., Any]], str | None, bool]:
+    column_filters: list[tuple[str, Any]] = []
+    closures: list[Callable[..., Any]] = []
+    raw_password: str | None = None
+    has_password_key = False
+
+    for key, val in credentials.items():
+        if isinstance(key, Callback) or callable(key):
+            closures.append(key)
+            if isinstance(val, Callback) or callable(val):
+                closures.append(val)
+            continue
+
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Credential key must be a column name string or Callback/callable, got {type(key).__name__}."
+            )
+
+        if key == "password":
+            has_password_key = True
+            raw_password = val if isinstance(val, str) else None
+            continue
+
+        if isinstance(val, Callback) or callable(val):
+            closures.append(val)
+            continue
+
+        safe_col = validate_identifier(key, allow_dotted=True, allow_wildcard=False)
+        column_filters.append((safe_col, _coerce_credential_value(user_cls, safe_col, val)))
+
+    return column_filters, closures, raw_password, has_password_key
+
+
+def _sanitize_credentials_for_event(credentials: Mapping[Any, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, val in credentials.items():
+        if isinstance(key, Callback) or callable(key):
+            continue
+        if not isinstance(key, str):
+            continue
+        if is_sensitive_key(key):
+            continue
+        if isinstance(val, Callback) or callable(val):
+            sanitized[key] = "<callback>"
+        else:
+            sanitized[key] = val
+    return sanitized
+
+
+def _extract_throttle_identifier(credentials: Mapping[Any, Any]) -> str:
+    for preferred in _THROTTLE_PRIORITY_KEYS:
+        if preferred in credentials:
+            raw = credentials[preferred]
+            if not callable(raw) and raw is not None:
+                return str(raw)
+    string_keys = sorted(
+        k
+        for k, v in credentials.items()
+        if isinstance(k, str)
+        and k != "password"
+        and not callable(v)
+        and v is not None
+    )
+    if string_keys:
+        return str(credentials[string_keys[0]])
+    return ""
+
+
+def _extract_client_ip(
+    request: Request | None = None,
+    explicit_ip: str | None = None,
+) -> str:
+    if explicit_ip is not None and explicit_ip.strip():
+        return explicit_ip.strip()
+    req = request if request is not None else Context.get("request")
+    if isinstance(req, Request):
+        client = req.scope.get("client")
+        if isinstance(client, (tuple, list)) and client and client[0]:
+            return str(client[0])
+    return "unknown"
+
+
+def _resolve_active_container_and_config() -> tuple[Container | None, Config | None]:
+    container: Container | None = None
+    cfg: Config | None = None
+    try:
+        container = get_container()
+        if container.has(Config):
+            cfg = container.resolve(Config)
+    except RuntimeError:
+        container = None
+    if cfg is None:
+        try:
+            cfg = Config.get_instance()
+        except (ConfigurationError, RuntimeError):
+            cfg = None
+    return container, cfg
+
+
+def _has_configured_jwt_credentials(
+    container: Container | None,
+    cfg: Config | None,
+) -> bool:
+    if container is not None and container.has(JWTIssuer):
+        return True
+    if cfg is not None:
+        for key in (
+            "auth.guards.jwt.secret",
+            "auth.jwt.secret",
+            "jwt_secret",
+            "auth.guards.jwt.private_key",
+            "auth.jwt.private_key",
+        ):
+            val = cfg.get(key)
+            if isinstance(val, str) and val.strip():
+                return True
+    env_secret = os.environ.get("JWT_SECRET")
+    return bool(env_secret and env_secret.strip())
 
 
 class AuthUser(dict[str, Any]):
@@ -393,11 +590,386 @@ class AuthProxy:
         Context.set("auth.user", None)
         Context.set(_CONTEXT_USER_MODEL_KEY, None)
         Context.set(_CONTEXT_AUTH_GUARD_KEY, None)
+        Context.set(CONTEXT_AUTH_VIA_REMEMBER_KEY, False)
+        Context.set(CONTEXT_AUTH_REMEMBER_TOKEN_KEY, None)
+        Context.set(CONTEXT_AUTH_TOKENS_KEY, None)
         req = request if isinstance(request, Request) else Context.get("request")
         if isinstance(req, Request) and hasattr(req, "state"):
             req.state.pop("user", None)
             req.state.pop("auth_guard", None)
+            req.state.pop(CONTEXT_AUTH_VIA_REMEMBER_KEY, None)
             req.state[CONTEXT_LOGGED_OUT_KEY] = True
+
+    def _guard_name(self) -> str:
+        if self._guard is not None:
+            return self._guard
+        _, cfg = _resolve_active_container_and_config()
+        if cfg is not None:
+            configured = cfg.get("auth.defaults.guard") or cfg.get("auth.default")
+            if isinstance(configured, str) and configured.strip():
+                return configured.strip()
+        return "jwt"
+
+    @staticmethod
+    def _resolve_throttle() -> LoginThrottle:
+        return LoginThrottle()
+
+    @staticmethod
+    def _resolve_user_model_class() -> type[Model]:
+        user_cls = resolve_user_model_class()
+        if user_cls is None:
+            raise ConfigurationError(
+                "Unable to resolve application User model. Configure 'auth.model' or define app.models.user.User."
+            )
+        return user_cls
+
+    def via_remember(self) -> bool:
+        """Return True if the active request was authenticated using a remember-me cookie."""
+        if bool(Context.get(CONTEXT_AUTH_VIA_REMEMBER_KEY)):
+            return True
+        req = Context.get("request")
+        if isinstance(req, Request) and hasattr(req, "state"):
+            return bool(req.state.get(CONTEXT_AUTH_VIA_REMEMBER_KEY))
+        return False
+
+    viaRemember = via_remember
+
+    def tokens(self) -> dict[str, Any] | None:
+        """Return the JWT access/refresh token pair issued during login, if any."""
+        val = Context.get(CONTEXT_AUTH_TOKENS_KEY)
+        return dict(val) if isinstance(val, dict) else None
+
+    def access_token(self) -> str | None:
+        """Return the active access token issued during login, if any."""
+        pair = self.tokens()
+        if pair is None:
+            return None
+        tok = pair.get("access_token")
+        return tok if isinstance(tok, str) else None
+
+    def refresh_token(self) -> str | None:
+        """Return the active refresh token issued during login, if any."""
+        pair = self.tokens()
+        if pair is None:
+            return None
+        tok = pair.get("refresh_token")
+        return tok if isinstance(tok, str) else None
+
+    def remember_token(self) -> str | None:
+        """Return the remember-me token active for the current session, if any."""
+        val = Context.get(CONTEXT_AUTH_REMEMBER_TOKEN_KEY)
+        if isinstance(val, str) and val:
+            return val
+        model_inst = current_user_model()
+        if model_inst is not None:
+            tok = getattr(model_inst, "remember_token", None)
+            if isinstance(tok, str) and tok:
+                return tok
+        return None
+
+    async def too_many_attempts(self, identifier: str, ip: str | None = None) -> bool:
+        """Return True if login attempts for `identifier` + `ip` are currently throttled."""
+        resolved_ip = _extract_client_ip(explicit_ip=ip)
+        return await self._resolve_throttle().too_many_attempts(identifier, resolved_ip)
+
+    async def available_in(self, identifier: str, ip: str | None = None) -> int:
+        """Return remaining lockout seconds for `identifier` + `ip`."""
+        resolved_ip = _extract_client_ip(explicit_ip=ip)
+        return await self._resolve_throttle().available_in(identifier, resolved_ip)
+
+    async def clear_throttle(self, identifier: str, ip: str | None = None) -> None:
+        """Clear recorded failed login attempts and lockout for `identifier` + `ip`."""
+        resolved_ip = _extract_client_ip(explicit_ip=ip)
+        await self._resolve_throttle().clear(identifier, resolved_ip)
+
+    async def _verify_credentials_candidate(
+        self,
+        credentials: Mapping[Any, Any],
+    ) -> tuple[bool, Model | None]:
+        if not isinstance(credentials, Mapping):
+            raise TypeError("credentials must be a mapping.")
+        if not credentials:
+            return False, None
+
+        user_cls = self._resolve_user_model_class()
+        column_filters, closures, raw_password, has_password_key = _partition_credentials(
+            credentials, user_cls
+        )
+        if not has_password_key:
+            await Hash.check_async("", _DUMMY_BCRYPT_HASH)
+            return False, None
+
+        query = user_cls.query()
+        for col, val in column_filters:
+            query = query.where(col, val)
+
+        for closure in closures:
+            closure_res = closure(query)
+            if inspect.isawaitable(closure_res):
+                closure_res = await closure_res
+            if isinstance(closure_res, ModelQueryBuilder):
+                query = closure_res
+
+        candidate = await query.first()
+        if candidate is None or raw_password is None:
+            await Hash.check_async(raw_password or "", _DUMMY_BCRYPT_HASH)
+            return False, candidate
+
+        stored_hash = getattr(candidate, "password", None) or getattr(
+            candidate, "password_hash", None
+        )
+        if not isinstance(stored_hash, str) or not stored_hash:
+            await Hash.check_async(raw_password, _DUMMY_BCRYPT_HASH)
+            return False, candidate
+
+        matched = await Hash.check_async(raw_password, stored_hash)
+        return matched, candidate
+
+    async def _attempt_internal(
+        self,
+        credentials: Mapping[Any, Any],
+        callback: Callable[[Any], Any] | None = None,
+        remember: bool = False,
+        *,
+        ip: str | None = None,
+    ) -> bool:
+        if not isinstance(credentials, Mapping):
+            raise TypeError("credentials must be a mapping.")
+        if callback is not None and not callable(callback):
+            raise TypeError("attempt_when callback must be callable.")
+
+        guard_name = self._guard_name()
+        identifier = _extract_throttle_identifier(credentials)
+        client_ip = _extract_client_ip(explicit_ip=ip)
+        throttle = self._resolve_throttle()
+
+        if throttle.enabled and await throttle.too_many_attempts(identifier, client_ip):
+            retry_after = await throttle.available_in(identifier, client_ip)
+            await dispatch_auth_event(
+                Lockout(
+                    identifier=identifier,
+                    ip=client_ip,
+                    max_attempts=throttle.max_attempts,
+                    retry_after=retry_after,
+                    guard=guard_name,
+                )
+            )
+            raise TooManyRequestsError(
+                f"Too many login attempts. Please try again in {retry_after} seconds.",
+                retry_after=retry_after,
+            )
+
+        safe_creds = _sanitize_credentials_for_event(credentials)
+        await dispatch_auth_event(
+            Attempting(guard=guard_name, credentials=safe_creds, remember=bool(remember))
+        )
+
+        matched, candidate = await self._verify_credentials_candidate(credentials)
+        if not matched or candidate is None:
+            if throttle.enabled:
+                await throttle.hit(identifier, client_ip)
+            await dispatch_auth_event(
+                Failed(guard=guard_name, user=candidate, credentials=safe_creds)
+            )
+            return False
+
+        if callback is not None:
+            verdict = callback(candidate)
+            if inspect.isawaitable(verdict):
+                verdict = await verdict
+            if not bool(verdict):
+                if throttle.enabled:
+                    await throttle.hit(identifier, client_ip)
+                await dispatch_auth_event(
+                    Failed(guard=guard_name, user=candidate, credentials=safe_creds)
+                )
+                return False
+
+        if throttle.enabled:
+            await throttle.clear(identifier, client_ip)
+
+        await self.login(candidate, remember=remember)
+        return True
+
+    async def attempt(
+        self,
+        credentials: Mapping[Any, Any],
+        remember: bool = False,
+        *,
+        ip: str | None = None,
+    ) -> bool:
+        """
+        Verify credentials against the User model, start an authenticated session,
+        issue tokens when JWT is configured, and enforce default login throttling.
+        """
+        return await self._attempt_internal(
+            credentials,
+            callback=None,
+            remember=remember,
+            ip=ip,
+        )
+
+    async def attempt_when(
+        self,
+        credentials: Mapping[Any, Any],
+        callback: Callable[[Any], Any],
+        remember: bool = False,
+        *,
+        ip: str | None = None,
+    ) -> bool:
+        """
+        Verify credentials and inspect the resolved User via ``callback`` before
+        completing authentication.
+        """
+        return await self._attempt_internal(
+            credentials,
+            callback=callback,
+            remember=remember,
+            ip=ip,
+        )
+
+    attemptWhen = attempt_when
+
+    async def login(self, user: Any, remember: bool = False) -> Any:
+        """Log in an existing User model or mapping and optionally set a remember-me cookie."""
+        if user is None:
+            raise ValueError("Cannot log in a None user.")
+
+        guard_name = self._guard_name()
+        container, cfg = _resolve_active_container_and_config()
+        raw_req = Context.get("request")
+        req = raw_req if isinstance(raw_req, Request) else None
+
+        set_user_model(user, guard=guard_name)
+        Context.set(CONTEXT_AUTH_VIA_REMEMBER_KEY, False)
+        if isinstance(req, Request) and hasattr(req, "state"):
+            req.state[CONTEXT_AUTH_VIA_REMEMBER_KEY] = False
+
+        pk_attr = getattr(user, "__primary_key__", "id")
+        if isinstance(user, Model):
+            user_id = getattr(user, pk_attr, None)
+        elif isinstance(user, Mapping):
+            user_id = user.get(pk_attr) if pk_attr in user else user.get("sub")
+        else:
+            user_id = getattr(user, pk_attr, None)
+
+        if remember:
+            if user_id is None:
+                raise ValueError("Cannot remember a user without a primary key.")
+            token = secrets.token_urlsafe(45)[:60]
+            if isinstance(user, Model):
+                fields = getattr(user.__class__, "__fields__", {})
+                if "remember_token" not in fields:
+                    raise ConfigurationError(
+                        f"Model {user.__class__.__name__} must declare a 'remember_token' field to use remember=True."
+                    )
+                await user.__class__.where(pk_attr, user_id).update(
+                    {"remember_token": token}
+                )
+                user.remember_token = token
+                if isinstance(getattr(user, "_original", None), dict):
+                    user._original["remember_token"] = token
+                if hasattr(user, "_modified_keys"):
+                    user._modified_keys.discard("remember_token")
+            elif isinstance(user, dict):
+                user["remember_token"] = token
+
+            Context.set(CONTEXT_AUTH_REMEMBER_TOKEN_KEY, token)
+            cookie_name, cookie_hdr = format_remember_set_cookie(
+                user_id,
+                token,
+                config=cfg,
+                request=req,
+            )
+            queue_auth_cookie(cookie_hdr, cookie_name=cookie_name, request=req)
+        else:
+            Context.set(CONTEXT_AUTH_REMEMBER_TOKEN_KEY, None)
+
+        Context.set(CONTEXT_AUTH_TOKENS_KEY, None)
+        if user_id is not None and _has_configured_jwt_credentials(container, cfg):
+            issuer: JWTIssuer | None = None
+            if container is not None and container.has(JWTIssuer):
+                issuer = container.resolve(JWTIssuer)
+            else:
+                issuer = JWTIssuer.from_config(cfg)
+            pair = issuer.issue_token_pair(user, user=user)
+            Context.set(CONTEXT_AUTH_TOKENS_KEY, pair)
+            Context.set(_CONTEXT_AUTH_GUARD_KEY, guard_name)
+            if isinstance(req, Request) and hasattr(req, "state"):
+                req.state["auth_guard"] = guard_name
+
+        await dispatch_auth_event(Authenticated(guard=guard_name, user=user))
+        await dispatch_auth_event(
+            Login(guard=guard_name, user=user, remember=bool(remember))
+        )
+        return user
+
+    async def login_using_id(self, user_id: Any, remember: bool = False) -> Any:
+        """Authenticate a user by primary key and return the User model (or False)."""
+        user_cls = self._resolve_user_model_class()
+        pk_attr = getattr(user_cls, "__primary_key__", "id")
+        pk_type = getattr(user_cls, "__fields__", {}).get(pk_attr)
+        lookup: Any = (
+            int(user_id)
+            if isinstance(user_id, str) and user_id.isdigit() and _expects_int_pk(pk_type)
+            else user_id
+        )
+        user = await user_cls.find(lookup)
+        if user is None:
+            return False
+        return await self.login(user, remember=remember)
+
+    loginUsingId = login_using_id
+    login_sing_id = login_using_id
+
+    async def once(self, credentials: Mapping[Any, Any]) -> bool:
+        """
+        Authenticate a user for the current request only without cookies,
+        sessions, remember tokens, JWT persistence, or dispatching Login.
+        """
+        guard_name = self._guard_name()
+        safe_creds = (
+            _sanitize_credentials_for_event(credentials)
+            if isinstance(credentials, Mapping)
+            else {}
+        )
+        matched, candidate = await self._verify_credentials_candidate(credentials)
+        if not matched or candidate is None:
+            await dispatch_auth_event(
+                Failed(guard=guard_name, user=candidate, credentials=safe_creds)
+            )
+            return False
+
+        set_user_model(candidate, guard=guard_name)
+        Context.set(CONTEXT_AUTH_VIA_REMEMBER_KEY, False)
+        Context.set(CONTEXT_AUTH_REMEMBER_TOKEN_KEY, None)
+        Context.set(CONTEXT_AUTH_TOKENS_KEY, None)
+        await dispatch_auth_event(Authenticated(guard=guard_name, user=candidate))
+        return True
+
+    async def once_using_id(self, user_id: Any) -> bool:
+        """Authenticate a user by ID for the current request only."""
+        user_cls = self._resolve_user_model_class()
+        pk_attr = getattr(user_cls, "__primary_key__", "id")
+        pk_type = getattr(user_cls, "__fields__", {}).get(pk_attr)
+        lookup: Any = (
+            int(user_id)
+            if isinstance(user_id, str) and user_id.isdigit() and _expects_int_pk(pk_type)
+            else user_id
+        )
+        user = await user_cls.find(lookup)
+        if user is None:
+            return False
+
+        guard_name = self._guard_name()
+        set_user_model(user, guard=guard_name)
+        Context.set(CONTEXT_AUTH_VIA_REMEMBER_KEY, False)
+        Context.set(CONTEXT_AUTH_REMEMBER_TOKEN_KEY, None)
+        Context.set(CONTEXT_AUTH_TOKENS_KEY, None)
+        await dispatch_auth_event(Authenticated(guard=guard_name, user=user))
+        return True
+
+    onceUsingId = once_using_id
 
     @staticmethod
     async def _revoke_raw_token(
@@ -428,10 +1000,24 @@ class AuthProxy:
         clear_context: bool = True,
     ) -> None:
         """
-        Revoke the current session's JWT token(s) in `TokenBlacklist` and clear request auth context.
+        Revoke the current session's JWT token(s) in `TokenBlacklist`, invalidate
+        any active remember-me token, and clear request auth context.
         """
         raw_req = request if request is not None else Context.get("request")
         req = raw_req if isinstance(raw_req, Request) else None
+        guard_name = self._guard_name()
+        logged_out_model = current_user_model()
+        logged_out_user = (
+            logged_out_model
+            if logged_out_model is not None
+            else Context.get(_CONTEXT_USER_KEY)
+        )
+        was_via_remember = self.via_remember()
+        had_remember_ctx = was_via_remember or bool(
+            Context.get(CONTEXT_AUTH_REMEMBER_TOKEN_KEY)
+        )
+        has_remember_cookie = extract_remember_cookie_from_request(req) is not None
+
         target_token = (
             token if token is not None else self._extract_bearer_token(req)
         )
@@ -491,8 +1077,55 @@ class AuthProxy:
                     token_label="refresh",
                 )
 
+        await self._invalidate_remember_state(logged_out_model, req, was_via_remember=was_via_remember, had_remember_ctx=had_remember_ctx, has_remember_cookie=has_remember_cookie)
+
         if clear_context:
             self._clear_auth_context(req)
+
+        await dispatch_auth_event(Logout(guard=guard_name, user=logged_out_user))
+
+    async def _invalidate_remember_state(
+        self,
+        model_inst: Any,
+        req: Request | None,
+        *,
+        was_via_remember: bool,
+        had_remember_ctx: bool,
+        has_remember_cookie: bool,
+    ) -> None:
+        container, cfg = _resolve_active_container_and_config()
+        if (
+            isinstance(model_inst, Model)
+            and "remember_token" in getattr(model_inst.__class__, "__fields__", {})
+            and (
+                bool(getattr(model_inst, "remember_token", None))
+                or was_via_remember
+                or had_remember_ctx
+            )
+        ):
+            pool = (
+                container.resolve(DatabasePool)
+                if container is not None and container.has(DatabasePool)
+                else None
+            )
+            if pool is not None and pool.is_initialized:
+                pk_attr = getattr(model_inst.__class__, "__primary_key__", "id")
+                pk_val = getattr(model_inst, pk_attr, None)
+                if pk_val is not None:
+                    await model_inst.__class__.where(pk_attr, pk_val).update(
+                        {"remember_token": None}
+                    )
+                    model_inst.remember_token = None
+                    if isinstance(getattr(model_inst, "_original", None), dict):
+                        model_inst._original["remember_token"] = None
+                    if hasattr(model_inst, "_modified_keys"):
+                        model_inst._modified_keys.discard("remember_token")
+
+        if was_via_remember or had_remember_ctx or has_remember_cookie:
+            cookie_name, forget_hdr = format_forget_remember_cookie(
+                config=cfg, request=req
+            )
+            queue_auth_cookie(forget_hdr, cookie_name=cookie_name, request=req)
 
     async def logout_all(
         self,
@@ -506,6 +1139,15 @@ class AuthProxy:
         Revoke all tokens issued for `subject` (or the currently authenticated user)
         via `TokenBlacklist.revoke_all_for_subject()`.
         """
+        raw_req = Context.get("request")
+        req = raw_req if isinstance(raw_req, Request) else None
+        logged_out_model = current_user_model()
+        was_via_remember = self.via_remember()
+        had_remember_ctx = was_via_remember or bool(
+            Context.get(CONTEXT_AUTH_REMEMBER_TOKEN_KEY)
+        )
+        has_remember_cookie = extract_remember_cookie_from_request(req) is not None
+
         current_subject = self.id()
         if current_subject is None:
             raw_user = Context.get(_CONTEXT_USER_KEY)
@@ -539,14 +1181,20 @@ class AuthProxy:
                     "Authentication service unavailable"
                 ) from exc
 
-        if clear_context and (
-            subject is None
-            or (
-                current_subject is not None
-                and str(target_subject) == str(current_subject)
+        is_current_subject = subject is None or (
+            current_subject is not None and str(target_subject) == str(current_subject)
+        )
+        if is_current_subject:
+            await self._invalidate_remember_state(
+                logged_out_model,
+                req,
+                was_via_remember=was_via_remember,
+                had_remember_ctx=had_remember_ctx,
+                has_remember_cookie=has_remember_cookie,
             )
-        ):
-            self._clear_auth_context()
+
+        if clear_context and is_current_subject:
+            self._clear_auth_context(req)
 
 
 def auth(guard: str | None = None) -> AuthProxy:
@@ -825,6 +1473,80 @@ class AuthManager:
         """Return the current user from task-scoped context."""
         return current_user()
 
+    async def attempt(
+        self,
+        credentials: Mapping[Any, Any],
+        remember: bool = False,
+        *,
+        guard_name: str | None = None,
+        ip: str | None = None,
+    ) -> bool:
+        """Delegate credential verification and session/token creation to AuthProxy."""
+        return await AuthProxy(guard=guard_name).attempt(
+            credentials, remember=remember, ip=ip
+        )
+
+    async def attempt_when(
+        self,
+        credentials: Mapping[Any, Any],
+        callback: Callable[[Any], Any],
+        remember: bool = False,
+        *,
+        guard_name: str | None = None,
+        ip: str | None = None,
+    ) -> bool:
+        """Delegate conditional authentication to AuthProxy."""
+        return await AuthProxy(guard=guard_name).attempt_when(
+            credentials, callback, remember=remember, ip=ip
+        )
+
+    attemptWhen = attempt_when
+
+    async def login(
+        self,
+        user: Any,
+        remember: bool = False,
+        *,
+        guard_name: str | None = None,
+    ) -> Any:
+        """Delegate direct user login to AuthProxy."""
+        return await AuthProxy(guard=guard_name).login(user, remember=remember)
+
+    async def login_using_id(
+        self,
+        user_id: Any,
+        remember: bool = False,
+        *,
+        guard_name: str | None = None,
+    ) -> Any:
+        """Delegate ID-based login to AuthProxy."""
+        return await AuthProxy(guard=guard_name).login_using_id(
+            user_id, remember=remember
+        )
+
+    loginUsingId = login_using_id
+    login_sing_id = login_using_id
+
+    async def once(
+        self,
+        credentials: Mapping[Any, Any],
+        *,
+        guard_name: str | None = None,
+    ) -> bool:
+        """Delegate stateless single-request authentication to AuthProxy."""
+        return await AuthProxy(guard=guard_name).once(credentials)
+
+    async def once_using_id(
+        self,
+        user_id: Any,
+        *,
+        guard_name: str | None = None,
+    ) -> bool:
+        """Delegate stateless single-request ID authentication to AuthProxy."""
+        return await AuthProxy(guard=guard_name).once_using_id(user_id)
+
+    onceUsingId = once_using_id
+
     def register_container_bindings(self, container: Container | None = None) -> None:
         """
         Register AuthManager as a singleton and CurrentUser as a task-scoped binding
@@ -838,10 +1560,178 @@ class AuthManager:
         )
 
 
+class Auth:
+    """
+    Static authentication facade providing Laravel-inspired ``Auth.attempt()``,
+    ``Auth.attempt_when()``, ``Auth.login()``, ``Auth.login_using_id()``,
+    ``Auth.once()``, and session/context inspection helpers.
+    """
+
+    @staticmethod
+    def guard(name: str | None = None) -> AuthProxy:
+        """Return an AuthProxy bound to ``name`` (or the default guard)."""
+        return AuthProxy(guard=name)
+
+    @staticmethod
+    def user() -> AuthUser | None:
+        """Return the authenticated user for the current task, or None."""
+        return AuthProxy().user()
+
+    @staticmethod
+    def check() -> bool:
+        """Return True if the current request task is authenticated."""
+        return AuthProxy().check()
+
+    @staticmethod
+    def guest() -> bool:
+        """Return True if the current request task is not authenticated."""
+        return AuthProxy().guest()
+
+    @staticmethod
+    def id() -> Any | None:
+        """Return the active authenticated user's primary key, or None."""
+        return AuthProxy().id()
+
+    @staticmethod
+    def via_remember() -> bool:
+        """Return True if the current user was authenticated via a remember-me cookie."""
+        return AuthProxy().via_remember()
+
+    viaRemember = via_remember
+
+    @staticmethod
+    def tokens() -> dict[str, Any] | None:
+        """Return the active JWT token pair issued during login, if available."""
+        return AuthProxy().tokens()
+
+    @staticmethod
+    def access_token() -> str | None:
+        """Return the access token issued during login, if available."""
+        return AuthProxy().access_token()
+
+    @staticmethod
+    def refresh_token() -> str | None:
+        """Return the refresh token issued during login, if available."""
+        return AuthProxy().refresh_token()
+
+    @staticmethod
+    def remember_token() -> str | None:
+        """Return the active remember-me token for the current user, if any."""
+        return AuthProxy().remember_token()
+
+    @staticmethod
+    async def attempt(
+        credentials: Mapping[Any, Any],
+        remember: bool = False,
+        *,
+        ip: str | None = None,
+    ) -> bool:
+        """Verify credentials and authenticate the matching user if valid."""
+        return await AuthProxy().attempt(credentials, remember=remember, ip=ip)
+
+    @staticmethod
+    async def attempt_when(
+        credentials: Mapping[Any, Any],
+        callback: Callable[[Any], Any],
+        remember: bool = False,
+        *,
+        ip: str | None = None,
+    ) -> bool:
+        """Verify credentials and require ``callback(user)`` to return truthy."""
+        return await AuthProxy().attempt_when(
+            credentials, callback, remember=remember, ip=ip
+        )
+
+    attemptWhen = attempt_when
+
+    @staticmethod
+    async def login(user: Any, remember: bool = False) -> Any:
+        """Log in a resolved user model instance (optionally with remember-me)."""
+        return await AuthProxy().login(user, remember=remember)
+
+    @staticmethod
+    async def login_using_id(user_id: Any, remember: bool = False) -> Any:
+        """Log in a user by primary key (returning User model or False)."""
+        return await AuthProxy().login_using_id(user_id, remember=remember)
+
+    loginUsingId = login_using_id
+    login_sing_id = login_using_id
+
+    @staticmethod
+    async def once(credentials: Mapping[Any, Any]) -> bool:
+        """Authenticate a user for a single request with no cookies/Login event."""
+        return await AuthProxy().once(credentials)
+
+    @staticmethod
+    async def once_using_id(user_id: Any) -> bool:
+        """Authenticate a user by ID for a single request only."""
+        return await AuthProxy().once_using_id(user_id)
+
+    onceUsingId = once_using_id
+
+    @staticmethod
+    async def too_many_attempts(identifier: str, ip: str | None = None) -> bool:
+        """Return True if login attempts for ``identifier`` + ``ip`` are throttled."""
+        return await AuthProxy().too_many_attempts(identifier, ip=ip)
+
+    @staticmethod
+    async def available_in(identifier: str, ip: str | None = None) -> int:
+        """Return remaining throttle lockout seconds for ``identifier`` + ``ip``."""
+        return await AuthProxy().available_in(identifier, ip=ip)
+
+    @staticmethod
+    async def clear_throttle(identifier: str, ip: str | None = None) -> None:
+        """Clear recorded throttle failures and lockouts for ``identifier`` + ``ip``."""
+        await AuthProxy().clear_throttle(identifier, ip=ip)
+
+    @staticmethod
+    async def authenticate(request: Request | None = None) -> Any:
+        """Authenticate the incoming request via the active guard."""
+        return await AuthProxy().authenticate(request)
+
+    @staticmethod
+    async def logout(
+        request: Request | None = None,
+        *,
+        token: str | None = None,
+        refresh_token: str | None = None,
+        blacklist: TokenBlacklist | None = None,
+        issuer: JWTIssuer | None = None,
+        clear_context: bool = True,
+    ) -> None:
+        """Log out the current authenticated user, revoking tokens & cookies."""
+        await AuthProxy().logout(
+            request=request,
+            token=token,
+            refresh_token=refresh_token,
+            blacklist=blacklist,
+            issuer=issuer,
+            clear_context=clear_context,
+        )
+
+    @staticmethod
+    async def logout_all(
+        subject: str | int | None = None,
+        *,
+        blacklist: TokenBlacklist | None = None,
+        ttl: int | None = None,
+        clear_context: bool = True,
+    ) -> None:
+        """Revoke all tokens issued for ``subject`` or the current user."""
+        await AuthProxy().logout_all(
+            subject=subject,
+            blacklist=blacklist,
+            ttl=ttl,
+            clear_context=clear_context,
+        )
+
+
 __all__ = [
+    "Auth",
     "AuthManager",
     "AuthProxy",
     "AuthUser",
+    "Callback",
     "CurrentUser",
     "auth",
     "current_user",

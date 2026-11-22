@@ -319,6 +319,10 @@ class Blueprint:
         col.length = validated_length
         return col
 
+    def remember_token(self, name: str = "remember_token", length: int = 100) -> ColumnDefinition:
+        """Create a nullable VARCHAR column for storing persistent remember-me tokens."""
+        return self.string(name, length).nullable()
+
     def text(self, name: str) -> ColumnDefinition:
         """Create an unbounded TEXT column (up to ~1 GB in PostgreSQL)."""
         return self._add_column(name, "text")

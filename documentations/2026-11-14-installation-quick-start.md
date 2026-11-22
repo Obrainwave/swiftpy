@@ -325,7 +325,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.3.0",
+       "swiftpy-framework>=0.3.1",
        # ...
    ]
    ```
@@ -355,7 +355,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.3.0"
+python -m pip install --upgrade "swiftpy-framework>=0.3.1"
 swiftpy --version
 ```
 

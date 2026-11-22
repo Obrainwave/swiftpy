@@ -90,7 +90,8 @@ def test_new_command_scaffolds_complete_structure(
     assert user_model_file.is_file()
     user_model_src = user_model_file.read_text(encoding="utf-8")
     assert '__fillable__ = ["name", "email", "password", "is_admin"]' in user_model_src
-    assert '__hidden__ = ["password"]' in user_model_src
+    assert '__hidden__ = ["password", "remember_token"]' in user_model_src
+    assert "remember_token: str | None = None" in user_model_src
     assert "ClassVar" not in user_model_src
     assert (app_dir / "app" / "schemas" / "user_schema.py").is_file()
     assert (app_dir / "app" / "services" / "user_service.py").is_file()

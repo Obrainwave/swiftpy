@@ -69,6 +69,27 @@ class PayloadTooLargeError(HttpException):
         super().__init__(message=message, status_code=413, headers=headers)
 
 
+class TooManyRequestsError(HttpException):
+    """Exception mapped automatically to HTTP 429 Too Many Requests."""
+
+    def __init__(
+        self,
+        message: str = "Too Many Requests",
+        retry_after: int | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        merged_headers = dict(headers) if headers is not None else {}
+        normalized_retry_after = max(0, retry_after) if retry_after is not None else None
+        if normalized_retry_after is not None:
+            merged_headers.setdefault("Retry-After", str(normalized_retry_after))
+        self.retry_after: int | None = normalized_retry_after
+        super().__init__(
+            message=message,
+            status_code=429,
+            headers=merged_headers or None,
+        )
+
+
 class ClientDisconnect(Exception):
     """Raised when the ASGI client disconnects before the request body is fully read."""
 
@@ -77,5 +98,6 @@ __all__ = [
     "ClientDisconnect",
     "HttpException",
     "PayloadTooLargeError",
+    "TooManyRequestsError",
     "abort",
 ]
