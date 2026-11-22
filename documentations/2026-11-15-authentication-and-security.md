@@ -9,15 +9,25 @@ Core authentication symbols can be imported from `swiftpy.auth` or lazily from t
 ```python
 from swiftpy.auth import (
     ApiKeyGuard,
+    Attempting,
+    Auth,
+    Authenticated,
     AuthenticationError,
     AuthManager,
+    Callback,
     CurrentUser,
+    Failed,
     Hash,
     InvalidApiKeyError,
     JWTGuard,
     JWTIssuer,
+    Lockout,
+    Login,
+    LoginThrottle,
+    Logout,
     TokenBlacklist,
     TokenRevokedError,
+    TooManyRequestsError,
     current_user,
     generate_api_key,
     hash_api_key,
@@ -97,6 +107,14 @@ JWT_REFRESH_TTL=604800
 
 # API Keys (AUTH_KEY_PEPPER requires at least 32 UTF-8 bytes)
 AUTH_KEY_PEPPER=replace-with-another-32-byte-random-secret
+
+# Remember Me Cookies & Login Throttling
+AUTH_REMEMBER_COOKIE=swiftpy_remember
+AUTH_REMEMBER_TTL=2592000
+AUTH_THROTTLE_ENABLED=true
+AUTH_THROTTLE_MAX_ATTEMPTS=5
+AUTH_THROTTLE_DECAY_SECONDS=60
+AUTH_THROTTLE_LOCKOUT_SECONDS=60
 ```
 
 When `APP_DEBUG=false` (or `APP_ENV=production`), `AuthServiceProvider.boot()` checks the active default guard (`auth.defaults.guard`) and fails fast with `ConfigurationError` if `JWT_SECRET` (for `jwt`) or `AUTH_KEY_PEPPER` (for `api_key`) is missing or shorter than 32 bytes.
@@ -297,7 +315,7 @@ async def login(payload: LoginRequest, jwt: JWTIssuer, current: CurrentUser) -> 
 
 > `CurrentUser.id` returns the raw token `sub` (a string) when no model is bound, while `auth().id()` coerces it to the User model's primary key type. Compare with `str(...)` or use `auth().id()` consistently.
 
-For token refresh endpoints, use `await jwt.refresh_token_pair(refresh_token)` rather than calling `issue_token_pair()` manually. It verifies the incoming token with `expected_type="refresh"`, checks `TokenBlacklist`, revokes the previous refresh token's `jti` automatically (`rotate=True` by default) so reused refresh tokens fail with `TokenRevokedError` (`401`), and issues a fresh access/refresh pair:
+For token refresh endpoints, inject `jwt: JWTIssuer` **or** invoke `await JWTIssuer.refresh_token_pair(...)` directly on `JWTIssuer` (both forms automatically resolve the active application's configuration and `TokenBlacklist`). Rather than calling `issue_token_pair()` manually, `refresh_token_pair()` verifies the incoming token with `expected_type="refresh"`, checks `TokenBlacklist`, revokes the previous refresh token's `jti` automatically (`rotate=True` by default) so reused refresh tokens fail with `TokenRevokedError` (`401`), and issues a fresh access/refresh pair:
 
 ```python
 from swiftpy.auth import JWTIssuer
@@ -317,9 +335,83 @@ async def refresh(payload: RefreshRequest, jwt: JWTIssuer) -> Response:
     # rotates by blacklisting the previous refresh JTI, and returns a new token pair.
     tokens = await jwt.refresh_token_pair(payload.refresh_token, rotate=True)
     return json_response(tokens)
+
+
+# Static / service-layer invocation against the active application container is also supported:
+async def refresh_in_service(refresh_token: str) -> dict[str, object]:
+    return await JWTIssuer.refresh_token_pair(refresh_token=refresh_token, rotate=True)
 ```
 
+> Both instance calls (`jwt.issue_token_pair(...)`, `jwt.decode_token(...)`, `await jwt.refresh_token_pair(...)`) and direct class calls (`JWTIssuer.issue_token_pair(...)`, `JWTIssuer.decode_token(...)`, `await JWTIssuer.refresh_token_pair(...)`) are supported across `JWTIssuer` using the active container's `JWTIssuer` singleton.
+
 > **WebSocket JWT support:** `require_jwt()` also extracts Bearer tokens from `Sec-WebSocket-Protocol` (`["bearer", "<jwt>"]` or `"bearer.<jwt>"`) or `?token=` / `?access_token=` query parameters on WebSocket handshakes (avoid query-string tokens in production where access logs record URLs).
+
+### 4b. Credential Authentication (`Auth.attempt`, `attempt_when`, Remember Me, `once`, `login_using_id` & Login Throttling)
+
+Use the `Auth` facade (`from swiftpy import Auth, Callback`) to verify user credentials against your configured `User` model (`auth.model` or `app.models.user.User`) using non-blocking `await Hash.check_async(...)` verification:
+
+```python
+from swiftpy import Auth, Callback, Request, Response, json_response
+from app.models.user import User
+
+
+@router.post("/login")
+async def login(request: Request) -> Response:
+    email = request.input("email")
+    password = request.input("password")
+    remember = bool(request.input("remember", False))
+
+    # 1. Verify email + plaintext password (+ arbitrary boolean/scalar filters such as active=1)
+    if await Auth.attempt({"email": email, "password": password, "active": 1}, remember):
+        return json_response({
+            "user": Auth.user().to_dict(),
+            "tokens": Auth.tokens(),
+        })
+
+    return json_response({"detail": "Invalid credentials"}, status_code=401)
+```
+
+Supported `Auth` login patterns:
+
+- **Extra conditions & boolean coercion:** Additional scalar key/value pairs in the `credentials` dictionary (such as `"active": 1`) are added as parameterized `WHERE` clauses and coerce `0`/`1` cleanly when the target model field is typed as `bool`.
+- **Closure query conditions (`Callback`):** Pass `Callback(lambda q: q.has("activeSubscription"))` as a key (or callable value) inside `credentials` to extend the underlying `ModelQueryBuilder` before selecting the candidate user:
+
+  ```python
+  ok = await Auth.attempt({
+      "email": email,
+      "password": password,
+      Callback(lambda query: query.has("activeSubscription")): True,
+  })
+  ```
+
+- **Post-retrieval inspection (`Auth.attempt_when` / `attemptWhen`):** Inspect the fetched `User` model (sync or async closure) after password verification completes:
+
+  ```python
+  if await Auth.attempt_when(
+      {"email": email, "password": password},
+      Callback(lambda user: user.is_not_banned()),
+  ):
+      # Authenticated cleanly
+      ...
+  ```
+
+- **Remember Me (`remember=True`):** Pass `remember=True` to `Auth.attempt()`, `Auth.attempt_when()`, `Auth.login()`, or `Auth.login_using_id()`. SwiftPY persists a 60-character random token in the user's nullable `remember_token` column (`table.remember_token()`, included in `create_users_table` and hidden via `User.__hidden__`) and automatically attaches an HMAC-SHA256 signed, `HttpOnly`, `SameSite=Lax` cookie (`swiftpy_remember`, with `Secure` enabled automatically under `APP_ENV=production` or HTTPS requests) to the HTTP response. Subsequent requests bearing that valid cookie are authenticated automatically (`Auth.via_remember() == True`). Each `remember=True` login rotates the user's single `remember_token` record (so signing in with remember-me on a new device invalidates older remembered device cookies), and `await Auth.logout()` / `await Auth.logout_all()` clears `remember_token` in PostgreSQL while expiring the browser cookie.
+- **Direct ID login (`Auth.login_using_id` / `loginUsingId` / `login_sing_id`):** Authenticate directly by database primary key (returns the `User` instance, or `False` if absent):
+
+  ```python
+  user = await Auth.login_using_id(1)
+  user = await Auth.login_using_id(1, remember=True)
+  ```
+
+- **Single-request stateless authentication (`Auth.once` / `Auth.once_using_id`):** Authenticates the user within the current task `Context` only—no `remember_token` writes, no cookies queued, no persistent token pairs stored, and no `Login` event dispatched:
+
+  ```python
+  if await Auth.once({"email": email, "password": password}):
+      # Authenticated for this request only
+      ...
+  ```
+
+- **Default Login Throttling (`LoginThrottle`):** Enabled by default on `Auth.attempt()` and `Auth.attempt_when()` (`max_attempts=5`, `decay_seconds=60`, `lockout_seconds=60` in `config/auth.py`). Exceeding `max_attempts` dispatches a `Lockout` event (`"auth.lockout"`) and raises `TooManyRequestsError`, mapping automatically to HTTP `429 Too Many Requests` with a `Retry-After` header. Call `await Auth.too_many_attempts(...)`, `await Auth.available_in(...)`, or `await Auth.clear_throttle(...)` to inspect or reset counters manually, or disable globally with `AUTH_THROTTLE_ENABLED=false`.
 
 ### 5. Token Revocation, `auth().logout()` & `auth().logout_all()`
 

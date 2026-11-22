@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -25,6 +26,8 @@ from swiftpy.auth import (
     auth,
 )
 from swiftpy.auth.exceptions import AuthenticationServiceUnavailableError
+from swiftpy.core.config import Config
+from swiftpy.core.container import Container, bind_container
 from swiftpy.core.context import Context
 
 
@@ -503,4 +506,210 @@ async def test_integer_zero_id_and_blacklist_cache_key_with_issued_at() -> None:
         Context.clear()
         await blacklist.clear()
         await blacklist.close()
+
+
+@pytest.mark.asyncio
+async def test_jwt_issuer_class_level_refresh_token_pair_e2e_service_pattern() -> None:
+    """Calling await JWTIssuer.refresh_token_pair(...) directly on the class resolves the active app singleton."""
+    prefix = f"test_cls_refresh_{uuid.uuid4().hex[:8]}:"
+    app = _make_auth_app(blacklist_prefix=prefix)
+    bl = app.container.resolve(TokenBlacklist)
+    await bl.clear()
+
+    assert inspect.iscoroutinefunction(JWTIssuer.refresh_token_pair)
+    sig_params = list(inspect.signature(JWTIssuer.refresh_token_pair).parameters)
+    assert sig_params[0] == "refresh_token"
+    assert "self" not in sig_params
+
+    class AuthService:
+        async def refresh(self, refresh_token: str) -> dict[str, Any]:
+            return await JWTIssuer.refresh_token_pair(
+                refresh_token=refresh_token,
+                rotate=True,
+            )
+
+    service = AuthService()
+
+    @app.post("/auth/login")
+    async def login(request: Request) -> Response:
+        pair = JWTIssuer.issue_token_pair(
+            subject=request.user_id,
+            claims={"email": request.email},
+        )
+        return json_response(pair)
+
+    @app.post("/auth/refresh")
+    async def refresh(request: Request) -> Response:
+        try:
+            data = await service.refresh(request.refresh_token)
+        except JWTError as exc:
+            return json_response({"detail": str(exc)}, status_code=401)
+        return json_response(data)
+
+    protected = Router(middleware=[JWTGuard])
+
+    @protected.get("/me")
+    async def me() -> Response:
+        u = auth().user()
+        assert u is not None
+        return json_response({"id": u.id, "email": u.email})
+
+    app.include_router(protected)
+
+    try:
+        async with TestClient(app) as client:
+            login_res = await client.post(
+                "/auth/login",
+                json={"user_id": 77, "email": "service@example.com"},
+            )
+            login_res.assert_ok()
+            tokens1 = login_res.json()
+
+            refresh_res = await client.post(
+                "/auth/refresh",
+                json={"refresh_token": tokens1["refresh_token"]},
+            )
+            refresh_res.assert_ok()
+            tokens2 = refresh_res.json()
+            assert tokens2["access_token"] != tokens1["access_token"]
+            assert tokens2["refresh_token"] != tokens1["refresh_token"]
+
+            # Reusing rotated refresh token via class call must be rejected by TokenBlacklist
+            replay_res = await client.post(
+                "/auth/refresh",
+                json={"refresh_token": tokens1["refresh_token"]},
+            )
+            replay_res.assert_status(401)
+
+            me_res = await client.get(
+                "/me",
+                headers={"Authorization": f"Bearer {tokens2['access_token']}"},
+            )
+            me_res.assert_ok()
+            assert me_res.json()["id"] == 77
+    finally:
+        Context.clear()
+        await bl.clear()
+        await bl.close()
+
+
+@pytest.mark.asyncio
+async def test_jwt_issuer_class_level_methods_container_isolation_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Class-level JWTIssuer methods stay isolated per active Container and fall back without a container."""
+    c1 = Container()
+    c1.instance(
+        Config,
+        Config(
+            {
+                "app": {"env": "testing", "debug": True},
+                "auth": {
+                    "blacklist_enabled": False,
+                    "guards": {
+                        "jwt": {"secret": "container-one-secret-at-least-32-bytes!"}
+                    },
+                },
+            }
+        ),
+    )
+    c2 = Container()
+    c2.instance(
+        Config,
+        Config(
+            {
+                "app": {"env": "testing", "debug": True},
+                "auth": {
+                    "blacklist_enabled": False,
+                    "guards": {
+                        "jwt": {"secret": "container-two-secret-at-least-32-bytes!"}
+                    },
+                },
+            }
+        ),
+    )
+
+    try:
+        with bind_container(c1):
+            pair1 = JWTIssuer.issue_token_pair(subject="u-1", claims={"tenant": "one"})
+            access1 = JWTIssuer.issue_access_token(subject="u-1")
+            refresh1 = JWTIssuer.issue_refresh_token(subject="u-1")
+            custom1 = JWTIssuer.issue_token(subject="u-1", token_type="verify")
+            assert JWTIssuer.decode_token(pair1["access_token"])["tenant"] == "one"
+            assert JWTIssuer.decode_token(access1, expected_type="access")["sub"] == "u-1"
+            assert JWTIssuer.decode_token(refresh1, expected_type="refresh")["sub"] == "u-1"
+            assert JWTIssuer.decode_token(custom1, expected_type="verify")["sub"] == "u-1"
+            rotated1 = await JWTIssuer.refresh_token_pair(
+                refresh_token=pair1["refresh_token"],
+                rotate=True,
+            )
+            assert JWTIssuer.decode_token(rotated1["access_token"])["sub"] == "u-1"
+            Context.clear()
+
+        with bind_container(c2):
+            pair2 = JWTIssuer.issue_token_pair(subject="u-2", claims={"tenant": "two"})
+            assert JWTIssuer.decode_token(pair2["access_token"])["tenant"] == "two"
+            with pytest.raises(InvalidSignatureError):
+                JWTIssuer.decode_token(pair1["access_token"])
+            with pytest.raises(InvalidSignatureError):
+                await JWTIssuer.refresh_token_pair(
+                    refresh_token=pair1["refresh_token"],
+                    rotate=True,
+                )
+            Context.clear()
+
+        # Explicit instance invocation still uses its own secret regardless of active container
+        explicit = JWTIssuer(secret="explicit-instance-secret-key-32-bytes!!")
+        explicit_pair = explicit.issue_token_pair(subject="explicit-u")
+        with bind_container(c1):
+            assert explicit.decode_token(explicit_pair["access_token"])["sub"] == "explicit-u"
+            refreshed_explicit = await explicit.refresh_token_pair(
+                explicit_pair["refresh_token"]
+            )
+            assert explicit.decode_token(refreshed_explicit["access_token"])["sub"] == "explicit-u"
+            Context.clear()
+
+        # Standalone fallback when no Container is bootstrapped reads Config.get_instance() cleanly
+        standalone_cfg = Config(
+            {
+                "app": {"env": "testing", "debug": True},
+                "auth": {
+                    "blacklist_enabled": False,
+                    "guards": {
+                        "jwt": {"secret": "standalone-fallback-secret-key-32-bytes!"}
+                    },
+                },
+            }
+        )
+
+        def _standalone_cfg_instance(cls: type[Config]) -> Config:
+            return standalone_cfg
+
+        def _raise_no_container() -> Container:
+            raise RuntimeError("Application container not bootstrapped")
+
+        monkeypatch.setattr(
+            Config,
+            "get_instance",
+            classmethod(_standalone_cfg_instance),
+        )
+        monkeypatch.setattr(
+            "swiftpy.auth.jwt_issuer.get_container",
+            _raise_no_container,
+        )
+        standalone_pair = JWTIssuer.issue_token_pair(subject="standalone-user")
+        assert (
+            JWTIssuer.decode_token(standalone_pair["access_token"])["sub"]
+            == "standalone-user"
+        )
+        standalone_rotated = await JWTIssuer.refresh_token_pair(
+            refresh_token=standalone_pair["refresh_token"],
+            rotate=False,
+        )
+        assert (
+            JWTIssuer.decode_token(standalone_rotated["access_token"])["sub"]
+            == "standalone-user"
+        )
+    finally:
+        Context.clear()
 

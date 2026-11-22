@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import math
@@ -11,7 +13,15 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import timedelta
-from typing import Any, ClassVar, Protocol, TypeGuard
+from typing import (
+    Any,
+    ClassVar,
+    Concatenate,
+    Protocol,
+    Self,
+    TypeGuard,
+    overload,
+)
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -94,6 +104,72 @@ def _validate_positive_int_ttl(value: Any, name: str) -> int:
             f"JWT {name} must be a positive integer, got {value!r}."
         )
     return value
+
+
+def _strip_self_signature(func: Callable[..., object]) -> inspect.Signature:
+    """Return `func`'s signature with its leading `self` parameter removed."""
+    sig = inspect.signature(func)
+    params = list(sig.parameters.values())
+    if params:
+        params = params[1:]
+    return sig.replace(parameters=params)
+
+
+class _DualMethod[JWTIssuerT: JWTIssuer, **P, R]:
+    """Descriptor allowing JWTIssuer methods to run on instances or directly on the class."""
+
+    def __init__(
+        self,
+        func: Callable[Concatenate[JWTIssuerT, P], R],
+    ) -> None:
+        self._func = func
+        self._is_coroutine = inspect.iscoroutinefunction(func)
+        self._public_signature = _strip_self_signature(func)
+        self.__doc__ = func.__doc__
+        self.__name__ = func.__name__
+        self.__qualname__ = func.__qualname__
+
+    @overload
+    def __get__(
+        self,
+        instance: None,
+        owner: type[JWTIssuerT],
+    ) -> Callable[P, R]: ...
+
+    @overload
+    def __get__(
+        self,
+        instance: JWTIssuerT,
+        owner: type[JWTIssuerT] | None = None,
+    ) -> Callable[P, R]: ...
+
+    def __get__(
+        self,
+        instance: JWTIssuerT | None,
+        owner: type[JWTIssuerT] | None = None,
+    ) -> Callable[P, R]:
+        if instance is None and owner is None:
+            raise AttributeError("Descriptor requires an instance or owner class")
+
+        func = self._func
+
+        def _wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            target: JWTIssuerT
+            if instance is not None:
+                target = instance
+            elif owner is not None:
+                target = owner._resolve_active_instance()
+            else:
+                raise AttributeError("Descriptor requires an instance or owner class")
+            return func(target, *args, **kwargs)
+
+        functools.update_wrapper(_wrapper, func)
+        # Keep bound-method introspection without a leading `self` parameter on both class and instance access.
+        _wrapper.__dict__.pop("__wrapped__", None)
+        _wrapper.__dict__["__signature__"] = self._public_signature
+        if self._is_coroutine:
+            inspect.markcoroutinefunction(_wrapper)
+        return _wrapper
 
 
 class JWTIssuer:
@@ -217,7 +293,7 @@ class JWTIssuer:
         *,
         blacklist: RefreshTokenBlacklist | None = None,
         blacklist_resolver: Callable[[], RefreshTokenBlacklist | None] | None = None,
-    ) -> JWTIssuer:
+    ) -> Self:
         """
         Build and configure a JWTIssuer from application Config.
 
@@ -346,6 +422,29 @@ class JWTIssuer:
 
         return private_pem, public_pem
 
+    @classmethod
+    def _resolve_active_instance(cls) -> Self:
+        """
+        Resolve the active JWTIssuer singleton from the current application container,
+        or construct one from application Config when no binding is registered.
+        """
+        container: Container | None
+        try:
+            container = get_container()
+        except RuntimeError:
+            container = None
+
+        if container is not None:
+            if container.has(cls):
+                return container.resolve(cls)
+            cfg = container.resolve(Config) if container.has(Config) else None
+            issuer = cls.from_config(cfg)
+            container.instance(cls, issuer)
+            return issuer
+
+        return cls.from_config()
+
+    @_DualMethod
     def issue_token(
         self,
         subject: TokenSubject,
@@ -456,6 +555,7 @@ class JWTIssuer:
 
         return f"{header_b64}.{payload_b64}.{signature_b64}"
 
+    @_DualMethod
     def issue_access_token(
         self,
         subject: TokenSubject,
@@ -473,6 +573,7 @@ class JWTIssuer:
             user=user,
         )
 
+    @_DualMethod
     def issue_refresh_token(
         self,
         subject: TokenSubject,
@@ -490,6 +591,7 @@ class JWTIssuer:
             user=user,
         )
 
+    @_DualMethod
     def issue_token_pair(
         self,
         subject: TokenSubject,
@@ -565,6 +667,7 @@ class JWTIssuer:
 
         return None
 
+    @_DualMethod
     async def refresh_token_pair(
         self,
         refresh_token: str,
@@ -682,6 +785,7 @@ class JWTIssuer:
         )
         return pair
 
+    @_DualMethod
     def decode_token(
         self,
         token: str,

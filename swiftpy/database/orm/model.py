@@ -685,6 +685,272 @@ class ModelQueryBuilder[T: Model]:
     async def delete(self) -> str:
         return await self.builder.delete()
 
+    def _resolve_relation(self, name: str) -> Relation[Any]:
+        """Resolve a defined relation on ``self.model_cls`` (supporting camelCase/snake_case)."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Relation name must be a non-empty string.")
+        clean_name = name.strip()
+        relations = self.model_cls.__relations_config__
+        if clean_name in relations:
+            return relations[clean_name]
+        snake_name = snake_case(clean_name)
+        if snake_name in relations:
+            return relations[snake_name]
+        for rel_name, rel in relations.items():
+            if snake_case(rel_name) == snake_name:
+                return rel
+        raise ValueError(
+            f"Relation '{name}' is not defined on model '{self.model_cls.__name__}'."
+        )
+
+    def _apply_relation_existence(
+        self,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        if callback is not None:
+            if not callable(callback):
+                raise TypeError("Relation query constraint callback must be callable.")
+            if inspect.iscoroutinefunction(callback):
+                raise TypeError(
+                    "Relation query callbacks passed to has()/where_has() must be synchronous."
+                )
+
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("Relation existence count must be a non-negative integer.")
+
+        normalized_op = "=" if operator == "==" else str(operator).strip()
+        if normalized_op not in {">=", ">", "=", "<", "<=", "!="}:
+            raise ValueError(f"Unsupported relation count operator: {operator!r}")
+
+        boolean_upper = str(boolean).strip().upper()
+        if boolean_upper not in {"AND", "OR"}:
+            raise ValueError(f"Unsupported boolean operator: {boolean!r}")
+
+        matches_zero = (
+            (normalized_op == ">=" and count == 0)
+            or (normalized_op == "=" and count == 0)
+            or (normalized_op == "<=")
+            or (normalized_op == "<" and count >= 1)
+            or (normalized_op == "!=" and count >= 1)
+        )
+        impossible_positive = (
+            (normalized_op == "=" and count == 0)
+            or (normalized_op == "<=" and count == 0)
+            or (normalized_op == "<" and count <= 1)
+        )
+
+        clean_relation = relation.strip()
+        if "." in clean_relation:
+            head, tail = clean_relation.split(".", 1)
+            if matches_zero and impossible_positive:
+                return self._apply_relation_existence(
+                    head,
+                    normalized_op,
+                    count,
+                    boolean=boolean_upper,
+                    callback=lambda q: q.has(tail, callback=callback),
+                )
+            return self._apply_relation_existence(
+                head,
+                ">=",
+                1,
+                boolean=boolean_upper,
+                callback=lambda q: q.has(tail, normalized_op, count, callback=callback),
+            )
+
+        rel = self._resolve_relation(clean_relation)
+        owner_cls = self.model_cls
+        owner_table = owner_cls.__table__
+        target_cls = rel.get_target_model()
+        target_table = target_cls.__table__
+
+        base_sub_mqb = target_cls.query()
+
+        if isinstance(rel, (HasOne, HasMany)):
+            fk = validate_identifier(
+                rel.foreign_key or f"{snake_case(owner_cls.__name__)}_id",
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            local_key = validate_identifier(
+                rel._resolve_local_key(owner_cls),
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            owner_col = f"{owner_table}.{local_key}"
+            sub_link_col = f"{target_table}.{fk}"
+        elif isinstance(rel, BelongsTo):
+            rel_attr = rel.name or clean_relation
+            fk = validate_identifier(
+                rel.foreign_key or f"{snake_case(rel_attr)}_id",
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            owner_key = validate_identifier(
+                rel._resolve_owner_key(target_cls),
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            owner_col = f"{owner_table}.{fk}"
+            sub_link_col = f"{target_table}.{owner_key}"
+        elif isinstance(rel, BelongsToMany):
+            parent_key = validate_identifier(
+                rel._resolve_parent_key(owner_cls),
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            related_key = validate_identifier(
+                rel._resolve_related_key(target_cls),
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            pivot_table = validate_identifier(
+                rel._resolve_pivot_table(owner_cls),
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            fpk = validate_identifier(
+                rel.foreign_pivot_key or f"{snake_case(owner_cls.__name__)}_id",
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            rpk = validate_identifier(
+                rel.related_pivot_key or f"{snake_case(target_cls.__name__)}_id",
+                allow_dotted=False,
+                allow_wildcard=False,
+            )
+            owner_col = f"{owner_table}.{parent_key}"
+            sub_link_col = f"{pivot_table}.{fpk}"
+            base_sub_mqb.builder.join(
+                pivot_table,
+                f"{target_table}.{related_key}",
+                "=",
+                f"{pivot_table}.{rpk}",
+            )
+        else:
+            raise TypeError(
+                f"Unsupported relation type '{type(rel).__name__}' for existence queries."
+            )
+
+        base_sub_mqb.where_not_null(sub_link_col)
+        if callback is not None:
+            res = callback(base_sub_mqb)
+            if isinstance(res, ModelQueryBuilder):
+                base_sub_mqb = res
+
+        all_sub_mqb = base_sub_mqb.clone()
+        all_sub_mqb.builder.select(sub_link_col)
+
+        positive_sub_mqb = base_sub_mqb.clone()
+        positive_sub_mqb.builder.select(sub_link_col).group_by(sub_link_col).having_raw(
+            f"COUNT(*) {normalized_op} ?", [count]
+        )
+
+        if not matches_zero:
+            self.builder.where_in(
+                owner_col, positive_sub_mqb.builder, boolean=boolean_upper
+            )
+            return self
+
+        def _zero_or_partial_group(qb: QueryBuilder) -> None:
+            qb.where_null(owner_col).or_where_not_in(owner_col, all_sub_mqb.builder)
+            if not impossible_positive:
+                qb.or_where_in(owner_col, positive_sub_mqb.builder)
+
+        self.builder.where_group(_zero_or_partial_group, boolean=boolean_upper)
+        return self
+
+    def has(
+        self,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        """Filter records by the existence/count of related models."""
+        return self._apply_relation_existence(
+            relation,
+            operator,
+            count,
+            boolean=boolean,
+            callback=callback,
+        )
+
+    def or_has(
+        self,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        """Add an OR relationship existence/count condition."""
+        return self.has(relation, operator, count, boolean="OR", callback=callback)
+
+    def doesnt_have(
+        self,
+        relation: str,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        """Filter records that do not have matching related models."""
+        return self.has(relation, "<", 1, boolean=boolean, callback=callback)
+
+    def or_doesnt_have(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        """Add an OR negated relationship existence condition."""
+        return self.doesnt_have(relation, boolean="OR", callback=callback)
+
+    def where_has(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        """Filter records by related model existence with an optional query callback."""
+        return self.has(relation, operator, count, boolean=boolean, callback=callback)
+
+    def or_where_has(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        operator: str = ">=",
+        count: int = 1,
+    ) -> Self:
+        """Add an OR constrained relationship existence condition."""
+        return self.where_has(relation, callback, operator, count, boolean="OR")
+
+    def where_doesnt_have(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        """Filter records lacking related models matching the optional query callback."""
+        return self.doesnt_have(relation, boolean=boolean, callback=callback)
+
+    def or_where_doesnt_have(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        """Add an OR negated constrained relationship existence condition."""
+        return self.where_doesnt_have(relation, callback, boolean="OR")
+
     def __await__(self) -> Generator[Any, None, list[T]]:
         return self.get().__await__()
 
@@ -1480,6 +1746,98 @@ class Model:
     def with_(cls, *relations: str) -> ModelQueryBuilder[Self]:
         """Eager-load specified relationships."""
         return cls.query().with_(*relations)
+
+    @classmethod
+    def has(
+        cls,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        """Filter records by the existence or count of a defined relationship."""
+        return cls.query().has(
+            relation, operator, count, boolean=boolean, callback=callback
+        )
+
+    @classmethod
+    def or_has(
+        cls,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR relationship existence or count condition."""
+        return cls.query().or_has(relation, operator, count, callback=callback)
+
+    @classmethod
+    def doesnt_have(
+        cls,
+        relation: str,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        """Filter records that lack any related model on a defined relationship."""
+        return cls.query().doesnt_have(relation, boolean=boolean, callback=callback)
+
+    @classmethod
+    def or_doesnt_have(
+        cls,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR condition filtering records lacking a defined relationship."""
+        return cls.query().or_doesnt_have(relation, callback=callback)
+
+    @classmethod
+    def where_has(
+        cls,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Filter records by a relationship constrained with a query callback."""
+        return cls.query().where_has(
+            relation, callback, operator, count, boolean=boolean
+        )
+
+    @classmethod
+    def or_where_has(
+        cls,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        operator: str = ">=",
+        count: int = 1,
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR constrained relationship existence condition."""
+        return cls.query().or_where_has(relation, callback, operator, count)
+
+    @classmethod
+    def where_doesnt_have(
+        cls,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Filter records lacking related models matching a query callback."""
+        return cls.query().where_doesnt_have(relation, callback, boolean=boolean)
+
+    @classmethod
+    def or_where_doesnt_have(
+        cls,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR negated constrained relationship existence condition."""
+        return cls.query().or_where_doesnt_have(relation, callback)
 
     @classmethod
     async def all(cls) -> list[Self]:

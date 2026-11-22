@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Generator, Iterator, Mapping
 from typing import Any, ClassVar, cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
@@ -98,6 +98,29 @@ class RequestHeaders(Mapping[str, str]):
         return list(self._items)
 
 
+def _parse_cookie_headers(cookie_headers: list[str]) -> dict[str, str]:
+    """Parse HTTP Cookie header strings into a decoded name -> value mapping."""
+    cookies: dict[str, str] = {}
+    for header in cookie_headers:
+        for chunk in header.split(";"):
+            part = chunk.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            clean_name = name.strip()
+            if not clean_name:
+                continue
+            clean_value = value.strip()
+            if (
+                len(clean_value) >= 2
+                and clean_value[0] == '"'
+                and clean_value[-1] == '"'
+            ):
+                clean_value = clean_value[1:-1]
+            cookies[clean_name] = unquote(clean_value)
+    return cookies
+
+
 class _HasFileResult:
     """Boolean result for ``Request.has_file()`` supporting sync truthiness and ``await``."""
 
@@ -171,6 +194,7 @@ class Request:
         self.max_json_depth = max_json_depth
 
         self._headers: RequestHeaders | None = None
+        self._cookies: dict[str, str] | None = None
         self._query_params: dict[str, str] | None = None
         self._query_param_list: dict[str, list[str]] | None = None
         self._body: bytes | None = None
@@ -203,6 +227,19 @@ class Request:
         if self._headers is None:
             self._headers = RequestHeaders(self.scope.get("headers", []))
         return self._headers
+
+    @property
+    def cookies(self) -> dict[str, str]:
+        """Parsed dictionary of HTTP request cookies decoded from Cookie headers."""
+        if self._cookies is None:
+            self._cookies = _parse_cookie_headers(self.headers.getlist("cookie"))
+        return dict(self._cookies)
+
+    def cookie(self, name: str, default: str | None = None) -> str | None:
+        """Return the decoded value of the named HTTP cookie, or `default` if absent."""
+        if self._cookies is None:
+            self._cookies = _parse_cookie_headers(self.headers.getlist("cookie"))
+        return self._cookies.get(name, default)
 
     @property
     def query_param_list(self) -> dict[str, list[str]]:

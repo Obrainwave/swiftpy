@@ -12,6 +12,7 @@ from swiftpy.http.exceptions import (
     ClientDisconnect,
     HttpException,
     PayloadTooLargeError,
+    TooManyRequestsError,
     abort,
 )
 from swiftpy.http.response import Response, json_response, unprocessable
@@ -351,6 +352,7 @@ __all__ = [
     "MethodNotAllowedError",
     "NotFoundError",
     "PayloadTooLargeError",
+    "TooManyRequestsError",
     "UnauthorizedError",
     "ValidationError",
     "abort",

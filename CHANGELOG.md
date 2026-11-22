@@ -4,6 +4,28 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-22
+
+### Added
+- **Credential Authentication Facade (`swiftpy.auth.auth_manager.Auth` & `AuthProxy`):**
+  - Added `Auth.attempt(credentials, remember=False)` verifying non-password column conditions against the resolved `User` model (`auth.model` / `app.models.user.User`) with non-blocking `Hash.check_async()` (and constant-time dummy bcrypt execution when no user matches), automatically coercing `1`/`0` integers to Python `bool` for PostgreSQL `BOOLEAN` fields (e.g., `{"email": email, "password": password, "active": 1}`), issuing JWT pairs when configured, and binding task-scoped `Context` / `CurrentUser`.
+  - Added `Callback` wrapper supporting closure conditions inside credentials dictionaries (`Callback(lambda q: q.has("activeSubscription"))` as key or callable value) and post-lookup inspection via `Auth.attempt_when(credentials, callback, remember=False)` / `attemptWhen(...)` for sync or async predicates.
+  - Added persistent "Remember Me" cookie sessions (`remember=True` on `attempt`, `attempt_when`, `login`, `login_using_id`): `Blueprint.remember_token()` (`VARCHAR(100) NULL`), `User.remember_token: str | None = None` (`__hidden__` & `SENSITIVE_USER_KEYS`), HMAC-SHA256 signed `HttpOnly` `swiftpy_remember` cookies queued onto HTTP responses via `Application`, `require_jwt()` / passive cookie authentication, `Auth.via_remember()` / `viaRemember()`, and DB/cookie invalidation in `AuthProxy.logout()` / `logout_all()`.
+  - Added `Auth.login(user, remember=False)`, `Auth.login_using_id(user_id, remember=False)` (plus `loginUsingId` and `login_sing_id` aliases), `Auth.once(credentials)`, and `Auth.once_using_id(user_id)` / `onceUsingId` (authenticating current task `Context` only with no cookies, no `remember_token` mutation, and no `Login` event).
+  - Added `Request.cookies` and `Request.cookie(name, default=None)` in `swiftpy.http.request`.
+- **Auth Lifecycle Events (`swiftpy.auth.events`):** Added `Attempting`, `Authenticated`, `Login`, `Failed`, `Logout`, and `Lockout` dataclasses dispatched as both typed event classes and `"auth.<name>"` dotted aliases (with sensitive credential fields stripped from event payloads).
+- **Default Login Throttling (`swiftpy.auth.throttle.LoginThrottle`, `TooManyRequestsError`):** Added HTTP `429 TooManyRequestsError` (with `Retry-After` header) in `swiftpy.http.exceptions` / `swiftpy.core.exceptions` / `swiftpy.auth.exceptions` and enabled cache-backed `LoginThrottle` (`max_attempts=5`, `decay_seconds=60`, `lockout_seconds=60`) by default in `Auth.attempt()` and `Auth.attempt_when()`, with `Auth.too_many_attempts()`, `Auth.available_in()`, `Auth.clear_throttle()`, `config/auth.py` (`remember`, `throttle`), `.env.example`, and `swiftpy new` scaffolding updates.
+- **ORM Relationship Existence Queries (`swiftpy.database.orm.model`):** Added `has()`, `or_has()`, `doesnt_have()`, `or_doesnt_have()`, `where_has()`, `or_where_has()`, `where_doesnt_have()`, and `or_where_doesnt_have()` on `ModelQueryBuilder` and `Model` supporting `HasOne`, `HasMany`, `BelongsTo`, `BelongsToMany`, `camelCase`/`snake_case` relation lookup, dot-nested relation chains, count operators, and NULL-safe PostgreSQL `NOT IN` compilation.
+
+### Changed
+- **Packaging & Scaffolding:** Bumped `swiftpy-framework` to `0.3.1`, refreshed `uv.lock`, updated `create_users_table` migration and `app/models/user.py`, and updated `swiftpy new` templates to emit `"swiftpy-framework>=0.3.1"`, `table.remember_token()`, `User.remember_token`, and default `remember` / `throttle` config sections.
+
+### Fixed
+- **`JWTIssuer` Class-Level Facade Calls (`swiftpy.auth.jwt_issuer.JWTIssuer`):** Fixed a `v0.3.0` regression where calling `await JWTIssuer.refresh_token_pair(...)` (or `issue_token`, `issue_access_token`, `issue_refresh_token`, `issue_token_pair`, `decode_token`) directly on the `JWTIssuer` class raised `TypeError: missing 1 required positional argument: 'self'`. Direct class calls now resolve the active container's `JWTIssuer` singleton (or construct one from `Config` without global state) while preserving bound instance calls (`issuer.refresh_token_pair(...)`).
+
+### Documentation
+- Updated Authentication & Security, Active Record ORM & Relationships, Database Schema & `Blueprint`, Installation Quick Start, and `README.md` for `v0.3.1`.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added

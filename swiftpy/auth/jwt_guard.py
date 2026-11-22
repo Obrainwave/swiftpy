@@ -15,7 +15,12 @@ from swiftpy.auth.exceptions import (
 )
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import TokenBlacklist, is_token_blacklist_enabled
-from swiftpy.auth.user_context import hydrate_jwt_user_context
+from swiftpy.auth.user_context import (
+    CONTEXT_USER_KEY,
+    authenticate_remember_cookie,
+    extract_remember_cookie_from_request,
+    hydrate_jwt_user_context,
+)
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
 from swiftpy.core.context import Context
@@ -105,6 +110,12 @@ async def require_jwt(
         if not token:
             raise AuthenticationError("Missing Authorization header or WebSocket authentication credentials")
     else:
+        remember_raw = extract_remember_cookie_from_request(req)
+        if remember_raw:
+            remembered_user = await authenticate_remember_cookie(req, guard="jwt")
+            if remembered_user is not None:
+                ctx_user = Context.get(CONTEXT_USER_KEY)
+                return ctx_user if isinstance(ctx_user, dict) else {}
         raise AuthenticationError("Missing Authorization header")
 
     # 3. Resolve JWTIssuer from parameters, container, or default

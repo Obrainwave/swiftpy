@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from swiftpy.core.config import Config
-from swiftpy.http.exceptions import HttpException
+from swiftpy.http.exceptions import HttpException, TooManyRequestsError
 
 
 class JWTError(Exception):
@@ -126,5 +126,6 @@ __all__ = [
     "JWTError",
     "TokenExpiredError",
     "TokenRevokedError",
+    "TooManyRequestsError",
     "is_token_blacklist_enabled",
 ]
