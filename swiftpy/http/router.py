@@ -3,9 +3,18 @@ from __future__ import annotations
 import inspect
 import math
 import re
-from collections.abc import Callable, Sequence
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar, get_args, get_origin, get_type_hints
+from typing import (
+    Any,
+    Literal,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+    overload,
+)
 
 from swiftpy.core.config import ConfigurationError
 from swiftpy.core.container import Container
@@ -35,7 +44,15 @@ _BUILTIN_TYPES: dict[str, type[Any]] = {
 }
 
 ParamKind = Literal[
-    "request", "path", "form", "di", "default", "websocket", "file", "files"
+    "request",
+    "path",
+    "form",
+    "di",
+    "default",
+    "websocket",
+    "file",
+    "files",
+    "controller",
 ]
 
 
@@ -73,21 +90,46 @@ def _coerce_float(value: str) -> float:
     return parsed
 
 
+def _is_internal_routing_frame(filename: str) -> bool:
+    norm = filename.replace("\\", "/")
+    return norm.endswith(("/swiftpy/http/router.py", "/swiftpy/core/application.py"))
+
+
 def _collect_caller_locals(handler: Callable[..., Any]) -> dict[str, Any]:
+    """
+    Collect local namespace symbols for resolving deferred handler annotations
+    and local controller classes with deterministic precedence:
+      1. Active frames in the handler's lexical definition file (`target_file`),
+         innermost first.
+      2. The single immediate route-registration caller frame outside the
+         framework's routing internals (`router.py` / `application.py`).
+    """
     localns: dict[str, Any] = {}
-    target_code = getattr(handler, "__code__", None)
+    raw_target = inspect.unwrap(handler)
+    target_code = getattr(raw_target, "__code__", None) or getattr(
+        handler, "__code__", None
+    )
     target_file = getattr(target_code, "co_filename", None)
+    direct_caller_locals: dict[str, Any] | None = None
     frame = inspect.currentframe()
     try:
         curr = frame.f_back if frame is not None else None
         depth = 0
-        while curr is not None and depth < 8:
-            if target_file is None or curr.f_code.co_filename == target_file:
+        while curr is not None and depth < 12:
+            code_file = curr.f_code.co_filename
+            is_internal = _is_internal_routing_frame(code_file)
+            if not is_internal and direct_caller_locals is None:
+                direct_caller_locals = dict(curr.f_locals)
+            if target_file is not None and code_file == target_file:
                 for k, v in curr.f_locals.items():
                     if k not in localns:
                         localns[k] = v
             curr = curr.f_back
             depth += 1
+        if direct_caller_locals is not None:
+            for k, v in direct_caller_locals.items():
+                if k not in localns:
+                    localns[k] = v
     finally:
         del frame
     return localns
@@ -305,6 +347,7 @@ class RouteGroup:
         path: str,
         handler: RouteHandler,
         *,
+        middleware: list[type[Any]] | None = None,
         is_websocket: bool = False,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
@@ -312,11 +355,12 @@ class RouteGroup:
         localns: dict[str, Any] | None = None,
     ) -> None:
         full_path = _join_route_path(self._normalized_prefix, path)
+        combined_middleware = [*self.middleware, *(middleware or ())]
         self.router.add_route(
             method=method,
             path=full_path,
             handler=handler,
-            middleware=list(self.middleware),
+            middleware=combined_middleware,
             is_websocket=is_websocket,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
@@ -324,19 +368,43 @@ class RouteGroup:
             localns=localns,
         )
 
-    def get(
+    def _register_route(
         self,
+        method: str,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
+    ) -> Callable[[F], F] | F:
+        if handler is not None:
+            if not callable(handler):
+                raise RouteRegistrationError(
+                    f"Route handler for {method} {path} must be callable, got {type(handler).__name__}."
+                )
+            self._add_route(
+                method,
+                path,
+                handler,
+                middleware=middleware,
+                is_websocket=is_websocket,
+                max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
+                localns=_collect_caller_locals(handler),
+            )
+            return handler
+
         def decorator(func: F) -> F:
             self._add_route(
-                "GET",
+                method,
                 path,
                 func,
+                middleware=middleware,
+                is_websocket=is_websocket,
                 max_body_size=max_body_size,
                 max_content_length=max_content_length,
                 max_json_depth=max_json_depth,
@@ -345,151 +413,347 @@ class RouteGroup:
             return func
 
         return decorator
+
+    @overload
+    def get(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def get(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
+
+    def get(
+        self,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "GET",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
+
+    @overload
+    def post(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def post(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def post(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "POST",
-                path,
-                func,
-                max_body_size=max_body_size,
-                max_content_length=max_content_length,
-                max_json_depth=max_json_depth,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "POST",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
-        return decorator
+    @overload
+    def put(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def put(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def put(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "PUT",
-                path,
-                func,
-                max_body_size=max_body_size,
-                max_content_length=max_content_length,
-                max_json_depth=max_json_depth,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "PUT",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
-        return decorator
+    @overload
+    def patch(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def patch(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def patch(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "PATCH",
-                path,
-                func,
-                max_body_size=max_body_size,
-                max_content_length=max_content_length,
-                max_json_depth=max_json_depth,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "PATCH",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
-        return decorator
+    @overload
+    def delete(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def delete(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def delete(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "DELETE",
-                path,
-                func,
-                max_body_size=max_body_size,
-                max_content_length=max_content_length,
-                max_json_depth=max_json_depth,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "DELETE",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
-        return decorator
+    @overload
+    def head(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def head(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def head(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "HEAD",
-                path,
-                func,
-                max_body_size=max_body_size,
-                max_content_length=max_content_length,
-                max_json_depth=max_json_depth,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "HEAD",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
-        return decorator
+    @overload
+    def options(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def options(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def options(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "OPTIONS",
-                path,
-                func,
-                max_body_size=max_body_size,
-                max_content_length=max_content_length,
-                max_json_depth=max_json_depth,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "OPTIONS",
+            path,
+            handler,
+            middleware=middleware,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
 
-        return decorator
+    @overload
+    def websocket(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> Callable[[F], F]: ...
 
-    def websocket(self, path: str) -> Callable[[F], F]:
-        def decorator(func: F) -> F:
-            self._add_route(
-                "WEBSOCKET",
-                path,
-                func,
-                is_websocket=True,
-                localns=_collect_caller_locals(func),
-            )
-            return func
+    @overload
+    def websocket(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> F: ...
 
-        return decorator
+    def websocket(
+        self,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> Callable[[F], F] | F:
+        return self._register_route(
+            "WEBSOCKET",
+            path,
+            handler,
+            middleware=middleware,
+            is_websocket=True,
+        )
 
 
 class Router:
@@ -535,6 +799,87 @@ class Router:
             return False
         return target_container.can_resolve(annotation)
 
+    @staticmethod
+    def _resolve_unbound_controller_class(route: Route) -> type[Any] | None:
+        """
+        Resolve the owning controller class when `route.handler` is an unbound
+        instance method (e.g. `PostController.index`).
+        """
+        params = list(route.signature.parameters.values())
+        if not params:
+            return None
+        first_param = params[0]
+        if first_param.name != "self" or first_param.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return None
+
+        self_ann = route.type_hints.get("self", first_param.annotation)
+        if (
+            self_ann is not inspect.Parameter.empty
+            and self_ann is not Any
+            and isinstance(self_ann, type)
+        ):
+            return self_ann
+
+        raw_target = inspect.unwrap(route.handler)
+        if not inspect.isfunction(raw_target):
+            return None
+
+        qualname = getattr(raw_target, "__qualname__", "") or ""
+        if "." not in qualname:
+            return None
+
+        parts = qualname.split(".")
+        if "<locals>" in parts[:-1]:
+            last_locals_idx = max(i for i, p in enumerate(parts[:-1]) if p == "<locals>")
+            class_parts = parts[last_locals_idx + 1 : -1]
+        else:
+            class_parts = parts[:-1]
+
+        if not class_parts:
+            return None
+
+        namespaces: list[Mapping[str, Any]] = []
+        if route.localns:
+            namespaces.append(route.localns)
+        raw_globals = getattr(raw_target, "__globals__", None)
+        if isinstance(raw_globals, Mapping):
+            namespaces.append(raw_globals)
+        handler_globals = getattr(route.handler, "__globals__", None)
+        if isinstance(handler_globals, Mapping) and handler_globals is not raw_globals:
+            namespaces.append(handler_globals)
+        mod_name = getattr(raw_target, "__module__", None)
+        if isinstance(mod_name, str) and mod_name in sys.modules:
+            mod_dict = getattr(sys.modules[mod_name], "__dict__", None)
+            if isinstance(mod_dict, Mapping):
+                namespaces.append(mod_dict)
+
+        for ns in namespaces:
+            obj: Any = ns.get(class_parts[0])
+            if obj is None:
+                continue
+            for attr_part in class_parts[1:]:
+                obj = getattr(obj, attr_part, None)
+                if obj is None:
+                    break
+            if isinstance(obj, type):
+                return obj
+
+        if route.localns:
+            target_method_name = getattr(raw_target, "__name__", "")
+            expected_cls_name = class_parts[-1]
+            for candidate in route.localns.values():
+                if (
+                    isinstance(candidate, type)
+                    and candidate.__name__ == expected_cls_name
+                ):
+                    attr = getattr(candidate, target_method_name, None)
+                    if callable(attr) and inspect.unwrap(attr) is raw_target:
+                        return candidate
+        return None
+
     def _analyze_handler(
         self,
         route: Route,
@@ -543,12 +888,28 @@ class Router:
     ) -> tuple[ParamSpec, ...]:
         specs: list[ParamSpec] = []
         ws_assigned = False
+        controller_cls = self._resolve_unbound_controller_class(route)
+        controller_bound = False
 
         for name, param in route.signature.parameters.items():
             if param.kind in (
                 inspect.Parameter.VAR_POSITIONAL,
                 inspect.Parameter.VAR_KEYWORD,
             ):
+                continue
+
+            if not controller_bound and controller_cls is not None and name == "self":
+                controller_bound = True
+                if not self._can_resolve_di(controller_cls, container=container):
+                    raise RouteRegistrationError(
+                        f"Handler '{route.handler.__qualname__}' belongs to controller "
+                        f"'{controller_cls.__name__}', which cannot be resolved by the DI container."
+                    )
+                specs.append(
+                    ParamSpec(
+                        name=name, kind="controller", annotation=controller_cls
+                    )
+                )
                 continue
 
             ann = route.type_hints.get(name, param.annotation)
@@ -693,6 +1054,10 @@ class Router:
             raise RouteRegistrationError(
                 "Method 'WEBSOCKET' is internal-only; use websocket() to register WebSocket routes."
             )
+        if inspect.isclass(handler):
+            raise RouteRegistrationError(
+                f"Route handler for {norm_method} {path} must be a function or method, not class '{handler.__name__}'."
+            )
 
         effective_locals = (
             localns if localns is not None else _collect_caller_locals(handler)
@@ -727,21 +1092,41 @@ class Router:
         self._counter += 1
         return self.add_compiled_route(route)
 
-    def route(
+    def _route(
         self,
         method: str,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         is_websocket: bool = False,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
+    ) -> Callable[[F], F] | F:
         if method.upper().strip() == "WEBSOCKET" and not is_websocket:
             raise RouteRegistrationError(
                 "Method 'WEBSOCKET' is internal-only; use websocket() to register WebSocket routes."
             )
+
+        if handler is not None:
+            if not callable(handler):
+                raise RouteRegistrationError(
+                    f"Route handler for {method.upper().strip()} {path} must be callable, "
+                    f"got {type(handler).__name__}."
+                )
+            self.add_route(
+                method,
+                path,
+                handler,
+                middleware=middleware,
+                is_websocket=is_websocket,
+                max_body_size=max_body_size,
+                max_content_length=max_content_length,
+                max_json_depth=max_json_depth,
+                localns=_collect_caller_locals(handler),
+            )
+            return handler
 
         def decorator(func: F) -> F:
             self.add_route(
@@ -759,141 +1144,394 @@ class Router:
 
         return decorator
 
+    @overload
+    def route(
+        self,
+        method: str,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def route(
+        self,
+        method: str,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
+
+    def route(
+        self,
+        method: str,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F] | F:
+        return self._route(
+            method,
+            path,
+            handler,
+            middleware=middleware,
+            is_websocket=is_websocket,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
+
+    @overload
     def get(
         self,
         path: str,
+        handler: None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def get(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
+
+    def get(
+        self,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "GET",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def post(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def post(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def post(
         self,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "POST",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def put(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def put(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def put(
         self,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "PUT",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def patch(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def patch(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def patch(
         self,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "PATCH",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def delete(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def delete(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def delete(
         self,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "DELETE",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def head(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def head(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def head(
         self,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "HEAD",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def options(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def options(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def options(
         self,
         path: str,
+        handler: F | None = None,
         *,
         middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "OPTIONS",
             path,
+            handler,
             middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
 
+    @overload
     def websocket(
         self,
         path: str,
+        handler: None = None,
         *,
         middleware: list[type[Any]] | None = None,
-    ) -> Callable[[F], F]:
-        return self.route(
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def websocket(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> F: ...
+
+    def websocket(
+        self,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> Callable[[F], F] | F:
+        return self._route(
             "WEBSOCKET",
             path,
+            handler,
             middleware=middleware,
             is_websocket=True,
         )

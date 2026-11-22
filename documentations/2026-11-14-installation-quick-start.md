@@ -16,7 +16,7 @@ This guide covers two ways to get started with SwiftPY:
 - **For Full Project Scaffolding:**
   - **Option A (Fully Dockerized):** Docker Engine / Docker Desktop with Compose v2, plus `uv` (`uvx`) or Python `>= 3.12` only to run `swiftpy new`.
   - **Option B (Without Docker at All):** Python `>= 3.12`, **PostgreSQL 16** (with `pgvector` if using AI vector stores), and **Redis 7** running natively on your machine.
-- Optional extras if needed later: `jinja2` (HTML mail/admin templates) and `aiosmtplib` (`smtp` mail transport).
+- Optional extras if needed later: `jinja2` (HTML mail templates) and `aiosmtplib` (`smtp` mail transport).
 
 ---
 
@@ -131,11 +131,20 @@ Pass `--force` only if overwriting an existing non-empty directory (existing `.e
 ```text
 my_api/
 ├── app/
+│   ├── ai/
+│   │   ├── agents/         # AI agent classes (AssistantAgent starter)
+│   │   ├── tools/          # Function-calling tool classes (SystemStatusTool starter)
+│   │   ├── pipelines/      # RAG pipeline configurations
+│   │   ├── providers/      # Custom LLM provider adapters
+│   │   ├── vectorstores/   # Custom vector store adapters
+│   │   └── observers/      # Custom AI observability hooks
 │   ├── events/             # Domain events
 │   ├── http/
+│   │   ├── controllers/    # HTTP controllers (UserController starter)
 │   │   ├── handler/        # Exception handlers (exceptions.py -> register_exception_handlers)
-│   │   ├── middleware/     # Auth & Admin middleware templates
-│   │   └── requests/       # Typed FormRequest classes
+│   │   ├── middleware/     # Auth & role/admin API guard middleware templates
+│   │   ├── requests/       # Typed FormRequest classes
+│   │   └── resources/      # API response serializers (UserResource starter)
 │   ├── jobs/               # Background Queue jobs
 │   ├── listeners/          # Event listeners
 │   ├── mail/               # Mailables (WelcomeEmail)
@@ -143,23 +152,26 @@ my_api/
 │   ├── providers/          # Auto-discovered service providers
 │   ├── repositories/       # Data access layer
 │   ├── schemas/            # Typed dataclasses/schemas (see Application Schemas guide)
-│   └── services/           # Business logic services
+│   └── services/           # Business logic services (UserService starter)
 ├── config/                 # Configuration files loading .env via env() / env_bool()
 ├── database/
 │   ├── migrations/         # Timestamped schema migrations (initial users table included)
 │   └── seeders/            # DatabaseSeeders
+├── prompts/
+│   ├── summarise.py        # Named prompt (module-level `messages` list)
+│   └── classify.py         # Named classification prompt
 ├── public/                 # Public web assets (storage symlink target)
 ├── routes/
-│   └── api.py              # Starter /api/health and /api/users routes
+│   └── api.py              # Starter /api/health and /api/users (UserController.index) routes
 ├── storage/                # Private, public, framework cache, and log directories
-├── views/                  # Jinja2 HTML templates (admin/, mail/)
+├── views/                  # Jinja2 HTML templates (mail/)
 ├── tests/                  # pytest conftest.py & starter API test
 ├── .env                    # Generated APP_KEY & JWT_SECRET, DB_DATABASE=my_api
 ├── .env.example
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.2.2, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.3.0, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -313,7 +325,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.2.2",
+       "swiftpy-framework>=0.3.0",
        # ...
    ]
    ```
@@ -343,7 +355,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.2.2"
+python -m pip install --upgrade "swiftpy-framework>=0.3.0"
 swiftpy --version
 ```
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 
 @dataclass(slots=True)
@@ -21,6 +24,12 @@ class UserResponseSchema:
     name: str
     email: str
 
+    @classmethod
+    def from_model(cls, user: User) -> UserResponseSchema:
+        return cls(id=user.id, name=user.name, email=user.email)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
+UserSchema = UserResponseSchema

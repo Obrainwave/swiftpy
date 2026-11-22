@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -10,9 +11,9 @@ from typing import Any
 import pytest
 
 from swiftpy import Application, Request, Response, Router, TestClient, json_response
-from swiftpy.admin.auth import AdminSessionStore, AdminUser
 from swiftpy.auth import (
     AuthenticationError,
+    CurrentUser,
     InvalidSignatureError,
     InvalidTokenError,
     JWTError,
@@ -397,30 +398,6 @@ async def test_auth_logout_all_explicit_subject_and_missing_subject_error() -> N
         await blacklist.close()
 
 
-def test_admin_session_store_flush_revokes_all_prior_sessions_immediately() -> None:
-    store = AdminSessionStore(secret_key="phase6-admin-flush-secret-32-bytes!!")
-    user1 = AdminUser(username="alice", session_id="sid-1")
-    user2 = AdminUser(username="bob", session_id="sid-2")
-
-    tok1 = store.create_token(user1, max_age=3600)
-    tok2 = store.create_token(user2, max_age=3600)
-    assert store.verify_token(tok1) is not None
-    assert store.verify_token(tok2) is not None
-
-    # Manually crafted legacy token without epoch field still works prior to flush
-    store.flush()
-
-    assert store.verify_token(tok1) is None
-    assert store.verify_token(tok2) is None
-
-    # New session created immediately after flush (within the same second) is valid
-    user3 = AdminUser(username="alice", session_id="sid-3")
-    tok3 = store.create_token(user3, max_age=3600)
-    verified3 = store.verify_token(tok3)
-    assert verified3 is not None
-    assert verified3.session_id == "sid-3"
-
-
 @pytest.mark.asyncio
 async def test_auth_logout_from_context_jti_without_bearer_header() -> None:
     prefix = f"test_p6_ctx_{uuid.uuid4().hex[:8]}:"
@@ -469,3 +446,61 @@ async def test_concurrent_refresh_token_rotation_allows_only_one_claim() -> None
     finally:
         await blacklist.clear()
         await blacklist.close()
+
+
+@pytest.mark.asyncio
+async def test_integer_zero_id_and_blacklist_cache_key_with_issued_at() -> None:
+    """Fixes 2 & 3: Integer id=0 is preserved (not treated as falsy) and TokenBlacklist._local_cache keys on issued_at."""
+    prefix = f"test_fix23_{uuid.uuid4().hex[:8]}:"
+    issuer = JWTIssuer(secret="fix23-secret-key-at-least-32-bytes-long!!")
+    blacklist = TokenBlacklist(prefix=prefix, issuer=issuer)
+    await blacklist.clear()
+    Context.clear()
+
+    try:
+        # 1. Integer ID 0 is preserved in AuthUser, CurrentUser, auth().id(), and logout_all()
+        Context.set("__swiftpy_current_user__", {"id": 0, "email": "root@example.com"})
+        user_obj = auth().user()
+        assert user_obj is not None
+        assert user_obj.id == 0
+        assert auth().id() == 0
+
+        cu = CurrentUser()
+        assert cu.id == 0
+
+        # Revoke all for subject 0 via logout_all()
+        await auth().logout_all(blacklist=blacklist)
+        assert auth().check() is False
+
+        # Subject 0 with issued_at <= cutoff must be detected as revoked (not skipped by `not subject`)
+        now_ts = int(time.time())
+        assert await blacklist.is_revoked("", subject=0, issued_at=now_ts - 5) is True
+
+        # 2. TokenBlacklist._local_cache must include issued_at so a negative cache hit
+        # for a newer token (issued_at > cutoff) never masks an older token (issued_at <= cutoff)
+        await blacklist.revoke_all_for_subject("42")
+        cutoff = int(time.time())
+
+        # Newer token (issued after cutoff) -> NOT revoked (populates _local_cache)
+        assert (
+            await blacklist.is_revoked(
+                "shared-or-empty-jti",
+                subject="42",
+                issued_at=cutoff + 100,
+            )
+            is False
+        )
+        # Older token with same (jti, subject) but issued_at <= cutoff checked immediately within 2s TTL -> MUST be revoked!
+        assert (
+            await blacklist.is_revoked(
+                "shared-or-empty-jti",
+                subject="42",
+                issued_at=cutoff - 10,
+            )
+            is True
+        )
+    finally:
+        Context.clear()
+        await blacklist.clear()
+        await blacklist.close()
+

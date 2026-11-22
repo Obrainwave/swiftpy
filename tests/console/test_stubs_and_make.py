@@ -34,6 +34,9 @@ def test_stubs_directory_and_files_exist() -> None:
         "listener.stub",
         "provider.stub",
         "seeder.stub",
+        "agent.stub",
+        "tool.stub",
+        "prompt.stub",
     ]
     for filename in expected_stubs:
         stub_file = STUBS_DIR / filename
@@ -43,14 +46,17 @@ def test_stubs_directory_and_files_exist() -> None:
 
 
 def test_all_stubs_render_and_compile() -> None:
-    """Verify that all 20 stubs render cleanly without unresolved placeholders and compile to valid Python."""
+    """Verify that all 23 stubs render cleanly without unresolved placeholders and compile to valid Python."""
     stub_files = list(STUBS_DIR.glob("*.stub"))
-    assert len(stub_files) == 20
+    assert len(stub_files) == 23
 
     for stub_path in stub_files:
         content = stub_path.read_text(encoding="utf-8")
-        rendered = content.replace("{class_name}", "SampleTestClass").replace(
-            "{table_name}", "sample_table"
+        rendered = (
+            content.replace("{class_name}", "SampleTestClass")
+            .replace("{table_name}", "sample_table")
+            .replace("{tool_name}", "sample_tool")
+            .replace("{prompt_name}", "sample_prompt")
         )
         # Ensure no unreplaced template placeholders remain
         unresolved = re.findall(r"\{[a-zA-Z0-9_]+\}", rendered)
@@ -444,5 +450,61 @@ def test_make_new_generators_and_on_demand_directories(
     seeder_file = tmp_path / "database" / "seeders" / "user_seeder.py"
     assert seeder_file.is_file()
     assert "class UserSeeder(Seeder):" in seeder_file.read_text(encoding="utf-8")
+
+    # 9. Agent
+    cli.run(["make:agent", "SupportAgent"])
+    agent_file = tmp_path / "app" / "ai" / "agents" / "support_agent.py"
+    assert agent_file.is_file()
+    agent_content = agent_file.read_text(encoding="utf-8")
+    assert "class SupportAgent(BaseAgent):" in agent_content
+    assert 'name="SupportAgent"' in agent_content
+
+    # 10. Tool
+    cli.run(["make:tool", "WeatherLookupTool"])
+    tool_file = tmp_path / "app" / "ai" / "tools" / "weather_lookup_tool.py"
+    assert tool_file.is_file()
+    tool_content = tool_file.read_text(encoding="utf-8")
+    assert "class WeatherLookupTool(BaseTool):" in tool_content
+    assert 'return "weather_lookup"' in tool_content
+
+    # 11. Prompt (flat and versioned)
+    cli.run(["make:prompt", "summarise"])
+    prompt_file = tmp_path / "prompts" / "summarise.py"
+    assert prompt_file.is_file()
+    prompt_content = prompt_file.read_text(encoding="utf-8")
+    assert "messages: list[dict[str, str]] =" in prompt_content
+    assert 'Prompt.load("summarise", ...)' in prompt_content
+
+    cli.run(["make:prompt", "support/summarise.v2"])
+    v2_file = tmp_path / "prompts" / "support" / "summarise.v2.py"
+    assert v2_file.is_file()
+    v2_content = v2_file.read_text(encoding="utf-8")
+    assert 'Prompt.load("support/summarise.v2", ...)' in v2_content
+
+
+def test_make_ai_generators_security_and_force_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    cli = CLI()
+
+    cli.run(["make:prompt", "classify.v2"])
+    prompt_path = tmp_path / "prompts" / "classify.v2.py"
+    assert prompt_path.is_file()
+
+    with pytest.raises(SystemExit, match="already exists"):
+        cli.run(["make:prompt", "classify.v2"])
+
+    cli.run(["make:prompt", "classify.v2", "--force"])
+    assert prompt_path.is_file()
+
+    for bad_prompt in ("../escape", "/abs/prompt", "bad\\prompt", "summarise.py", "a..b"):
+        with pytest.raises(SystemExit):
+            cli.run(["make:prompt", bad_prompt])
+
+    custom_prompts = tmp_path / "custom_prompts"
+    cli.run(["make:prompt", "triage.v1", "--path", str(custom_prompts)])
+    assert (custom_prompts / "triage.v1.py").is_file()
+
 
 

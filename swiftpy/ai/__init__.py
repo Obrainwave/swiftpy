@@ -58,7 +58,9 @@ from swiftpy.ai.pricing import (
     register_model_pricing,
 )
 from swiftpy.ai.prompts import (
+    Prompt,
     PromptLoader,
+    aload_prompt,
     load_prompt,
 )
 from swiftpy.ai.providers.base import (
@@ -166,6 +168,7 @@ __all__ = [
     "PgVectorAdapter",
     "PineconeAdapter",
     "PlainConcatenationFormatter",
+    "Prompt",
     "PromptLoader",
     "ProviderInterface",
     "QdrantAdapter",
@@ -187,6 +190,7 @@ __all__ = [
     "WebSearchTool",
     "XMLBlocksFormatter",
     "ai",
+    "aload_prompt",
     "calculate_token_cost",
     "compute_prompt_hash",
     "generate_deterministic_embedding",

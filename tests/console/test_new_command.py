@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from swiftpy.ai.prompts import PromptLoader
 from swiftpy.auth.jwt_issuer import JWTIssuer
 from swiftpy.auth.token_blacklist import is_token_blacklist_enabled
 from swiftpy.cache.cache import Cache
@@ -31,9 +32,17 @@ def test_new_command_scaffolds_complete_structure(
     app_dir = tmp_path / "my_api_app"
     assert app_dir.is_dir()
 
-    # 1. Verify on-demand folders are NOT present initially
-    assert not (app_dir / "app" / "http" / "controllers").exists()
-    assert not (app_dir / "app" / "http" / "resources").exists()
+    # 1. Verify starter controllers, resources, AI folders, and prompts exist
+    assert (app_dir / "app" / "http" / "controllers" / "user_controller.py").is_file()
+    assert (app_dir / "app" / "http" / "resources" / "user_resource.py").is_file()
+    assert (app_dir / "app" / "ai" / "agents" / "assistant_agent.py").is_file()
+    assert (app_dir / "app" / "ai" / "tools" / "system_status_tool.py").is_file()
+    assert (app_dir / "app" / "ai" / "pipelines" / ".gitkeep").is_file()
+    assert (app_dir / "app" / "ai" / "providers" / ".gitkeep").is_file()
+    assert (app_dir / "app" / "ai" / "vectorstores" / ".gitkeep").is_file()
+    assert (app_dir / "app" / "ai" / "observers" / ".gitkeep").is_file()
+    assert (app_dir / "prompts" / "summarise.py").is_file()
+    assert (app_dir / "prompts" / "classify.py").is_file()
 
     # 2. Verify all 11 config files exist
     expected_configs = [
@@ -100,10 +109,9 @@ def test_new_command_scaffolds_complete_structure(
     ).is_file()
     assert (app_dir / "database" / "seeders" / "database_seeder.py").is_file()
 
-    # 7. Verify dedicated views
+    # 7. Verify dedicated views (admin views removed)
     assert (app_dir / "views" / "mail" / "template.html").is_file()
-    assert (app_dir / "views" / "admin" / "login.html").is_file()
-    assert (app_dir / "views" / "admin" / "dashboard.html").is_file()
+    assert not (app_dir / "views" / "admin").exists()
 
     # 8. Verify root files
     assert (app_dir / "routes" / "api.py").is_file()
@@ -210,58 +218,98 @@ async def test_scaffolded_app_e2e_lifecycle(
     if not (monkeypatch and os.getenv("JWT_SECRET")):
         monkeypatch.setenv("JWT_SECRET", "e2e-scaffold-jwt-secret-at-least-32-bytes!!")
 
-    # Initialize application with generated project root
-    app = Application(project_root=app_dir)
+    prefixes = ("main", "app", "routes")
+    saved_modules = {
+        name: mod
+        for name, mod in list(sys.modules.items())
+        if name in prefixes or name.startswith(("app.", "routes."))
+    }
+    for name in saved_modules:
+        sys.modules.pop(name, None)
 
-    # 1. Verify generated configuration loaded
-    assert app.config.get("app.name") == "SwiftPY"
-    assert app.config.get("app.cipher") == "AES-256-GCM"
+    try:
+        # Initialize application with generated project root
+        app = Application(project_root=app_dir)
 
-    # 2. Verify all 8 providers were auto-discovered and registered
-    provider_names = {type(p).__name__ for p in app._providers}
-    assert "AppServiceProvider" in provider_names
-    assert "AuthServiceProvider" in provider_names
-    assert "CacheServiceProvider" in provider_names
-    assert "DatabaseServiceProvider" in provider_names
-    assert "EventServiceProvider" in provider_names
-    assert "FilesystemServiceProvider" in provider_names
-    assert "MailServiceProvider" in provider_names
-    assert "QueueServiceProvider" in provider_names
+        # 1. Verify generated configuration loaded
+        assert app.config.get("app.name") == "SwiftPY"
+        assert app.config.get("app.cipher") == "AES-256-GCM"
 
-    # 3. Mount generated routes/api.py into the application
-    api_module = importlib.import_module("routes.api")
-    app.include_router(api_module.router, prefix="/api")
+        # 2. Verify all 8 providers were auto-discovered and registered
+        provider_names = {type(p).__name__ for p in app._providers}
+        assert "AppServiceProvider" in provider_names
+        assert "AuthServiceProvider" in provider_names
+        assert "CacheServiceProvider" in provider_names
+        assert "DatabaseServiceProvider" in provider_names
+        assert "EventServiceProvider" in provider_names
+        assert "FilesystemServiceProvider" in provider_names
+        assert "MailServiceProvider" in provider_names
+        assert "QueueServiceProvider" in provider_names
 
-    # 4. Verify route registration
-    route_paths = [r.path for r in app.router.routes]
-    assert "/api/health" in route_paths
-    assert "/api/users" in route_paths
+        # 3. Mount generated routes/api.py into the application
+        api_module = importlib.import_module("routes.api")
+        app.include_router(api_module.router, prefix="/api")
 
-    # 5. Mock database pool connection to test full lifespan startup and shutdown without external postgres
-    if app.container.has(DatabasePool):
-        pool = app.container.resolve(DatabasePool)
-        monkeypatch.setattr(pool, "init", AsyncMock())
-        monkeypatch.setattr(pool, "close", AsyncMock())
+        # 4. Verify route registration
+        route_paths = [r.path for r in app.router.routes]
+        assert "/api/health" in route_paths
+        assert "/api/users" in route_paths
 
-    # 6. Execute normal application lifespan startup and shutdown
-    await app.startup()
-    assert app._started is True
+        # 5. Mock database pool connection to test full lifespan startup and shutdown without external postgres
+        if app.container.has(DatabasePool):
+            pool = app.container.resolve(DatabasePool)
+            monkeypatch.setattr(pool, "init", AsyncMock())
+            monkeypatch.setattr(pool, "close", AsyncMock())
 
-    # 7. Execute live HTTP requests via TestClient
-    client = TestClient(app)
-    res_health = await client.get("/api/health")
-    assert res_health.status_code == 200
-    assert res_health.json() == {"status": "ok", "app": "SwiftPY"}
+        # 6. Execute normal application lifespan startup and shutdown
+        await app.startup()
+        assert app._started is True
 
-    res_users = await client.get("/api/users")
-    assert res_users.status_code == 200
-    data = res_users.json()
-    assert isinstance(data, list)
-    assert len(data) == 1
-    assert data[0]["email"] == "alice@example.com"
-    assert data[0]["name"] == "Alice Doe"
+        # 7. Execute live HTTP requests via TestClient
+        client = TestClient(app)
+        res_health = await client.get("/api/health")
+        assert res_health.status_code == 200
+        assert res_health.json() == {"status": "ok", "app": "SwiftPY"}
 
-    await app.shutdown()
+        res_users = await client.get("/api/users")
+        assert res_users.status_code == 200
+        data = res_users.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["email"] == "alice@example.com"
+        assert data[0]["name"] == "Alice Doe"
+
+        # Verify starter AI agent, tool, and named prompt integration
+        assistant_mod = importlib.import_module("app.ai.agents.assistant_agent")
+        agent = assistant_mod.AssistantAgent(config=app.config)
+        assert agent.name == "AssistantAgent"
+
+        prompt_loader = PromptLoader(base_dir=app_dir / "prompts", config=app.config)
+        rendered_summarise = prompt_loader.load(
+            "summarise",
+            style="bullet-point",
+            text="SwiftPY 0.3.0 ships prompt versioning.",
+        )
+        assert rendered_summarise == [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise technical editor. Summarise the provided content "
+                    "clearly in bullet-point style."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "SwiftPY 0.3.0 ships prompt versioning.",
+            },
+        ]
+
+        await app.shutdown()
+    finally:
+        for name in list(sys.modules):
+            if name in prefixes or name.startswith(("app.", "routes.")):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
 
 
 def test_environment_overrides_in_scaffolded_app(
@@ -292,10 +340,16 @@ def test_generated_project_passes_ruff_and_mypy(
     bin_dir = Path(sys.executable).parent
     repo_root = Path(__file__).resolve().parents[2]
 
-    # Generated CLI models (flat and nested) inside the project must also pass ruff and strict mypy
+    # Generated CLI models and AI/HTTP artifacts inside the project must pass ruff and strict mypy
     monkeypatch.chdir(app_dir)
     CLI().run(["make:model", "Article", "-m"])
     CLI().run(["make:model", "Billing/Invoice"])
+    CLI().run(["make:controller", "PostController"])
+    CLI().run(["make:resource", "PostResource"])
+    CLI().run(["make:service", "PostService"])
+    CLI().run(["make:agent", "SupportAgent"])
+    CLI().run(["make:tool", "WeatherLookupTool"])
+    CLI().run(["make:prompt", "summarise.v2"])
 
     ruff = subprocess.run(
         [str(bin_dir / "ruff"), "check", "."],

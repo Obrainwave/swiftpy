@@ -4,7 +4,7 @@ from typing import Any
 
 
 class {class_name}:
-    """{class_name} data schema."""
+    """{class_name} application data schema (rule map or structured DTO)."""
 
     schema: dict[str, Any] = {
         # "id": int,

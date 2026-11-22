@@ -1,22 +1,13 @@
-# WebSockets & Admin Dashboard
+# WebSockets & Real-Time Channels
 
 ## Introduction
 
-SwiftPY provides built-in real-time messaging and a zero-boilerplate administrative panel integrated directly into `Application`:
+SwiftPY provides built-in real-time messaging integrated directly into `Application`:
 
-- **WebSockets (`swiftpy.websockets`):** Define WebSocket endpoints with `@app.websocket(...)`, manage rooms and topic-style broadcasts with `WebSocketManager` (`ws_manager()`), enforce Decision `D-14` origin checks, authenticate handshakes with HTTP middleware (`JWTGuard` / `require_api_key`), bound frame sizes and idle timeouts, and fan out broadcasts across workers via `RedisEventBus`.
-- **Admin Dashboard (`swiftpy.admin`):** Register ORM `Model` classes with `AdminSite` (`admin`) and `ModelAdmin`, enforce RBAC permissions and HMAC-signed cookie/CSRF sessions (`AdminUser`, `AdminSessionStore`, `AdminAuthenticator`), and mount full HTML + JSON CRUD views (plus AI observability stats) onto your application with `admin.mount(app)`.
+- **WebSockets (`swiftpy.websockets`):** Define WebSocket endpoints with `@app.websocket(...)` (or `router.websocket(...)`), manage rooms and topic-style broadcasts with `WebSocketManager` (`ws_manager()`), enforce Decision `D-14` origin checks, authenticate handshakes with HTTP middleware (`JWTGuard` / `require_api_key`), bound frame sizes and idle timeouts, and fan out broadcasts across workers via `RedisEventBus`.
 
 ```python
 from swiftpy import Application
-from swiftpy.admin import (
-    AdminAuthenticator,
-    AdminSite,
-    AdminUser,
-    ModelAdmin,
-    admin,
-    get_admin_authenticator,
-)
 from swiftpy.helpers import websocket_manager, ws_manager
 from swiftpy.websockets import (
     WebSocket,
@@ -34,13 +25,6 @@ from swiftpy.websockets import (
   - Define `@app.websocket(...)` routes alongside HTTP routes (for example in `routes/web.py`, `routes/api.py`, or dedicated `Router` instances included on `app`).
   - `Application` creates a `WebSocketManager` singleton on `app.websocket_manager`, registers it in `app.container`, subscribes it to `RedisEventBus` (when configured) on startup, and disconnects/cleans up active connections on shutdown.
   - WebSocket runtime settings can be supplied directly on `Application(...)` (`allowed_origins`, `max_ws_message_size`, `ws_idle_timeout`) or via config keys under `websockets.*` (`websockets.allowed_origins`, `websockets.max_message_size`, `websockets.idle_timeout`).
-- **Admin registration & starter views:**
-  - Put `AdminSite` registrations (`@admin.register(...)` / `admin.register(...)`) in an imported module (e.g., `app/admin.py`) and mount with `admin.mount(app, prefix="/admin")` during app bootstrap in `main.py`.
-  - Newly scaffolded projects also include reference HTML templates in `views/admin/login.html` and `views/admin/dashboard.html`; `AdminSite.mount()` generates responsive HTML and JSON endpoints dynamically from your registered `ModelAdmin` classes.
-  - Configure admin credentials and signing secret via `config={"admin": {...}}` (or a `config/admin.py` file / double-underscore environment variables such as `ADMIN__SECRET_KEY`, `ADMIN__USERNAME`, `ADMIN__PASSWORD`):
-    - `admin.username` & `admin.password`
-    - `admin.secret_key` (falls back to `app.key`; required outside local debug mode)
-    - `admin.cookie_secure` (optional boolean override; otherwise enabled automatically on HTTPS / `production` env)
 
 ---
 
@@ -185,104 +169,12 @@ async def notifications(ws: WebSocketConnection) -> None:
 
 > `JWTGuard` accepts tokens via `Authorization: Bearer <token>`, `Sec-WebSocket-Protocol: bearer, <token>`, or `?token=<token>` on WebSocket handshakes.
 
-### 4. Registering Models in `AdminSite` & Customizing `ModelAdmin`
-
-Register ORM `Model` classes with `admin` (default `AdminSite` singleton) or a dedicated `AdminSite(title="...")`:
-
-```python
-from typing import ClassVar
-
-from swiftpy.admin import AdminSite, ModelAdmin, admin
-from swiftpy.database.orm import Field, Model
-
-
-class Post(Model):
-    __table__ = "posts"
-    __fillable__ = ["title", "body", "published"]
-
-    id: int | None = None
-    title: str = ""
-    body: str = ""
-    published: bool = Field(default=False)
-    internal_notes: str | None = None
-
-
-@admin.register(Post)
-class PostAdmin(ModelAdmin):
-    list_display: ClassVar[list[str] | tuple[str, ...] | None] = ["id", "title", "published"]
-    search_fields: ClassVar[list[str]] = ["title", "body"]
-    ordering: ClassVar[str | None] = "-id"
-    per_page: ClassVar[int] = 25
-    exclude: ClassVar[list[str]] = ["internal_notes"]
-    can_delete: ClassVar[bool] = True
-```
-
-Supported registration styles:
-
-- `admin.register(User)` — default `ModelAdmin` configuration
-- `admin.register(User, UserAdmin)` — explicit `ModelAdmin` pairing
-- `@admin.register` directly on a `Model` subclass
-- `@admin.register(Post)` on a `ModelAdmin` subclass
-
-Key `ModelAdmin` features:
-
-- **Auto-introspection & N+1 avoidance:** Automatically inspects `Model` field types (`checkbox`, `number`, `textarea`, `datetime-local`, `text`), renders `<select>` dropdowns for `BelongsTo` foreign keys, and eager-loads `BelongsTo` relations on list queries (`get_queryset()`).
-- **Mass-assignment & protected fields (`D-4`):** Because `AdminSite` constructs new records with `model_cls(**data)`, registered models must declare `__fillable__` (recommended) or `__guarded__` — otherwise create submissions raise `MassAssignmentError` (HTTP `422`). `exclude` removes fields from Create/Edit forms and ignores them on POST, while `primary_key`, `created_at`, and `updated_at` are always protected.
-- **SQL search escaping:** `search_fields` generates case-insensitive `OR` search filters (`?q=...`) with wildcard `%` / `_` escaping.
-
-### 5. Mounting Admin Routes, Sessions, CSRF & RBAC
-
-Mount your `AdminSite` onto `Application` during app startup:
-
-```python
-from swiftpy import Application
-from swiftpy.admin import AdminUser, admin, get_admin_authenticator
-
-app = Application()
-
-# Optional: plug in your own user database / hash verification
-def verify_admin(username: str, password: str) -> AdminUser | None:
-    if username == "alice" and password == "strong-passphrase":
-        return AdminUser(
-            username="alice",
-            is_admin=True,
-            permissions=["models:read", "posts:create", "posts:edit"],
-        )
-    return None
-
-get_admin_authenticator().set_authenticator(verify_admin)
-admin.mount(app, prefix="/admin")
-```
-
-Mounted endpoints (for `prefix="/admin"`):
-
-- `GET` / `POST /admin/login` — issues HMAC-SHA256-signed `HttpOnly; SameSite=Lax` cookie `swiftpy_admin_session`
-- `POST /admin/logout` — requires CSRF token and revokes the active `session_id`
-- `GET /admin` and `GET /admin/` — admin overview dashboard
-- `GET /admin/ai-usage` — LLM observability dashboard
-- `GET /admin/{slug}` — paginated, searchable model list (`?q=...&page=1&per_page=25&format=json`)
-- `GET` / `POST /admin/{slug}/create` — create record form / handler
-- `GET` / `POST /admin/{slug}/{id}/edit` — edit record form / handler
-- `POST /admin/{slug}/{id}/delete` and `DELETE /admin/{slug}/{id}` — delete record handler
-
-RBAC and permission enforcement:
-
-- `AdminUser(username, is_admin=True, permissions=[...])` controls authorization (`"all"` or `"*"` grants full access; otherwise granular scopes apply).
-- Default permission checks on `ModelAdmin`:
-  - **View:** `required_view_permission`, or any of `("all", "models:read", f"{slug}:read")`
-  - **Create:** `can_create=True` plus `required_create_permission`, or any of `("all", "models:write", f"{slug}:create")`
-  - **Edit:** `can_edit=True` plus `required_edit_permission`, or any of `("all", "models:write", f"{slug}:edit")`
-  - **Delete:** `can_delete=True` plus `required_delete_permission`, or any of `("all", "models:write", "models:delete", f"{slug}:delete")`
-- **CSRF protection:** Every state-changing `POST` / `DELETE` admin action (create, edit, delete, logout) verifies `_csrf_token` (form/JSON body) or `X-CSRF-Token` header bound to the user's `session_id` and returns HTTP `403` on mismatch.
-
 ---
 
 ## Important Defaults & Production Safeguards
 
 - **Origin checks fail closed against cross-site WebSocket hijacking (`D-14`):** Leave `allowed_origins=None` for same-origin browser policies or list exact origins (never `"*"` when authenticating browser cookies/sessions).
 - **Never trust unauthenticated WebSocket handshakes or unbounded frames:** Attach authentication middleware (`JWTGuard` / API keys) to sensitive WebSocket routes/groups and set `ws_idle_timeout` alongside `max_ws_message_size` (`1 MiB` default) to prevent resource exhaustion.
-- **Default admin credentials (`admin`/`admin123`) and ephemeral secrets are blocked outside local debug mode:** `AdminAuthenticator` and `AdminSessionStore` raise `ConfigurationError` in production or non-debug apps unless you configure strong `admin.username`/`admin.password` (or `set_authenticator(...)`) and `admin.secret_key` / `app.key`.
-- **Use `exclude` on `ModelAdmin` to hide sensitive columns:** Always exclude password hashes, secrets, or internal fields from `ModelAdmin` forms (`exclude = ["password"]`), and ensure HTTPS / `admin.cookie_secure=True` in production so `swiftpy_admin_session` carries the `Secure` flag.
 
 ---
 

@@ -321,7 +321,7 @@ async def refresh(payload: RefreshRequest, jwt: JWTIssuer) -> Response:
 
 > **WebSocket JWT support:** `require_jwt()` also extracts Bearer tokens from `Sec-WebSocket-Protocol` (`["bearer", "<jwt>"]` or `"bearer.<jwt>"`) or `?token=` / `?access_token=` query parameters on WebSocket handshakes (avoid query-string tokens in production where access logs record URLs).
 
-### 5. Token Revocation, `auth().logout()` & `AdminSessionStore.flush()`
+### 5. Token Revocation, `auth().logout()` & `auth().logout_all()`
 
 `TokenBlacklist` uses Redis to track revoked `jti` IDs and subject-wide cutoffs with automatic TTL expiration (`min(exp - now, max_token_lifetime)`, capped at 7 days by default).
 
@@ -351,7 +351,7 @@ async def logout_all(request: Request) -> Response:
     return json_response({"logged_out_all": True})
 ```
 
-You can also interact with `TokenBlacklist` (`await blacklist.revoke_token(token, issuer=jwt)`, `await blacklist.revoke_if_not_revoked(jti, ttl=...)`, `await blacklist.revoke_all_for_subject(user_id)`) or invalidate active admin panel cookie sessions in the current worker process with `AdminSessionStore.flush()` (increments the in-memory `_flush_epoch` counter so tokens issued under an older epoch are rejected immediately; for multi-worker or cross-restart invalidation, rotate `admin.secret_key` / `APP_KEY`).
+You can also interact with `TokenBlacklist` directly (`await blacklist.revoke_token(token, issuer=jwt)`, `await blacklist.revoke_if_not_revoked(jti, ttl=...)`, `await blacklist.revoke_all_for_subject(user_id)`).
 
 `require_jwt()`, `JWTGuard`, and `JWTIssuer.refresh_token_pair()` automatically consult `TokenBlacklist` whenever `AUTH_BLACKLIST_ENABLED=true` (the default). If Redis becomes unavailable during a check, SwiftPY **fails closed** with HTTP `503 AuthenticationServiceUnavailableError` rather than letting potentially revoked tokens through. Set `AUTH_BLACKLIST_ENABLED=false` if your application runs stateless JWTs without Redis.
 

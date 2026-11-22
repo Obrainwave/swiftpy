@@ -407,4 +407,4 @@ with Mail.fake() as fake:
 
 ## Next Step
 
-Continue to [WebSockets & Admin Dashboard](2026-11-15-websockets-and-admin.md) to build real-time `@app.websocket` endpoints with `WebSocketManager` and mount the RBAC-protected `AdminSite` dashboard.
+Continue to [WebSockets](2026-11-15-websockets-and-admin.md) to build real-time `@app.websocket` endpoints, manage topic broadcasts, and enforce WebSocket origin validation with `WebSocketManager`.

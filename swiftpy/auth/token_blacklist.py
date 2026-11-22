@@ -75,7 +75,7 @@ class TokenBlacklist(BaseTokenBlacklist):
         self._container = container
         self._owns_client = redis_client is None
         self._lock = asyncio.Lock()
-        self._local_cache: dict[tuple[str, str], float] = {}
+        self._local_cache: dict[tuple[str, str, str | None, int | None], float] = {}
         self._local_cache_ttl: float = 2.0
 
     async def get_client(self) -> _BlacklistRedisClient:
@@ -117,6 +117,7 @@ class TokenBlacklist(BaseTokenBlacklist):
 
         self._local_cache.clear()
         await client.set(key, "revoked", ex=expiration)
+        self._local_cache.clear()
 
     async def revoke_if_not_revoked(
         self,
@@ -144,7 +145,9 @@ class TokenBlacklist(BaseTokenBlacklist):
             if await self.is_revoked(jti):
                 return False
             await client.set(key, "revoked", ex=expiration)
+            self._local_cache.clear()
             return True
+        self._local_cache.clear()
         return bool(res)
 
     async def revoke_token(
@@ -224,6 +227,7 @@ class TokenBlacklist(BaseTokenBlacklist):
         now = int(time.time())
         self._local_cache.clear()
         await client.set(sub_key, str(now), ex=expiration)
+        self._local_cache.clear()
 
     async def is_revoked(
         self,
@@ -235,10 +239,20 @@ class TokenBlacklist(BaseTokenBlacklist):
         Determine whether a JWT ID (jti) or subject has been revoked.
         O(1) check against individual jti and per-subject not_before timestamp.
         """
-        if not jti and not subject:
+        norm_sub = (
+            str(subject)
+            if subject is not None and str(subject) != ""
+            else None
+        )
+        if not jti and norm_sub is None:
             return False
 
-        cache_key = (jti or "", str(subject) if subject is not None else "")
+        norm_iat = (
+            int(issued_at)
+            if issued_at is not None and not isinstance(issued_at, bool)
+            else None
+        )
+        cache_key = (self.prefix, jti or "", norm_sub, norm_iat)
         now = time.monotonic()
         cached_ts = self._local_cache.get(cache_key)
         if cached_ts is not None and (now - cached_ts) < self._local_cache_ttl:
@@ -248,12 +262,12 @@ class TokenBlacklist(BaseTokenBlacklist):
 
         pipe = client.pipeline()
         has_jti = bool(jti)
-        has_sub = subject is not None
+        has_sub = norm_sub is not None
 
         if has_jti:
             pipe.exists(f"{self.prefix}{jti}")
         if has_sub:
-            pipe.get(f"{self.prefix}sub:{subject}")
+            pipe.get(f"{self.prefix}sub:{norm_sub}")
 
         results = await pipe.execute()
 
@@ -267,7 +281,7 @@ class TokenBlacklist(BaseTokenBlacklist):
             sub_cutoff = results[res_idx]
             if sub_cutoff is not None:
                 cutoff_ts = int(sub_cutoff)
-                if issued_at is None or issued_at <= cutoff_ts:
+                if norm_iat is None or norm_iat <= cutoff_ts:
                     return True
 
         if len(self._local_cache) > 10000:
@@ -298,6 +312,7 @@ class TokenBlacklist(BaseTokenBlacklist):
 
         if keys_to_delete:
             await client.delete(*keys_to_delete)
+        self._local_cache.clear()
 
     async def close(self) -> None:
         """Close the underlying Redis client connection pool."""

@@ -304,8 +304,11 @@ async def require_api_key(
         record_dict.pop("secret", None)
         record_dict.pop("password", None)
         record_dict.pop("password_hash", None)
+        req.state.pop("__swiftpy_logged_out__", None)
         req.state["user"] = record_dict
         req.state["auth_guard"] = "api_key"
+        Context.set("__swiftpy_logged_out__", False)
+        Context.set("auth.user", record_dict)
         Context.set("__swiftpy_current_user__", record_dict)
         Context.set("__swiftpy_auth_guard__", "api_key")
         return record_dict
@@ -416,8 +419,11 @@ async def require_api_key(
     safe_record.pop("password", None)
     safe_record.pop("password_hash", None)
 
+    req.state.pop("__swiftpy_logged_out__", None)
     req.state["user"] = safe_record
     req.state["auth_guard"] = "api_key"
+    Context.set("__swiftpy_logged_out__", False)
+    Context.set("auth.user", safe_record)
     Context.set("__swiftpy_current_user__", safe_record)
     Context.set("__swiftpy_auth_guard__", "api_key")
 

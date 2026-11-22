@@ -41,6 +41,9 @@ Use the `make:*` commands to generate typed stubs conforming to SwiftPY's conven
 | `swiftpy make:listener <Name>` | `app/listeners/` | `--path`, `--force` |
 | `swiftpy make:provider <Name>` | `app/providers/` | `--path`, `--force` |
 | `swiftpy make:seeder <Name>` | `database/seeders/` | `--path`, `--force` |
+| `swiftpy make:agent <Name>` | `app/ai/agents/` | `--path`, `--force` |
+| `swiftpy make:tool <Name>` | `app/ai/tools/` | `--path`, `--force` |
+| `swiftpy make:prompt <name>` | `prompts/` (`summarise`, `summarise.v2`) | `--path`, `--force` |
 | `swiftpy make:api-key` | Config/table guidance + key generation | `--prefix`, `--pepper`, `-m` / `--migration`, `--path`, `--force` |
 
 > [!TIP]

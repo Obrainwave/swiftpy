@@ -144,3 +144,59 @@ def test_production_caching_behavior() -> None:
         loader.clear_cache()
         res3 = loader.load("cached_prompt", val="C")
         assert res3 == "Version 2: C"
+
+
+def test_prompt_loader_validates_name_before_cache_and_avoids_resolve_on_cache_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix 6: Validate prompt names before cache lookup and avoid filesystem resolve() on cache hits."""
+    prompt_file = tmp_path / "fast_cached.md"
+    prompt_file.write_text("Fast {{ x }}", encoding="utf-8")
+
+    loader = PromptLoader(base_dir=tmp_path, cache=True)
+    assert loader.load("fast_cached", x="1") == "Fast 1"
+
+    # Even if a malicious key were somehow in _cache, lexical validation rejects it first
+    loader._cache["../poisoned"] = "poison"
+    with pytest.raises(ValueError, match="Path traversal detected"):
+        loader.get_template("../poisoned")
+
+    # On a valid cache hit, Path.resolve must NOT be invoked
+    def _fail_resolve(self: Path, strict: bool = False) -> Path:
+        raise AssertionError(f"Unexpected Path.resolve() called on cache hit for {self}")
+
+    monkeypatch.setattr(Path, "resolve", _fail_resolve)
+    assert loader.load("fast_cached", x="2") == "Fast 2"
+
+
+def test_prompt_loader_rejects_symlinks_and_sanitizes_versioned_module_names(
+    tmp_path: Path,
+) -> None:
+    """Fix 6: Symlink prompt files/dirs are rejected and versioned .v2 Python files use dot-free module names."""
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    outside_file = tmp_path / "outside.md"
+    outside_file.write_text("Outside secret", encoding="utf-8")
+    inside_target = prompts_dir / "real.md"
+    inside_target.write_text("Inside {{ val }}", encoding="utf-8")
+
+    # Symlink to outside file
+    (prompts_dir / "link_outside.md").symlink_to(outside_file)
+    # Symlink to inside file
+    (prompts_dir / "link_inside.md").symlink_to(inside_target)
+
+    loader = PromptLoader(base_dir=prompts_dir, cache=False)
+    with pytest.raises(ValueError, match="Path traversal detected"):
+        loader.get_template("link_outside")
+    with pytest.raises(ValueError, match="Path traversal detected"):
+        loader.get_template("link_inside")
+
+    # Versioned Python prompt module __name__ must be a valid dot-free identifier
+    v2_py = prompts_dir / "summarise.v2.py"
+    v2_py.write_text(
+        'assert "." not in __name__ and __name__.isidentifier()\n'
+        'messages = [{"role": "user", "content": "OK {{ v }}"}]\n',
+        encoding="utf-8",
+    )
+    assert loader.load("summarise.v2", v="2") == [{"role": "user", "content": "OK 2"}]
+

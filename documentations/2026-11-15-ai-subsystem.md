@@ -135,12 +135,16 @@ CONFIG = {
 
 > **Configuration Detail (`ai.redis`):** `RedisConversationStore`, `RedisMemoryBackend`, `AIRateLimitMiddleware`, and `TokenBudgetMiddleware` resolve Redis settings via `resolve_redis_params(cfg, section="ai")`. Because a freshly generated `config/ai.py` omits `"redis"` by default (and top-level `REDIS_HOST` / `REDIS_PASSWORD` env vars only bind when `"redis"` exists in a loaded config section or when double-underscore vars like `AI__REDIS__HOST` / `REDIS__HOST` are used), explicitly define `"redis"` inside `config/ai.py` as shown above or pass `redis_client=` / `config=` when deploying against password-protected or non-local Redis.
 
-Recommended file organization inside your SwiftPY application:
+Recommended file organization inside your SwiftPY application (see also [Application Architecture & Project Structure](2026-11-21-application-architecture-and-project-structure.md)):
 
-- `config/ai.py`: Central AI provider, HTTP pool, observability, vectorstore, and reranker settings.
-- `prompts/`: Prompt templates stored as Markdown (`.md`) or Python (`.py`) files, including nested folders such as `prompts/support/triage.md`.
-- `app/ai/tools.py` (or `app/ai/tools/`): Custom `BaseTool` subclasses and `@tool` functions shared across services and agents.
-- `app/ai/agents.py` (or `app/ai/agents/`): Domain agent classes/factories wrapping `Agent`, `AgentMemory`, and allowed tools.
+- `config/ai.py`: Central AI provider, prompt path/cache (`prompts.path`, `prompts.cache`), HTTP pool, observability, vectorstore, and reranker settings.
+- `prompts/`: Prompt templates stored as Markdown (`.md`) or Python (`.py`) files, including named prompts (`prompts/summarise.py`, `prompts/classify.py`), nested folders (`prompts/support/triage.md`), and versioned prompts (`prompts/summarise.v2.py` via `swiftpy make:prompt summarise.v2`).
+- `app/ai/agents/`: Domain `BaseAgent` subclasses defining model, tools, memory, and system prompt (generated via `swiftpy make:agent <Name>`; includes starter `AssistantAgent`).
+- `app/ai/tools/`: Function-calling `BaseTool` subclasses — each tool is one class (generated via `swiftpy make:tool <Name>`; includes starter `SystemStatusTool`).
+- `app/ai/pipelines/`: RAG pipeline configurations combining retrievers, rerankers, and generators.
+- `app/ai/providers/`: Custom LLM provider adapters beyond built-in providers.
+- `app/ai/vectorstores/`: Custom vector store adapters beyond built-in adapters.
+- `app/ai/observers/`: Custom AI observability hooks.
 - `app/providers/` or `main.py`: Application startup/shutdown hooks for global middlewares, `DatabaseObservabilityDriver.ensure_table()`, background agent cancellation (`AgentTracker.get_instance().cancel_all()`), and explicit vector/Redis handle cleanup. Note that `Application` already closes singleton and global `AIHttpPool` instances automatically during shutdown.
 - `bootstrap/cache/prompts.json` (+ sidecar `.meta.json`): Generated automatically alongside `bootstrap/cache/config.json` when running `python -m swiftpy cache:build`.
 
@@ -265,22 +269,30 @@ Notice how `AIClient.stream()` behaves cleanly with observability and HTTP conne
 
 ---
 
-### Step 3: Prompt Templates (`PromptLoader`), Precompilation & Security
+### Step 3: Prompt Templates (`Prompt` & `PromptLoader`), Versioning, Precompilation & Security
 
-Instead of hardcoding long prompt strings in route handlers or services, organize templates under `prompts/` as `.md` or `.py` files.
+Instead of hardcoding long prompt strings in route handlers or services, organize templates under `prompts/` as `.md` or `.py` files (using `swiftpy make:prompt summarise` or `swiftpy make:prompt summarise.v2`).
 
-#### Resolution Order & Interpolation Rules
+#### Resolution Order, `messages` Lists & Interpolation Rules
 
-When loading a prompt such as `"support/triage"`:
+When loading a prompt such as `"support/triage"` or `"summarise.v2"`:
 
-1. `PromptLoader` resolves relative paths safely under its `base_dir` (default `"prompts"`), rejecting traversal attempts (`"../secret"`, symlinks outside `base_dir`, or empty names) with `ValueError`.
-2. **Precedence:** It checks `prompts/support/triage.md` first, then `prompts/support/triage.py`.
-3. Inside `.py` prompt files, `PromptLoader` checks attributes in order: `PROMPT`, `prompt`, `TEMPLATE`, `template` (either a `str` or a zero-argument callable returning a `str`), falling back to the module docstring if present.
+1. `PromptLoader` resolves relative paths safely under `ai.prompts.path` (default `"prompts"`), rejecting traversal attempts (`"../secret"`, symlinks outside `base_dir`, or empty names) with `ValueError`.
+2. **Precedence:** It checks `prompts/support/triage.md` first, then `prompts/support/triage.py`. Dotted version names such as `"summarise.v2"` resolve cleanly to `prompts/summarise.v2.py`.
+3. Inside `.py` prompt files, `PromptLoader` checks attributes in order: `MESSAGES`, `messages` (a sequence of `{"role": ..., "content": ...}` dicts or `Message` objects, or zero-arg callable returning them), then `PROMPT`, `prompt`, `TEMPLATE`, `template` (`str`, sequence, or zero-arg callable), falling back to the module docstring if present.
 4. Variables use double curly braces: `{{ issue }}` (whitespace inside braces is optional: `{{issue}}` or `{{ issue }}`).
 5. **Single-pass rendering & escaping:**
    - Missing template variables raise `KeyError`.
    - Use `\{{ literal }}` to output literal `{{ literal }}` without substitution. Preceding literal backslashes such as `C:\\{{ folder }}` are preserved accurately.
    - Variable values containing `{{ ... }}` are never re-interpolated on a second pass.
+
+```python
+# prompts/summarise.v2.py
+messages: list[dict[str, str]] = [
+    {"role": "system", "content": "Summarise concisely in {{ style }} style."},
+    {"role": "user", "content": "{{ text }}"},
+]
+```
 
 ```markdown
 <!-- prompts/support/triage.md -->
@@ -291,15 +303,15 @@ Customer message:
 {{ body }}
 ```
 
-Use `aload_prompt` / `.aprompt(...)` inside `async def` request handlers so filesystem reads run via `asyncio.to_thread` rather than blocking the event loop:
+Use `Prompt.aload(...)` / `aload_prompt(...)` / `.aprompt(...)` inside `async def` request handlers so filesystem reads run via `asyncio.to_thread` rather than blocking the event loop:
 
 ```python
-from swiftpy.ai import AI, PromptLoader
-from swiftpy.ai.prompts import aload_prompt
+from swiftpy.ai import AI, Prompt, PromptLoader, aload_prompt
 
 
 async def draft_triage_reply(ticket_id: int, plan: str, body: str) -> str:
     # Option A: attach rendered template directly on a fluent AIClient
+    # (when the prompt defines a `messages` list, all messages are appended automatically)
     res = await (
         AI.aprompt(
             "support/triage",
@@ -314,8 +326,10 @@ async def draft_triage_reply(ticket_id: int, plan: str, body: str) -> str:
     return res.content
 
 
-async def render_only(ticket_id: int, plan: str, body: str) -> str:
-    # Option B: load and render standalone string asynchronously
+async def render_only(ticket_id: int, plan: str, body: str) -> str | list[dict[str, str]]:
+    # Option B: load via the Prompt facade (supports versioned .v2 names and messages lists)
+    rendered_v2 = await Prompt.aload("summarise.v2", style="3-bullet", text=body)
+    # Or standalone string/template helpers
     rendered = await aload_prompt(
         "support/triage",
         ticket_id=ticket_id,
@@ -325,10 +339,12 @@ async def render_only(ticket_id: int, plan: str, body: str) -> str:
     # Or via a scoped loader instance: PromptLoader(base_dir="prompts")
     loader = PromptLoader.get_instance()
     raw = await loader.aget_template("support/triage")
-    return loader.render(raw, ticket_id=ticket_id, plan=plan, body=body)
+    assert isinstance(raw, str)
+    assert isinstance(rendered_v2, list)
+    return loader.render(raw, ticket_id=ticket_id, plan=plan, body=body) or rendered
 ```
 
-> **`AI.prompt()` vs. `AI.aprompt()`:** `AI.prompt(name, ...)` (class method) and `client.prompt(name, role="user", ...)` perform synchronous disk reads unless the template is already cached. Inside async request paths, prefer `await AI.aprompt(...)` (note: `AI.aprompt` returns an `AIClient` after `await`) or `await client.aprompt(name, role=..., ...)` (an `async def` method returning `AIClient`).
+> **`AI.prompt()` / `Prompt.load()` vs. `AI.aprompt()` / `Prompt.aload()`:** Synchronous `AI.prompt()`, `Prompt.load()`, and `client.prompt()` read disk files synchronously unless cached. Inside async request handlers, prefer `await AI.aprompt(...)`, `await client.aprompt(...)`, `await Prompt.aload(...)`, or `await Prompt.aload_messages(...)`.
 
 #### Production Precompilation (`cache:build`)
 

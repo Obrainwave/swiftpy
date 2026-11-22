@@ -271,6 +271,15 @@ class SyntheticDataclassProvider(ServiceProvider):
         encoding="utf-8",
     )
 
+    prefixes = ("app", "_swiftpy_providers")
+    saved_modules = {
+        name: mod
+        for name, mod in list(sys.modules.items())
+        if name in prefixes or name.startswith(("app.", "_swiftpy_providers."))
+    }
+    for name in saved_modules:
+        sys.modules.pop(name, None)
+
     before_sys_path = list(sys.path)
     try:
         discovered = discover_providers(providers_dir, project_root=isolated_root)
@@ -283,8 +292,7 @@ class SyntheticDataclassProvider(ServiceProvider):
         assert [c.__name__ for c in synthetic] == ["SyntheticDataclassProvider"]
         assert synthetic[0].__module__ in sys.modules
     finally:
-        sys.modules.pop("app", None)
-        sys.modules.pop("app.providers", None)
-        sys.modules.pop("app.providers.custom_provider", None)
-        sys.modules.pop("_swiftpy_providers.custom_provider", None)
-        sys.modules.pop("_swiftpy_providers.dataclass_provider", None)
+        for name in list(sys.modules):
+            if name in prefixes or name.startswith(("app.", "_swiftpy_providers.")):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)

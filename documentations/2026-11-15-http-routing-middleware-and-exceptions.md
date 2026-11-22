@@ -307,22 +307,25 @@ class OrderController:
         return json_response(OrderResource(record).to_dict())
 ```
 
-There are two clean ways to wire a controller in `routes/orders.py`:
+There are three clean ways to wire a controller in `routes/orders.py`:
 
 ```python
-# Option A: Inject the controller via DI inside route handlers (recommended when controller uses DI)
+# Option A (Recommended): Direct unbound controller method binding with automatic DI
 # routes/orders.py
 from __future__ import annotations
 
-from swiftpy.http.request import Request
-from swiftpy.http.response import Response
 from swiftpy.http.router import Router
 
 from app.http.controllers.order_controller import OrderController
 
 router = Router()
 
+router.get("/", OrderController.index)
+router.get("/{order_id}", OrderController.show)
+```
 
+```python
+# Option B: Decorator function injecting the controller via DI
 @router.get("/")
 async def index(request: Request, controller: OrderController) -> Response:
     return await controller.index(request)
@@ -336,11 +339,13 @@ async def show(order_id: int, controller: OrderController) -> Response:
 Or if your controller takes no constructor dependencies, instantiate it directly and register bound methods with `router.add_route(...)`:
 
 ```python
-# Option B: Direct method binding with router.add_route(...)
+# Option C: Direct bound method binding with router.add_route(...)
 controller = StaticController()
 router.add_route("GET", "/", controller.index)
 router.add_route("GET", "/{order_id}", controller.show)
 ```
+
+> With **Option A** (`router.get("/", OrderController.index)` or `app.get("/orders", OrderController.index)`), SwiftPY resolves `OrderController.__init__(...)` per request from the DI container cleanly without sharing instance state across concurrent requests. See [Application Architecture & Project Structure](2026-11-21-application-architecture-and-project-structure.md) for recommended layering patterns.
 
 ---
 

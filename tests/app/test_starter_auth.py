@@ -9,7 +9,7 @@ import pytest
 from app.http.middleware.admin_middleware import AdminMiddleware
 from app.http.middleware.auth_middleware import AuthMiddleware
 from app.providers.auth_service_provider import AuthServiceProvider
-from swiftpy.auth import JWTIssuer
+from swiftpy.auth import AuthManager, AuthUser, JWTIssuer, auth, set_user_model
 from swiftpy.core.application import Application
 from swiftpy.core.context import Context
 from swiftpy.core.exceptions import HttpException
@@ -200,3 +200,80 @@ async def test_benchmark_token_endpoint_disabled_unless_explicitly_enabled_in_de
     resp_enabled = await client_enabled.get("/benchmarks/token")
     resp_enabled.assert_ok()
     assert "token" in resp_enabled.json()
+
+
+@pytest.mark.asyncio
+async def test_auth_logout_clears_auth_user_context_and_admin_middleware_supports_models() -> None:
+    """Fix 1: Logout clears Context['auth.user'], AdminMiddleware respects logout and model-backed admin flags, and AuthMiddleware avoids truthiness traps."""
+    mw = AdminMiddleware()
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "GET",
+        "path": "/admin-check",
+        "headers": [],
+        "query_string": b"",
+    }
+
+    async def _recv() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def _next_ok(req: Request) -> Response:
+        return json_response({"ok": True})
+
+    Context.clear()
+    try:
+        # 1. Logout clears Context["auth.user"] so AdminMiddleware rejects with 401
+        req1 = Request(scope, _recv)
+        Context.set("request", req1)
+        Context.set("auth.user", {"id": 1, "is_admin": True})
+        Context.set("__swiftpy_current_user__", {"id": 1, "is_admin": True})
+        req1.state["user"] = {"id": 1, "is_admin": True}
+
+        await auth().logout(req1)
+        assert Context.get("auth.user") is None
+        assert Context.get("__swiftpy_current_user__") is None
+        with pytest.raises(HttpException) as exc_after_logout:
+            await mw.handle(req1, _next_ok)
+        assert exc_after_logout.value.status_code == 401
+
+        # 2. AdminMiddleware resolves model-backed admin flag on AuthUser(dict_without_is_admin, model=...)
+        Context.clear()
+        req2 = Request(scope, _recv)
+        Context.set("request", req2)
+        admin_model: Any = SimpleNamespace(id=7, is_admin=True)
+        wrapped_user = AuthUser({"id": 7, "is_admin": None}, model=admin_model)
+        Context.set("auth.user", wrapped_user)
+        resp_model_admin = await mw.handle(req2, _next_ok)
+        assert resp_model_admin.status_code == 200
+
+        # 3. set_user_model synchronizes Context["auth.user"] and model-backed admin lookup
+        Context.clear()
+        req3 = Request(scope, _recv)
+        Context.set("request", req3)
+        set_user_model(SimpleNamespace(id=8, is_admin=True))
+        resp_set_model = await mw.handle(req3, _next_ok)
+        assert resp_set_model.status_code == 200
+
+        # 4. AuthMiddleware uses `user is None` rather than truthiness (falsy non-None user object passes)
+        class _FalsyCustomUser:
+            def __bool__(self) -> bool:
+                return False
+
+        app = _build_test_app()
+        auth_mgr = app.container.resolve(AuthManager)
+        auth_mgr.extend("falsy_custom", lambda _: lambda _req: _FalsyCustomUser())
+        app.config.set("auth.defaults.guard", "falsy_custom")
+
+        @app.get("/falsy-auth", middleware=[AuthMiddleware])
+        async def _falsy_endpoint(request: Request) -> Response:
+            return json_response(
+                {"is_custom": isinstance(request.state.get("user"), _FalsyCustomUser)}
+            )
+
+        client = TestClient(app)
+        res_falsy = await client.get("/falsy-auth")
+        res_falsy.assert_ok()
+        assert res_falsy.json() == {"is_custom": True}
+    finally:
+        Context.clear()
+

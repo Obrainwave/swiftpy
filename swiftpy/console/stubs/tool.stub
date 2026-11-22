@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+from typing import Any
+
+from swiftpy.ai.tools import BaseTool
+
+
+class {class_name}(BaseTool):
+    """{class_name} AI function-calling tool."""
+
+    @property
+    def name(self) -> str:
+        return "{tool_name}"
+
+    @property
+    def description(self) -> str:
+        return "Describe what {tool_name} does so the model knows when to call it."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Input parameter for {tool_name}.",
+                }
+            },
+            "required": ["query"],
+        }
+
+    async def handle(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute the tool logic asynchronously."""
+        query = str(kwargs.get("query", args[0] if args else ""))
+        return {"tool": self.name, "query": query}

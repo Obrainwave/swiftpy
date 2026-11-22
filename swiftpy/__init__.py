@@ -4,17 +4,18 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from swiftpy.admin import (
-        AdminSite,
-        ModelAdmin,
-        admin,
-    )
     from swiftpy.ai.agents import (
         Agent,
         AgentMemory,
         AgentResponse,
         AgentTask,
         BaseAgent,
+    )
+    from swiftpy.ai.prompts import (
+        Prompt,
+        PromptLoader,
+        aload_prompt,
+        load_prompt,
     )
     from swiftpy.auth import (
         ApiKeyGuard,
@@ -213,7 +214,6 @@ if TYPE_CHECKING:
     )
 
 _EXPORT_MAP: dict[str, tuple[str, str]] = {
-    'AdminSite': ('swiftpy.admin', 'AdminSite'),
     'Agent': ('swiftpy.ai.agents', 'Agent'),
     'AgentMemory': ('swiftpy.ai.agents', 'AgentMemory'),
     'AgentResponse': ('swiftpy.ai.agents', 'AgentResponse'),
@@ -278,7 +278,6 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'Middleware': ('swiftpy.http.middleware', 'Middleware'),
     'MinRule': ('swiftpy.validation', 'MinRule'),
     'Model': ('swiftpy.database.orm', 'Model'),
-    'ModelAdmin': ('swiftpy.admin', 'ModelAdmin'),
     'ModelNotFoundError': ('swiftpy.database', 'ModelNotFoundError'),
     'NotFoundError': ('swiftpy.core.exceptions', 'NotFoundError'),
     'NotInRule': ('swiftpy.validation', 'NotInRule'),
@@ -286,6 +285,8 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'Paginator': ('swiftpy.database.pagination', 'Paginator'),
     'PathNormalizer': ('swiftpy.filesystem', 'PathNormalizer'),
     'PayloadTooLargeError': ('swiftpy.core.exceptions', 'PayloadTooLargeError'),
+    'Prompt': ('swiftpy.ai.prompts', 'Prompt'),
+    'PromptLoader': ('swiftpy.ai.prompts', 'PromptLoader'),
     'QueueDispatcher': ('swiftpy.queue', 'QueueDispatcher'),
     'QueueWorker': ('swiftpy.queue', 'QueueWorker'),
     'RecordNotFoundError': ('swiftpy.database', 'RecordNotFoundError'),
@@ -333,7 +334,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'WebSocketManager': ('swiftpy.websockets', 'WebSocketManager'),
     'WebSocketState': ('swiftpy.websockets', 'WebSocketState'),
     'abort': ('swiftpy.core.exceptions', 'abort'),
-    'admin': ('swiftpy.admin', 'admin'),
+    'aload_prompt': ('swiftpy.ai.prompts', 'aload_prompt'),
     'app': ('swiftpy.helpers.helper', 'app'),
     'between': ('swiftpy.validation', 'between'),
     'bool_': ('swiftpy.validation', 'bool_'),
@@ -359,6 +360,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'int_': ('swiftpy.validation', 'int_'),
     'isset': ('swiftpy.helpers.helper', 'isset'),
     'json_response': ('swiftpy.http.response', 'json_response'),
+    'load_prompt': ('swiftpy.ai.prompts', 'load_prompt'),
     'mail': ('swiftpy.helpers.helper', 'mail'),
     'max_': ('swiftpy.validation', 'max_'),
     'min_': ('swiftpy.validation', 'min_'),
@@ -389,7 +391,6 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
 }
 
 _SUBMODULE_EXPORTS: frozenset[str] = frozenset({
-    'admin',
     'ai',
     'auth',
     'cache',
@@ -433,7 +434,6 @@ def __dir__() -> list[str]:
 
 __all__ = [
     'CORS',
-    'AdminSite',
     'Agent',
     'AgentMemory',
     'AgentResponse',
@@ -497,7 +497,6 @@ __all__ = [
     'Middleware',
     'MinRule',
     'Model',
-    'ModelAdmin',
     'ModelNotFoundError',
     'NotFoundError',
     'NotInRule',
@@ -505,6 +504,8 @@ __all__ = [
     'Paginator',
     'PathNormalizer',
     'PayloadTooLargeError',
+    'Prompt',
+    'PromptLoader',
     'QueueDispatcher',
     'QueueWorker',
     'RecordNotFoundError',
@@ -552,7 +553,7 @@ __all__ = [
     'WebSocketManager',
     'WebSocketState',
     'abort',
-    'admin',
+    'aload_prompt',
     'app',
     'between',
     'bool_',
@@ -578,6 +579,7 @@ __all__ = [
     'int_',
     'isset',
     'json_response',
+    'load_prompt',
     'mail',
     'max_',
     'min_',

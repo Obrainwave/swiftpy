@@ -1,0 +1,14 @@
+"""Prompt template loaded via Prompt.load("{prompt_name}", ...)."""
+
+from __future__ import annotations
+
+messages: list[dict[str, str]] = [
+    {
+        "role": "system",
+        "content": "You are a helpful assistant.",
+    },
+    {
+        "role": "user",
+        "content": "{{ input }}",
+    },
+]

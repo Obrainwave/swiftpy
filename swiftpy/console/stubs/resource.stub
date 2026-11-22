@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 class {class_name}:
@@ -10,12 +13,12 @@ class {class_name}:
         self.resource = resource
 
     def to_dict(self) -> dict[str, Any]:
-        """Transform the resource into an array/dict."""
+        """Transform the resource into an HTTP-safe dictionary."""
         return {
             "id": getattr(self.resource, "id", None),
         }
 
     @classmethod
-    def collection(cls, items: list[Any]) -> list[dict[str, Any]]:
-        """Transform a collection of resources."""
+    def collection(cls, items: Iterable[Any]) -> list[dict[str, Any]]:
+        """Transform a collection of resources into HTTP-safe dictionaries."""
         return [cls(item).to_dict() for item in items]
