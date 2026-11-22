@@ -5,12 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from swiftpy.admin import (
-    ADMIN_COOKIE_NAME,
-    AdminSite,
-    AdminUser,
-    create_admin_session,
-)
 from swiftpy.ai.client import AI, AIClient
 from swiftpy.ai.observability.drivers import (
     DatabaseObservabilityDriver,
@@ -23,11 +17,8 @@ from swiftpy.ai.observability.observer import (
     get_observability,
 )
 from swiftpy.ai.providers.base import Message
-from swiftpy.core.application import Application
 from swiftpy.core.config import Config
 from swiftpy.database.pool import DatabasePool
-from swiftpy.http.response import Response
-from swiftpy.testing.http_client import TestClient
 
 
 def test_prompt_hash_deterministic() -> None:
@@ -223,8 +214,7 @@ async def test_observability_records_streaming_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_panel_ai_usage_dashboard_views() -> None:
-    # Set up in-memory observability records
+async def test_observability_manager_aggregation_stats_and_observations() -> None:
     driver = InMemoryObservabilityDriver()
     manager = AIObservabilityManager(drivers=[driver])
     AIObservabilityManager.set_instance(manager)
@@ -236,7 +226,7 @@ async def test_admin_panel_ai_usage_dashboard_views() -> None:
             input_tokens=100,
             output_tokens=50,
             latency_ms=130.0,
-            prompt_hash="admin_hash_1",
+            prompt_hash="obs_hash_1",
         )
         await manager.record(
             model="claude-3-5-sonnet",
@@ -244,46 +234,16 @@ async def test_admin_panel_ai_usage_dashboard_views() -> None:
             input_tokens=200,
             output_tokens=100,
             latency_ms=210.0,
-            prompt_hash="admin_hash_2",
+            prompt_hash="obs_hash_2",
         )
 
-        site = AdminSite(title="AI Admin Portal")
-        app = Application()
-        site.mount(app, prefix="/admin")
-        client = TestClient(app)
+        stats = await manager.get_stats()
+        assert stats["total_calls"] == 2
+        assert stats["total_tokens"] == 450
+        assert set(stats["by_provider"].keys()) == {"openai", "anthropic"}
 
-        user = AdminUser(username="admin_tester")
-        login_resp = Response()
-        token = create_admin_session(login_resp, user)
-        auth_cookie = f"{ADMIN_COOKIE_NAME}={token}"
-        headers = {"cookie": auth_cookie}
-
-        # 1. Unauthenticated request to /admin/ai-usage redirects or returns 401
-        unauth_resp = await client.get("/admin/ai-usage")
-        assert unauth_resp.status_code == 302
-
-        # 2. Authenticated request to /admin/ai-usage returns 200 HTML
-        resp_html = await client.get("/admin/ai-usage", headers=headers)
-        assert resp_html.status_code == 200
-        assert "AI Observability &amp; Usage" in resp_html.text or "AI Observability & Usage" in resp_html.text
-        assert "Provider Breakdown" in resp_html.text
-        assert "Recent Observations" in resp_html.text
-        assert "gpt-4o" in resp_html.text
-        assert "claude-3-5-sonnet" in resp_html.text
-
-        # 3. Authenticated JSON API request to /admin/ai-usage?format=json
-        resp_json = await client.get("/admin/ai-usage?format=json", headers=headers)
-        assert resp_json.status_code == 200
-        payload = resp_json.json()
-        assert "stats" in payload
-        assert payload["stats"]["total_calls"] == 2
-        assert len(payload["recent_observations"]) == 2
-        assert payload["recent_observations"][0]["model"] in ("gpt-4o", "claude-3-5-sonnet")
-
-        # 4. Main admin dashboard includes the AI Observability card
-        resp_dash = await client.get("/admin/", headers=headers)
-        assert resp_dash.status_code == 200
-        assert "AI Observability &amp; Usage" in resp_dash.text or "AI Observability & Usage" in resp_dash.text
-        assert "/admin/ai-usage" in resp_dash.text
+        observations = await manager.get_observations(limit=10)
+        assert len(observations) == 2
+        assert {obs.model for obs in observations} == {"gpt-4o", "claude-3-5-sonnet"}
     finally:
         AIObservabilityManager.set_instance(None)

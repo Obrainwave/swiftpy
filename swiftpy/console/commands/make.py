@@ -18,6 +18,7 @@ from swiftpy.database.identifiers import validate_identifier
 from swiftpy.support.strings import pluralize, snake_case
 
 _SEGMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PROMPT_SUFFIX_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def _pascal_case(snake_str: str) -> str:
@@ -82,6 +83,81 @@ def _validate_and_split_name(
     return segments[:-1], snake_name, class_name
 
 
+def _validate_and_split_prompt_name(raw_name: str) -> tuple[list[str], str, str]:
+    """
+    Validate a prompt name (with optional nested '/' folders and dotted version suffixes
+    such as 'summarise.v2') and return (dir_segments, filename_stem, prompt_name).
+    """
+    trimmed = raw_name.strip()
+    if not trimmed:
+        raise SystemExit(f"Invalid prompt name: {raw_name!r}")
+
+    if (
+        "\\" in trimmed
+        or trimmed.startswith("/")
+        or trimmed.endswith("/")
+        or "//" in trimmed
+        or Path(trimmed).is_absolute()
+    ):
+        raise SystemExit(
+            f"Invalid prompt path {raw_name!r}: absolute or malformed paths are not allowed."
+        )
+
+    segments = trimmed.split("/")
+    for seg in segments:
+        if seg in ("", ".", ".."):
+            raise SystemExit(
+                f"Invalid prompt path {raw_name!r}: path traversal is not allowed."
+            )
+
+    for seg in segments[:-1]:
+        seg_snake = snake_case(seg)
+        if not _SEGMENT_PATTERN.fullmatch(seg) or not _SEGMENT_PATTERN.fullmatch(
+            seg_snake
+        ):
+            raise SystemExit(
+                f"Invalid prompt directory segment {seg!r} in {raw_name!r}. "
+                "Each directory segment must be a valid identifier."
+            )
+
+    leaf = segments[-1]
+    parts = leaf.split(".")
+    if any(not part for part in parts):
+        raise SystemExit(
+            f"Invalid prompt name {raw_name!r}: empty dotted segment is not allowed."
+        )
+
+    if len(parts) > 1 and parts[-1].lower() in ("py", "md"):
+        raise SystemExit(
+            f"Invalid prompt name {raw_name!r}: omit the '.{parts[-1]}' file extension."
+        )
+
+    base_part = parts[0]
+    base_snake = snake_case(base_part)
+    if not _SEGMENT_PATTERN.fullmatch(base_part) or not _SEGMENT_PATTERN.fullmatch(
+        base_snake
+    ):
+        raise SystemExit(
+            f"Invalid prompt name segment {base_part!r} in {raw_name!r}. "
+            "Prompt names must start with a letter or underscore."
+        )
+
+    normalized_parts = [base_snake]
+    for suffix in parts[1:]:
+        if not _PROMPT_SUFFIX_PATTERN.fullmatch(suffix):
+            raise SystemExit(
+                f"Invalid prompt version/variant suffix {suffix!r} in {raw_name!r}."
+            )
+        normalized_parts.append(suffix)
+
+    filename_stem = ".".join(normalized_parts)
+    dir_segments = segments[:-1]
+    prompt_name = (
+        "/".join([*dir_segments, filename_stem]) if dir_segments else filename_stem
+    )
+    return dir_segments, filename_stem, prompt_name
+
+
 _CREATE_PATTERNS = (
     re.compile(r"^create_(\w+?)_table$"),
     re.compile(r"^create_(\w+)$"),
@@ -108,30 +184,19 @@ _ALTER_STUB = get_stub("migration.alter")
 _BLANK_STUB = get_stub("migration.blank")
 
 
-def _scaffold_file(
+def _write_scaffold_file(
+    *,
     raw_name: str,
-    default_dir_rel: str,
-    stub_name: str,
-    override_path: str | None = None,
-    force: bool = False,
-    extra_replacements: dict[str, str] | None = None,
-    item_type: str = "File",
+    base_dir: Path,
+    dir_segments: list[str],
+    filename: str,
+    content: str,
+    force: bool,
+    item_type: str,
 ) -> Path:
-    """
-    Generic scaffolding engine for SwiftPY generators.
-    Resolves class names, filenames, validates path containment, creates target directories,
-    and writes stub templates.
-    """
-    dir_segments, snake_name, class_name = _validate_and_split_name(
-        raw_name,
-        item_type=item_type,
-        allow_nested=True,
-    )
-
-    base_dir = Path(override_path) if override_path else Path.cwd() / default_dir_rel
+    """Validate path containment, write scaffolded content, and print confirmation."""
     resolved_base = base_dir.resolve()
     target_dir = base_dir.joinpath(*dir_segments) if dir_segments else base_dir
-    filename = f"{snake_name}.py"
     filepath = target_dir / filename
 
     resolved_target_dir = target_dir.resolve()
@@ -154,21 +219,57 @@ def _scaffold_file(
     if filepath.exists() and not force:
         raise SystemExit(f"{item_type} already exists: {filepath}. Use --force to overwrite.")
 
-    stub = get_stub(stub_name)
-    content = stub.replace("{class_name}", class_name)
-    if extra_replacements:
-        for k, v in extra_replacements.items():
-            content = content.replace(f"{{{k}}}", v)
-
     filepath.write_text(content, encoding="utf-8")
 
-    display_name = str(filepath.relative_to(Path.cwd())) if filepath.is_relative_to(Path.cwd()) else str(filepath)
+    display_name = (
+        str(filepath.relative_to(Path.cwd()))
+        if filepath.is_relative_to(Path.cwd())
+        else str(filepath)
+    )
     if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
         print(f"\033[32mCreated {item_type}:\033[0m {display_name}")
     else:
         print(f"Created {item_type}: {display_name}")
 
     return filepath
+
+
+def _scaffold_file(
+    raw_name: str,
+    default_dir_rel: str,
+    stub_name: str,
+    override_path: str | None = None,
+    force: bool = False,
+    extra_replacements: dict[str, str] | None = None,
+    item_type: str = "File",
+) -> Path:
+    """
+    Generic scaffolding engine for SwiftPY generators.
+    Resolves class names, filenames, validates path containment, creates target directories,
+    and writes stub templates.
+    """
+    dir_segments, snake_name, class_name = _validate_and_split_name(
+        raw_name,
+        item_type=item_type,
+        allow_nested=True,
+    )
+
+    stub = get_stub(stub_name)
+    content = stub.replace("{class_name}", class_name)
+    if extra_replacements:
+        for k, v in extra_replacements.items():
+            content = content.replace(f"{{{k}}}", v)
+
+    base_dir = Path(override_path) if override_path else Path.cwd() / default_dir_rel
+    return _write_scaffold_file(
+        raw_name=raw_name,
+        base_dir=base_dir,
+        dir_segments=dir_segments,
+        filename=f"{snake_name}.py",
+        content=content,
+        force=force,
+        item_type=item_type,
+    )
 
 
 class MakeCommand:
@@ -606,6 +707,78 @@ class MakeCommand:
             _handler=MakeCommand.handle_seeder,
         )
 
+        # 17. make:agent
+        parser_agent = subparsers.add_parser(
+            "make:agent",
+            help="Create a new AI Agent class",
+        )
+        parser_agent.add_argument(
+            "name",
+            help="The name of the agent (e.g., SupportAgent)",
+        )
+        parser_agent.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the agent should be saved (defaults to app/ai/agents)",
+        )
+        parser_agent.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the agent if it already exists",
+        )
+        parser_agent.set_defaults(
+            _handler=MakeCommand.handle_agent,
+        )
+
+        # 18. make:tool
+        parser_tool = subparsers.add_parser(
+            "make:tool",
+            help="Create a new AI Tool class",
+        )
+        parser_tool.add_argument(
+            "name",
+            help="The name of the tool (e.g., WeatherLookupTool)",
+        )
+        parser_tool.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the tool should be saved (defaults to app/ai/tools)",
+        )
+        parser_tool.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the tool if it already exists",
+        )
+        parser_tool.set_defaults(
+            _handler=MakeCommand.handle_tool,
+        )
+
+        # 19. make:prompt
+        parser_prompt = subparsers.add_parser(
+            "make:prompt",
+            help="Create a new versioned AI prompt template in prompts/",
+        )
+        parser_prompt.add_argument(
+            "name",
+            help="The name of the prompt (e.g., summarise or summarise.v2)",
+        )
+        parser_prompt.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the prompt should be saved (defaults to prompts)",
+        )
+        parser_prompt.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the prompt if it already exists",
+        )
+        parser_prompt.set_defaults(
+            _handler=MakeCommand.handle_prompt,
+        )
+
     @staticmethod
     def handle_migration(args: argparse.Namespace) -> None:
         """Handle make:migration command execution."""
@@ -932,4 +1105,60 @@ class MakeCommand:
             override_path=getattr(args, "path", None),
             force=bool(getattr(args, "force", False)),
             item_type="Seeder",
+        )
+
+    @staticmethod
+    def handle_agent(args: argparse.Namespace) -> None:
+        """Handle make:agent command execution."""
+        _scaffold_file(
+            raw_name=args.name,
+            default_dir_rel="app/ai/agents",
+            stub_name="agent",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            item_type="Agent",
+        )
+
+    @staticmethod
+    def handle_tool(args: argparse.Namespace) -> None:
+        """Handle make:tool command execution."""
+        raw_name = str(args.name).strip()
+        _, snake_name, _ = _validate_and_split_name(
+            raw_name,
+            item_type="Tool",
+            allow_nested=True,
+        )
+        tool_name = (
+            snake_name.removesuffix("_tool")
+            if snake_name.endswith("_tool") and len(snake_name) > len("_tool")
+            else snake_name
+        )
+        _scaffold_file(
+            raw_name=raw_name,
+            default_dir_rel="app/ai/tools",
+            stub_name="tool",
+            override_path=getattr(args, "path", None),
+            force=bool(getattr(args, "force", False)),
+            extra_replacements={"tool_name": tool_name},
+            item_type="Tool",
+        )
+
+    @staticmethod
+    def handle_prompt(args: argparse.Namespace) -> None:
+        """Handle make:prompt command execution."""
+        raw_name = str(args.name)
+        dir_segments, filename_stem, prompt_name = _validate_and_split_prompt_name(
+            raw_name
+        )
+        override_path = getattr(args, "path", None)
+        base_dir = Path(override_path) if override_path else Path.cwd() / "prompts"
+        content = get_stub("prompt").replace("{prompt_name}", prompt_name)
+        _write_scaffold_file(
+            raw_name=raw_name,
+            base_dir=base_dir,
+            dir_segments=dir_segments,
+            filename=f"{filename_stem}.py",
+            content=content,
+            force=bool(getattr(args, "force", False)),
+            item_type="Prompt",
         )

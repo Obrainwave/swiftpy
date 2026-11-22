@@ -3,15 +3,11 @@ from __future__ import annotations
 from app.http.middleware.test_middleware import TestMiddleware
 from routes.api import router as api_router
 from swiftpy import Application, Request, Response, RouteGroup, json_response
-from swiftpy.admin import admin
 
 app = Application()
 
 # Mount default API routes under /api
 app.include_router(api_router, prefix="/api")
-
-# Mount admin panel
-admin.mount(app, prefix="/admin")
 
 
 @app.get("/")
@@ -25,9 +21,9 @@ async def root(request: Request) -> Response:
             "endpoints": {
                 "ping": "/ping",
                 "show_user": "/show-user",
+                "api_health": "/api/health",
+                "api_users": "/api/users",
                 "api_user": "/api/v1/users/1",
-                "admin": "/admin",
-                "admin_login": "/admin/login",
             },
         }
     )

@@ -32,8 +32,12 @@ class AuthMiddleware(Middleware):
                 message="Unauthenticated: Missing or invalid credentials",
             )
 
+        Context.set("__swiftpy_logged_out__", False)
         Context.set("auth.user", user)
         Context.set("__swiftpy_current_user__", user)
+        if hasattr(user, "__table__"):
+            Context.set("__swiftpy_current_user_model__", user)
+        request.state.pop("__swiftpy_logged_out__", None)
         request.state["user"] = user
 
         return await next_handler(request)

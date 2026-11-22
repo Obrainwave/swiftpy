@@ -236,6 +236,8 @@ LOG_LEVEL=info
 # AI Subsystem
 AI_ENABLED=true
 AI_DEFAULT_PROVIDER=openai
+AI_PROMPTS_PATH=prompts
+AI_PROMPTS_CACHE=false
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4o
 ANTHROPIC_API_KEY=
@@ -273,7 +275,7 @@ from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
 from swiftpy.http.router import Router
 
-from app.schemas.user_schema import UserResponseSchema
+from app.http.controllers.user_controller import UserController
 
 router = Router()
 
@@ -284,16 +286,7 @@ async def health_check(request: Request) -> Response:
     return json_response({"status": "ok", "app": "SwiftPY"})
 
 
-@router.get("/users")
-async def list_users(request: Request) -> Response:
-    \"\"\"Example user listing endpoint returning typed schema response.\"\"\"
-    return json_response(
-        [
-            UserResponseSchema(
-                id=1, name="Alice Doe", email="alice@example.com"
-            ).to_dict()
-        ]
-    )
+router.get("/users", UserController.index)
 """
 
 USER_MODEL_CONTENT = """from __future__ import annotations
@@ -326,7 +319,10 @@ class User(Model):
 USER_SCHEMA_CONTENT = """from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 
 @dataclass(slots=True)
@@ -346,24 +342,42 @@ class UserResponseSchema:
     name: str
     email: str
 
+    @classmethod
+    def from_model(cls, user: User) -> UserResponseSchema:
+        return cls(id=user.id, name=user.name, email=user.email)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+UserSchema = UserResponseSchema
 """
 
 USER_SERVICE_CONTENT = """from __future__ import annotations
 
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
+from app.schemas.user_schema import UserResponseSchema
 
 
 class UserService:
     \"\"\"
     Domain business logic layer for user entity management.
-    Coordinates between repositories, transactions, events, and background notifications.
+    Coordinates between repositories, schemas, transactions, events, and background notifications.
     \"\"\"
 
     def __init__(self, repository: UserRepository | None = None) -> None:
         self.repository = repository or UserRepository()
+
+    async def list_users(self) -> list[UserResponseSchema]:
+        \"\"\"Return starter user response DTOs.\"\"\"
+        return [
+            UserResponseSchema(
+                id=1,
+                name="Alice Doe",
+                email="alice@example.com",
+            )
+        ]
 
     async def create_user(
         self, name: str, email: str, password_hash: str
@@ -376,6 +390,192 @@ class UserService:
             is_admin=False,
         )
         return user
+
+    async def create_user_schema(
+        self, name: str, email: str, password_hash: str
+    ) -> UserResponseSchema:
+        \"\"\"Create a new user account and return an explicit response schema.\"\"\"
+        user = await self.create_user(name, email, password_hash)
+        return UserResponseSchema.from_model(user)
+"""
+
+USER_RESOURCE_CONTENT = """from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+class UserResource:
+    \"\"\"HTTP API resource transformer for User entities and schemas.\"\"\"
+
+    def __init__(self, resource: Any) -> None:
+        self.resource = resource
+
+    def to_dict(self) -> dict[str, Any]:
+        \"\"\"Transform a User model or UserResponseSchema into an HTTP-safe dictionary.\"\"\"
+        if isinstance(self.resource, dict):
+            return {
+                "id": self.resource.get("id"),
+                "name": self.resource.get("name"),
+                "email": self.resource.get("email"),
+            }
+        return {
+            "id": getattr(self.resource, "id", None),
+            "name": getattr(self.resource, "name", None),
+            "email": getattr(self.resource, "email", None),
+        }
+
+    @classmethod
+    def collection(cls, items: Iterable[Any]) -> list[dict[str, Any]]:
+        \"\"\"Transform a collection of user items into HTTP-safe dictionaries.\"\"\"
+        return [cls(item).to_dict() for item in items]
+"""
+
+USER_CONTROLLER_CONTENT = """from __future__ import annotations
+
+from swiftpy.http.request import Request
+from swiftpy.http.response import Response, json_response
+
+from app.http.resources.user_resource import UserResource
+from app.services.user_service import UserService
+
+
+class UserController:
+    \"\"\"
+    HTTP controller for user API endpoints.
+
+    Resolves constructor dependencies via the SwiftPY DI container and delegates
+    domain logic to UserService before formatting responses with UserResource.
+    \"\"\"
+
+    def __init__(self, user_service: UserService) -> None:
+        self.user_service = user_service
+
+    async def index(self, request: Request) -> Response:
+        \"\"\"List users serialized through UserResource.\"\"\"
+        users = await self.user_service.list_users()
+        return json_response(UserResource.collection(users))
+"""
+
+ASSISTANT_AGENT_CONTENT = """from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from swiftpy.ai.agents import AgentMemory, BaseAgent
+
+from app.ai.tools.system_status_tool import SystemStatusTool
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from swiftpy.ai.agents import BaseMemoryBackend
+    from swiftpy.ai.client import AIClient
+    from swiftpy.ai.tools import BaseTool
+    from swiftpy.core.config import Config
+
+
+class AssistantAgent(BaseAgent):
+    \"\"\"Default conversational assistant agent wired with starter tools.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        system_prompt: str = (
+            "You are a helpful, concise SwiftPY application assistant."
+        ),
+        tools: Sequence[BaseTool | type[BaseTool]] | None = None,
+        memory: AgentMemory | BaseMemoryBackend | None = None,
+        client: AIClient | None = None,
+        config: Config | None = None,
+    ) -> None:
+        default_tools: list[BaseTool | type[BaseTool]] = (
+            list(tools) if tools is not None else [SystemStatusTool()]
+        )
+        super().__init__(
+            name="AssistantAgent",
+            model=model,
+            system_prompt=system_prompt,
+            tools=default_tools,
+            memory=memory if memory is not None else AgentMemory(),
+            client=client,
+            config=config,
+        )
+"""
+
+SYSTEM_STATUS_TOOL_CONTENT = """from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from swiftpy.ai.tools import BaseTool
+
+
+class SystemStatusTool(BaseTool):
+    \"\"\"Function-calling tool reporting basic application runtime status.\"\"\"
+
+    @property
+    def name(self) -> str:
+        return "system_status"
+
+    @property
+    def description(self) -> str:
+        return "Return the current UTC timestamp and application health status."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+
+    async def handle(self, *args: Any, **kwargs: Any) -> Any:
+        \"\"\"Return structured UTC timestamp and ok status.\"\"\"
+        return {
+            "status": "ok",
+            "utc_time": datetime.now(tz=UTC).isoformat(),
+        }
+"""
+
+PROMPT_SUMMARISE_CONTENT = """\"\"\"Named prompt template loaded via Prompt.load("summarise", ...).\"\"\"
+
+from __future__ import annotations
+
+messages: list[dict[str, str]] = [
+    {
+        "role": "system",
+        "content": (
+            "You are a precise technical editor. Summarise the provided content "
+            "clearly in {{ style }} style."
+        ),
+    },
+    {
+        "role": "user",
+        "content": "{{ text }}",
+    },
+]
+"""
+
+PROMPT_CLASSIFY_CONTENT = """\"\"\"Named classification prompt template loaded via Prompt.load("classify", ...).\"\"\"
+
+from __future__ import annotations
+
+messages: list[dict[str, str]] = [
+    {
+        "role": "system",
+        "content": (
+            "Classify the user input into exactly one of the allowed categories: "
+            "{{ categories }}. Return only the chosen category label."
+        ),
+    },
+    {
+        "role": "user",
+        "content": "{{ text }}",
+    },
+]
 """
 
 USER_REPOSITORY_CONTENT = """from __future__ import annotations
@@ -554,8 +754,12 @@ class AuthMiddleware(Middleware):
                 message="Unauthenticated: Missing or invalid credentials",
             )
 
+        Context.set("__swiftpy_logged_out__", False)
         Context.set("auth.user", user)
         Context.set("__swiftpy_current_user__", user)
+        if hasattr(user, "__table__"):
+            Context.set("__swiftpy_current_user_model__", user)
+        request.state.pop("__swiftpy_logged_out__", None)
         request.state["user"] = user
 
         return await next_handler(request)
@@ -564,12 +768,44 @@ class AuthMiddleware(Middleware):
 ADMIN_MIDDLEWARE_CONTENT = """from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any
 
 from swiftpy.core.context import Context
 from swiftpy.core.exceptions import HttpException
 from swiftpy.http.middleware import Handler, Middleware
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response
+
+
+def _resolve_authenticated_user(request: Request) -> Any:
+    \"\"\"Resolve the active authenticated user across Context and request.state, respecting logout state.\"\"\"
+    if Context.get("__swiftpy_logged_out__") or request.state.get(
+        "__swiftpy_logged_out__"
+    ):
+        return None
+    user = Context.get("auth.user")
+    if user is None:
+        user = Context.get("__swiftpy_current_user__")
+    if user is None:
+        user = Context.get("__swiftpy_current_user_model__")
+    if user is None:
+        user = request.state.get("user")
+    return user
+
+
+def _is_admin_user(user: Any) -> bool:
+    \"\"\"Return True only when user carries an explicit boolean `is_admin is True` in a mapping or model.\"\"\"
+    if isinstance(user, Mapping):
+        raw_flag = user.get("is_admin")
+        if raw_flag is not None:
+            return raw_flag is True
+        if getattr(user, "is_admin", None) is True:
+            return True
+        model = getattr(user, "model", None) or Context.get(
+            "__swiftpy_current_user_model__"
+        )
+        return getattr(model, "is_admin", None) is True
+    return getattr(user, "is_admin", None) is True
 
 
 class AdminMiddleware(Middleware):
@@ -582,23 +818,14 @@ class AdminMiddleware(Middleware):
     \"\"\"
 
     async def handle(self, request: Request, next_handler: Handler) -> Response:
-        user = Context.get("auth.user")
-        if user is None:
-            user = Context.get("__swiftpy_current_user__")
-        if user is None:
-            user = request.state.get("user")
+        user = _resolve_authenticated_user(request)
         if user is None:
             raise HttpException(
                 status_code=401,
                 message="Unauthenticated: Please authenticate first",
             )
 
-        is_admin = (
-            user.get("is_admin") is True
-            if isinstance(user, Mapping)
-            else getattr(user, "is_admin", None) is True
-        )
-        if not is_admin:
+        if not _is_admin_user(user):
             raise HttpException(
                 status_code=403,
                 message="Forbidden: Administrator access required",
@@ -899,6 +1126,10 @@ from swiftpy.helpers.helper import env, env_bool
 CONFIG = {
     "enabled": env_bool("AI_ENABLED", True),
     "default": env("AI_DEFAULT_PROVIDER", "openai"),
+    "prompts": {
+        "path": env("AI_PROMPTS_PATH", "prompts"),
+        "cache": env_bool("AI_PROMPTS_CACHE", False),
+    },
     "providers": {
         "openai": {
             "api_key": env("OPENAI_API_KEY", ""),
@@ -908,6 +1139,12 @@ CONFIG = {
             "api_key": env("ANTHROPIC_API_KEY", ""),
             "model": env("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
         },
+    },
+    "http": {
+        "max_connections": int(env("AI_HTTP_MAX_CONNECTIONS", "100")),
+        "max_keepalive_connections": int(env("AI_HTTP_MAX_KEEPALIVE", "20")),
+        "keepalive_expiry": float(env("AI_HTTP_KEEPALIVE_EXPIRY", "30.0")),
+        "timeout": float(env("AI_HTTP_TIMEOUT", "60.0")),
     },
 }
 """
@@ -1268,197 +1505,6 @@ VIEWS_MAIL_TEMPLATE_CONTENT = """<!DOCTYPE html>
 </html>
 """
 
-VIEWS_ADMIN_LOGIN_CONTENT = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Login - SwiftPY</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #0f172a;
-            color: #e2e8f0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            margin: 0;
-        }
-        .card {
-            background: #1e293b;
-            padding: 2.5rem;
-            border-radius: 12px;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
-            width: 100%;
-            max-width: 400px;
-        }
-        h1 {
-            font-size: 1.5rem;
-            margin-bottom: 1.5rem;
-            text-align: center;
-            color: #38bdf8;
-        }
-        .form-group {
-            margin-bottom: 1.25rem;
-        }
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-size: 0.875rem;
-            color: #94a3b8;
-        }
-        input {
-            width: 100%;
-            padding: 0.75rem;
-            border-radius: 6px;
-            border: 1px solid #334155;
-            background: #0f172a;
-            color: #f8fafc;
-            box-sizing: border-box;
-        }
-        input:focus {
-            outline: none;
-            border-color: #38bdf8;
-        }
-        button {
-            width: 100%;
-            padding: 0.75rem;
-            border-radius: 6px;
-            border: none;
-            background: #0284c7;
-            color: #fff;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        button:hover {
-            background: #0369a1;
-        }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>SwiftPY Admin</h1>
-        <form method="POST" action="/admin/login">
-            <div class="form-group">
-                <label for="username">Username</label>
-                <input type="text" id="username" name="username" required autocomplete="username">
-            </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" required autocomplete="current-password">
-            </div>
-            <button type="submit">Sign In</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-VIEWS_ADMIN_DASHBOARD_CONTENT = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - SwiftPY Admin</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #0f172a;
-            color: #e2e8f0;
-            margin: 0;
-            display: flex;
-            min-height: 100vh;
-        }
-        .sidebar {
-            width: 250px;
-            background: #1e293b;
-            padding: 2rem 1.5rem;
-            border-right: 1px solid #334155;
-        }
-        .sidebar h2 {
-            font-size: 1.25rem;
-            color: #38bdf8;
-            margin-top: 0;
-            margin-bottom: 2rem;
-        }
-        .nav-link {
-            display: block;
-            color: #94a3b8;
-            text-decoration: none;
-            padding: 0.75rem 1rem;
-            border-radius: 6px;
-            margin-bottom: 0.5rem;
-            transition: all 0.2s;
-        }
-        .nav-link:hover, .nav-link.active {
-            background: #334155;
-            color: #f8fafc;
-        }
-        .main-content {
-            flex: 1;
-            padding: 2.5rem;
-        }
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-        }
-        .card-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-            gap: 1.5rem;
-        }
-        .card {
-            background: #1e293b;
-            padding: 1.5rem;
-            border-radius: 8px;
-            border: 1px solid #334155;
-        }
-        .card h3 {
-            margin-top: 0;
-            font-size: 0.875rem;
-            color: #94a3b8;
-            text-transform: uppercase;
-        }
-        .card .value {
-            font-size: 1.75rem;
-            font-weight: 700;
-            color: #f8fafc;
-        }
-    </style>
-</head>
-<body>
-    <div class="sidebar">
-        <h2>SwiftPY Admin</h2>
-        <nav>
-            <a href="/admin" class="nav-link active">Dashboard</a>
-            <a href="/admin/users" class="nav-link">Users</a>
-            <a href="/admin/logs" class="nav-link">Logs</a>
-            <a href="/admin/settings" class="nav-link">Settings</a>
-        </nav>
-    </div>
-    <div class="main-content">
-        <div class="header">
-            <h1>System Overview</h1>
-        </div>
-        <div class="card-grid">
-            <div class="card">
-                <h3>System Status</h3>
-                <div class="value">Operational</div>
-            </div>
-            <div class="card">
-                <h3>Version</h3>
-                <div class="value">1.0.0</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
 TESTS_CONFTEST_CONTENT = """from __future__ import annotations
 
 import os
@@ -1538,7 +1584,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.2.2",
+    "swiftpy-framework>=0.3.0",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
@@ -1621,9 +1667,13 @@ A high-performance Python ASGI backend powered by the [SwiftPY](https://github.c
 
 - `swiftpy make:model <Name> -m`: Create model and migration
 - `swiftpy make:controller <Name>`: Create an HTTP controller
+- `swiftpy make:resource <Name>`: Create an API resource serializer
 - `swiftpy make:service <Name>`: Create a domain service
 - `swiftpy make:repository <Name>`: Create a data repository
 - `swiftpy make:schema <Name>`: Create an input/output schema
+- `swiftpy make:agent <Name>`: Create an AI agent under `app/ai/agents`
+- `swiftpy make:tool <Name>`: Create an AI function-calling tool under `app/ai/tools`
+- `swiftpy make:prompt <name>`: Create a versioned prompt template under `prompts/`
 - `swiftpy make:seeder <Name>`: Create a database seeder
 - `swiftpy db:seed`: Seed the database
 - `swiftpy queue:work`: Start background queue worker
@@ -1713,10 +1763,18 @@ class NewCommand:
 
         # Create directory layout
         dirs_to_create = [
+            "app/ai/agents",
+            "app/ai/observers",
+            "app/ai/pipelines",
+            "app/ai/providers",
+            "app/ai/tools",
+            "app/ai/vectorstores",
             "app/events",
+            "app/http/controllers",
             "app/http/handler",
             "app/http/middleware",
             "app/http/requests",
+            "app/http/resources",
             "app/jobs",
             "app/listeners",
             "app/mail",
@@ -1728,13 +1786,13 @@ class NewCommand:
             "config",
             "database/migrations",
             "database/seeders",
+            "prompts",
             "public",
             "routes",
             "storage/app/private",
             "storage/app/public",
             "storage/framework",
             "storage/logs",
-            "views/admin",
             "views/mail",
             "tests",
         ]
@@ -1778,6 +1836,12 @@ class NewCommand:
             "README.md": _get_readme(raw_name),
             "routes/__init__.py": "from __future__ import annotations\n",
             "routes/api.py": ROUTES_API_PY_CONTENT,
+            "app/ai/agents/assistant_agent.py": ASSISTANT_AGENT_CONTENT,
+            "app/ai/tools/system_status_tool.py": SYSTEM_STATUS_TOOL_CONTENT,
+            "app/ai/pipelines/.gitkeep": "",
+            "app/ai/providers/.gitkeep": "",
+            "app/ai/vectorstores/.gitkeep": "",
+            "app/ai/observers/.gitkeep": "",
             "app/models/user.py": USER_MODEL_CONTENT,
             "app/schemas/user_schema.py": USER_SCHEMA_CONTENT,
             "app/services/user_service.py": USER_SERVICE_CONTENT,
@@ -1786,10 +1850,14 @@ class NewCommand:
             "app/listeners/send_welcome_notification.py": SEND_WELCOME_NOTIFICATION_CONTENT,
             "app/jobs/send_notification_job.py": SEND_NOTIFICATION_JOB_CONTENT,
             "app/mail/welcome_email.py": WELCOME_EMAIL_CONTENT,
+            "app/http/controllers/user_controller.py": USER_CONTROLLER_CONTENT,
             "app/http/handler/exceptions.py": EXCEPTIONS_CONTENT,
             "app/http/middleware/auth_middleware.py": AUTH_MIDDLEWARE_CONTENT,
             "app/http/middleware/admin_middleware.py": ADMIN_MIDDLEWARE_CONTENT,
             "app/http/requests/create_user_request.py": CREATE_USER_REQUEST_CONTENT,
+            "app/http/resources/user_resource.py": USER_RESOURCE_CONTENT,
+            "prompts/summarise.py": PROMPT_SUMMARISE_CONTENT,
+            "prompts/classify.py": PROMPT_CLASSIFY_CONTENT,
             "app/providers/app_service_provider.py": APP_SERVICE_PROVIDER_CONTENT,
             "app/providers/auth_service_provider.py": AUTH_SERVICE_PROVIDER_CONTENT,
             "app/providers/cache_service_provider.py": CACHE_SERVICE_PROVIDER_CONTENT,
@@ -1811,8 +1879,6 @@ class NewCommand:
             "config/queue.py": CONFIG_QUEUE_CONTENT,
             "database/migrations/2026_01_01_000000_create_users_table.py": CREATE_USERS_MIGRATION_CONTENT,
             "database/seeders/database_seeder.py": DATABASE_SEEDER_CONTENT,
-            "views/admin/dashboard.html": VIEWS_ADMIN_DASHBOARD_CONTENT,
-            "views/admin/login.html": VIEWS_ADMIN_LOGIN_CONTENT,
             "views/mail/template.html": VIEWS_MAIL_TEMPLATE_CONTENT,
             "tests/conftest.py": TESTS_CONFTEST_CONTENT,
             "tests/test_api.py": TESTS_TEST_API_CONTENT,

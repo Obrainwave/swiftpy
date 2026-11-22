@@ -4,6 +4,25 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
+### Added
+- **Routing & Controller DI Ergonomics (`swiftpy.http.router`, `swiftpy.core.application`):** Added dual decorator + direct handler binding across `Router`, `RouteGroup`, and `Application` (`router.get("/posts", PostController.index)`, `@router.get("/posts")`, `app.get("/posts", PostController.index)`), plus automatic per-request container resolution for unbound controller methods (`controller_cls` resolved once cleanly at compile/dispatch and instantiated isolated per request). Rejects passing raw controller classes directly with `RouteRegistrationError`.
+- **Prompt Versioning & `messages` Templates (`swiftpy.ai.prompts`, `swiftpy.ai.client`):** Added `Prompt` facade (`Prompt.load("summarise.v2", ...)`, `await Prompt.aload(...)`, `Prompt.load_messages(...)`, `Prompt.aload_messages(...)`), module-level `messages` list support (`.py` sequences or zero-arg callables of role/content dicts or `Message` objects), `ai.prompts.path` config resolution, multi-message appending in `AIClient.prompt()` / `AIClient.aprompt()`, compiled cache round-tripping for `messages` lists and dotted versioned names, and exports via `swiftpy.ai.prompts`, `swiftpy.ai`, and top-level `swiftpy`.
+- **CLI AI Generators (`make:agent`, `make:tool`, `make:prompt`):** Added `agent.stub`, `tool.stub`, `prompt.stub` and `swiftpy make:agent`, `swiftpy make:tool`, and `swiftpy make:prompt` (supporting nested folders and versioned `.v2` filenames such as `summarise.v2` with strict path-traversal and extension guards).
+- **Starter Scaffolding Alignment (`swiftpy new`):** Scaffolded `app/ai/{agents,tools,pipelines,providers,vectorstores,observers}/` (`AssistantAgent` and `SystemStatusTool`), `prompts/{summarise.py,classify.py}`, `UserController` + `UserResource` + `UserResponseSchema` -> `routes/api.py` (`router.get("/users", UserController.index)`), and `config/ai.py` (`prompts.path`, `prompts.cache`, `http`).
+
+### Changed
+- **Stubs & Resource Invariance (`swiftpy/console/stubs/`):** Refined `controller.stub`, `service.stub`, `repository.stub`, `schema.stub`, and `resource.stub` (typing `collection(cls, items: Iterable[Any])` for `mypy --strict` variance compatibility and removing unused imports).
+- **Packaging:** Bumped `swiftpy-framework` package version and `swiftpy new` dependency floor to `0.3.0`.
+
+### Removed
+- **Admin Dashboard (`swiftpy.admin`, `views/admin/`):** Completely removed the built-in HTML Admin Dashboard package (`swiftpy/admin/`), admin HTML templates (`views/admin/`), `AdminSite`/`ModelAdmin`/`AdminSessionStore` exports and scaffolding references, while preserving `app/http/middleware/admin_middleware.py` (`is_admin` API guard) and `views/mail/template.html`.
+
+### Documentation
+- Added [`documentations/2026-11-21-application-architecture-and-project-structure.md`](documentations/2026-11-21-application-architecture-and-project-structure.md) covering the full layered `app/` architecture, `Request` vs. `Schema` vs. `Resource` vs. `Model`, Patterns A–D + feature grouping, `app/ai/` and `prompts/`, decision table, Golden Rule, and verified CRUD walkthrough.
+- Updated Installation Quick Start, HTTP Routing, Application Schemas, AI Subsystem, CLI & Testing, Authentication, Filesystem/Mail, CORS, WebSockets, `README.md`, and `docs/2026-11-14_documentation_plan.md` for `v0.3.0`.
+
 ## [0.2.2] - 2026-11-21
 
 ### Added

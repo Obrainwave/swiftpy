@@ -20,7 +20,7 @@ from swiftpy.ai.observability.observer import (
     get_observability,
 )
 from swiftpy.ai.pool import AIHttpPool
-from swiftpy.ai.prompts.loader import aload_prompt, load_prompt
+from swiftpy.ai.prompts.loader import PromptLoader
 from swiftpy.ai.providers.anthropic_provider import AnthropicProvider
 from swiftpy.ai.providers.base import (
     INTERNAL_ATTRIBUTION_KEYS,
@@ -128,6 +128,8 @@ class AIClient:
         http_pool: AIHttpPool | None = None,
         default_provider: str | None = None,
     ) -> None:
+        self._has_custom_config: bool = config is not None
+        self._prompt_loader: PromptLoader | None = None
         if config is None:
             try:
                 self._config = Config.get_instance()
@@ -173,10 +175,13 @@ class AIClient:
         options, middlewares, and tools without mutating ``AIClient._registry``.
         """
         cloned = AIClient(
-            config=self._config,
+            config=self._config if self._has_custom_config else None,
             http_pool=self._http_pool,
             default_provider=self._provider_name,
         )
+        cloned._config = self._config
+        cloned._has_custom_config = self._has_custom_config
+        cloned._prompt_loader = self._prompt_loader
         cloned._model = self._model
         cloned._temperature = self._temperature
         cloned._max_tokens = self._max_tokens
@@ -249,21 +254,65 @@ class AIClient:
         if assistant_content:
             self._attached_conversation.add_assistant(assistant_content)
 
+    def _resolve_prompt_loader(self) -> PromptLoader:
+        """
+        Return the PromptLoader for this client.
+
+        Clients constructed with an explicit `Config` that configures `ai.prompts`
+        (or when no manual `PromptLoader._instance` override is pinned) own an isolated
+        `PromptLoader` bound to `self._config`, independent of `PromptLoader.get_instance()`
+        singleton order.
+        """
+        has_pinned_singleton = (
+            PromptLoader._instance is not None
+            and PromptLoader._instance is not PromptLoader._auto_instance
+        )
+        if self._has_custom_config and (
+            self._config.get("ai.prompts") is not None or not has_pinned_singleton
+        ):
+            if self._prompt_loader is None:
+                self._prompt_loader = PromptLoader(config=self._config)
+            return self._prompt_loader
+        if has_pinned_singleton and PromptLoader._instance is not None:
+            return PromptLoader._instance
+        return PromptLoader.get_instance()
+
     def prompt(self, name: str, /, role: str = "user", **variables: Any) -> Self:
         """
-        Load a prompt template from disk, interpolate variables, and append as message.
+        Load a prompt template from disk, interpolate variables, and append message(s).
+        Supports both string templates and module-level `messages` lists.
         """
-        rendered = load_prompt(name, **variables)
-        self._append_message(Message(role=role, content=rendered))
+        rendered = self._resolve_prompt_loader().load(name, **variables)
+        if isinstance(rendered, list):
+            for msg in rendered:
+                self._append_message(
+                    Message(
+                        role=str(msg["role"]),
+                        content=str(msg["content"]),
+                        name=msg.get("name"),
+                    )
+                )
+        else:
+            self._append_message(Message(role=role, content=rendered))
         return self
 
     async def aprompt(self, name: str, /, role: str = "user", **variables: Any) -> Self:
         """
         Asynchronously load a prompt template off the event loop, interpolate variables,
-        and append as message.
+        and append message(s). Supports both string templates and module-level `messages` lists.
         """
-        rendered = await aload_prompt(name, **variables)
-        self._append_message(Message(role=role, content=rendered))
+        rendered = await self._resolve_prompt_loader().aload(name, **variables)
+        if isinstance(rendered, list):
+            for msg in rendered:
+                self._append_message(
+                    Message(
+                        role=str(msg["role"]),
+                        content=str(msg["content"]),
+                        name=msg.get("name"),
+                    )
+                )
+        else:
+            self._append_message(Message(role=role, content=rendered))
         return self
 
     def system(self, content: str) -> Self:

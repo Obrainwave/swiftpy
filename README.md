@@ -25,9 +25,9 @@ SwiftPY brings the joy and productivity of Laravel to the modern asynchronous Py
 - **Query Builder, GROUP BY & Dynamic Pagination**: Full length-aware `paginate()` and lightweight `simple_paginate()`, `limit()`/`offset()` (with `take()`/`skip()`), group-aware subquery counting, and aggregate selectors (`select_count`, `select_sum`, etc.) with `having` and `or_having` logical filtering.
 - **Multi-Disk Storage & Streaming Engine**: Flysystem-inspired `Storage` abstraction supporting local and S3 disks, high-throughput streaming uploads/downloads, magic-byte validation, and `storage:link`.
 - **Validation Ergonomics & Input Hardening**: `FormRequest` and `await validate(request, rules)` returning `ValidatedData` (supporting both dict and dot attribute access), `stop_on_first_error`, `ValidationException.single()`, automatic 422 JSON errors, configurable body streaming limits, Content-Length checks, and JSON recursion depth caps.
-- **Authentication, Refresh Rotation & Session Revocation**: `JWTIssuer` with `refresh_token_pair()` rotation and reuse rejection, `auth().logout()` / `auth().logout_all()`, `TokenBlacklist`, `ApiKeyGuard`, and `AdminSessionStore.flush()`.
+- **Authentication, Refresh Rotation & Session Revocation**: `JWTIssuer` with `refresh_token_pair()` rotation and reuse rejection, `auth().logout()` / `auth().logout_all()`, `TokenBlacklist`, and `ApiKeyGuard`.
 - **Structured Asynchronous Logging**: Non-blocking `Log` facade and `LogManager` (`single`, `daily`, `stderr`, `stack`) backed by bounded `QueueHandler` / `QueueListener` with clean ASGI startup/shutdown flushing and per-application isolation.
-- **Native AI Subsystem (`swiftpy.ai`)**: Fluent async `AI` client across OpenAI and Anthropic providers with shared `AIHttpPool` pooling and SSE streaming, batched `EmbeddingsClient`, unified `VectorStore` adapters (`PgVectorAdapter` for PostgreSQL `pgvector`, `InMemoryVectorStore`, Qdrant, Pinecone, Chroma, LanceDB), nonce-bounded RAG pipelines (`rag()`, `Retriever`, Cohere/CrossEncoder rerankers), autonomous `@tool` / `Agent` loops with session memory, prompt templates (`prompts/`), moderation/rate-limit/budget middlewares, observability telemetry, and `AIFake` / `VectorStoreFake` test doubles.
+- **Native AI Subsystem (`swiftpy.ai`)**: Fluent async `AI` client across OpenAI and Anthropic providers with shared `AIHttpPool` pooling and SSE streaming, batched `EmbeddingsClient`, unified `VectorStore` adapters (`PgVectorAdapter` for PostgreSQL `pgvector`, `InMemoryVectorStore`, Qdrant, Pinecone, Chroma, LanceDB), nonce-bounded RAG pipelines (`rag()`, `Retriever`, Cohere/CrossEncoder rerankers), autonomous `@tool` / `Agent` loops (`app/ai/{agents,tools,pipelines,providers,vectorstores,observers}/`), versioned `messages`-list prompt templates (`Prompt.load("summarise.v2")`, `prompts/`), moderation/rate-limit/budget middlewares, observability telemetry, and `AIFake` / `VectorStoreFake` test doubles.
 - **Database Engine & Native Transactions**: Connection pool management, automatic transaction propagation across context variables, nested transaction savepoints, and strict SQL injection prevention with full identifier quoting for reserved words.
 - **Fluent Migration DSL & Schema Builder**: Laravel-inspired `Blueprint` table definitions, safe statement ordering (drops executed before adds), column comments, unsigned checks, composite keys, and distributed PostgreSQL advisory locks.
 - **At-Least-Once Queues & Signed Bus**: Robust background jobs with Redis visibility timeout leases, HMAC-SHA256 envelope signing, dead-letter routing, and a cryptographically protected cross-worker event bus.
@@ -61,8 +61,9 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Release v0.2.0: DX, Logging, Auth Refresh & Docs** | `ValidatedData` & `validate(request)`, `Request.input()` & `abort()`, `Router(prefix, middleware)`, `Blueprint.enum`/`medium_text`/`long_text`, `swiftpy.logging` (`Log`), `refresh_token_pair()` & `auth().logout()`, 17 user guides in `documentations/` | ✅ Completed |
 | **Release v0.2.1: Auth Context on Token Issue** | `CurrentUser` / `auth()` available when an access token is issued, `user=` / `Model` subjects, opt-in `auth.hydrate_user` & `auth.passive_resolution` | ✅ Completed |
 | **Release v0.2.2: Model `.update()`, `isset()`, `has_file()`, & Auth TTL** | `Model.update()` / `force_update()`, `JWT_ACCESS_TTL=3600`, 405 `"for route"` detail, `isset()` helper, `request.has_file()` (sync & `await`), CORS guide | ✅ Completed |
+| **Release v0.3.0: Project Structure, AI/Prompts & Controller Routing** | Standardized `app/` + `app/ai/{agents,tools,pipelines,providers,vectorstores,observers}/` + `prompts/` scaffolding, `Prompt.load("summarise.v2")` & `messages` lists, direct unbound controller method DI (`router.get(..., Controller.index)`), `make:agent`/`make:tool`/`make:prompt`, Admin Dashboard removal | ✅ Completed |
 
-*See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md) for the complete step-by-step documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
+*See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md) and [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md) for the complete documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
 ---
 
@@ -565,7 +566,7 @@ Across the hardening and audit remediation phases, architectural decisions (`D-1
 - **D-8 (Config Environment Variable Coercion)**: Coercion preserves strings unless the default type is known (e.g. `"0012"` is not silently cast to integer `12`).
 - **D-9 (`FormRequest` Fail-Closed Validation)**: If `rules()` raises `TypeError` or any exception, the request fails closed with `ConfigurationError` (HTTP 500) rather than falling back to unvalidated `{}`.
 - **D-10 (`update()`/`delete()` Without `WHERE`)**: Mass write/delete queries without a `WHERE` clause raise `QueryError` unless `.allow_all()` is explicitly chained.
-- **G-1 (`swiftpy/ai` & Wheel Packaging)**: `swiftpy/ai` (LLM clients, embeddings, vector stores, RAG pipelines, agents, tools, prompt templates, observability), `swiftpy/admin`, `swiftpy/mail`, `swiftpy/filesystem`, and `swiftpy/validation` are fully implemented and distributed in the main `swiftpy-framework` wheel (dev test utilities remain in `swiftpy/testing`). `swiftpy/__init__.py` uses PEP 562 lazy exports so lightweight CLI/app imports avoid heavy optional subpackages until accessed.
+- **G-1 (`swiftpy/ai` & Wheel Packaging)**: `swiftpy/ai` (LLM clients, embeddings, vector stores, RAG pipelines, agents, tools, prompt templates, observability), `swiftpy/mail`, `swiftpy/filesystem`, and `swiftpy/validation` are fully implemented and distributed in the main `swiftpy-framework` wheel (dev test utilities remain in `swiftpy/testing`). `swiftpy/__init__.py` uses PEP 562 lazy exports so lightweight CLI/app imports avoid heavy optional subpackages until accessed.
 - **G-16 (`dict` Auto-JSON & Cache Cleanup)**: Route handlers returning plain `dict` or `list` values are automatically serialized to JSON; legacy unbootstrapped `RouteCache` was removed (`swiftpy cache:build` compiles `config.json` and `prompts.json`); `/docs/` and `AGENTS.md` remain gitignored.
 - **D-12 (Repository Hygiene)**: `.coverage` and cache artifacts untracked from git; `docs/`, `AGENTS.md`, and `DEVLOG.md` maintained untracked at repo root.
 - **D-13 (Default `max_body_size`)**: Default 2 MiB request body limit (`413 Payload Too Large`) enforced across all buffered and streaming HTTP requests, configurable per app and per route.
@@ -576,16 +577,19 @@ Across the hardening and audit remediation phases, architectural decisions (`D-1
 
 ## Project Structure
 
-SwiftPY follows a clean, intuitive layout inspired by modern application architectures:
+SwiftPY follows a clean, intuitive layout inspired by modern application architectures (see [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md)):
 
 ```text
 ├── app/
-│   ├── exceptions/         # Application-level exceptions
-│   ├── http/               # Controllers, middleware, and request handlers
+│   ├── ai/                 # AI agents, tools, pipelines, custom providers/vectorstores/observers
+│   ├── events/             # Domain events
+│   ├── http/               # Controllers, resources, middleware, requests, exception handlers
+│   ├── jobs/               # Background queue jobs
+│   ├── listeners/          # Event listeners
+│   ├── mail/               # Mailables
 │   ├── models/             # Active Record ORM models
 │   ├── providers/          # Service providers (auto-discovered on boot)
-│   │   ├── app_service_provider.py
-│   │   └── database_service_provider.py
+│   ├── repositories/       # Data access repositories
 │   ├── schemas/            # Typed dataclasses & request/response DTOs
 │   └── services/           # Domain business logic
 ├── config/                 # Environment & framework configuration
@@ -602,9 +606,9 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   └── queue.py
 ├── database/
 │   └── migrations/         # Timestamped database migrations
-├── views/                  # Sandboxed Jinja2 HTML templates (admin/, mail/)
+├── prompts/                # Named & versioned AI prompt templates (summarise.py, classify.py)
+├── views/                  # Sandboxed Jinja2 HTML templates (mail/)
 ├── swiftpy/                # SwiftPY framework core
-│   ├── admin/              # Auto-introspecting admin site, RBAC & session auth
 │   ├── ai/                 # AI client, embeddings, vectorstores, RAG, agents, tools, prompts
 │   ├── auth/               # JWT issuer, API key guards, token blacklist
 │   ├── cache/              # Redis and memory cache drivers

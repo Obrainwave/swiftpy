@@ -237,6 +237,7 @@ def bind_jwt_user_context(
         if isinstance(previous, Model) and _model_pk(previous) != sub:
             Context.set(CONTEXT_USER_MODEL_KEY, None)
     Context.set(CONTEXT_USER_KEY, user_ctx)
+    Context.set("auth.user", user_ctx)
     Context.set(CONTEXT_AUTH_GUARD_KEY, "jwt")
 
     request = Context.get("request")

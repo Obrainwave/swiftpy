@@ -255,9 +255,9 @@ data = (await validate(request, OrderSchema.schema)).raise_if_failed().validated
 Both `make:schema` and `make:resource` help structure API responses:
 
 - **`app/schemas/` (`UserResponseSchema`, `OrderCreateSchema`):** Framework-agnostic typed `@dataclass(slots=True)` DTOs ideal when you want strict `mypy` field checking, shared input/output contracts between routes and `app/services/`, and reusable `RULES` dicts.
-- **`app/http/resources/` (`UserResource`):** HTTP-layer transformer wrappers (`UserResource(model).to_dict()`, `UserResource.collection(models)`) geared toward transforming ORM models directly for HTTP responses.
+- **`app/http/resources/` (`UserResource`):** HTTP-layer transformer wrappers (`UserResource(model_or_schema).to_dict()`, `UserResource.collection(items)`) geared toward shaping ORM models or service schemas cleanly for HTTP responses.
 
-Pick one convention per module or combine input DTOs in `app/schemas/` with resources in `app/http/resources/` for complex response shaping.
+SwiftPY's starter application wires these layers together via **`UserService -> UserResponseSchema -> UserResource -> UserController -> routes/api.py`**. See [Application Architecture & Project Structure](2026-11-21-application-architecture-and-project-structure.md) for the complete decision guide on when to use `Schema` vs. `FormRequest` vs. `Resource`.
 
 ---
 

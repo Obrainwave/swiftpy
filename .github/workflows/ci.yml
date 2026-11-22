@@ -102,7 +102,6 @@ jobs:
             cd /tmp && /tmp/swiftpy-wheel-smoke/bin/python -c '
           import asyncio
           import swiftpy
-          import swiftpy.admin
           import swiftpy.testing
           from swiftpy import Application, Request, json_response
           from swiftpy.ai.client import AI, AIClient

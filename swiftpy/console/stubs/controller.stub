@@ -7,8 +7,10 @@ from swiftpy.http.response import Response, json_response
 class {class_name}:
     """
     HTTP Controller for handling request endpoints.
+
+    Supports constructor dependency injection and direct route binding, e.g.:
+    `router.get("/items", {class_name}.index)`.
     """
 
     async def index(self, request: Request) -> Response:
         return json_response({"message": "Hello from {class_name}"})
-

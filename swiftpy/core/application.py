@@ -8,7 +8,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from typing import Any, Self, TypeVar
+from typing import Any, Self, TypeVar, overload
 from urllib.parse import urlsplit
 
 from swiftpy.ai.pool import AIHttpPool
@@ -768,9 +768,14 @@ class Application:
                     ):
                         pass
 
+                controller_instance: Any = None
+                has_controller = False
                 call_kwargs: dict[str, Any] = {}
                 for spec in param_specs:
-                    if spec.kind == "request":
+                    if spec.kind == "controller":
+                        controller_instance = self.container.resolve(spec.annotation)
+                        has_controller = True
+                    elif spec.kind == "request":
                         call_kwargs[spec.name] = request
                     elif spec.kind == "path":
                         call_kwargs[spec.name] = params[spec.name]
@@ -909,12 +914,20 @@ class Application:
                         if k not in call_kwargs:
                             call_kwargs[k] = v
 
-                if is_coro:
-                    res = await handler(**call_kwargs)
+                if has_controller:
+                    if is_coro:
+                        res = await handler(controller_instance, **call_kwargs)
+                    else:
+                        res = handler(controller_instance, **call_kwargs)
+                        if inspect.isawaitable(res):
+                            res = await res
                 else:
-                    res = handler(**call_kwargs)
-                    if inspect.isawaitable(res):
-                        res = await res
+                    if is_coro:
+                        res = await handler(**call_kwargs)
+                    else:
+                        res = handler(**call_kwargs)
+                        if inspect.isawaitable(res):
+                            res = await res
 
                 if isinstance(res, Response):
                     return res
@@ -939,9 +952,14 @@ class Application:
         async def dispatched_ws_handler(
             websocket: WebSocketConnection, *args: Any, **params: Any
         ) -> Any:
+            controller_instance: Any = None
+            has_controller = False
             call_kwargs: dict[str, Any] = {}
             for spec in param_specs:
-                if spec.kind == "websocket":
+                if spec.kind == "controller":
+                    controller_instance = self.container.resolve(spec.annotation)
+                    has_controller = True
+                elif spec.kind == "websocket":
                     call_kwargs[spec.name] = websocket
                 elif spec.kind == "path":
                     call_kwargs[spec.name] = params[spec.name]
@@ -954,6 +972,14 @@ class Application:
                 for k, v in params.items():
                     if k not in call_kwargs:
                         call_kwargs[k] = v
+
+            if has_controller:
+                if is_coro:
+                    return await handler(controller_instance, **call_kwargs)
+                res = handler(controller_instance, **call_kwargs)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
 
             if is_coro:
                 return await handler(**call_kwargs)
@@ -1100,109 +1126,393 @@ class Application:
             else:
                 route.compiled_handler = self._compile_http_handler(route)
 
-    def websocket(self, path: str) -> Callable[[F], F]:
-        return self.router.websocket(path)
+    @overload
+    def websocket(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def websocket(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> F: ...
+
+    def websocket(
+        self,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "WEBSOCKET",
+            path,
+            handler,
+            middleware=middleware,
+            is_websocket=True,
+        )
+
+    @overload
+    def route(
+        self,
+        method: str,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def route(
+        self,
+        method: str,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
+
+    def route(
+        self,
+        method: str,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        is_websocket: bool = False,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            method,
+            path,
+            handler,
+            middleware=middleware,
+            is_websocket=is_websocket,
+            max_body_size=max_body_size,
+            max_content_length=max_content_length,
+            max_json_depth=max_json_depth,
+        )
+
+    @overload
+    def get(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def get(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def get(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.get(
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "GET",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def post(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def post(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def post(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.post(
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "POST",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def put(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def put(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def put(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.put(
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "PUT",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def patch(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def patch(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def patch(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.patch(
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "PATCH",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def delete(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def delete(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def delete(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.delete(
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "DELETE",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
+
+    @overload
+    def head(
+        self,
+        path: str,
+        handler: None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def head(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
 
     def head(
         self,
         path: str,
+        handler: F | None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.head(
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "HEAD",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,
         )
 
+    @overload
     def options(
         self,
         path: str,
+        handler: None = None,
         *,
+        middleware: list[type[Any]] | None = None,
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
-    ) -> Callable[[F], F]:
-        return self.router.options(
+    ) -> Callable[[F], F]: ...
+
+    @overload
+    def options(
+        self,
+        path: str,
+        handler: F,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> F: ...
+
+    def options(
+        self,
+        path: str,
+        handler: F | None = None,
+        *,
+        middleware: list[type[Any]] | None = None,
+        max_body_size: int | None = None,
+        max_content_length: int | None = None,
+        max_json_depth: int | None = None,
+    ) -> Callable[[F], F] | F:
+        return self.router._route(
+            "OPTIONS",
             path,
+            handler,
+            middleware=middleware,
             max_body_size=max_body_size,
             max_content_length=max_content_length,
             max_json_depth=max_json_depth,

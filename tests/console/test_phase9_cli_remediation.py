@@ -6,11 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from swiftpy.admin.registry import AdminSite, humanize_name
-from swiftpy.admin.views import create_admin_router
 from swiftpy.console.cli import CLI
 from swiftpy.core.application import Application
-from swiftpy.http.router import Router
 from swiftpy.mail.templates.renderer import MailTemplateRenderer
 
 
@@ -27,7 +24,7 @@ def test_new_command_templates_hardened(
     assert "pyproject.toml" in dockerfile
 
     pyproject = (app_dir / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"swiftpy-framework>=0.2.2"' in pyproject
+    assert '"swiftpy-framework>=0.3.0"' in pyproject
 
     dockerignore = (app_dir / ".dockerignore").read_text(encoding="utf-8")
     assert "public/storage" in dockerignore
@@ -169,12 +166,3 @@ def test_queue_commands_app_lifecycle_and_bounded_limit(
     cli.run(["queue:failed", "--app", "dummy:app", "--limit", "10"])
     startup_mock.assert_awaited_once()
     shutdown_mock.assert_awaited_once()
-
-
-def test_admin_humanize_name_and_router_factory_typing() -> None:
-    """CLI-3 / ADMIN-5: humanize_name shared cleanly and get_router returns real Router without cast."""
-    assert humanize_name("user_id") == "User"
-    assert humanize_name("id") == "ID"
-    site = AdminSite()
-    _ = create_admin_router  # ensures route compiler wired
-    assert isinstance(site.get_router(), Router)

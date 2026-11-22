@@ -67,7 +67,8 @@ class AuthUser(dict[str, Any]):
     @property
     def id(self) -> Any:
         """Return the user primary key or token subject identifier."""
-        return self.get("id") or self.get("sub")
+        val = self.get("id")
+        return val if val is not None else self.get("sub")
 
     @property
     def email(self) -> Any:
@@ -84,12 +85,18 @@ class AuthUser(dict[str, Any]):
         return dict(self)
 
     def __getattr__(self, name: str) -> Any:
-        if name in self:
+        if name in self and (
+            self[name] is not None
+            or self._model is None
+            or not hasattr(self._model, name)
+        ):
             return self[name]
         if self._model is not None and hasattr(self._model, name):
             hidden = set(getattr(self._model, "__hidden__", ()) or ())
             if name not in hidden:
                 return getattr(self._model, name)
+        if name in self:
+            return self[name]
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute {name!r}")
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -104,23 +111,38 @@ class AuthUser(dict[str, Any]):
 
 def _adopt_request_state_user() -> Any:
     """
-    Adopt a user already stored in `request.state` (for example by a guard that ran in a
-    different task) into `Context`. Never decodes credentials: authentication stays with
-    guards (`JWTGuard`, `require_jwt`), which also enforce token revocation.
+    Adopt a user already stored in `request.state` or `Context['auth.user']` (for example
+    by a guard or middleware that ran in a different task) into `Context`. Never decodes
+    credentials: authentication stays with guards (`JWTGuard`, `require_jwt`), which also
+    enforce token revocation.
     """
-    existing = Context.get(_CONTEXT_USER_KEY)
-    if existing is not None or Context.get(CONTEXT_LOGGED_OUT_KEY):
-        return existing
+    if Context.get(CONTEXT_LOGGED_OUT_KEY):
+        return None
 
     req = Context.get("request")
-    if not isinstance(req, Request) or not isinstance(req.state, dict):
+    if (
+        isinstance(req, Request)
+        and isinstance(req.state, dict)
+        and req.state.get(CONTEXT_LOGGED_OUT_KEY)
+    ):
         return None
-    if req.state.get(CONTEXT_LOGGED_OUT_KEY):
+
+    existing = Context.get(_CONTEXT_USER_KEY)
+    if existing is not None:
+        return existing
+
+    auth_user = Context.get("auth.user")
+    if auth_user is not None:
+        Context.set(_CONTEXT_USER_KEY, auth_user)
+        return auth_user
+
+    if not isinstance(req, Request) or not isinstance(req.state, dict):
         return None
     state_user = req.state.get("user")
     if state_user is None:
         return None
     Context.set(_CONTEXT_USER_KEY, state_user)
+    Context.set("auth.user", state_user)
     if "auth_guard" in req.state:
         Context.set(_CONTEXT_AUTH_GUARD_KEY, req.state["auth_guard"])
     return state_user
@@ -218,15 +240,18 @@ def set_user_model(model: Any, guard: str | None = None) -> None:
     if hasattr(model, "to_dict") and callable(model.to_dict):
         user_dict = model.to_dict()
         Context.set(_CONTEXT_USER_KEY, user_dict)
+        Context.set("auth.user", user_dict)
     elif isinstance(model, dict):
         user_dict = model
         Context.set(_CONTEXT_USER_KEY, user_dict)
+        Context.set("auth.user", user_dict)
+    else:
+        Context.set("auth.user", model)
 
     req = Context.get("request")
     if isinstance(req, Request) and isinstance(req.state, dict):
         req.state.pop(CONTEXT_LOGGED_OUT_KEY, None)
-        if user_dict is not None:
-            req.state["user"] = user_dict
+        req.state["user"] = user_dict if user_dict is not None else model
         if guard is not None:
             req.state["auth_guard"] = guard
 
@@ -365,6 +390,7 @@ class AuthProxy:
     def _clear_auth_context(request: Request | None = None) -> None:
         Context.set(CONTEXT_LOGGED_OUT_KEY, True)
         Context.set(_CONTEXT_USER_KEY, None)
+        Context.set("auth.user", None)
         Context.set(_CONTEXT_USER_MODEL_KEY, None)
         Context.set(_CONTEXT_AUTH_GUARD_KEY, None)
         req = request if isinstance(request, Request) else Context.get("request")
@@ -484,7 +510,10 @@ class AuthProxy:
         if current_subject is None:
             raw_user = Context.get(_CONTEXT_USER_KEY)
             if isinstance(raw_user, dict):
-                current_subject = raw_user.get("sub") or raw_user.get("id")
+                sub_val = raw_user.get("sub")
+                current_subject = (
+                    sub_val if sub_val is not None else raw_user.get("id")
+                )
 
         target_subject = current_subject if subject is None else subject
         if target_subject is None or str(target_subject) == "":
@@ -655,7 +684,8 @@ class CurrentUser(dict[str, Any]):
     @property
     def id(self) -> Any:
         self._sync()
-        return super().get("id") or super().get("sub")
+        val = super().get("id")
+        return val if val is not None else super().get("sub")
 
     @property
     def email(self) -> Any:

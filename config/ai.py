@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from swiftpy import env
+from swiftpy import env, env_bool
 
 CONFIG: dict[str, object] = {
     "enabled": env("AI_ENABLED", "true").lower() in ("true", "1", "yes"),
     "default": env("AI_DEFAULT_PROVIDER", "openai"),
+    "prompts": {
+        "path": env("AI_PROMPTS_PATH", "prompts"),
+        "cache": env_bool("AI_PROMPTS_CACHE", False),
+    },
     "providers": {
         "openai": {
             "api_key": env("OPENAI_API_KEY", ""),
