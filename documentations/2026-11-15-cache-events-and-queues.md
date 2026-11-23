@@ -296,6 +296,8 @@ swiftpy queue:retry all --queue emails --app main:app
 swiftpy queue:flush --queue emails --app main:app
 ```
 
+When `QueueWorker` executes tasks submitted by the [Task Scheduler](2026-11-22-task-scheduling.md), it automatically records `running`, `completed`, and `failed` occurrence transitions in Redis, retains `.without_overlapping()` locks across intermediate backoff retries, and releases locks via compare-and-delete Lua upon `ack()` or final DLQ exhaustion.
+
 ---
 
 ## Important Defaults & Production Safeguards

@@ -153,6 +153,11 @@ if TYPE_CHECKING:
         QueueWorker,
         push,
     )
+    from swiftpy.scheduling import (
+        Schedule,
+        Scheduler,
+        scheduler,
+    )
     from swiftpy.support.hashing import (
         Hash,
         hash_password,
@@ -309,6 +314,8 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'RouteGroup': ('swiftpy.http.router', 'RouteGroup'),
     'Router': ('swiftpy.http.router', 'Router'),
     'S3StorageDriver': ('swiftpy.filesystem', 'S3StorageDriver'),
+    'Schedule': ('swiftpy.scheduling', 'Schedule'),
+    'Scheduler': ('swiftpy.scheduling', 'Scheduler'),
     'SecurityHeaders': ('swiftpy.http.middleware', 'SecurityHeaders'),
     'SecurityHeadersMiddleware': ('swiftpy.http.middleware', 'SecurityHeadersMiddleware'),
     'Seeder': ('swiftpy.database', 'Seeder'),
@@ -382,6 +389,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     'require_jwt': ('swiftpy.auth', 'require_jwt'),
     'required': ('swiftpy.validation', 'required'),
     'resolve': ('swiftpy.helpers.helper', 'resolve'),
+    'scheduler': ('swiftpy.helpers.helper', 'scheduler'),
     'set_user_model': ('swiftpy.auth_manager', 'set_user_model'),
     'snake_case': ('swiftpy.helpers.helper', 'snake_case'),
     'storage': ('swiftpy.helpers.helper', 'storage'),
@@ -413,6 +421,7 @@ _SUBMODULE_EXPORTS: frozenset[str] = frozenset({
     'logging',
     'mail',
     'queue',
+    'scheduling',
     'support',
     'testing',
     'validation',
@@ -532,6 +541,8 @@ __all__ = [
     'RouteGroup',
     'Router',
     'S3StorageDriver',
+    'Schedule',
+    'Scheduler',
     'SecurityHeaders',
     'SecurityHeadersMiddleware',
     'Seeder',
@@ -605,6 +616,7 @@ __all__ = [
     'require_jwt',
     'required',
     'resolve',
+    'scheduler',
     'set_user_model',
     'snake_case',
     'storage',

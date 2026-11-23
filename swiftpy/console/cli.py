@@ -11,6 +11,7 @@ from swiftpy.console.commands.make import MakeCommand
 from swiftpy.console.commands.migrate import MigrateCommand
 from swiftpy.console.commands.new import NewCommand
 from swiftpy.console.commands.queue import QueueCommand
+from swiftpy.console.commands.schedule import ScheduleCommand
 from swiftpy.console.commands.seed import SeedCommand
 from swiftpy.console.commands.start import StartCommand
 from swiftpy.console.commands.storage import StorageCommand
@@ -73,6 +74,7 @@ class CLI:
         SeedCommand.register(self.subparsers)
         MakeCommand.register(self.subparsers)
         QueueCommand.register(self.subparsers)
+        ScheduleCommand.register(self.subparsers)
         CacheCommand.register(self.subparsers)
         StorageCommand.register(self.subparsers)
 

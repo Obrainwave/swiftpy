@@ -30,7 +30,7 @@ SwiftPY brings the joy and productivity of Laravel to the modern asynchronous Py
 - **Native AI Subsystem (`swiftpy.ai`)**: Fluent async `AI` client across OpenAI and Anthropic providers with shared `AIHttpPool` pooling and SSE streaming, batched `EmbeddingsClient`, unified `VectorStore` adapters (`PgVectorAdapter` for PostgreSQL `pgvector`, `InMemoryVectorStore`, Qdrant, Pinecone, Chroma, LanceDB), nonce-bounded RAG pipelines (`rag()`, `Retriever`, Cohere/CrossEncoder rerankers), autonomous `@tool` / `Agent` loops (`app/ai/{agents,tools,pipelines,providers,vectorstores,observers}/`), versioned `messages`-list prompt templates (`Prompt.load("summarise.v2")`, `prompts/`), moderation/rate-limit/budget middlewares, observability telemetry, and `AIFake` / `VectorStoreFake` test doubles.
 - **Database Engine & Native Transactions**: Connection pool management, automatic transaction propagation across context variables, nested transaction savepoints, and strict SQL injection prevention with full identifier quoting for reserved words.
 - **Fluent Migration DSL & Schema Builder**: Laravel-inspired `Blueprint` table definitions, safe statement ordering (drops executed before adds), column comments, unsigned checks, composite keys, and distributed PostgreSQL advisory locks.
-- **At-Least-Once Queues & Signed Bus**: Robust background jobs with Redis visibility timeout leases, HMAC-SHA256 envelope signing, dead-letter routing, and a cryptographically protected cross-worker event bus.
+- **At-Least-Once Queues, Task Scheduler & Signed Bus**: Robust background jobs with Redis visibility timeout leases, HMAC-SHA256 envelope signing, dead-letter routing, proxy-aware client IP resolution (`request.ip()`, `Request.ip()`, `websocket.ip()` behind `TRUSTED_PROXIES`), a native 5-field Vixie cron + `ZoneInfo` task scheduler (`Schedule` / `Scheduler`, crash-recoverable `RedisScheduleStore`, overlap locks, `schedule:work` / `schedule:run` / `schedule:list`), and a cryptographically protected cross-worker event bus.
 - **WebSocket Gateway**: Structured WebSocket connection management, topic subscriptions, broadcast fan-out, ping/pong heartbeats, and strict same-origin handshake validation.
 - **Zero-Config Provider Auto-Discovery**: Automatic service provider discovery in `app/providers/` that registers container dependencies behind the scenes without manual entrypoint registration.
 - **Developer CLI (`swiftpy`)**: Built-in CLI for scaffolding new projects (`new`) and components (`make:*`), running/rolling back/resetting/seeding migrations (`migrate*`, `db:seed`), linking public storage, managing queue workers and failed jobs, precompiling caches, and starting the ASGI server.
@@ -63,8 +63,9 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Release v0.2.2: Model `.update()`, `isset()`, `has_file()`, & Auth TTL** | `Model.update()` / `force_update()`, `JWT_ACCESS_TTL=3600`, 405 `"for route"` detail, `isset()` helper, `request.has_file()` (sync & `await`), CORS guide | ✅ Completed |
 | **Release v0.3.0: Project Structure, AI/Prompts & Controller Routing** | Standardized `app/` + `app/ai/{agents,tools,pipelines,providers,vectorstores,observers}/` + `prompts/` scaffolding, `Prompt.load("summarise.v2")` & `messages` lists, direct unbound controller method DI (`router.get(..., Controller.index)`), `make:agent`/`make:tool`/`make:prompt`, Admin Dashboard removal | ✅ Completed |
 | **Release v0.3.1: Auth Ergonomics, ORM `has()` & Login Throttling** | `Auth.attempt()`, `Callback` conditions + ORM `has()`/`where_has()`, `attempt_when()`, Remember Me cookies (`Blueprint.remember_token()`, `via_remember()`), `login_using_id()`, `once()`, default `LoginThrottle` (`429 TooManyRequestsError`), `Request.cookies` | ✅ Completed |
+| **Release v0.3.5: Client IP Detection & Native Task Scheduler** | Fail-safe `request.ip()` / `Request.ip()` / `websocket.ip()` & `LoginThrottle` IP trust via `TRUSTED_PROXIES`, zero-dependency 5-field cron + `ZoneInfo` scheduler (`Schedule` / `Scheduler`), Redis crash recovery (`_CLAIM_DUE_LUA` / `_RECLAIM_PENDING_LUA`), worker overlap locks, `schedule:list`/`run`/`work` | ✅ Completed |
 
-*See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md) and [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md) for the complete documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
+*See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md), [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md), and [`documentations/2026-11-22-task-scheduling.md`](./documentations/2026-11-22-task-scheduling.md) for the complete documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
 ---
 
@@ -457,6 +458,11 @@ swiftpy queue:failed --limit 50
 swiftpy queue:retry --all
 swiftpy queue:flush
 
+# List, trigger once, or run the dedicated task scheduler loop
+swiftpy schedule:list --app main:app
+swiftpy schedule:run --app main:app
+swiftpy schedule:work --app main:app --sleep 1.0
+
 # Run, inspect, rollback, reset, and seed database migrations
 swiftpy migrate
 swiftpy migrate:status
@@ -514,6 +520,10 @@ SwiftPY reads environment variables and YAML/Python configuration files with str
 | `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | `[]` | Comma-separated list of exact allowed CORS origins (never pair `"*"` with `CORS_ALLOW_CREDENTIALS=true`). See the [CORS Guide](./documentations/2026-11-21-cors.md). |
 | `CORS_ALLOW_CREDENTIALS` | `cors.allow_credentials` | `False` | Whether cross-origin requests may include credentials/cookies. |
 | `CORS_MAX_AGE` | `cors.max_age` | `600` | Preflight `OPTIONS` cache duration (`Access-Control-Max-Age`) in seconds. |
+| `TRUSTED_PROXIES` | `http.trusted_proxies` | `[]` | Comma-separated or JSON array of trusted proxy IPs / strict CIDRs for `request.ip()`, `ws.ip()`, and `LoginThrottle`. |
+| `SCHEDULE_DRIVER` | `schedule.driver` | `"redis"` | Scheduler persistence backend (`"redis"` on `REDIS_QUEUE_DB` or non-durable `"memory"`). See the [Task Scheduling Guide](./documentations/2026-11-22-task-scheduling.md). |
+| `SCHEDULE_TIMEZONE` | `schedule.timezone` | `"UTC"` | Default IANA timezone name for scheduled cron/one-time tasks (`fallbacks` to `APP_TIMEZONE` then `"UTC"`). |
+| `SCHEDULE_AUTO_START` | `schedule.auto_start` | `False` | Opt-in in-process scheduler loop during `Application.startup()` (keep `False` when scaling multiple web workers). |
 | `AI_ENABLED` | `ai.enabled` | `True` | Master toggle for `swiftpy.ai` requests (raises `AIModuleDisabledError` when disabled). |
 | `AI_DEFAULT_PROVIDER` | `ai.default` | `"openai"` | Default LLM provider (`"openai"` or `"anthropic"`) when not inferred from model name. |
 | `OPENAI_API_KEY` | `ai.providers.openai.api_key` | `""` | OpenAI API key for chat, streaming, and embeddings. |
@@ -608,9 +618,11 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   ├── database.py
 │   ├── events.py
 │   ├── filesystems.py
+│   ├── http.py
 │   ├── logging.py
 │   ├── mail.py
-│   └── queue.py
+│   ├── queue.py
+│   └── schedule.py
 ├── database/
 │   └── migrations/         # Timestamped database migrations
 ├── prompts/                # Named & versioned AI prompt templates (summarise.py, classify.py)
@@ -629,6 +641,7 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   ├── logging/            # Log facade, LogManager, async QueueHandler/QueueListener drivers
 │   ├── mail/               # Mailables, SMTP/Sendmail/API transports, templates
 │   ├── queue/              # At-least-once queue workers, job serialization
+│   ├── scheduling/         # 5-field cron engine, Redis/Memory stores, Scheduler & builders
 │   ├── support/            # Shared identifiers, keys, Redis config, string inflection
 │   ├── testing/            # TestClient, TestCase, AIFake, MailFake, VectorStoreFake, DB fixtures
 │   ├── validation/         # FormRequest, fail-closed Validator, builtin & DB rules

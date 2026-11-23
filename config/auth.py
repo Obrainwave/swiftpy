@@ -19,6 +19,12 @@ CONFIG: dict[str, object] = {
         "max_attempts": int(env("AUTH_THROTTLE_MAX_ATTEMPTS", "5")),
         "decay_seconds": int(env("AUTH_THROTTLE_DECAY_SECONDS", "60")),
         "lockout_seconds": int(env("AUTH_THROTTLE_LOCKOUT_SECONDS", "60")),
+        "identifier_max_attempts": int(
+            env("AUTH_THROTTLE_IDENTIFIER_MAX_ATTEMPTS", "0")
+        ),
+        "identifier_window_seconds": int(
+            env("AUTH_THROTTLE_IDENTIFIER_WINDOW_SECONDS", "3600")
+        ),
         "prefix": env("AUTH_THROTTLE_PREFIX", "auth:throttle"),
     },
     "guards": {

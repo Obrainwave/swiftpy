@@ -40,6 +40,15 @@ Synchronous request metadata is available immediately without `await`:
 | `request.headers` | `RequestHeaders` | Case-insensitive immutable `Mapping[str, str]` |
 | `request.query_params` | `dict[str, str]` | First value for each URL query key (UTF-8 decoded) |
 | `request.query_param_list` | `dict[str, list[str]]` | All values for repeated query keys (`?tag=a&tag=b`) |
+| `request.ip()` / `Request.ip()` | `str \| None` | Proxy-verified client IP resolved from ASGI peer + configured `http.trusted_proxies` |
+
+#### Proxy-Aware Client IP Resolution (`request.ip()` / `Request.ip()`)
+
+Call `request.ip()` on an injected `Request` or `Request.ip()` class-level inside request-scoped services (`None` outside request context):
+
+- **Fail-safe default:** `config/http.py` defaults `"trusted_proxies": []` (`TRUSTED_PROXIES`), ignoring all `X-Forwarded-For` / `X-Real-IP` headers unless the direct ASGI peer IP matches an explicitly trusted proxy IP or strict CIDR (`"172.30.0.0/24"`, `"127.0.0.1"`, `"::1"`). Private/Docker subnets are **never** implicitly trusted.
+- **Validation & normalization:** `Application(...)` validates `trusted_proxies` eagerly at startup (raising `ConfigurationError` on hostnames, `IP:port`, wildcards, or non-strict CIDRs). IPv4-mapped IPv6 addresses (`::ffff:172.30.0.5`) unwrap cleanly to canonical IPv4 (`172.30.0.5`).
+- **Strict forwarding state machine:** When the direct peer is trusted, SwiftPY inspects `X-Forwarded-For` right-to-left skipping trusted hops (`4096` byte max, `32` hop max, rejecting ports/hostnames/zone IDs). If `X-Forwarded-For` is malformed, empty/whitespace-only, oversized, or contains only trusted proxies, it resolves conservatively to the direct peer **without** falling back to `X-Real-IP`; `X-Real-IP` is inspected only when `X-Forwarded-For` is completely absent.
 
 `RequestHeaders` decodes header keys/values as `latin-1` per the ASGI spec and supports repeated headers cleanly:
 

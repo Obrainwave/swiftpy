@@ -174,6 +174,7 @@ async def notifications(ws: WebSocketConnection) -> None:
 ## Important Defaults & Production Safeguards
 
 - **Origin checks fail closed against cross-site WebSocket hijacking (`D-14`):** Leave `allowed_origins=None` for same-origin browser policies or list exact origins (never `"*"` when authenticating browser cookies/sessions).
+- **Proxy-aware WebSocket client IP (`ws.ip()`):** Call `ws.ip()` (or `Request.ip()` inside WebSocket handshake middleware) to obtain the canonical proxy-verified client IP governed by `http.trusted_proxies` / `TRUSTED_PROXIES`, ignoring forged forwarding headers from untrusted peers.
 - **Never trust unauthenticated WebSocket handshakes or unbounded frames:** Attach authentication middleware (`JWTGuard` / API keys) to sensitive WebSocket routes/groups and set `ws_idle_timeout` alongside `max_ws_message_size` (`1 MiB` default) to prevent resource exhaustion.
 
 ---

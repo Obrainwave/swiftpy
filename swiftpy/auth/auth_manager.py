@@ -195,9 +195,9 @@ def _extract_client_ip(
         return explicit_ip.strip()
     req = request if request is not None else Context.get("request")
     if isinstance(req, Request):
-        client = req.scope.get("client")
-        if isinstance(client, (tuple, list)) and client and client[0]:
-            return str(client[0])
+        resolved = req.ip()
+        if resolved is not None:
+            return resolved
     return "unknown"
 
 

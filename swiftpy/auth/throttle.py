@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import math
 import time
@@ -30,13 +31,26 @@ def _normalize_ip(ip: str | None) -> str:
     if not ip:
         return "unknown"
     cleaned = ip.strip().lower()
-    return cleaned or "unknown"
+    if not cleaned:
+        return "unknown"
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return cleaned
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        # A single IPv6 subscriber typically controls a whole /64, so bucket by prefix.
+        return str(ipaddress.IPv6Network((int(addr) >> 64 << 64, 64)))
+    return str(addr)
 
 
 class LoginThrottle:
     """
     Cache-backed login rate limiter enforcing failed-attempt thresholds and
-    temporary lockouts per normalized identifier + client IP pair.
+    temporary lockouts per normalized identifier + client IP pair (IPv6 addresses
+    are bucketed by /64). An optional identifier-wide cap across all client IPs
+    can be enabled with ``auth.throttle.identifier_max_attempts``.
     """
 
     def __init__(
@@ -46,6 +60,8 @@ class LoginThrottle:
         max_attempts: int | None = None,
         decay_seconds: int | None = None,
         lockout_seconds: int | None = None,
+        identifier_max_attempts: int | None = None,
+        identifier_window_seconds: int | None = None,
         prefix: str | None = None,
         store: str | None = None,
         driver: CacheDriver | None = None,
@@ -54,6 +70,8 @@ class LoginThrottle:
         self._explicit_max_attempts = max_attempts
         self._explicit_decay_seconds = decay_seconds
         self._explicit_lockout_seconds = lockout_seconds
+        self._explicit_identifier_max_attempts = identifier_max_attempts
+        self._explicit_identifier_window_seconds = identifier_window_seconds
         self._explicit_prefix = prefix
         self._store = store
         self._driver = driver
@@ -117,6 +135,28 @@ class LoginThrottle:
         return 60
 
     @property
+    def identifier_max_attempts(self) -> int | None:
+        """Failed attempts per identifier across all IPs before lockout (None = disabled)."""
+        raw: Any = self._explicit_identifier_max_attempts
+        if raw is None:
+            cfg = self._get_config()
+            raw = cfg.get("auth.throttle.identifier_max_attempts", None) if cfg else None
+        if raw is None:
+            return None
+        value = int(raw)
+        return value if value > 0 else None
+
+    @property
+    def identifier_window_seconds(self) -> int:
+        if self._explicit_identifier_window_seconds is not None:
+            return max(1, int(self._explicit_identifier_window_seconds))
+        cfg = self._get_config()
+        if cfg is not None:
+            val = cfg.get("auth.throttle.identifier_window_seconds", 3600)
+            return max(1, int(val))
+        return 3600
+
+    @property
     def prefix(self) -> str:
         if self._explicit_prefix is not None:
             return self._explicit_prefix
@@ -133,6 +173,12 @@ class LoginThrottle:
         norm_ip = _normalize_ip(ip)
         digest = hashlib.sha256(f"{norm_id}|{norm_ip}".encode()).hexdigest()
         return f"{self.prefix}:{digest}"
+
+    def _identifier_key(self, identifier: str) -> str:
+        digest = hashlib.sha256(
+            f"id|{_normalize_identifier(identifier)}".encode()
+        ).hexdigest()
+        return f"{self.prefix}:id:{digest}"
 
     def _lockout_key(self, base_key: str) -> str:
         return f"{base_key}:lockout"
@@ -214,16 +260,16 @@ class LoginThrottle:
             )
             return await self._fallback_driver().increment(key, 1, ttl=ttl)
 
-    async def _driver_increment_persistent(self, key: str) -> int:
+    async def _driver_increment_generation(self, key: str, ttl: float) -> int:
         driver = self._resolve_driver()
         try:
-            return await driver.increment(key, 1, ttl=None)
+            return await driver.increment(key, 1, ttl=ttl)
         except (ConnectionError, TimeoutError, OSError, RedisError) as exc:
             logger.warning(
                 "Cache backend unavailable during generation increment; falling back to memory: %s",
                 exc,
             )
-            return await self._fallback_driver().increment(key, 1, ttl=None)
+            return await self._fallback_driver().increment(key, 1, ttl=ttl)
 
     async def _driver_forget(self, key: str) -> bool:
         driver = self._resolve_driver()
@@ -250,18 +296,22 @@ class LoginThrottle:
         return max(1, math.ceil(remaining))
 
     async def too_many_attempts(self, identifier: str, ip: str | None = None) -> bool:
-        """Return True if the identifier + IP pair is currently locked out."""
+        """Return True if the identifier + IP pair (or the identifier globally) is locked out."""
         if not self.enabled:
             return False
-        base_key = self.make_key(identifier, ip)
-        return (await self._remaining_lockout_seconds(base_key)) > 0
+        return (await self.available_in(identifier, ip)) > 0
 
     async def available_in(self, identifier: str, ip: str | None = None) -> int:
         """Return remaining lockout duration in seconds (0 when not locked out)."""
         if not self.enabled:
             return 0
-        base_key = self.make_key(identifier, ip)
-        return await self._remaining_lockout_seconds(base_key)
+        remaining = await self._remaining_lockout_seconds(self.make_key(identifier, ip))
+        if self.identifier_max_attempts is not None:
+            remaining = max(
+                remaining,
+                await self._remaining_lockout_seconds(self._identifier_key(identifier)),
+            )
+        return remaining
 
     async def _current_generation(self, base_key: str) -> int:
         raw_gen = await self._driver_get(self._generation_key(base_key))
@@ -307,7 +357,7 @@ class LoginThrottle:
         if not self.enabled:
             return 0
         base_key = self.make_key(identifier, ip)
-        if (await self._remaining_lockout_seconds(base_key)) > 0:
+        if (await self.available_in(identifier, ip)) > 0:
             return await self.attempts(identifier, ip)
 
         gen = await self._current_generation(base_key)
@@ -323,8 +373,28 @@ class LoginThrottle:
                 ttl=float(self.lockout_seconds),
             )
             if acquired_lock:
-                await self._driver_increment_persistent(self._generation_key(base_key))
+                await self._driver_increment_generation(
+                    self._generation_key(base_key),
+                    ttl=2.0 * float(self.lockout_seconds + self.decay_seconds),
+                )
+        await self._hit_identifier(identifier)
         return count
+
+    async def _hit_identifier(self, identifier: str) -> None:
+        cap = self.identifier_max_attempts
+        if cap is None:
+            return
+        id_key = self._identifier_key(identifier)
+        total = await self._driver_increment(
+            id_key, ttl=float(self.identifier_window_seconds)
+        )
+        if total >= cap:
+            await self._driver_add(
+                self._lockout_key(id_key),
+                time.time() + float(self.lockout_seconds),
+                ttl=float(self.lockout_seconds),
+            )
+            await self._driver_forget(id_key)
 
     async def clear(self, identifier: str, ip: str | None = None) -> None:
         """Reset recorded failed attempts and any active lockout for an identifier + IP."""
@@ -335,6 +405,10 @@ class LoginThrottle:
             await self._driver_forget(self._attempt_key(base_key, gen - 1))
         await self._driver_forget(self._generation_key(base_key))
         await self._driver_forget(self._lockout_key(base_key))
+        if self.identifier_max_attempts is not None:
+            id_key = self._identifier_key(identifier)
+            await self._driver_forget(id_key)
+            await self._driver_forget(self._lockout_key(id_key))
 
 
 __all__ = ["LoginThrottle"]

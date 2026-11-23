@@ -325,7 +325,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.3.1",
+       "swiftpy-framework>=0.3.5",
        # ...
    ]
    ```

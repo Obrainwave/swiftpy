@@ -139,11 +139,12 @@ APP_KEY=
 APP_DEBUG=false
 APP_URL=http://localhost:8000
 
-# Server (Uvicorn)
+# Server (Uvicorn) & HTTP Proxy Trust
 SERVER_HOST=127.0.0.1
 SERVER_PORT=8000
 SERVER_WORKERS=1
 SERVER_RELOAD=true
+TRUSTED_PROXIES=
 
 # Database (PostgreSQL / asyncpg)
 DB_CONNECTION=postgresql
@@ -184,6 +185,17 @@ EVENTS_PREFIX=swiftpy_events:
 QUEUE_DRIVER=redis
 QUEUE_PREFIX=swiftpy_queue:
 QUEUE_NAME=default
+
+# Task Scheduler
+SCHEDULE_DRIVER=redis
+SCHEDULE_TIMEZONE=UTC
+SCHEDULE_AUTO_START=false
+SCHEDULE_POLL_INTERVAL=1.0
+SCHEDULE_GRACE_SECONDS=60.0
+SCHEDULE_DISPATCH_LEASE_SECONDS=30.0
+SCHEDULE_MAX_DISPATCH_ATTEMPTS=5
+SCHEDULE_DEFAULT_LOCK_TTL=900
+SCHEDULE_PREFIX=swiftpy_schedule:
 
 # Filesystems & Storage
 FILESYSTEM_DISK=local
@@ -228,6 +240,8 @@ AUTH_THROTTLE_ENABLED=true
 AUTH_THROTTLE_MAX_ATTEMPTS=5
 AUTH_THROTTLE_DECAY_SECONDS=60
 AUTH_THROTTLE_LOCKOUT_SECONDS=60
+AUTH_THROTTLE_IDENTIFIER_MAX_ATTEMPTS=0
+AUTH_THROTTLE_IDENTIFIER_WINDOW_SECONDS=3600
 
 # CORS (opt-in explicit comma-separated origins, e.g. http://localhost:3000,http://localhost:8000)
 # Never pair '*' with CORS_ALLOW_CREDENTIALS=true
@@ -1192,6 +1206,12 @@ CONFIG = {
         "max_attempts": int(env("AUTH_THROTTLE_MAX_ATTEMPTS", "5") or "5"),
         "decay_seconds": int(env("AUTH_THROTTLE_DECAY_SECONDS", "60") or "60"),
         "lockout_seconds": int(env("AUTH_THROTTLE_LOCKOUT_SECONDS", "60") or "60"),
+        "identifier_max_attempts": int(
+            env("AUTH_THROTTLE_IDENTIFIER_MAX_ATTEMPTS", "0") or "0"
+        ),
+        "identifier_window_seconds": int(
+            env("AUTH_THROTTLE_IDENTIFIER_WINDOW_SECONDS", "3600") or "3600"
+        ),
         "prefix": env("AUTH_THROTTLE_PREFIX", "auth:throttle"),
     },
     "blacklist_enabled": env_bool("AUTH_BLACKLIST_ENABLED", True),
@@ -1353,6 +1373,50 @@ CONFIG = {
 }
 """
 
+CONFIG_HTTP_CONTENT = """from __future__ import annotations
+
+import json
+from typing import Any
+
+from swiftpy.helpers.helper import env
+
+
+def _parse_proxy_env(raw: Any) -> Any:
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str):
+        return raw
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return [stripped]
+        if isinstance(parsed, list):
+            return parsed
+        return parsed
+    return [entry.strip() for entry in stripped.split(",")]
+
+
+_RAW_TRUSTED_PROXIES = env("TRUSTED_PROXIES", env("HTTP_TRUSTED_PROXIES", "")) or ""
+_RAW_MAX_CONTENT_LENGTH = env("HTTP_MAX_CONTENT_LENGTH", None)
+
+CONFIG: dict[str, Any] = {
+    "trusted_proxies": _parse_proxy_env(_RAW_TRUSTED_PROXIES),
+    "max_body_size": int(
+        env("HTTP_MAX_BODY_SIZE", str(2 * 1024 * 1024)) or (2 * 1024 * 1024)
+    ),
+    "max_content_length": (
+        int(_RAW_MAX_CONTENT_LENGTH)
+        if _RAW_MAX_CONTENT_LENGTH not in (None, "")
+        else None
+    ),
+    "max_json_depth": int(env("HTTP_MAX_JSON_DEPTH", "32") or "32"),
+}
+"""
+
 CONFIG_LOGGING_CONTENT = """from __future__ import annotations
 
 from swiftpy.helpers.helper import env
@@ -1449,6 +1513,33 @@ CONFIG = {
             "prefix": env("QUEUE_PREFIX", "swiftpy_queue:"),
         },
     },
+}
+"""
+
+CONFIG_SCHEDULE_CONTENT = """from __future__ import annotations
+
+from swiftpy.helpers.helper import env, env_bool
+
+CONFIG: dict[str, object] = {
+    "driver": env("SCHEDULE_DRIVER", "redis"),
+    "timezone": env("SCHEDULE_TIMEZONE", env("APP_TIMEZONE", "UTC")),
+    "auto_start": env_bool("SCHEDULE_AUTO_START", False),
+    "poll_interval": float(env("SCHEDULE_POLL_INTERVAL", "1.0") or "1.0"),
+    "grace_seconds": float(env("SCHEDULE_GRACE_SECONDS", "60.0") or "60.0"),
+    "dispatch_lease_seconds": float(
+        env("SCHEDULE_DISPATCH_LEASE_SECONDS", "30.0") or "30.0"
+    ),
+    "max_dispatch_attempts": int(
+        env("SCHEDULE_MAX_DISPATCH_ATTEMPTS", "5") or "5"
+    ),
+    "default_lock_ttl": int(env("SCHEDULE_DEFAULT_LOCK_TTL", "900") or "900"),
+    "prefix": env("SCHEDULE_PREFIX", "swiftpy_schedule:"),
+    "retention_seconds": int(
+        env("SCHEDULE_RETENTION_SECONDS", str(7 * 24 * 3600)) or str(7 * 24 * 3600)
+    ),
+    "max_occurrences_per_schedule": int(
+        env("SCHEDULE_MAX_OCCURRENCES", "200") or "200"
+    ),
 }
 """
 
@@ -1603,7 +1694,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.3.1",
+    "swiftpy-framework>=0.3.5",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
@@ -1893,9 +1984,11 @@ class NewCommand:
             "config/database.py": _get_config_database(raw_name),
             "config/events.py": CONFIG_EVENTS_CONTENT,
             "config/filesystems.py": CONFIG_FILESYSTEMS_CONTENT,
+            "config/http.py": CONFIG_HTTP_CONTENT,
             "config/logging.py": CONFIG_LOGGING_CONTENT,
             "config/mail.py": CONFIG_MAIL_CONTENT,
             "config/queue.py": CONFIG_QUEUE_CONTENT,
+            "config/schedule.py": CONFIG_SCHEDULE_CONTENT,
             "database/migrations/2026_01_01_000000_create_users_table.py": CREATE_USERS_MIGRATION_CONTENT,
             "database/seeders/database_seeder.py": DATABASE_SEEDER_CONTENT,
             "views/mail/template.html": VIEWS_MAIL_TEMPLATE_CONTENT,

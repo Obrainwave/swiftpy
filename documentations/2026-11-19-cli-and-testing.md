@@ -61,7 +61,7 @@ Use the `make:*` commands to generate typed stubs conforming to SwiftPY's conven
 
 Pass `--app main:app` so migrations and seeders boot your full application `Config`, service providers, and database pool cleanly.
 
-### Queues, Caching & Storage Commands
+### Queues, Task Scheduler, Caching & Storage Commands
 
 ```bash
 # Precompile config/*.py and prompts into bootstrap/cache/
@@ -76,6 +76,11 @@ uv run swiftpy queue:work --app main:app --queue default --concurrency 4
 uv run swiftpy queue:failed --app main:app --queue default --limit 20
 uv run swiftpy queue:retry all --app main:app --queue default
 uv run swiftpy queue:flush --app main:app --queue default
+
+# Inspect and run scheduled tasks (cron, intervals, and one-time jobs)
+uv run swiftpy schedule:list --app main:app --json
+uv run swiftpy schedule:run --app main:app
+uv run swiftpy schedule:work --app main:app --sleep 1.0
 ```
 
 Full option summary:
@@ -87,6 +92,9 @@ Full option summary:
 - `queue:failed`: `[--queue] [--limit] [--prefix] [--app]`
 - `queue:retry <id|all>`: `[--queue] [--prefix] [--app]`
 - `queue:flush`: `[--queue] [--prefix] [--app]`
+- `schedule:list`: `[--app] [--json] [--prefix]`
+- `schedule:run`: `[--app] [--limit] [--prefix]`
+- `schedule:work`: `[--app] [--sleep] [--max-ticks] [--prefix]`
 
 ---
 

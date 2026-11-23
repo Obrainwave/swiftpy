@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Generator
 from typing import Any, ClassVar
@@ -387,3 +388,195 @@ async def test_throttle_concurrent_atomicity_memory_and_redis(
         await redis_throttle.clear("redis@example.com", "9.9.9.9")
         await redis_throttle.clear("redis-exact@example.com", "9.9.9.9")
         await redis_cache.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_attempt_throttle_uses_trusted_client_ip_and_ignores_spoofing(
+    throttle_app: Application,
+) -> None:
+    """
+    Auth throttling must use Request.ip() rather than raw scope['client'] so:
+    - Trusted reverse proxies isolate rate-limit buckets per real client IP.
+    - Untrusted peers cannot bypass or poison buckets using spoofed forwarding headers.
+    """
+    throttle_app.config.set("http.trusted_proxies", ["172.30.0.0/24"])
+    throttle_app.config.set(
+        "auth.throttle",
+        {
+            "enabled": True,
+            "max_attempts": 2,
+            "decay_seconds": 60,
+            "lockout_seconds": 60,
+            "prefix": "test:proxy:throttle",
+        },
+    )
+
+    @throttle_app.post("/login")
+    async def login(request: Request) -> Any:
+        ok = await Auth.attempt(
+            {"email": str(request.get("email", "")), "password": str(request.get("password", ""))}
+        )
+        return json_response({"ok": ok, "ip": request.ip()}, status_code=200 if ok else 401)
+
+    async def _post_login(
+        *,
+        peer_ip: str,
+        email: str,
+        password: str,
+        headers: list[tuple[bytes, bytes]] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        payload = json.dumps({"email": email, "password": password}).encode("utf-8")
+        raw_headers: list[tuple[bytes, bytes]] = [
+            (b"content-type", b"application/json"),
+            *(headers or []),
+        ]
+        scope: dict[str, Any] = {
+            "type": "http",
+            "method": "POST",
+            "path": "/login",
+            "headers": raw_headers,
+            "query_string": b"",
+            "client": (peer_ip, 51234),
+            "server": ("127.0.0.1", 8000),
+        }
+        body_sent = False
+        status = 0
+        resp_body = bytearray()
+
+        async def receive() -> dict[str, Any]:
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(msg: dict[str, Any]) -> None:
+            nonlocal status
+            if msg["type"] == "http.response.start":
+                status = msg["status"]
+            elif msg["type"] == "http.response.body":
+                resp_body.extend(msg.get("body", b""))
+
+        await throttle_app(scope, receive, send)
+        return status, json.loads(resp_body.decode("utf-8"))
+
+    # 1. Behind trusted proxy (172.30.0.10), victim 198.51.100.1 gets locked out after 2 bad attempts
+    for _ in range(2):
+        status, data = await _post_login(
+            peer_ip="172.30.0.10",
+            email="alice@example.com",
+            password="wrong",
+            headers=[(b"x-forwarded-for", b"198.51.100.1")],
+        )
+        assert status == 401
+        assert data["ip"] == "198.51.100.1"
+
+    locked_status, _ = await _post_login(
+        peer_ip="172.30.0.10",
+        email="alice@example.com",
+        password="correct-password",
+        headers=[(b"x-forwarded-for", b"198.51.100.1")],
+    )
+    assert locked_status == 429
+
+    # Different client behind the SAME trusted proxy IP is NOT locked out (isolated bucket!)
+    other_status, other_data = await _post_login(
+        peer_ip="172.30.0.10",
+        email="alice@example.com",
+        password="correct-password",
+        headers=[(b"x-forwarded-for", b"198.51.100.2")],
+    )
+    assert other_status == 200
+    assert other_data == {"ok": True, "ip": "198.51.100.2"}
+
+    # 2. Untrusted direct peer CANNOT rotate/bypass throttle using spoofed XFF headers
+    for spoof_idx in range(2):
+        s_status, s_data = await _post_login(
+            peer_ip="203.0.113.99",
+            email="bob@example.com",
+            password="wrong",
+            headers=[
+                (b"x-forwarded-for", f"198.51.100.{50 + spoof_idx}".encode("ascii")),
+                (b"x-real-ip", f"198.51.100.{80 + spoof_idx}".encode("ascii")),
+            ],
+        )
+        assert s_status == 401
+        assert s_data["ip"] == "203.0.113.99"
+
+    blocked_spoof_status, _ = await _post_login(
+        peer_ip="203.0.113.99",
+        email="bob@example.com",
+        password="correct-password",
+        headers=[(b"x-forwarded-for", b"198.51.100.200")],
+    )
+    assert blocked_spoof_status == 429
+
+
+
+@pytest.mark.asyncio
+async def test_throttle_buckets_ipv6_by_64_prefix_and_unwraps_ipv4_mapped() -> None:
+    throttle = LoginThrottle(
+        max_attempts=3,
+        decay_seconds=60,
+        lockout_seconds=60,
+        driver=MemoryDriver(prefix="ipv6:"),
+    )
+    user = "ipv6@example.com"
+
+    # Rotating addresses inside one /64 must not reset the attempt counter
+    for host in ("2001:db8:1:2::1", "2001:db8:1:2::2", "2001:db8:1:2:ffff::9"):
+        await throttle.hit(user, host)
+    assert await throttle.too_many_attempts(user, "2001:db8:1:2::abcd") is True
+
+    # A different /64 and an unrelated IPv4 remain independent
+    assert await throttle.too_many_attempts(user, "2001:db8:1:3::1") is False
+    assert await throttle.too_many_attempts(user, "203.0.113.5") is False
+
+    # IPv4-mapped IPv6 shares the bucket with the plain IPv4 form
+    for _ in range(3):
+        await throttle.hit(user, "::ffff:203.0.113.5")
+    assert await throttle.too_many_attempts(user, "203.0.113.5") is True
+
+
+@pytest.mark.asyncio
+async def test_throttle_generation_counter_expires() -> None:
+    now = [1000.0]
+    driver = MemoryDriver(prefix="gen:", clock=lambda: now[0])
+    throttle = LoginThrottle(
+        max_attempts=1, decay_seconds=10, lockout_seconds=10, driver=driver
+    )
+    base_key = throttle.make_key("gen@example.com", "198.51.100.1")
+    gen_key = throttle._generation_key(base_key)
+
+    await throttle.hit("gen@example.com", "198.51.100.1")
+    assert await driver.get(gen_key) == 1
+
+    now[0] += 41.0  # beyond 2 * (lockout + decay)
+    assert await driver.get(gen_key) is None
+
+
+@pytest.mark.asyncio
+async def test_throttle_identifier_cap_spans_ips_and_is_off_by_default() -> None:
+    capped = LoginThrottle(
+        max_attempts=5,
+        lockout_seconds=60,
+        identifier_max_attempts=3,
+        driver=MemoryDriver(prefix="idcap:"),
+    )
+    user = "victim@example.com"
+    for idx in range(3):
+        await capped.hit(user, f"198.51.100.{idx + 1}")
+
+    assert await capped.too_many_attempts(user, "192.0.2.77") is True
+    assert await capped.available_in(user, "192.0.2.77") > 0
+    assert await capped.too_many_attempts("other@example.com", "192.0.2.77") is False
+
+    await capped.clear(user, "192.0.2.77")
+    assert await capped.too_many_attempts(user, "192.0.2.77") is False
+
+    default = LoginThrottle(
+        max_attempts=5, lockout_seconds=60, driver=MemoryDriver(prefix="idoff:")
+    )
+    for idx in range(20):
+        await default.hit(user, f"198.51.100.{idx + 1}")
+    assert await default.too_many_attempts(user, "192.0.2.77") is False

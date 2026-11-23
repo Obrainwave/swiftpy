@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import json
-from collections.abc import AsyncIterator, Generator, Iterator, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from typing import Any, ClassVar, cast
 from urllib.parse import parse_qs, unquote
 
 from swiftpy.core.config import Config
 from swiftpy.core.container import get_container
+from swiftpy.core.context import Context
 from swiftpy.filesystem.uploads.handlers import FormData, MultipartParser
 from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
+from swiftpy.http.client_ip import (
+    TrustedProxies,
+    extract_trusted_proxies_from_config,
+    parse_trusted_proxies,
+    resolve_client_ip,
+)
 from swiftpy.http.exceptions import (
     ClientDisconnect,
     HttpException,
@@ -160,6 +176,39 @@ class _HasFileResult:
         return f"_HasFileResult({bool(self)!r})"
 
 
+class _ClientIPMethod:
+    """Descriptor supporting both ``request.ip()`` and ``Request.ip()`` via one resolver path."""
+
+    def __init__(self, func: Callable[[Request], str | None]) -> None:
+        self._func = func
+        self.__doc__ = func.__doc__
+        self.__name__ = func.__name__
+        self.__qualname__ = func.__qualname__
+
+    def __get__(
+        self,
+        instance: Request | None,
+        owner: type[Request] | None = None,
+    ) -> Callable[[], str | None]:
+        func = self._func
+
+        def _call() -> str | None:
+            target = instance if instance is not None else Context.get("request")
+            if isinstance(target, Request):
+                return func(target)
+            return None
+
+        functools.update_wrapper(_call, func)
+        _call.__dict__.pop("__wrapped__", None)
+        _call.__dict__["__signature__"] = inspect.Signature(
+            return_annotation=str | None
+        )
+        if instance is not None:
+            # Non-data descriptor: later ``request.ip`` lookups hit the instance dict directly.
+            instance.__dict__[self.__name__] = _call
+        return _call
+
+
 class Request:
     _RESERVED_INPUT_ATTRS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -169,6 +218,7 @@ class Request:
             "client",
             "cookies",
             "http_version",
+            "ip",
             "is_admin",
             "is_authenticated",
             "root_path",
@@ -186,12 +236,22 @@ class Request:
         max_body_size: int = DEFAULT_MAX_BODY_SIZE,
         max_content_length: int | None = None,
         max_json_depth: int = DEFAULT_MAX_JSON_DEPTH,
+        config: Config | None = None,
+        trusted_proxies: Sequence[str] | TrustedProxies | str | None = None,
     ) -> None:
         self.scope = scope
         self._receive = receive
         self.max_body_size = max_body_size
         self.max_content_length = max_content_length
         self.max_json_depth = max_json_depth
+        self._config = config
+        self._explicit_trusted_proxies: TrustedProxies | None = (
+            parse_trusted_proxies(trusted_proxies)
+            if trusted_proxies is not None
+            else None
+        )
+        self._client_ip_resolved: bool = False
+        self._client_ip: str | None = None
 
         self._headers: RequestHeaders | None = None
         self._cookies: dict[str, str] | None = None
@@ -206,6 +266,34 @@ class Request:
         self._non_dict_payload: bool = False
 
         self.state: dict[str, Any] = {}
+
+    def _resolve_trusted_proxies(self) -> TrustedProxies:
+        if self._explicit_trusted_proxies is not None:
+            return self._explicit_trusted_proxies
+        if self._config is not None:
+            return extract_trusted_proxies_from_config(self._config)
+        try:
+            container = get_container()
+            if container.has(Config):
+                return extract_trusted_proxies_from_config(container.resolve(Config))
+        except RuntimeError:
+            pass
+        return ()
+
+    @_ClientIPMethod
+    def ip(self) -> str | None:
+        """
+        Resolve the canonical client IPv4 or IPv6 address for this request
+        (or active request in task Context when called via ``Request.ip()``).
+        """
+        if not self._client_ip_resolved:
+            self._client_ip = resolve_client_ip(
+                self.scope,
+                self.headers,
+                trusted_proxies=self._resolve_trusted_proxies(),
+            )
+            self._client_ip_resolved = True
+        return self._client_ip
 
     @property
     def method(self) -> str:
