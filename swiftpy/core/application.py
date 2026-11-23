@@ -4,6 +4,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from importlib.util import module_from_spec, spec_from_file_location
@@ -37,6 +38,11 @@ from swiftpy.database.pool import DatabasePool
 from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.events.redis_bus import RedisEventBus
 from swiftpy.filesystem.manager import FilesystemManager
+from swiftpy.http.client_ip import (
+    TrustedProxies,
+    extract_trusted_proxies_from_config,
+    parse_trusted_proxies,
+)
 from swiftpy.http.exceptions import ClientDisconnect, HttpException
 from swiftpy.http.middleware import Middleware, MiddlewarePipeline
 from swiftpy.http.request import (
@@ -53,6 +59,9 @@ from swiftpy.http.router import PathParamCoercionError, Route, RouteGroup, Route
 from swiftpy.logging.manager import LogManager
 from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
+from swiftpy.scheduling.cron import resolve_timezone
+from swiftpy.scheduling.exceptions import InvalidScheduleError
+from swiftpy.scheduling.scheduler import Scheduler, ensure_memory_driver_allowed
 from swiftpy.support.keys import (
     resolve_configured_app_key,
     validate_signing_key,
@@ -221,6 +230,16 @@ class FrameworkServiceProvider(ServiceProvider):
                     config=c.resolve(Config) if c.has(Config) else None
                 ),
             )
+        if not self.container.has(Scheduler):
+            self.container.singleton(
+                Scheduler,
+                lambda c: Scheduler.from_config(
+                    c.resolve(Config) if c.has(Config) else None,
+                    dispatcher=c.resolve(QueueDispatcher)
+                    if c.has(QueueDispatcher)
+                    else None,
+                ),
+            )
 
     async def startup(self) -> None:
         log_manager = (
@@ -245,6 +264,15 @@ class FrameworkServiceProvider(ServiceProvider):
                 bus = self.container.resolve(RedisEventBus)
                 ws_manager = self.container.resolve(WebSocketManager)
                 ws_manager.subscribe_to_bus(bus)
+
+            auto_start_scheduler = False
+            if self.container.has(Config):
+                cfg = self.container.resolve(Config)
+                auto_start_scheduler = bool(cfg.get("schedule.auto_start", False))
+            if auto_start_scheduler and self.container.has(Scheduler):
+                sched = self.container.resolve(Scheduler)
+                if isinstance(sched, Scheduler):
+                    sched.start()
         except Exception:
             if isinstance(log_manager, LogManager):
                 await log_manager.astop()
@@ -270,14 +298,22 @@ class FrameworkServiceProvider(ServiceProvider):
                         "Error disconnecting WebSocket connection during shutdown"
                     )
 
-        # 2. Stop RedisEventBus and close its Redis connection
+        # 2. Stop Scheduler loop & store before shutting down queue/database pools
+        sched = self.container.get_singleton(Scheduler)
+        if isinstance(sched, Scheduler):
+            try:
+                await sched.close()
+            except Exception:
+                logger.exception("Error closing Scheduler during shutdown")
+
+        # 3. Stop RedisEventBus and close its Redis connection
         if isinstance(bus, RedisEventBus):
             try:
                 await bus.close()
             except Exception:
                 logger.exception("Error closing RedisEventBus during shutdown")
 
-        # 3. Close background clients (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager, MailManager)
+        # 4. Close background clients (Cache, QueueDispatcher, TokenBlacklist, FilesystemManager, MailManager)
         for service_cls in (
             Cache,
             QueueDispatcher,
@@ -325,6 +361,47 @@ class FrameworkServiceProvider(ServiceProvider):
                 await log_manager.astop()
             except Exception:
                 logger.exception("Error stopping LogManager during shutdown")
+
+
+def _validate_schedule_config(cfg: Config) -> None:
+    """Validate explicit ``schedule.*`` configuration values eagerly at boot."""
+    raw_driver = cfg.get("schedule.driver")
+    if raw_driver is not None:
+        driver = str(raw_driver).strip().lower()
+        if driver not in ("redis", "memory"):
+            raise ConfigurationError(
+                f"Invalid schedule.driver {raw_driver!r}: expected 'redis' or 'memory'."
+            )
+        if driver == "memory":
+            ensure_memory_driver_allowed(cfg)
+    raw_tz = cfg.get("schedule.timezone")
+    if raw_tz is not None:
+        try:
+            resolve_timezone(str(raw_tz))
+        except InvalidScheduleError as exc:
+            raise ConfigurationError(str(exc)) from exc
+    for numeric_key, allow_zero in (
+        ("schedule.poll_interval", False),
+        ("schedule.dispatch_lease_seconds", False),
+        ("schedule.grace_seconds", True),
+    ):
+        raw_val = cfg.get(numeric_key)
+        if raw_val is not None:
+            try:
+                parsed = float(raw_val)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError(
+                    f"Invalid {numeric_key} {raw_val!r}: expected finite number."
+                ) from exc
+            if (
+                isinstance(raw_val, bool)
+                or not math.isfinite(parsed)
+                or (not allow_zero and parsed <= 0)
+                or (allow_zero and parsed < 0)
+            ):
+                raise ConfigurationError(
+                    f"Invalid {numeric_key} {raw_val!r}."
+                )
 
 
 def _deep_merge_config(target: dict[str, Any], updates: Mapping[str, Any]) -> None:
@@ -473,6 +550,7 @@ class Application:
         max_body_size: int | None = None,
         max_content_length: int | None = None,
         max_json_depth: int | None = None,
+        trusted_proxies: Sequence[str] | str | None = None,
         allowed_origins: Sequence[str] | set[str] | None = None,
         max_ws_message_size: int | None = None,
         ws_idle_timeout: float | None = None,
@@ -510,6 +588,21 @@ class Application:
         # Merge additional kwargs into config (explicit kwargs always take top precedence)
         if kwargs:
             _deep_merge_config(self.config._data, kwargs)
+
+        # Eagerly validate trusted proxy configuration (fail fast at startup)
+        if trusted_proxies is not None:
+            self.trusted_proxies: TrustedProxies = parse_trusted_proxies(
+                trusted_proxies
+            )
+            _deep_merge_config(
+                self.config._data,
+                {"http": {"trusted_proxies": [str(net) for net in self.trusted_proxies]}},
+            )
+        else:
+            self.trusted_proxies = extract_trusted_proxies_from_config(self.config)
+
+        # Eagerly validate schedule configuration when present
+        _validate_schedule_config(self.config)
 
         cfg_max_body = self.config.get("http.max_body_size")
         if max_body_size is not None:
@@ -1674,6 +1767,7 @@ class Application:
                         send,
                         max_message_size=self.max_ws_message_size,
                         idle_timeout=self.ws_idle_timeout,
+                        config=self.config,
                     )
                     Context.set("websocket", connection)
                     try:
@@ -1693,19 +1787,18 @@ class Application:
                             await connection.close(code=1008, reason="Origin not allowed")
                             return
 
-                        # 2. Handshake middleware pipeline (P9-W1)
-                        # Global middleware + route group middleware
+                        # 2. Bind handshake Request in Context and run middleware pipeline (P9-W1)
+                        handshake_request = Request(
+                            scope,
+                            receive,
+                            max_body_size=self.max_body_size,
+                            max_content_length=self.max_content_length,
+                            max_json_depth=self.max_json_depth,
+                            config=self.config,
+                        )
+                        Context.set("request", handshake_request)
                         all_middleware = list(self._middleware) + list(route.middleware)
                         if all_middleware:
-                            handshake_request = Request(
-                                scope,
-                                receive,
-                                max_body_size=self.max_body_size,
-                                max_content_length=self.max_content_length,
-                                max_json_depth=self.max_json_depth,
-                            )
-                            Context.set("request", handshake_request)
-
                             pipeline = MiddlewarePipeline(self.container, all_middleware)
 
                             async def _handshake_terminal(req: Request) -> Response:
@@ -1783,6 +1876,7 @@ class Application:
                         max_body_size=self.max_body_size,
                         max_content_length=self.max_content_length,
                         max_json_depth=self.max_json_depth,
+                        config=self.config,
                     )
                     Context.set("request", request)
                     send_body = request.method.upper() != "HEAD"

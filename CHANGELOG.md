@@ -4,6 +4,37 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-23
+
+### Added
+- **Proxy-Aware Client IP Detection (`swiftpy.http.client_ip`, `swiftpy.http.request`, `swiftpy.websockets.connection`, `swiftpy.auth.auth_manager`):**
+  - Added pure stateless resolver module `swiftpy.http.client_ip` (`parse_trusted_proxies`, `extract_trusted_proxies_from_config`, `resolve_client_ip`) defaulting `http.trusted_proxies` fail-safely to `[]` via [`config/http.py`](config/http.py) (`TRUSTED_PROXIES`, `HTTP_TRUSTED_PROXIES`).
+  - Added dual instance/class descriptor `request.ip()` and `Request.ip()` on `Request`, `WebSocketConnection.ip()`, WebSocket handshake `Request` context binding in `Application`, and unified `Auth` / `LoginThrottle` IP extraction via `req.ip() or "unknown"`.
+  - Enforces strict CIDR validation (`strict=True`), IPv4-mapped IPv6 unwrapping (`::ffff:172.30.0.5` -> `172.30.0.5`), right-to-left `X-Forwarded-For` traversal with header/hop bounds (`4096` bytes / `32` hops) and port/zone-ID/hostname rejection, and conservative resolution to direct peer (without consulting `X-Real-IP`) whenever `X-Forwarded-For` is malformed, empty, or all-trusted.
+- **Native Task Scheduler (`swiftpy.scheduling`):**
+  - Added zero-dependency strict 5-field Vixie cron + IANA `ZoneInfo` engine (`cron.py`: macros, ranges, steps, lists, named month/weekday aliases, DOM/DOW OR rule, impossible calendar date rejection with `InvalidCronError`, DST spring-forward/fall-back handling with `fold=0` single firing, `UTC` default).
+  - Separated persistent `ScheduleRecord` definitions from `ScheduleOccurrence` execution lifecycles (`pending` -> `claimed` -> `dispatch_pending` -> `dispatched` -> `running` -> `completed` | `failed` | `skipped` | `cancelled`).
+  - Added fluent `Schedule` facade, `Scheduler` singleton, `scheduler()` helper, and builders (`cron`, `every_minute`, `every(N).seconds()/minutes()/hours()/days()`, `hourly`, `hourly_at`, `daily`, `daily_at`, `weekly`, `weekly_at`, `monthly`, `monthly_at`, `schedule(at=...)`, `delay(seconds=...)`, `@scheduler.task(...)`, `upsert()`, `update()`, `enable()`, `disable()`, `cancel()`, `get()`, `list_schedules()`, `get_occurrence()`).
+  - Added durable `RedisScheduleStore` on `REDIS_QUEUE_DB` (`swiftpy_schedule:`) using atomic Lua scripts (`SAVE_SCHEDULE_LUA`, `CLAIM_DUE_LUA`, `RECLAIM_PENDING_LUA`, `CONFIRM_DISPATCHED_LUA`, compare-and-del `RELEASE_OVERLAP_LOCK_LUA`, monotonic state guards, bounded occurrence history + retention TTLs), plus non-durable process-local `MemoryScheduleStore` (`is_durable = False`, production `ConfigurationError` guard unless opted in) and typed `scheduler.*` lifecycle events (`ScheduleRegistered`, `ScheduledTaskDue`, `ScheduledTaskDispatched`, `ScheduledTaskSkipped`, `ScheduledTaskCompleted`, `ScheduledTaskFailed`).
+  - Integrated `QueueWorker` (`running` / `completed` / `failed` hooks, retry overlap lock retention, DLQ lock release, standalone worker Redis prefix resolution), `FrameworkServiceProvider` (`schedule.auto_start = False` default, `SCHEDULE_AUTO_START=true`, clean loop cancellation on shutdown), and CLI commands `schedule:list [--app] [--json] [--prefix]`, `schedule:run [--app] [--limit] [--prefix]`, and `schedule:work [--app] [--sleep] [--max-ticks] [--prefix]`.
+
+### Changed
+- **Packaging, Configuration & Scaffolding:** Bumped `swiftpy-framework` and `swiftpy new` dependency floor to `0.3.5`, added [`config/http.py`](config/http.py) and [`config/schedule.py`](config/schedule.py), added `SCHEDULE_*` keys to [`.env.example`](.env.example), and updated `swiftpy new` templates accordingly.
+
+### Fixed
+- **`Application(trusted_proxies="a,b")`:** a comma-separated string passed validation but was stored in config as a single invalid entry, making every `request.ip()` (and therefore `Auth.attempt`) raise `ConfigurationError`. The normalized network list is now stored.
+- **Scheduler wake-up cost:** the scheduler loop no longer lists every schedule per iteration; it reads the earliest due time through the new `ScheduleStore.next_due_at()` (`ZRANGE ... 0 0` on Redis) and backs off instead of spinning when overdue work cannot be claimed.
+- **Overlap lock lifetime:** `without_overlapping()` locks are re-armed to their full `lock_ttl` when the worker starts the job, kept alive by a worker heartbeat while the job runs, and extended across retry backoff delays, so queue wait time or long runs no longer allow overlapping executions. Added `ScheduleStore.extend_overlap_lock()` (token-verified compare-and-pexpire).
+- **Duplicate delivery:** `QueueWorker` acknowledges and skips a scheduled job whose occurrence has already completed. Delivery stays at-least-once; use `job.data["_swiftpy_schedule_occurrence"]` as an idempotency key for non-idempotent work.
+- **Request/Scheduler internals:** `request.ip()` is memoized per request, `_instantiate_job_class` no longer relies on `assert`, and the production `memory` schedule-driver guard is shared through `ensure_memory_driver_allowed()`.
+
+### Security
+- **Login throttle (`LoginThrottle`):** IPv6 clients are bucketed by `/64` (IPv4-mapped IPv6 collapses to IPv4) so rotating addresses inside one prefix cannot bypass lockouts; the per-key generation counter now expires (`2 * (lockout_seconds + decay_seconds)`) instead of living forever; added optional identifier-wide cap across all IPs via `auth.throttle.identifier_max_attempts` / `identifier_window_seconds` (`AUTH_THROTTLE_IDENTIFIER_MAX_ATTEMPTS`, `AUTH_THROTTLE_IDENTIFIER_WINDOW_SECONDS`; disabled by default because it lets an attacker lock a known account for `lockout_seconds`).
+- **Signed schedules:** schedule records now carry an HMAC-SHA256 `signature` (APP_KEY, previous keys accepted) over `task_kind`, `task_name`, `args`, `kwargs`, and `queue`. The signature is copied onto each occurrence and verified before a job is built; tampered or unsigned records (for example rewritten directly in Redis) are marked `failed` with `ScheduleSignatureError` and never pushed. Schedules registered before an `APP_KEY` was configured must be re-registered.
+
+### Documentation
+- Added dedicated Task Scheduler user guide [`documentations/2026-11-22-task-scheduling.md`](documentations/2026-11-22-task-scheduling.md) and updated Requests & Responses, WebSockets, Authentication & Security, Cache/Events/Queues, CLI & Testing, Installation Quick Start, [`docs/2026-11-14_documentation_plan.md`](docs/2026-11-14_documentation_plan.md), and [`README.md`](README.md) for `v0.3.5`.
+
 ## [0.3.1] - 2026-11-22
 
 ### Added

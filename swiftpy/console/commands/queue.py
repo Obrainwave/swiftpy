@@ -1,41 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import concurrent.futures
-import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from swiftpy.console.loader import load_application
-from swiftpy.core.config import ConfigurationError
+from swiftpy.console.loader import load_application, load_optional_app, run_app_action
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.worker import QueueWorker
 
 if TYPE_CHECKING:
     from swiftpy.core.application import Application
-
-logger = logging.getLogger("swiftpy.console")
-
-
-def _load_optional_app(app_target: str | None) -> Application | None:
-    """Load the optional `module:attribute` application target or exit on failure."""
-    if not app_target:
-        return None
-    try:
-        return load_application(app_target)
-    except (
-        ImportError,
-        AttributeError,
-        TypeError,
-        ConfigurationError,
-        OSError,
-        ValueError,
-        RuntimeError,
-        SyntaxError,
-    ) as exc:
-        logger.error("Could not boot application target '%s': %s", app_target, exc)
-        raise SystemExit(1) from exc
 
 
 def _run_queue_action(
@@ -45,30 +19,8 @@ def _run_queue_action(
     temporary_dispatcher: QueueDispatcher | None = None,
 ) -> None:
     """Execute an async queue CLI action within optional app lifespan and dispatcher cleanup."""
-
-    async def _execute() -> None:
-        if app is not None:
-            await app.startup()
-        try:
-            await action()
-        finally:
-            if temporary_dispatcher is not None:
-                await temporary_dispatcher.close()
-            if app is not None:
-                await app.shutdown()
-
-    _run_coroutine(_execute())
-
-
-def _run_coroutine(coro: Any) -> Any:
-    """Run an async coroutine synchronously, safely handling existing active event loops."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, coro).result()
+    cleanup = temporary_dispatcher.close if temporary_dispatcher is not None else None
+    run_app_action(action, app=app, cleanup=cleanup)
 
 
 class QueueCommand:
@@ -216,7 +168,7 @@ class QueueCommand:
     @staticmethod
     def handle_work(args: argparse.Namespace) -> None:
         """Run the queue worker process."""
-        app = _load_optional_app(getattr(args, "app", None))
+        app = load_optional_app(getattr(args, "app", None), loader=load_application)
         temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
         worker = QueueWorker(
             queues=args.queue,
@@ -241,7 +193,7 @@ class QueueCommand:
                 f"Invalid --limit {args.limit}: must be between 1 and 1000."
             )
 
-        app = _load_optional_app(getattr(args, "app", None))
+        app = load_optional_app(getattr(args, "app", None), loader=load_application)
         temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
         dispatcher = temporary_dispatcher or QueueDispatcher.get_instance()
 
@@ -271,7 +223,7 @@ class QueueCommand:
     @staticmethod
     def handle_retry(args: argparse.Namespace) -> None:
         """Retry one or all failed jobs."""
-        app = _load_optional_app(getattr(args, "app", None))
+        app = load_optional_app(getattr(args, "app", None), loader=load_application)
         temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
         dispatcher = temporary_dispatcher or QueueDispatcher.get_instance()
 
@@ -291,7 +243,7 @@ class QueueCommand:
     @staticmethod
     def handle_flush(args: argparse.Namespace) -> None:
         """Flush failed jobs from the Dead Letter Queue."""
-        app = _load_optional_app(getattr(args, "app", None))
+        app = load_optional_app(getattr(args, "app", None), loader=load_application)
         temporary_dispatcher = QueueDispatcher(prefix=args.prefix) if args.prefix else None
         dispatcher = temporary_dispatcher or QueueDispatcher.get_instance()
 

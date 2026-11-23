@@ -44,7 +44,7 @@ def test_new_command_scaffolds_complete_structure(
     assert (app_dir / "prompts" / "summarise.py").is_file()
     assert (app_dir / "prompts" / "classify.py").is_file()
 
-    # 2. Verify all 11 config files exist
+    # 2. Verify all 13 config files exist
     expected_configs = [
         "ai.py",
         "app.py",
@@ -54,9 +54,11 @@ def test_new_command_scaffolds_complete_structure(
         "database.py",
         "events.py",
         "filesystems.py",
+        "http.py",
         "logging.py",
         "mail.py",
         "queue.py",
+        "schedule.py",
     ]
     for cfg in expected_configs:
         cfg_file = app_dir / "config" / cfg
@@ -404,6 +406,8 @@ def test_scaffolded_dotenv_overrides_and_framework_config_keys(
         "REDIS_EVENTS_DB",
         "CORS_ALLOWED_ORIGINS",
         "CORS_ALLOW_CREDENTIALS",
+        "TRUSTED_PROXIES",
+        "HTTP_TRUSTED_PROXIES",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -424,6 +428,12 @@ def test_scaffolded_dotenv_overrides_and_framework_config_keys(
                 "REDIS_EVENTS_DB=6",
                 "CORS_ALLOWED_ORIGINS=https://app.example.com",
                 "CORS_ALLOW_CREDENTIALS=true",
+                "TRUSTED_PROXIES=127.0.0.1,172.30.0.0/24",
+                "SCHEDULE_DRIVER=memory",
+                "SCHEDULE_TIMEZONE=America/New_York",
+                "SCHEDULE_AUTO_START=true",
+                "SCHEDULE_POLL_INTERVAL=2.5",
+                "SCHEDULE_PREFIX=app_sched:",
             ]
         )
         + "\n",
@@ -454,6 +464,12 @@ def test_scaffolded_dotenv_overrides_and_framework_config_keys(
     assert app.config.get("cors.allowed_origins") == ["https://app.example.com"]
     assert app.config.get("cors.expose_headers") == ["X-Request-ID"]
     assert app.config.get("cors.allow_credentials") is True
+    assert app.config.get("http.trusted_proxies") == ["127.0.0.1", "172.30.0.0/24"]
+    assert app.config.get("schedule.driver") == "memory"
+    assert app.config.get("schedule.timezone") == "America/New_York"
+    assert app.config.get("schedule.auto_start") is True
+    assert app.config.get("schedule.poll_interval") == 2.5
+    assert app.config.get("schedule.prefix") == "app_sched:"
 
 
 def test_scaffolded_packaging_and_plain_mypy_config(

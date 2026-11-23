@@ -3,10 +3,18 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, cast
 from urllib.parse import parse_qs
 
+from swiftpy.core.config import Config
+from swiftpy.core.container import get_container
+from swiftpy.http.client_ip import (
+    TrustedProxies,
+    extract_trusted_proxies_from_config,
+    parse_trusted_proxies,
+    resolve_client_ip,
+)
 from swiftpy.http.response import encode_json
 
 
@@ -42,12 +50,21 @@ class WebSocketConnection:
         send: Callable[[dict[str, Any]], Awaitable[None]],
         max_message_size: int = 1_048_576,
         idle_timeout: float | None = None,
+        *,
+        config: Config | None = None,
+        trusted_proxies: Sequence[str] | TrustedProxies | str | None = None,
     ) -> None:
         self.scope = scope
         self._receive = receive
         self._send = send
         self.max_message_size = max_message_size
         self.idle_timeout = idle_timeout
+        self._config = config
+        self._explicit_trusted_proxies: TrustedProxies | None = (
+            parse_trusted_proxies(trusted_proxies)
+            if trusted_proxies is not None
+            else None
+        )
 
         self.client_state = WebSocketState.CONNECTING
         self.close_code: int | None = None
@@ -56,6 +73,27 @@ class WebSocketConnection:
         self._headers: dict[str, str] | None = None
         self._query_param_list: dict[str, list[str]] | None = None
         self._query_params: dict[str, str] | None = None
+
+    def _resolve_trusted_proxies(self) -> TrustedProxies:
+        if self._explicit_trusted_proxies is not None:
+            return self._explicit_trusted_proxies
+        if self._config is not None:
+            return extract_trusted_proxies_from_config(self._config)
+        try:
+            container = get_container()
+            if container.has(Config):
+                return extract_trusted_proxies_from_config(container.resolve(Config))
+        except RuntimeError:
+            pass
+        return ()
+
+    def ip(self) -> str | None:
+        """Resolve the canonical client IPv4 or IPv6 address for this WebSocket connection."""
+        return resolve_client_ip(
+            self.scope,
+            self.headers,
+            trusted_proxies=self._resolve_trusted_proxies(),
+        )
 
     @property
     def origin(self) -> str | None:

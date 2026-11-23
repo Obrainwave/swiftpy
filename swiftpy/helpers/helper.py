@@ -17,6 +17,7 @@ from swiftpy.http.request import Request
 from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
+from swiftpy.scheduling.scheduler import Scheduler
 from swiftpy.support.hashing import (
     hash_password,
     hash_password_async,
@@ -175,6 +176,11 @@ def ws_manager() -> WebSocketManager:
     return websocket_manager()
 
 
+def scheduler() -> Scheduler:
+    """Retrieve the active application Scheduler instance."""
+    return Scheduler.get_instance()
+
+
 def _resolve_isset_step(target: Any, key: Any) -> Any:
     """Resolve one lookup step for ``isset()``, returning ``_MISSING`` if absent."""
     if target is None or isinstance(
@@ -331,6 +337,7 @@ __all__ = [
     "pluralize",
     "queue",
     "resolve",
+    "scheduler",
     "snake_case",
     "verify_password",
     "verify_password_async",
