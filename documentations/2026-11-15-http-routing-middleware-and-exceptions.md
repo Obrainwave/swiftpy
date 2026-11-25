@@ -210,9 +210,10 @@ SwiftPY inspects your route handler's signature and automatically binds any comb
 1. `request: Request` — the incoming HTTP request.
 2. **Path parameters** matching `{param_name}` in the route pattern.
 3. **`FormRequest` subclasses** — automatically parsed and validated before your handler executes (covered in Guide #4).
-4. **Uploaded files** — `UploadedFile` or `list[UploadedFile]` matching the multipart field name.
-5. **DI container services** — any class or binding registered in the application container (such as `OrderService`, `Config`, or repository classes).
-6. **Optional defaulted parameters** — parameters with default values when not satisfied by path or DI bindings.
+4. **`BaseSchema` / `Schema` subclasses** — automatically parsed from JSON, form-urlencoded, or multipart bodies, coerced to your field annotations, and validated via `Field(...)` constraints (HTTP `422` on failure; covered in [Application Schemas](2026-11-19-application-schemas.md)).
+5. **Uploaded files** — `UploadedFile` or `list[UploadedFile]` matching the multipart field name.
+6. **DI container services** — any class or binding registered in the application container (such as `OrderService`, `Config`, or repository classes).
+7. **Optional defaulted parameters** — parameters with default values when not satisfied by path or DI bindings.
 
 ```python
 @router.post("/orders/{order_id}/receipt")
@@ -473,14 +474,15 @@ async def bulk_import(request: Request) -> dict[str, str]:
 
 ## Returning Responses (`Response` & Helpers)
 
-### Auto-JSON Serialization for `dict` and `list`
+### Auto-JSON Serialization for `dict`, `list`, and `BaseSchema`
 
-Any `dict` or `list` returned from a handler is automatically wrapped into an `application/json` `Response`. SwiftPY's JSON encoder handles:
+Any `dict`, `list`, or `BaseSchema` / `Schema` instance returned from a handler is automatically wrapped into an `application/json` `Response`. SwiftPY's JSON encoder handles:
 
 - `datetime`, `date`, `time` -> ISO-8601 strings
 - `UUID` and `Decimal` -> strings
 - `Enum` -> `.value`
-- Objects with `.to_dict()` -> dictionary output with any keys listed in `__hidden__` removed
+- `set` and `frozenset` -> JSON arrays
+- `BaseSchema` and other objects with `.to_dict()` -> dictionary output with excluded (`exclude=True`) or `__hidden__` fields removed
 
 For safety and RFC compliance, `NaN`/`Infinity` floats and raw `bytes` values raise `TypeError` during JSON serialization.
 

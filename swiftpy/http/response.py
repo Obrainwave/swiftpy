@@ -182,6 +182,8 @@ def _json_default(obj: Any) -> Any:
         return str(obj)
     if isinstance(obj, Enum):
         return obj.value
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
     if hasattr(obj, "to_dict") and callable(obj.to_dict):
         raw_dict = obj.to_dict()
         if isinstance(raw_dict, dict):

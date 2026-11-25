@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import inspect
+import json
+import logging
 import math
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, cast, overload
+from datetime import date, datetime, time
+from decimal import Decimal
+from typing import Any, NoReturn, cast, overload
+from uuid import UUID
 
 import asyncpg
 
 from swiftpy.core.container import get_container
-from swiftpy.database.exceptions import RecordNotFoundError
+from swiftpy.database.exceptions import QueryDumpError, RecordNotFoundError
 from swiftpy.database.identifiers import (
     quote_identifier,
+    split_json_path,
     validate_column_identifier,
     validate_identifier,
 )
@@ -22,7 +28,13 @@ from swiftpy.database.pool import DatabasePool
 from swiftpy.database.transaction import get_active_connection
 
 _MISSING = object()
+_WHERE_OPERATORS = frozenset(
+    {"=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "ILIKE", "IN", "NOT IN"}
+)
+_COMPARISON_OPERATORS = frozenset({"=", "!=", "<>", "<", ">", "<=", ">="})
+logger = logging.getLogger(__name__)
 
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 _HAVING_AGGREGATE_RE = re.compile(
     r"^(COUNT|SUM|AVG|MIN|MAX)\(\s*(DISTINCT\s+)?(\*|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)$",
     re.IGNORECASE,
@@ -81,6 +93,166 @@ def _normalize_raw_bindings(
             f"{placeholder_count} '?' placeholder(s), but {len(bindings_list)} binding(s) were provided."
         )
     return bindings_list
+
+
+def _encode_json_value(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise QueryError(f"Value is not JSON serializable: {exc}") from exc
+
+
+def _quote_sql_string(value: str) -> str:
+    return "'" + value.replace("\x00", "\\x00").replace("'", "''") + "'"
+
+
+def _sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "'NaN'::float8"
+        if math.isinf(value):
+            return "'Infinity'::float8" if value > 0 else "'-Infinity'::float8"
+        return repr(value)
+    if isinstance(value, Decimal):
+        if value.is_nan():
+            return "'NaN'::numeric"
+        if value.is_infinite():
+            return "'Infinity'::numeric" if value > 0 else "'-Infinity'::numeric"
+        return str(value)
+    if isinstance(value, str):
+        return _quote_sql_string(value)
+    if isinstance(value, bytes):
+        return "'\\x" + value.hex() + "'::bytea"
+    if isinstance(value, datetime | date | time):
+        return _quote_sql_string(value.isoformat())
+    if isinstance(value, UUID):
+        return _quote_sql_string(str(value))
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "'{}'"
+        return f"ARRAY[{', '.join(_sql_literal(item) for item in value)}]"
+    if isinstance(value, dict):
+        return f"{_quote_sql_string(_encode_json_value(value))}::jsonb"
+    return _quote_sql_string(str(value))
+
+
+def _scan_quoted_sql_region(
+    sql: str,
+    start: int,
+    quote_char: str,
+    *,
+    escape_backslash: bool = False,
+) -> int:
+    """Return the index immediately after a single- or double-quoted SQL region."""
+    index = start
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if escape_backslash and char == "\\" and index + 1 < length:
+            index += 2
+            continue
+        if char == quote_char:
+            if index + 1 < length and sql[index + 1] == quote_char:
+                index += 2
+                continue
+            return index + 1
+        index += 1
+    return length
+
+
+def _scan_block_comment(sql: str, start: int) -> int:
+    """Return the index immediately after a possibly nested ``/* ... */`` block comment."""
+    index = start + 2
+    length = len(sql)
+    depth = 1
+    while index < length and depth > 0:
+        if sql.startswith("/*", index):
+            depth += 1
+            index += 2
+        elif sql.startswith("*/", index):
+            depth -= 1
+            index += 2
+        else:
+            index += 1
+    return index
+
+
+def _substitute_bindings(sql: str, bindings: Sequence[Any]) -> str:
+    output: list[str] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if (
+            char in {"e", "E"}
+            and index + 1 < length
+            and sql[index + 1] == "'"
+            and (index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] in {"_", "$"}))
+        ):
+            end = _scan_quoted_sql_region(sql, index + 2, "'", escape_backslash=True)
+            output.append(sql[index:end])
+            index = end
+            continue
+        if char == "'":
+            end = _scan_quoted_sql_region(sql, index + 1, "'")
+            output.append(sql[index:end])
+            index = end
+            continue
+        if char == '"':
+            end = _scan_quoted_sql_region(sql, index + 1, '"')
+            output.append(sql[index:end])
+            index = end
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            end = length if newline == -1 else newline + 1
+            output.append(sql[index:end])
+            index = end
+            continue
+        if sql.startswith("/*", index):
+            end = _scan_block_comment(sql, index)
+            output.append(sql[index:end])
+            index = end
+            continue
+        if char == "$":
+            is_standalone = index == 0 or not (
+                sql[index - 1].isalnum() or sql[index - 1] == "_"
+            )
+            if is_standalone:
+                dollar_match = _DOLLAR_TAG_RE.match(sql, index)
+                if dollar_match is not None:
+                    tag = dollar_match.group(0)
+                    close = sql.find(tag, dollar_match.end())
+                    end = length if close == -1 else close + len(tag)
+                    output.append(sql[index:end])
+                    index = end
+                    continue
+            if index + 1 < length and sql[index + 1].isdigit():
+                end = index + 1
+                while end < length and sql[end].isdigit():
+                    end += 1
+                binding_index = int(sql[index + 1 : end])
+                if binding_index < 1 or binding_index > len(bindings):
+                    raise QueryError(
+                        f"SQL placeholder ${binding_index} has no corresponding binding."
+                    )
+                output.append(_sql_literal(bindings[binding_index - 1]))
+                index = end
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
 
 
 def _compile_raw_sql(raw: Raw, start_idx: int) -> tuple[str, list[Any], int]:
@@ -150,13 +322,45 @@ class _WhereRawClause:
 
 
 @dataclass(slots=True, frozen=True)
+class _WhereColumnClause:
+    boolean: str
+    first: str
+    operator: str
+    second: str
+
+
+@dataclass(slots=True, frozen=True)
+class _WhereExistsClause:
+    boolean: str
+    query: QueryBuilder
+    negated: bool
+
+
+@dataclass(slots=True, frozen=True)
+class _WhereJsonClause:
+    boolean: str
+    column: str
+    path: tuple[str, ...]
+    kind: str
+    operator: str
+    value: Any
+
+
+@dataclass(slots=True, frozen=True)
 class _WhereGroupClause:
     boolean: str
     clauses: tuple[_WhereClauseType, ...]
+    negated: bool = False
 
 
 _WhereClauseType = (
-    _WhereClause | _WhereBetweenClause | _WhereRawClause | _WhereGroupClause
+    _WhereClause
+    | _WhereBetweenClause
+    | _WhereRawClause
+    | _WhereColumnClause
+    | _WhereExistsClause
+    | _WhereJsonClause
+    | _WhereGroupClause
 )
 
 
@@ -167,7 +371,10 @@ def _clone_where_clause(wc: _WhereClauseType) -> _WhereClauseType:
         return _WhereGroupClause(
             wc.boolean,
             tuple(_clone_where_clause(child) for child in wc.clauses),
+            wc.negated,
         )
+    if isinstance(wc, _WhereExistsClause):
+        return _WhereExistsClause(wc.boolean, wc.query.clone(), wc.negated)
     return wc
 
 
@@ -208,6 +415,9 @@ class QueryBuilder:
         self._distinct: bool = False
         self._distinct_columns: list[str] = []
         self._allow_all: bool = False
+        self._lock: str | None = None
+        self._unions: list[tuple[bool, QueryBuilder]] = []
+        self._order_name: str | None = None
 
     def clone(self) -> QueryBuilder:
         """Create an independent copy of this QueryBuilder so terminal operations do not mutate it."""
@@ -236,6 +446,9 @@ class QueryBuilder:
         cloned._distinct = self._distinct
         cloned._distinct_columns = list(self._distinct_columns)
         cloned._allow_all = self._allow_all
+        cloned._lock = self._lock
+        cloned._unions = [(all_flag, query.clone()) for all_flag, query in self._unions]
+        cloned._order_name = self._order_name
         return cloned
 
     def allow_all(self) -> QueryBuilder:
@@ -396,14 +609,13 @@ class QueryBuilder:
         self._columns.append(Raw(sql_expr))
         return self
 
-    def where(
-        self,
+    @staticmethod
+    def _make_where_clause(
         column: str,
         operator_or_value: Any,
-        value: Any = _MISSING,
-        *,
-        boolean: str = "AND",
-    ) -> QueryBuilder:
+        value: Any,
+        boolean: str,
+    ) -> _WhereClause:
         column = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
         bool_op = _validate_boolean(boolean, context="WHERE")
 
@@ -414,33 +626,15 @@ class QueryBuilder:
         else:
             operator = " ".join(str(operator_or_value).upper().split())
 
-        allowed = {
-            "=",
-            "!=",
-            "<>",
-            "<",
-            ">",
-            "<=",
-            ">=",
-            "LIKE",
-            "ILIKE",
-            "IN",
-            "NOT IN",
-        }
-
-        if operator not in allowed:
+        if operator not in _WHERE_OPERATORS:
             raise QueryError(f"Unsupported operator: {operator}")
 
         if value is None:
             if operator == "=":
-                self._wheres.append((column, "IS", None))
-                self._where_clauses.append(_WhereClause(bool_op, column, "IS", None))
-                return self
+                return _WhereClause(bool_op, column, "IS", None)
 
             if operator in {"!=", "<>"}:
-                self._wheres.append((column, "IS NOT", None))
-                self._where_clauses.append(_WhereClause(bool_op, column, "IS NOT", None))
-                return self
+                return _WhereClause(bool_op, column, "IS NOT", None)
 
             raise QueryError(
                 f"Cannot compare NULL using operator '{operator}'. Use '=' / '!=' or where_null() / where_not_null()."
@@ -451,9 +645,357 @@ class QueryBuilder:
                 f"Operator '{operator}' requires a list, tuple, or QueryBuilder subquery, got {type(value).__name__}."
             )
 
-        self._wheres.append((column, operator, value))
-        self._where_clauses.append(_WhereClause(bool_op, column, operator, value))
+        return _WhereClause(bool_op, column, operator, value)
 
+    def where(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        if isinstance(column, str) and "->" in column:
+            json_clause = self._make_json_where_clause(
+                column, operator_or_value, value, boolean
+            )
+            self._where_clauses.append(json_clause)
+            return self
+
+        plain_clause = self._make_where_clause(
+            column, operator_or_value, value, boolean
+        )
+        self._wheres.append(
+            (plain_clause.column, plain_clause.operator, plain_clause.value)
+        )
+        self._where_clauses.append(plain_clause)
+
+        return self
+
+    def _make_json_where_clause(
+        self, column: str, operator_or_value: Any, value: Any, boolean: str
+    ) -> _WhereJsonClause:
+        safe_column, path = split_json_path(column)
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        if value is _MISSING:
+            operator = "="
+            value = operator_or_value
+        else:
+            operator = " ".join(str(operator_or_value).upper().split())
+        if operator not in _WHERE_OPERATORS:
+            raise QueryError(f"Unsupported operator: {operator}")
+
+        encoded: str | tuple[str, ...] | int | float | None
+        if operator in {"=", "!=", "<>"}:
+            encoded = None if value is None else _encode_json_value(value)
+        elif operator in {"<", ">", "<=", ">="}:
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise QueryError(
+                    f"JSON operator '{operator}' requires a string or number value."
+                )
+            if isinstance(value, float) and not math.isfinite(value):
+                raise QueryError(
+                    "Value is not JSON serializable: Out of range float values are not JSON compliant"
+                )
+            encoded = value
+        elif operator in {"LIKE", "ILIKE"}:
+            if not isinstance(value, str):
+                raise QueryError(
+                    f"JSON operator '{operator}' requires a string value."
+                )
+            encoded = value
+        else:
+            if not isinstance(value, (list, tuple)):
+                raise QueryError(
+                    f"Operator '{operator}' requires a list or tuple of JSON scalars."
+                )
+            encoded_values: list[str] = []
+            for item in value:
+                if item is not None and not isinstance(item, (str, int, float, bool)):
+                    raise QueryError(
+                        f"Operator '{operator}' requires a list or tuple of JSON scalars."
+                    )
+                encoded_values.append(_encode_json_value(item))
+            encoded = tuple(encoded_values)
+        return _WhereJsonClause(
+            bool_op, safe_column, path, "where", operator, encoded
+        )
+
+    def where_json_contains(
+        self, column: str, value: Any, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        return self._where_json_contains(column, value, boolean=boolean, negated=False)
+
+    def where_json_doesnt_contain(
+        self, column: str, value: Any, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        return self._where_json_contains(column, value, boolean=boolean, negated=True)
+
+    def or_where_json_contains(self, column: str, value: Any) -> QueryBuilder:
+        return self.where_json_contains(column, value, boolean="OR")
+
+    def or_where_json_doesnt_contain(self, column: str, value: Any) -> QueryBuilder:
+        return self.where_json_doesnt_contain(column, value, boolean="OR")
+
+    def _where_json_contains(
+        self, column: str, value: Any, *, boolean: str, negated: bool
+    ) -> QueryBuilder:
+        safe_column, path = split_json_path(column, require_path=False)
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        self._where_clauses.append(
+            _WhereJsonClause(
+                bool_op,
+                safe_column,
+                path,
+                "doesnt_contain" if negated else "contains",
+                "@>",
+                _encode_json_value(value),
+            )
+        )
+        return self
+
+    def where_json_contains_key(
+        self, column: str, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        return self._where_json_key(column, boolean=boolean, negated=False)
+
+    def where_json_doesnt_contain_key(
+        self, column: str, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        return self._where_json_key(column, boolean=boolean, negated=True)
+
+    def or_where_json_contains_key(self, column: str) -> QueryBuilder:
+        return self.where_json_contains_key(column, boolean="OR")
+
+    def or_where_json_doesnt_contain_key(self, column: str) -> QueryBuilder:
+        return self.where_json_doesnt_contain_key(column, boolean="OR")
+
+    def _where_json_key(
+        self, column: str, *, boolean: str, negated: bool
+    ) -> QueryBuilder:
+        safe_column, path = split_json_path(column)
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        self._where_clauses.append(
+            _WhereJsonClause(
+                bool_op,
+                safe_column,
+                path,
+                "doesnt_contain_key" if negated else "contains_key",
+                "IS",
+                None,
+            )
+        )
+        return self
+
+    def where_json_length(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        safe_column, path = split_json_path(column, require_path=False)
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        if value is _MISSING:
+            operator = "="
+            value = operator_or_value
+        else:
+            operator = " ".join(str(operator_or_value).upper().split())
+        if operator not in _COMPARISON_OPERATORS:
+            raise QueryError(f"Unsupported operator: {operator}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise QueryError("JSON length must be a non-negative integer.")
+        self._where_clauses.append(
+            _WhereJsonClause(
+                bool_op, safe_column, path, "length", operator, value
+            )
+        )
+        return self
+
+    def or_where_json_length(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> QueryBuilder:
+        return self.where_json_length(
+            column, operator_or_value, value, boolean="OR"
+        )
+
+    def where_column(
+        self, first: str, operator: str, second: str, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        first = validate_identifier(first, allow_dotted=True, allow_wildcard=False)
+        second = validate_identifier(second, allow_dotted=True, allow_wildcard=False)
+        if not isinstance(operator, str):
+            raise TypeError("Column comparison operator must be a string.")
+        operator = " ".join(operator.upper().split())
+        if operator not in _COMPARISON_OPERATORS:
+            raise QueryError(f"Unsupported operator: {operator}")
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        self._where_clauses.append(
+            _WhereColumnClause(bool_op, first, operator, second)
+        )
+        return self
+
+    def or_where_column(self, first: str, operator: str, second: str) -> QueryBuilder:
+        return self.where_column(first, operator, second, boolean="OR")
+
+    def where_exists(
+        self, query: QueryBuilder, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        return self._where_exists(query, boolean=boolean, negated=False)
+
+    def where_not_exists(
+        self, query: QueryBuilder, *, boolean: str = "AND"
+    ) -> QueryBuilder:
+        return self._where_exists(query, boolean=boolean, negated=True)
+
+    def or_where_exists(self, query: QueryBuilder) -> QueryBuilder:
+        return self.where_exists(query, boolean="OR")
+
+    def or_where_not_exists(self, query: QueryBuilder) -> QueryBuilder:
+        return self.where_not_exists(query, boolean="OR")
+
+    def _where_exists(
+        self, query: QueryBuilder, *, boolean: str, negated: bool
+    ) -> QueryBuilder:
+        if not isinstance(query, QueryBuilder):
+            raise TypeError("where_exists expects a QueryBuilder.")
+        if query._lock is not None:
+            raise QueryError("A locked query cannot be used as an EXISTS subquery.")
+        if query._table == self._table:
+            raise QueryError(
+                "EXISTS subqueries must use a different table; aliases are not supported."
+            )
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        self._where_clauses.append(
+            _WhereExistsClause(bool_op, query.clone(), negated)
+        )
+        return self
+
+    def where_any(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        return self._where_columns_group(
+            columns, operator_or_value, value, boolean=boolean, mode="any"
+        )
+
+    def where_all(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        return self._where_columns_group(
+            columns, operator_or_value, value, boolean=boolean, mode="all"
+        )
+
+    def where_none(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> QueryBuilder:
+        return self._where_columns_group(
+            columns, operator_or_value, value, boolean=boolean, mode="none"
+        )
+
+    def or_where_any(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+    ) -> QueryBuilder:
+        return self.where_any(columns, operator_or_value, value, boolean="OR")
+
+    def or_where_all(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+    ) -> QueryBuilder:
+        return self.where_all(columns, operator_or_value, value, boolean="OR")
+
+    def or_where_none(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+    ) -> QueryBuilder:
+        return self.where_none(columns, operator_or_value, value, boolean="OR")
+
+    def _where_columns_group(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any,
+        *,
+        boolean: str,
+        mode: str,
+    ) -> QueryBuilder:
+        if isinstance(columns, str) or not isinstance(columns, (list, tuple)):
+            raise TypeError("columns must be a non-empty list or tuple of strings.")
+        if not columns:
+            raise QueryError("columns must not be empty.")
+        if any(not isinstance(column, str) for column in columns):
+            raise TypeError("Every column must be a string.")
+
+        clauses = tuple(
+            self._make_where_clause(column, operator_or_value, value, "AND")
+            for column in columns
+        )
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        if mode == "all":
+            clauses = tuple(
+                _WhereClause(
+                    "AND", clause.column, clause.operator, clause.value
+                )
+                for clause in clauses
+            )
+            group_negated = False
+        else:
+            clauses = tuple(
+                _WhereClause("OR", clause.column, clause.operator, clause.value)
+                for clause in clauses
+            )
+            group_negated = mode == "none"
+        self._where_clauses.append(
+            _WhereGroupClause(bool_op, clauses, negated=group_negated)
+        )
+        return self
+
+    def where_past(self, column: str, *, boolean: str = "AND") -> QueryBuilder:
+        return self._where_time_comparison(column, "<", boolean=boolean)
+
+    def where_future(self, column: str, *, boolean: str = "AND") -> QueryBuilder:
+        return self._where_time_comparison(column, ">", boolean=boolean)
+
+    def or_where_past(self, column: str) -> QueryBuilder:
+        return self.where_past(column, boolean="OR")
+
+    def or_where_future(self, column: str) -> QueryBuilder:
+        return self.where_future(column, boolean="OR")
+
+    def _where_time_comparison(
+        self, column: str, operator: str, *, boolean: str
+    ) -> QueryBuilder:
+        safe_column = validate_identifier(
+            column, allow_dotted=True, allow_wildcard=False
+        )
+        bool_op = _validate_boolean(boolean, context="WHERE")
+        raw = Raw(
+            f"{quote_identifier(safe_column, allow_wildcard=False)} "
+            f"{operator} CURRENT_TIMESTAMP"
+        )
+        self._where_clauses.append(_WhereRawClause(bool_op, raw))
         return self
 
     def or_where(
@@ -754,6 +1296,7 @@ class QueryBuilder:
 
         self._order_random = False
         self._order_column = quote_identifier(column, allow_wildcard=False)
+        self._order_name = column
         self._order_direction = direction
 
         return self
@@ -769,6 +1312,41 @@ class QueryBuilder:
     def in_random_order(self) -> QueryBuilder:
         """Order records randomly using PostgreSQL RANDOM()."""
         self._order_random = True
+        self._order_name = None
+        return self
+
+    def union(self, query: QueryBuilder) -> QueryBuilder:
+        return self._add_union(query, all_rows=False)
+
+    def union_all(self, query: QueryBuilder) -> QueryBuilder:
+        return self._add_union(query, all_rows=True)
+
+    def _add_union(self, query: QueryBuilder, *, all_rows: bool) -> QueryBuilder:
+        if not isinstance(query, QueryBuilder):
+            raise TypeError("union expects a QueryBuilder.")
+        if query._unions:
+            raise QueryError("Nested union queries are not supported.")
+        if query._lock is not None:
+            raise QueryError("A locked query cannot be used as a UNION branch.")
+        if self._lock is not None:
+            raise QueryError("A locked query cannot be combined with a UNION.")
+        self._unions.append((all_rows, query.clone()))
+        return self
+
+    def _ensure_not_union(self, method: str) -> None:
+        if self._unions:
+            raise QueryError(
+                f"{method}() is not supported on a union query."
+            )
+
+    def shared_lock(self) -> QueryBuilder:
+        """Lock selected rows for sharing; execution requires an active transaction."""
+        self._lock = "SHARE"
+        return self
+
+    def lock_for_update(self) -> QueryBuilder:
+        """Lock selected rows for update; execution requires an active transaction."""
+        self._lock = "UPDATE"
         return self
 
     def when(
@@ -1033,6 +1611,96 @@ class QueryBuilder:
         return (boolean, f"{col_quoted} {operator} ${idx}"), [value], idx + 1
 
     @staticmethod
+    def _compile_json_clause(
+        clause: _WhereJsonClause, start_idx: int
+    ) -> tuple[tuple[str, str], list[Any], int]:
+        column = quote_identifier(
+            clause.column, allow_dotted=True, allow_wildcard=False
+        )
+        root = f"{column}::jsonb"
+        bindings: list[Any] = []
+        idx = start_idx
+        path_placeholder: str | None = None
+        if clause.path:
+            path_placeholder = f"${idx}::text[]"
+            bindings.append(list(clause.path))
+            idx += 1
+        expression = (
+            f"({root} #> {path_placeholder})"
+            if path_placeholder is not None
+            else root
+        )
+        kind = clause.kind
+
+        if kind == "where":
+            operator = clause.operator
+            if operator in {"=", "!=", "<>"} and clause.value is None:
+                comparison = "=" if operator == "=" else "<>"
+                sql = (
+                    "COALESCE(jsonb_typeof("
+                    f"{expression}), 'null') {comparison} 'null'"
+                )
+                return (clause.boolean, sql), bindings, idx
+            if operator in {"=", "!=", "<>"}:
+                sql = f"{expression} {operator} ${idx}::jsonb"
+                bindings.append(clause.value)
+                return (clause.boolean, sql), bindings, idx + 1
+            if operator in {"IN", "NOT IN"}:
+                values = cast(tuple[str, ...], clause.value)
+                if not values:
+                    return (
+                        clause.boolean,
+                        "FALSE" if operator == "IN" else "TRUE",
+                    ), [], start_idx
+                placeholders = [f"${idx + offset}::jsonb" for offset in range(len(values))]
+                bindings.extend(values)
+                return (
+                    clause.boolean,
+                    f"{expression} {operator} ({', '.join(placeholders)})",
+                ), bindings, idx + len(values)
+            if operator in {"<", ">", "<=", ">="}:
+                json_type = "number" if isinstance(clause.value, (int, float)) else "string"
+                scalar = (
+                    f"({root} #>> {path_placeholder})"
+                    if path_placeholder is not None
+                    else "NULL"
+                )
+                scalar = f"({scalar})::numeric" if json_type == "number" else scalar
+                sql = (
+                    f"CASE WHEN jsonb_typeof({expression}) = '{json_type}' "
+                    f"THEN {scalar} END {operator} ${idx}"
+                )
+                bindings.append(clause.value)
+                return (clause.boolean, sql), bindings, idx + 1
+            sql = (
+                f"CASE WHEN jsonb_typeof({expression}) = 'string' "
+                f"THEN {root} #>> {path_placeholder} END "
+                f"{operator} ${idx} ESCAPE '\\'"
+            )
+            bindings.append(clause.value)
+            return (clause.boolean, sql), bindings, idx + 1
+
+        if kind in {"contains", "doesnt_contain"}:
+            predicate = f"{expression} @> ${idx}::jsonb"
+            if kind == "doesnt_contain":
+                predicate = f"NOT COALESCE({predicate}, FALSE)"
+            bindings.append(clause.value)
+            return (clause.boolean, predicate), bindings, idx + 1
+        if kind == "contains_key":
+            return (clause.boolean, f"{expression} IS NOT NULL"), bindings, idx
+        if kind == "doesnt_contain_key":
+            return (clause.boolean, f"{expression} IS NULL"), bindings, idx
+        if kind == "length":
+            sql = (
+                f"CASE WHEN jsonb_typeof({expression}) = 'array' "
+                f"THEN jsonb_array_length({expression}) END "
+                f"{clause.operator} ${idx}"
+            )
+            bindings.append(clause.value)
+            return (clause.boolean, sql), bindings, idx + 1
+        raise QueryError(f"Unknown JSON where clause kind: {kind}")
+
+    @staticmethod
     def _compile_clauses(
         clause_list: Sequence[_WhereClauseType], start_idx: int
     ) -> tuple[list[tuple[str, str]], list[Any], int]:
@@ -1057,6 +1725,50 @@ class QueryBuilder:
                 clauses.append((clause.boolean, sql))
                 continue
 
+            if isinstance(clause, _WhereColumnClause):
+                first = quote_identifier(
+                    clause.first, allow_dotted=True, allow_wildcard=False
+                )
+                second = quote_identifier(
+                    clause.second, allow_dotted=True, allow_wildcard=False
+                )
+                clauses.append(
+                    (clause.boolean, f"{first} {clause.operator} {second}")
+                )
+                continue
+
+            if isinstance(clause, _WhereJsonClause):
+                compiled_clause, clause_bindings, idx = (
+                    QueryBuilder._compile_json_clause(clause, idx)
+                )
+                clauses.append(compiled_clause)
+                bindings.extend(clause_bindings)
+                continue
+
+            if isinstance(clause, _WhereExistsClause):
+                subquery = clause.query.clone()
+                subquery._columns = [Raw("1")]
+                subquery._distinct = False
+                subquery._distinct_columns = []
+                subquery._order_column = None
+                subquery._order_name = None
+                subquery._order_random = False
+                for _, branch in subquery._unions:
+                    branch._columns = [Raw("1")]
+                    branch._distinct = False
+                    branch._distinct_columns = []
+                    branch._order_column = None
+                    branch._order_name = None
+                    branch._order_random = False
+                sub_sql, sub_bindings = subquery.to_sql(idx)
+                operator = "NOT EXISTS" if clause.negated else "EXISTS"
+                clauses.append(
+                    (clause.boolean, f"{operator} ({sub_sql})")
+                )
+                bindings.extend(sub_bindings)
+                idx += len(sub_bindings)
+                continue
+
             if isinstance(clause, _WhereGroupClause):
                 inner_clauses, inner_bindings, next_idx = QueryBuilder._compile_clauses(
                     clause.clauses, idx
@@ -1067,6 +1779,8 @@ class QueryBuilder:
                 for bool_op, clause_str in inner_clauses[1:]:
                     inner_parts.append(f"{bool_op} {clause_str}")
                 inner_sql = f"({' '.join(inner_parts)})"
+                if clause.negated:
+                    inner_sql = f"NOT {inner_sql}"
                 clauses.append((clause.boolean, inner_sql))
                 bindings.extend(inner_bindings)
                 idx = next_idx
@@ -1157,8 +1871,7 @@ class QueryBuilder:
 
         return " HAVING " + " ".join(sql_parts), bindings, idx
 
-    def to_sql(self, start_idx: int = 1) -> tuple[str, list[Any]]:
-        """Compiles the entire query to raw SQL and bindings."""
+    def _compile_core(self, start_idx: int = 1) -> tuple[str, list[Any], int]:
         select_sql, select_bindings, idx = self._compile_select(start_idx)
         join_sql = self._compile_joins()
         where_sql, where_bindings, idx = self._compile_where(idx)
@@ -1167,25 +1880,154 @@ class QueryBuilder:
 
         bindings = select_bindings + where_bindings + having_bindings
         sql = f"SELECT {select_sql} FROM {quote_identifier(self._table)}{join_sql}{where_sql}{group_sql}{having_sql}"
+        return sql, bindings, idx
 
-        if self._order_random:
+    def _validate_lock_compatibility(self) -> None:
+        if self._lock is None:
+            return
+        if self._distinct:
+            raise QueryError("Row locks cannot be combined with DISTINCT.")
+        if self._groups or self._havings or self._raw_havings:
+            raise QueryError("Row locks cannot be combined with GROUP BY or HAVING.")
+        if self._unions:
+            raise QueryError("Row locks cannot be combined with UNION.")
+
+    @staticmethod
+    def _append_order_and_pagination(
+        sql: str,
+        bindings: list[Any],
+        idx: int,
+        *,
+        order_random: bool,
+        order_column: str | None,
+        order_direction: str,
+        limit_value: int | None,
+        offset_value: int | None,
+    ) -> tuple[str, list[Any], int]:
+        if order_random:
             sql += " ORDER BY RANDOM()"
-        elif self._order_column:
-            sql += f" ORDER BY {self._order_column} {self._order_direction}"
+        elif order_column:
+            sql += f" ORDER BY {order_column} {order_direction}"
 
-        if self._limit_value is not None:
+        if limit_value is not None:
             sql += f" LIMIT ${idx}"
-            bindings.append(self._limit_value)
+            bindings.append(limit_value)
             idx += 1
 
-        if self._offset_value is not None:
+        if offset_value is not None:
             sql += f" OFFSET ${idx}"
-            bindings.append(self._offset_value)
+            bindings.append(offset_value)
             idx += 1
+        return sql, bindings, idx
 
+    def to_sql(self, start_idx: int = 1) -> tuple[str, list[Any]]:
+        """Compile the entire query to parameterized SQL and bindings."""
+        self._validate_lock_compatibility()
+
+        core_sql, bindings, idx = self._compile_core(start_idx)
+        if self._unions:
+            parts = [f"({core_sql})"]
+            for all_rows, branch in self._unions:
+                branch_sql, branch_bindings = branch.to_sql(idx)
+                parts.append(
+                    f"{'UNION ALL' if all_rows else 'UNION'} ({branch_sql})"
+                )
+                bindings.extend(branch_bindings)
+                idx += len(branch_bindings)
+            combined = " ".join(parts)
+            has_outer_clauses = (
+                self._order_random
+                or self._order_name is not None
+                or self._limit_value is not None
+                or self._offset_value is not None
+            )
+            if has_outer_clauses:
+                if self._order_random:
+                    outer_order = "RANDOM()"
+                elif self._order_name is not None:
+                    outer_column = self._order_name.split(".")[-1]
+                    outer_order = (
+                        f"{quote_identifier(outer_column, allow_dotted=False, allow_wildcard=False)} "
+                        f"{self._order_direction}"
+                    )
+                else:
+                    outer_order = None
+                sql = f'SELECT * FROM ({combined}) AS "swiftpy_union"'
+                if outer_order is not None:
+                    sql += f" ORDER BY {outer_order}"
+                sql, bindings, idx = self._append_order_and_pagination(
+                    sql,
+                    bindings,
+                    idx,
+                    order_random=False,
+                    order_column=None,
+                    order_direction=self._order_direction,
+                    limit_value=self._limit_value,
+                    offset_value=self._offset_value,
+                )
+            else:
+                sql = combined
+        else:
+            sql = core_sql
+            sql, bindings, idx = self._append_order_and_pagination(
+                sql,
+                bindings,
+                idx,
+                order_random=self._order_random,
+                order_column=self._order_column,
+                order_direction=self._order_direction,
+                limit_value=self._limit_value,
+                offset_value=self._offset_value,
+            )
+
+        if self._lock == "SHARE":
+            sql += " FOR SHARE"
+        elif self._lock == "UPDATE":
+            sql += " FOR UPDATE"
         return sql, bindings
 
+    def to_raw_sql(self) -> str:
+        """
+        Return a debug-only SQL rendering. Never execute this output or build queries from it.
+
+        String escaping assumes PostgreSQL's default ``standard_conforming_strings=on``.
+        Values that cannot be represented as ordinary PostgreSQL text literals (such as
+        strings containing NUL bytes or unsupported custom Python objects) are rendered
+        diagnostically for human inspection only.
+        """
+        sql, bindings = self.to_sql()
+        return _substitute_bindings(sql, bindings)
+
+    def dump(self) -> QueryBuilder:
+        """Log parameterized SQL and bindings at INFO and return this builder."""
+        sql, bindings = self.to_sql()
+        logger.info("Query SQL: %s | bindings=%r", sql, bindings)
+        return self
+
+    def dump_raw_sql(self) -> QueryBuilder:
+        """Log the human-readable debug SQL at INFO and return this builder."""
+        logger.info("Query SQL (debug rendering): %s", self.to_raw_sql())
+        return self
+
+    def dd(self) -> NoReturn:
+        """Log parameterized SQL and stop execution with QueryDumpError."""
+        self.dump()
+        raise QueryDumpError("Query execution stopped by dd().")
+
+    def dd_raw_sql(self) -> NoReturn:
+        """Log debug SQL and stop execution with QueryDumpError."""
+        self.dump_raw_sql()
+        raise QueryDumpError("Query execution stopped by dd_raw_sql().")
+
+    def _ensure_lock_has_transaction(self) -> None:
+        if self._lock is not None and get_active_connection() is None:
+            raise QueryError(
+                "Row locks require an active transaction. "
+                "Wrap the query in `async with db.transaction():`."
+            )
+
     async def get(self) -> list[dict[str, Any]]:
+        self._ensure_lock_has_transaction()
         sql, bindings = self.to_sql()
         conn = await self._connection()
         try:
@@ -1207,6 +2049,7 @@ class QueryBuilder:
 
     async def value(self, column: str) -> Any | None:
         """Fetch the value of a single column from the first matching row."""
+        self._ensure_not_union("value")
         col = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
         clone = self.clone().select(col).limit(1)
         row = await clone.first()
@@ -1228,6 +2071,7 @@ class QueryBuilder:
         Retrieve an array or dictionary of values for the given column.
         If key is specified, returns a dictionary mapping key column values to target column values.
         """
+        self._ensure_not_union("pluck")
         col = validate_identifier(column, allow_dotted=True, allow_wildcard=False)
         col_name = col.split(".")[-1]
         if key is not None:
@@ -1245,19 +2089,27 @@ class QueryBuilder:
 
     async def exists(self) -> bool:
         """Return True if at least one row matches the current query."""
+        self._ensure_not_union("exists")
         cloned = self.clone()
         cloned._columns = [Raw("1")]
         cloned._order_column = None
+        cloned._order_name = None
+        cloned._order_random = False
+        cloned._lock = None
         row = await cloned.first()
         return row is not None
 
     async def _aggregate(self, function: str, column: str) -> Any:
+        self._ensure_not_union(function.lower())
         col_safe = (
             quote_identifier(column, allow_wildcard=False) if column != "*" else "*"
         )
         cloned = self.clone()
         cloned._columns = [Raw(f"{function}({col_safe}) AS agg_result")]
         cloned._order_column = None
+        cloned._order_name = None
+        cloned._order_random = False
+        cloned._lock = None
         cloned._limit_value = None
         cloned._offset_value = None
         rows = await cloned.get()
@@ -1284,6 +2136,8 @@ class QueryBuilder:
         """
         Execute the query with length-aware pagination, counting total matching records or groups.
         """
+        self._ensure_not_union("paginate")
+        self._ensure_lock_has_transaction()
         if isinstance(page, bool) or not isinstance(page, int):
             raise TypeError("page must be an integer.")
         if page < 1:
@@ -1299,6 +2153,9 @@ class QueryBuilder:
         count_builder._limit_value = None
         count_builder._offset_value = None
         count_builder._order_column = None
+        count_builder._order_name = None
+        count_builder._order_random = False
+        count_builder._lock = None
 
         if (
             count_builder._groups
@@ -1454,7 +2311,68 @@ class QueryBuilder:
 
         return 0
 
+    def _compile_update_sets(
+        self, data: dict[str, Any]
+    ) -> tuple[list[str], list[Any]]:
+        bindings: list[Any] = []
+        sets: list[str] = []
+        idx = 1
+        ordered_keys: list[tuple[str, str]] = []
+        plain_columns: set[str] = set()
+        json_paths: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+
+        for column, value in data.items():
+            if "->" not in column:
+                safe_name = validate_identifier(
+                    column, allow_dotted=False, allow_wildcard=False
+                )
+                if safe_name in json_paths:
+                    raise QueryError(
+                        f"Cannot update both JSON paths and the whole column '{safe_name}'."
+                    )
+                plain_columns.add(safe_name)
+                ordered_keys.append(("plain", safe_name))
+                continue
+
+            safe_column, path = split_json_path(column)
+            safe_column = validate_identifier(
+                safe_column, allow_dotted=False, allow_wildcard=False
+            )
+            if safe_column in plain_columns:
+                raise QueryError(
+                    f"Cannot update both JSON paths and the whole column '{safe_column}'."
+                )
+            if safe_column not in json_paths:
+                json_paths[safe_column] = []
+                ordered_keys.append(("json", safe_column))
+            json_paths[safe_column].append((path, _encode_json_value(value)))
+
+        for kind, column in ordered_keys:
+            quoted_column = quote_identifier(
+                column, allow_dotted=False, allow_wildcard=False
+            )
+            if kind == "plain":
+                value = data[column]
+                sets.append(f"{quoted_column} = ${idx}")
+                bindings.append(value)
+                idx += 1
+                continue
+
+            expression = f"COALESCE({quoted_column}::jsonb, '{{}}'::jsonb)"
+            for path, encoded_value in json_paths[column]:
+                expression = (
+                    f"jsonb_set({expression}, ${idx}::text[], "
+                    f"${idx + 1}::jsonb, true)"
+                )
+                bindings.extend((list(path), encoded_value))
+                idx += 2
+            sets.append(f"{quoted_column} = {expression}")
+        return sets, bindings
+
     async def update(self, data: dict[str, Any]) -> str:
+        self._ensure_not_union("update")
+        if self._lock is not None:
+            raise QueryError("A row lock cannot be used with UPDATE.")
         if not isinstance(data, dict) or not data:
             raise QueryError("Cannot execute UPDATE with empty data dictionary.")
 
@@ -1463,19 +2381,8 @@ class QueryBuilder:
                 "Refusing to execute UPDATE without a WHERE clause. Call .allow_all() to update all rows explicitly."
             )
 
-        bindings: list[Any] = []
-
-        sets: list[str] = []
-
-        idx = 1
-
-        for column, value in data.items():
-            safe_column = quote_identifier(
-                column, allow_dotted=False, allow_wildcard=False
-            )
-            sets.append(f"{safe_column} = ${idx}")
-            bindings.append(value)
-            idx += 1
+        sets, bindings = self._compile_update_sets(data)
+        idx = len(bindings) + 1
 
         where_sql, where_bindings, _ = self._compile_where(idx)
 
@@ -1493,6 +2400,9 @@ class QueryBuilder:
             await self._release(conn)
 
     async def delete(self) -> str:
+        self._ensure_not_union("delete")
+        if self._lock is not None:
+            raise QueryError("A row lock cannot be used with DELETE.")
         if not self._where_clauses and not self._wheres and not self._raw_wheres and not self._allow_all:
             raise QueryError(
                 "Refusing to execute DELETE without a WHERE clause. Call .allow_all() to delete all rows explicitly."
@@ -1518,6 +2428,9 @@ class QueryBuilder:
         extra: dict[str, Any] | None = None,
     ) -> str:
         """Atomically increment a column's value by amount."""
+        self._ensure_not_union("increment")
+        if self._lock is not None:
+            raise QueryError("A row lock cannot be used with increment().")
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             raise TypeError(
                 f"Amount must be a numeric int or float, got {type(amount).__name__}."
@@ -1570,6 +2483,9 @@ class QueryBuilder:
         extra: dict[str, Any] | None = None,
     ) -> str:
         """Atomically decrement a column's value by amount."""
+        self._ensure_not_union("decrement")
+        if self._lock is not None:
+            raise QueryError("A row lock cannot be used with decrement().")
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             raise TypeError(
                 f"Amount must be a numeric int or float, got {type(amount).__name__}."
@@ -1624,6 +2540,7 @@ class QueryBuilder:
         Process records in batches of size count via limit and offset.
         Returning False from callback terminates iteration early.
         """
+        self._ensure_not_union("chunk")
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("Chunk count must be an integer >= 1.")
 
@@ -1660,6 +2577,7 @@ class QueryBuilder:
         Process records in batches ordered by ID, advancing past the last observed ID.
         Safe against record updates/deletions during iteration.
         """
+        self._ensure_not_union("chunk_by_id")
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("Chunk count must be an integer >= 1.")
 
@@ -1707,6 +2625,9 @@ class QueryBuilder:
         Perform a PostgreSQL INSERT ... ON CONFLICT (unique_by) DO UPDATE / DO NOTHING.
         Returns the number of affected rows.
         """
+        self._ensure_not_union("upsert")
+        if self._lock is not None:
+            raise QueryError("A row lock cannot be used with UPSERT.")
         if not values or not isinstance(values, list):
             raise QueryError("upsert() requires a non-empty list of dictionary rows.")
 

@@ -339,36 +339,23 @@ class User(Model):
 
 USER_SCHEMA_CONTENT = """from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from app.models.user import User
+from swiftpy.schemas import BaseSchema, Field
 
 
-@dataclass(slots=True)
-class UserCreateSchema:
-    \"\"\"Input validation DTO for user creation requests.\"\"\"
+class UserCreateSchema(BaseSchema):
+    \"\"\"Input validation schema for user creation requests.\"\"\"
 
-    name: str
-    email: str
-    password: str
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., max_length=255)
+    password: str = Field(..., min_length=8)
 
 
-@dataclass(slots=True)
-class UserResponseSchema:
+class UserResponseSchema(BaseSchema):
     \"\"\"Output serialization schema for user responses.\"\"\"
 
     id: int
     name: str
     email: str
-
-    @classmethod
-    def from_model(cls, user: User) -> UserResponseSchema:
-        return cls(id=user.id, name=user.name, email=user.email)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 UserSchema = UserResponseSchema
@@ -1694,7 +1681,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.3.5",
+    "swiftpy-framework>=0.3.7",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",

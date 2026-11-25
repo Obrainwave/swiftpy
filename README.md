@@ -64,6 +64,8 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Release v0.3.0: Project Structure, AI/Prompts & Controller Routing** | Standardized `app/` + `app/ai/{agents,tools,pipelines,providers,vectorstores,observers}/` + `prompts/` scaffolding, `Prompt.load("summarise.v2")` & `messages` lists, direct unbound controller method DI (`router.get(..., Controller.index)`), `make:agent`/`make:tool`/`make:prompt`, Admin Dashboard removal | ✅ Completed |
 | **Release v0.3.1: Auth Ergonomics, ORM `has()` & Login Throttling** | `Auth.attempt()`, `Callback` conditions + ORM `has()`/`where_has()`, `attempt_when()`, Remember Me cookies (`Blueprint.remember_token()`, `via_remember()`), `login_using_id()`, `once()`, default `LoginThrottle` (`429 TooManyRequestsError`), `Request.cookies` | ✅ Completed |
 | **Release v0.3.5: Client IP Detection & Native Task Scheduler** | Fail-safe `request.ip()` / `Request.ip()` / `websocket.ip()` & `LoginThrottle` IP trust via `TRUSTED_PROXIES`, zero-dependency 5-field cron + `ZoneInfo` scheduler (`Schedule` / `Scheduler`), Redis crash recovery (`_CLAIM_DUE_LUA` / `_RECLAIM_PENDING_LUA`), worker overlap locks, `schedule:list`/`run`/`work` | ✅ Completed |
+| **Release v0.3.6: Query Builder Helpers** | `where_column()`, correlated `where_exists()`, `where_any()`/`where_all()`/`where_none()`, `where_past()`/`where_future()`, JSON `column->path` queries & updates, `union()`/`union_all()`, `shared_lock()`/`lock_for_update()`, debug helpers (`to_raw_sql()`, `dump()`, `dd()`) with ORM parity | ✅ Completed |
+| **Release v0.3.7: Declarative Schemas (`swiftpy.schemas`) & Pyrefly/PEP 561 Typing** | `swiftpy/py.typed` PEP 561 marker, `Model` / `ModelQueryBuilder[T]` fluent generic preservation, `BaseSchema` / `Schema` & `Field(...)` constraints, `@field_validator` / `@model_validator`, Router/Controller auto-injection & JSON serialization, ORM `create()`/`update()` schema interop, `make:schema` & `swiftpy new` updates | ✅ Completed |
 
 *See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md), [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md), and [`documentations/2026-11-22-task-scheduling.md`](./documentations/2026-11-22-task-scheduling.md) for the complete documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
@@ -642,10 +644,12 @@ SwiftPY follows a clean, intuitive layout inspired by modern application archite
 │   ├── mail/               # Mailables, SMTP/Sendmail/API transports, templates
 │   ├── queue/              # At-least-once queue workers, job serialization
 │   ├── scheduling/         # 5-field cron engine, Redis/Memory stores, Scheduler & builders
+│   ├── schemas/            # Declarative BaseSchema / Schema DTOs, Field constraints & validators
 │   ├── support/            # Shared identifiers, keys, Redis config, string inflection
 │   ├── testing/            # TestClient, TestCase, AIFake, MailFake, VectorStoreFake, DB fixtures
 │   ├── validation/         # FormRequest, fail-closed Validator, builtin & DB rules
-│   └── websockets/         # WebSocket manager, connections, broadcast
+│   ├── websockets/         # WebSocket manager, connections, broadcast
+│   └── py.typed            # PEP 561 static typing marker
 ├── tests/                  # Automated pytest suite
 ├── docker-compose.yml      # Hardened local PostgreSQL & Redis environment
 ├── Dockerfile              # Multi-stage production container

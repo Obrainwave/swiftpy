@@ -2,7 +2,12 @@ from __future__ import annotations
 
 
 class {class_name}:
-    """{class_name} data access repository."""
+    """{class_name} data access repository.
+
+    Tip: When referencing a model via `self.model`, annotate the attribute
+    explicitly (e.g. `model: type[YourModel] = YourModel`) or call the Model
+    class directly so static type checkers preserve the concrete model type.
+    """
 
     def __init__(self) -> None:
         pass

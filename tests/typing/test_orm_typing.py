@@ -4,8 +4,9 @@ from typing import Any, ClassVar
 
 import pytest
 
+from swiftpy.database import QueryDumpError
 from swiftpy.database.orm.fields import Field
-from swiftpy.database.orm.model import MassAssignmentError, Model
+from swiftpy.database.orm.model import MassAssignmentError, Model, ModelQueryBuilder
 from swiftpy.database.orm.relationships import (
     BelongsTo,
     BelongsToMany,
@@ -95,6 +96,99 @@ async def test_static_typing_contracts() -> None:
     # Query builder operations
     builder = user.posts_query if hasattr(user, "posts_query") else User.posts.build_lazy_query(user)
     assert builder is not None
+    extended_query: ModelQueryBuilder[User] = (
+        User.query()
+        .where_column("typing_users.id", "=", "typing_users.id")
+        .or_where_column("typing_users.id", "!=", "typing_users.id")
+        .where_any(["email", "name"], "alice")
+        .or_where_any(["email", "name"], "like", "%alice%")
+        .where_all(["email", "name"], "!=", None)
+        .or_where_all(["email", "name"], "alice")
+        .where_none(["email", "name"], "bob")
+        .or_where_none(["email", "name"], "charlie")
+        .where_past("created_at")
+        .or_where_past("created_at")
+        .where_future("created_at")
+        .or_where_future("created_at")
+        .where_json_contains("preferences->roles", "editor")
+        .or_where_json_contains("preferences->roles", "admin")
+        .where_json_doesnt_contain("preferences->roles", "banned")
+        .or_where_json_doesnt_contain("preferences->roles", "guest")
+        .where_json_contains_key("preferences->theme")
+        .or_where_json_contains_key("preferences->lang")
+        .where_json_doesnt_contain_key("preferences->retired")
+        .or_where_json_doesnt_contain_key("preferences->legacy")
+        .where_json_length("tags", ">=", 1)
+        .or_where_json_length("tags", 0)
+        .shared_lock()
+        .lock_for_update()
+        .dump()
+        .dump_raw_sql()
+    )
+    assert isinstance(extended_query, ModelQueryBuilder)
+    compiled_sql, compiled_bindings = extended_query.to_sql()
+    raw_sql: str = extended_query.to_raw_sql()
+    assert isinstance(compiled_sql, str)
+    assert isinstance(compiled_bindings, list)
+    assert isinstance(raw_sql, str)
+
+    class_entry_query: ModelQueryBuilder[User] = (
+        User.where_column("typing_users.id", "=", "typing_users.id")
+        .where_not_exists(
+            Post.query().where_column("typing_posts.user_id", "=", "typing_users.id")
+        )
+        .or_where_exists(
+            Post.query().where_column("typing_posts.user_id", "=", "typing_users.id")
+        )
+        .or_where_not_exists(
+            Post.query().where_column("typing_posts.user_id", "=", "typing_users.id")
+        )
+        .where_all(["email", "name"], "alice")
+        .where_none(["email", "name"], "bob")
+        .where_future("created_at")
+        .where_json_contains("preferences->roles", "editor")
+        .where_json_doesnt_contain("preferences->roles", "banned")
+        .where_json_doesnt_contain_key("preferences->retired")
+        .where_json_length("tags", 1)
+        .shared_lock()
+    )
+    assert isinstance(class_entry_query, ModelQueryBuilder)
+
+    exists_query: ModelQueryBuilder[User] = User.where_exists(
+        Post.query().where_column("typing_posts.user_id", "=", "typing_users.id")
+    )
+    assert isinstance(exists_query, ModelQueryBuilder)
+
+    class_shortcuts: list[ModelQueryBuilder[User]] = [
+        User.or_where_column("typing_users.id", "=", "typing_users.id"),
+        User.where_not_exists(Post.query()),
+        User.or_where_exists(Post.query()),
+        User.or_where_not_exists(Post.query()),
+        User.where_any(["email", "name"], "alice"),
+        User.or_where_any(["email", "name"], "alice"),
+        User.where_all(["email", "name"], "alice"),
+        User.or_where_all(["email", "name"], "alice"),
+        User.where_none(["email", "name"], "bob"),
+        User.or_where_none(["email", "name"], "bob"),
+        User.where_past("created_at"),
+        User.or_where_past("created_at"),
+        User.where_future("created_at"),
+        User.or_where_future("created_at"),
+        User.where_json_contains("preferences->roles", "editor"),
+        User.or_where_json_contains("preferences->roles", "editor"),
+        User.where_json_doesnt_contain("preferences->roles", "banned"),
+        User.or_where_json_doesnt_contain("preferences->roles", "banned"),
+        User.where_json_contains_key("preferences->theme"),
+        User.or_where_json_contains_key("preferences->theme"),
+        User.where_json_doesnt_contain_key("preferences->retired"),
+        User.or_where_json_doesnt_contain_key("preferences->retired"),
+        User.where_json_length("tags", 1),
+        User.or_where_json_length("tags", ">=", 1),
+        User.shared_lock(),
+        User.lock_for_update(),
+    ]
+    assert len(class_shortcuts) == 26
+    assert issubclass(QueryDumpError, Exception)
 
     # 5. HasOne and BelongsTo relationship operations on loaded relation
     prof = Profile(id=1, user_id=1, bio="Pythonista")
@@ -179,3 +273,61 @@ def test_models_without_classvar_hydrate_and_typecheck() -> None:
     # __guarded__ = [] also works without ClassVar
     open_article = OpenArticleNoClassVar(id=1, title="Open")
     assert open_article.title == "Open"
+
+
+class _DocGroup(Model):
+    __table__ = "typing_doc_groups"
+    id: int
+    name: str
+    __guarded__: ClassVar[list[str]] = []
+
+
+class _DocVersion(Model):
+    __table__ = "typing_doc_versions"
+    id: int
+    version: str
+    slug: str
+    sort_order: int = 0
+    is_active: bool = True
+    groups = HasMany(_DocGroup, foreign_key="version_id")
+    author = BelongsTo(User, foreign_key="author_id")
+    __guarded__: ClassVar[list[str]] = []
+
+
+class _DocVersionRepository:
+    """Repository pattern verifying `self.model: type[Model]` preserves concrete types."""
+
+    model: type[_DocVersion] = _DocVersion
+
+    async def get_doc_version(self, version_id: int) -> _DocVersion:
+        version = await self.model.with_("groups").where("id", version_id).first()
+        if not version:
+            raise LookupError("Version not found")
+        return version
+
+    async def get_doc_versions(self) -> list[_DocVersion]:
+        return await self.model.with_("groups", "author").order_by("sort_order").get()
+
+
+class _GenericRepository[M: Model]:
+    """Generic repository base preserving concrete Model type parameter across chains."""
+
+    def __init__(self, model: type[M]) -> None:
+        self.model: type[M] = model
+
+    async def get_by_id(self, record_id: int) -> M:
+        item = await self.model.where("id", record_id).first()
+        if item is None:
+            raise LookupError("Not found")
+        return item
+
+    async def list_ordered(self) -> list[M]:
+        return await self.model.order_by("id").get()
+
+
+def test_repository_query_chaining_type_preservation() -> None:
+    """Verify repository methods preserve concrete model return types statically."""
+    repo = _DocVersionRepository()
+    generic_repo = _GenericRepository(_DocVersion)
+    assert repo.model is _DocVersion
+    assert generic_repo.model is _DocVersion

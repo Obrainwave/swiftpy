@@ -22,6 +22,7 @@ from swiftpy.core.exceptions import MethodNotAllowedError, ValidationError
 from swiftpy.filesystem.uploads.uploaded_file import UploadedFile
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response
+from swiftpy.schemas.base import BaseSchema
 from swiftpy.validation.form_request import FormRequest
 from swiftpy.websockets.connection import WebSocket, WebSocketConnection
 
@@ -47,6 +48,7 @@ ParamKind = Literal[
     "request",
     "path",
     "form",
+    "schema",
     "di",
     "default",
     "websocket",
@@ -964,6 +966,8 @@ class Router:
                 specs.append(ParamSpec(name=name, kind="path", annotation=ann))
             elif isinstance(ann, type) and issubclass(ann, FormRequest):
                 specs.append(ParamSpec(name=name, kind="form", annotation=ann))
+            elif isinstance(ann, type) and issubclass(ann, BaseSchema):
+                specs.append(ParamSpec(name=name, kind="schema", annotation=ann))
             elif self._can_resolve_di(ann, container=container):
                 specs.append(ParamSpec(name=name, kind="di", annotation=ann))
             elif param.default is not inspect.Parameter.empty:
@@ -979,8 +983,8 @@ class Router:
                 raise RouteRegistrationError(
                     f"Handler '{route.handler.__qualname__}' has unsatisfiable "
                     f"parameter '{name}' (annotation: {ann!r}). Route handler "
-                    "parameters must be path parameters, Request, FormRequest "
-                    "subclasses, or container-resolvable types."
+                    "parameters must be path parameters, Request, FormRequest or "
+                    "BaseSchema subclasses, or container-resolvable types."
                 )
 
         return tuple(specs)

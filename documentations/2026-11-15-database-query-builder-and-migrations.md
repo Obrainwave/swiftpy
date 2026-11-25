@@ -170,6 +170,9 @@ Key filtering methods:
 - **`NULL` handling:** `.where("deleted_at", None)` compiles to `IS NULL` and `.where("deleted_at", "!=", None)` compiles to `IS NOT NULL` (or use `.where_null()`, `.or_where_null()`, `.where_not_null()`, `.or_where_not_null()`). Passing `None` with `<`, `>`, `LIKE`, or `IN` raises `QueryError`.
 - **Lists & subqueries:** `.where_in(col, values)`, `.or_where_in(...)`, `.where_not_in(...)`, `.or_where_not_in(...)`. Empty lists compile safely (`IN []` -> `WHERE FALSE`; `NOT IN []` -> `WHERE TRUE`).
 - **Ranges:** `.where_between(col, (min_v, max_v))`, `.where_not_between(...)`, `.or_where_between(...)`, `.or_where_not_between(...)`.
+- **Multi-column comparisons:** `.where_any(columns, operator, value)`, `.where_all(...)`, and `.where_none(...)` compare the same value against a non-empty list/tuple of columns. `where_any` matches one or more columns, `where_all` requires every comparison, and `where_none` negates the OR group. Each value is bound separately; the one-argument form defaults to equality.
+- **Column comparisons & existence:** `.where_column("orders.user_id", "=", "users.id")` compares two validated identifiers. `.where_exists(query)` / `.where_not_exists(query)` accept a `QueryBuilder`, including a correlated subquery; use the outer table's real name in `where_column`. Table aliases are not supported, and the subquery must use a different table.
+- **Time comparisons:** `.where_past("due_at")` and `.where_future("starts_at")` compare against PostgreSQL `CURRENT_TIMESTAMP`; `or_where_past` and `or_where_future` are available. `CURRENT_TIMESTAMP` is fixed at the start of the current transaction. For `timestamp without time zone`, PostgreSQL's session time zone applies. SQL NULL timestamps do not match.
 - **Escaped `LIKE` / `ILIKE`:** `.where_like(col, value, case_insensitive=False, match="contains")` and `.where_ilike(...)` (plus `or_where_like` / `or_where_ilike`). Supported `match` modes are `"contains"`, `"starts_with"` / `"prefix"`, `"ends_with"` / `"suffix"`, and `"exact"`. User characters `%`, `_`, and `\` are automatically escaped via `escape_like()` with `ESCAPE '\'`.
 - **Nested parentheses:** `.where_group(callback)` / `.or_where_group(callback)` group boolean expressions (`AND (...)` / `OR (...)`).
 - **Conditionals:** `.when(cond, fn, default=None)` and `.unless(cond, fn, default=None)`.
@@ -177,6 +180,112 @@ Key filtering methods:
 
 > [!CAUTION]
 > Never pass untrusted user strings directly into `select_raw()`, `where_raw()`, or `having_raw()`. Always use `?` placeholders in `sql` and pass user values in `bindings`.
+
+### JSON Columns
+
+JSON paths use PostgreSQL's `->` separator, not dots. Dots already qualify identifiers (`users.settings` means a table-qualified column); `users.settings.theme` would otherwise be ambiguous. A path is a validated column followed by one or more identifier or non-negative array-index segments:
+
+```python
+from swiftpy.database import Query
+
+query = (
+    Query.table("users")
+    .where("settings->theme", "dark")
+    .where_in("settings->languages", ["en", "fr"])
+    .where_json_contains("settings->roles", "editor")
+    .where_json_contains_key("settings->theme")
+)
+```
+
+In addition to plain columns, `->` paths are accepted only in `where`/`or_where`, `where_in`/`where_not_in` and their `or_` variants, the `where_json_*` methods, and `update()` keys. The path is sent as a bound `text[]`; values remain bound parameters. JSON paths are not accepted in `select`, `order_by`, `group_by`, `pluck`, `value`, null/range filters, joins, inserts, upserts, counters, or direct instance `Model.update(...)`.
+
+For `where()` and `where_in()` on a JSON path:
+
+| Operator | Value | Behavior |
+|---|---|---|
+| `=` | JSON value | JSONB equality; Python values are JSON-encoded at registration |
+| `=` / `!=` / `<>` | `None` | `=` matches JSON null and missing paths; `!=` / `<>` matches only non-null JSON values |
+| `!=` / `<>` | non-`None` value | JSONB inequality; missing paths and SQL NULL do not match |
+| `<`, `>`, `<=`, `>=` | string or number (not bool) | Compare only rows whose JSON type matches, so mixed-type rows do not raise cast errors |
+| `LIKE`, `ILIKE` | string | Compare JSON string values only |
+| `IN`, `NOT IN` | list/tuple of JSON scalars | Compare JSONB values; an empty list becomes `FALSE` / `TRUE` |
+
+Use the dedicated helpers for PostgreSQL containment, key existence, and array length:
+
+```python
+from swiftpy.database import Query
+
+query = (
+    Query.table("users")
+    .where_json_contains("settings->roles", "editor")
+    .where_json_doesnt_contain("settings->roles", "banned")
+    .where_json_contains_key("settings->theme")
+    .where_json_doesnt_contain_key("settings->retired")
+    .where_json_length("settings->languages", ">=", 2)
+)
+```
+
+Containment follows PostgreSQL `jsonb @>` semantics: the scalar `"editor"` is contained in an array such as `["editor", "admin"]`; an array value means that all its elements must be present. `where_json_doesnt_contain()` also matches a missing path or SQL NULL. A JSON `null` value counts as an existing key. `where_json_length()` compares array lengths only; an object, scalar, missing path, or SQL NULL never matches, including for `!=`.
+
+JSON path updates use `jsonb_set()` and can be mixed with ordinary assignments:
+
+```python
+from swiftpy.database import Query
+
+await (
+    Query.table("users")
+    .where("id", user_id)
+    .update({"settings->theme": "dark", "settings->notifications->email": True})
+)
+```
+
+A SQL NULL JSON column is treated as `{}`, and assigning Python `None` writes JSON `null`. PostgreSQL `jsonb_set()` does not create missing intermediate parents: when `settings->notifications` does not already exist, setting `settings->notifications->email` leaves the document unchanged. Updating both an entire JSON column and one of its paths in the same statement is rejected. JSON path updates are available through query-builder `.update(...)`, not a persisted model instance's `update(...)`.
+
+### Unions
+
+`QueryBuilder.union(query)` removes duplicate rows; `union_all(query)` preserves them. Each branch must be a `QueryBuilder` that selects the same number of compatible columns. A branch's own ordering and pagination stay inside that branch; ordering/limit/offset on the base builder apply to the combined result. An order column must name an output column. Clauses added after `union()` still belong to the base query. Nested unions and union methods on `ModelQueryBuilder` / `Model` are not supported.
+
+```python
+from swiftpy.database import Query
+
+combined = (
+    Query.table("current_users").select("id", "email")
+    .union_all(Query.table("archived_users").select("id", "email"))
+    .order_by("id")
+    .limit(50)
+)
+rows = await combined.get()
+```
+
+Union queries support `get()`, `first()`, `simple_paginate()`, `to_sql()`, and the debugging helpers below. Aggregates, `exists()`, `paginate()`, `pluck()`, `value()`, writes, and chunking raise `QueryError` rather than silently operating on only one branch. A union builder can be used as a subquery.
+
+### Pessimistic Row Locks
+
+`shared_lock()` emits `FOR SHARE`; `lock_for_update()` emits `FOR UPDATE`. Locks require a live SwiftPY transaction when a read is executed:
+
+```python
+from swiftpy.database import Query, db
+
+async with db.transaction():
+    user = await Query.table("users").where("id", user_id).lock_for_update().first()
+```
+
+The lock is applied to reads such as `get()`, `first()`, `value()`, and `simple_paginate()`. Calling `to_sql()` only compiles SQL and does not require a transaction. Locks cannot be combined with `DISTINCT`, `GROUP BY`, `HAVING`, or unions; they are rejected on write operations. Aggregates and the count query in `paginate()` do not carry the row lock, while the page's data query does.
+
+### Query Debugging
+
+`to_raw_sql()` produces a human-readable rendering; `dump()` logs parameterized SQL plus bindings, and `dump_raw_sql()` logs the rendering. The `dd()` variants log and raise `QueryDumpError` to stop the current flow. Enable INFO logging for `swiftpy.database.query_builder` to see these records.
+
+```python
+from swiftpy.database import Query
+
+query = Query.table("users").where("email", "ada@example.com")
+sql, bindings = query.to_sql()  # Parameterized SQL and safe binding values
+debug_sql = query.to_raw_sql()  # Human-readable only
+query.dump()
+```
+
+`to_raw_sql()` output is for human debugging only: never execute it or use it to construct another query. Its string escaping assumes PostgreSQL's default `standard_conforming_strings=on`, and values that cannot be represented as ordinary PostgreSQL text literals (such as Python strings containing NUL bytes or unsupported custom objects) are rendered diagnostically rather than as executable SQL literals. Bindings may contain credentials or tokens, so keep `dump*()` and `dd*()` out of production code paths.
 
 ### Grouping, `HAVING`, Ordering & Terminals
 

@@ -251,9 +251,38 @@ Dirty-tracking safeguards:
 
 - If an existing persisted model has **no dirty non-PK attributes**, calling `await model.save()` performs **0 SQL queries** and emits no `updated` event.
 
-- **Direct instance updates (`update()` & `force_update()`):** On a persisted model instance, call `await model.update({"name": "New Name"})` or `await model.update(name="New Name")` to apply attributes via `.fill()`, respect `__fillable__` / `__guarded__` rules, update `updated_at`, run dirty checks (0 SQL queries if nothing changed), emit `updating` / `updated` events, and persist via `.save()` (returning `self`). For trusted internal writes bypassing mass-assignment rules, use `await model.force_update(...)`. Calling `update()` or `force_update()` on an unsaved model raises `PrimaryKeyError`.
+- **Direct instance updates (`update()` & `force_update()`):** On a persisted model instance, call `await model.update({"name": "New Name"})`, `await model.update(name="New Name")`, or pass a `BaseSchema` DTO (`await model.update(payload)`) to apply attributes via `.fill()`, respect `__fillable__` / `__guarded__` rules, update `updated_at`, run dirty checks (0 SQL queries if nothing changed), emit `updating` / `updated` events, and persist via `.save()` (returning `self`). When given a `BaseSchema`, `update()` extracts `payload.to_dict(exclude_unset=True)` so omitted optional fields in partial-update payloads do not overwrite existing columns, while `Model.create(payload)` extracts `payload.to_dict()` (merging any extra keyword overrides such as `organization_id=org_id`). For trusted internal writes bypassing mass-assignment rules, use `await Model.force_create(...)` or `await model.force_update(...)`. Calling `update()` or `force_update()` on an unsaved model raises `PrimaryKeyError`.
 - If the model defines `updated_at`, saving a dirty existing record refreshes `updated_at` to `datetime.now(UTC)` automatically.
 - If you load a partial subset of columns with `.select("id", "title")`, SwiftPY records only the selected columns in its original snapshot. Calling `await post.save()` after modifying `post.title` updates only `title` and never clobbers unselected database columns.
+
+#### Typed Repository Pattern (`Model` Class Attribute)
+
+When wrapping ORM queries inside repository classes, annotate `model` explicitly with `type[YourModel]` (or parameterize a generic repository base with `T = TypeVar("T", bound=Model)` / `class BaseRepository[T: Model]`) so Pyrefly and `mypy --strict` preserve concrete model types through `.with_(...).where(...).first()` and `.get()`:
+
+```python
+from typing import TypeVar
+
+from swiftpy.database.orm import Model
+
+T = TypeVar("T", bound=Model)
+
+
+class BaseRepository(Generic[T]):  # or class BaseRepository[T: Model]: in Python 3.12+
+    model: type[T]
+
+    async def find_or_fail(self, record_id: int) -> T:
+        row = await self.model.where("id", record_id).first()
+        if row is None:
+            raise NotFoundError(f"{self.model.__name__} not found")
+        return row
+
+
+class DocVersionRepository(BaseRepository[DocVersion]):
+    model: type[DocVersion] = DocVersion
+
+    async def get_doc_versions(self) -> list[DocVersion]:
+        return await self.model.with_("groups", "author").order_by("sort_order").get()
+```
 
 #### Query Builder Methods on `Model`
 
@@ -303,7 +332,31 @@ async def send_digest_batch(users: list[User]) -> None:
 completed = await User.where("needs_digest", True).chunk_by_id(200, send_digest_batch)
 ```
 
-`ModelQueryBuilder` supports `.where()`, `.or_where()`, `.where_group()`, `.or_where_group()`, `.where_in()`, `.where_like()`, `.where_ilike()`, `.where_between()`, `.where_null()`, `.where_not_null()`, `.where_raw()`, `.join()`, `.left_join()`, `.right_join()`, `.select()`, `.select_raw()`, `.distinct()`, `.group_by()`, `.having()`, `.latest()`, `.oldest()`, `.in_random_order()`, `.when()`, `.unless()`, `.limit()`/`.take()`, `.offset()`/`.skip()`, `.clone()`, `.count()`, `.exists()`, `.sum()`, `.avg()`, `.min()`, `.max()`, `.value()`, `.pluck()`, `.upsert()`, `.chunk()`, `.chunk_by_id()`, `.paginate()`, `.simple_paginate()`, and `.allow_all()`. Both `.latest()` and `.oldest()` default to sorting by `"created_at"` (pass a column name such as `.latest("id")` if your table uses another column), and `.chunk(count, callback)` / `.chunk_by_id(count, callback)` return `False` early if `callback` returns `False`.
+`ModelQueryBuilder` supports `.where()`, `.or_where()`, `.where_group()`, `.or_where_group()`, `.where_in()`, `.where_like()`, `.where_ilike()`, `.where_between()`, `.where_null()`, `.where_not_null()`, `.where_raw()`, `.join()`, `.left_join()`, `.right_join()`, `.select()`, `.select_raw()`, `.distinct()`, `.group_by()`, `.having()`, `.latest()`, `.oldest()`, `.in_random_order()`, `.when()`, `.unless()`, `.limit()`/`.take()`, `.offset()`/`.skip()`, `.clone()`, `.count()`, `.exists()`, `.sum()`, `.avg()`, `.min()`, `.max()`, `.value()`, `.pluck()`, `.upsert()`, `.chunk()`, `.chunk_by_id()`, `.paginate()`, `.simple_paginate()`, and `.allow_all()`. It also forwards `.where_column()`, `.where_exists()`/`.where_not_exists()`, `.where_any()`/`.where_all()`/`.where_none()`, `.where_past()`/`.where_future()`, the `.where_json_*()` helpers, `.shared_lock()`/`.lock_for_update()`, `.to_sql()`, `.to_raw_sql()`, `.dump()`, `.dump_raw_sql()`, `.dd()`, and `.dd_raw_sql()`. Both `.latest()` and `.oldest()` default to sorting by `"created_at"` (pass a column name such as `.latest("id")` if your table uses another column), and `.chunk(count, callback)` / `.chunk_by_id(count, callback)` return `False` early if `callback` returns `False`.
+
+#### Column, JSON, Existence & Time Filters
+
+The ORM forwards these filters through `ModelQueryBuilder` and model classmethods. `where_exists()` accepts either another model query or a core `QueryBuilder`; use the real outer table name in a correlated `where_column()` condition:
+
+```python
+users_with_posts = User.where_exists(
+    Post.query().where_column("posts.user_id", "=", "users.id")
+)
+active_users = User.where_any(["email", "name"], "ada").where_future("created_at")
+```
+
+JSON `->` paths are supported in `Model.where()` / `where_in()` and in the `where_json_*()` methods. For example, `User.where_json_contains("preferences->roles", "editor")` or `User.where_json_length("preferences->languages", ">=", 2)`. Query-builder `.update({...})` also accepts JSON path keys; instance `await user.update({...})` intentionally does not.
+
+`where_past()` and `where_future()` compare with PostgreSQL `CURRENT_TIMESTAMP`, which is fixed at the start of the active transaction. Row locks must be read inside `db.transaction()`:
+
+```python
+from swiftpy.database import db
+
+async with db.transaction():
+    user = await User.where("id", user_id).lock_for_update().first()
+```
+
+Unions are intentionally limited to the lower-level `QueryBuilder`; `ModelQueryBuilder` and `Model` do not expose `union()`. Table aliases are not supported for correlated existence queries. See the [query-builder guide](./2026-11-15-database-query-builder-and-migrations.md) for JSON comparison rules, update limitations, lock compatibility, union terminal restrictions, and debugging safety.
 
 ### 5. Lifecycle Events & Transactions
 
@@ -504,7 +557,7 @@ await post.tags.sync([tag_a.id, tag_b])
 - **Never share models with unloaded relations into sync templates/serializers**: Either eager-load with `.with_()` upfront or catch missing eager loads early in development/CI with `prevent_lazy_loading = True` so `LazyLoadingDisabledError` surfaces N+1 paths before production.
 - **Bulk deletes/updates vs single-record saves**: `model.save()` and `model.delete()` execute targeted single-row operations wrapped in dirty checks and lifecycle hooks. Never loop `await row.save()` inside a handler when a single batched query or `Model.upsert()` / `Query` update is appropriate, and remember `Query` bulk updates/deletes require `.allow_all()` if called intentionally without a `WHERE` clause.
 - **Database migrations remain the source of truth**: `Field(...)`, `Vector(...)`, and relationship descriptors describe application-level behavior; always create corresponding tables, foreign keys, indexes, and `vector(...)` columns in `database/migrations/` using `Schema` and `Blueprint` (see [Database Schema, `Blueprint` & Migrations](2026-11-19-database-schema-and-blueprint.md)).
-- **Combine models cleanly with schemas**: Return domain `Model` records from repositories and transform responses with `.to_dict()`, `Resource` classes, or `@dataclass` schemas in [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md).
+- **Combine models cleanly with schemas**: Return domain `Model` records from repositories and transform or validate payloads with `BaseSchema.from_model()`, `Model.create(schema)`, `model.update(schema)`, `.to_dict()`, or `Resource` classes in [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md).
 
 ---
 

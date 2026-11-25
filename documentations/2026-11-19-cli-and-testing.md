@@ -47,7 +47,7 @@ Use the `make:*` commands to generate typed stubs conforming to SwiftPY's conven
 | `swiftpy make:api-key` | Config/table guidance + key generation | `--prefix`, `--pepper`, `-m` / `--migration`, `--path`, `--force` |
 
 > [!TIP]
-> Remember that `swiftpy make:schema` scaffolds a validation rule-map class, while starter projects also use `@dataclass(slots=True)` input/output schemas in `app/schemas/`. See [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md).
+> Remember that `swiftpy make:schema` and starter projects scaffold strongly typed `swiftpy.schemas.BaseSchema` DTOs in `app/schemas/`. See [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md).
 
 ### Migrations & Database Seeders
 

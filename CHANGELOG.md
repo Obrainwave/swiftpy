@@ -4,6 +4,34 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-11-25
+
+### Added
+- **PEP 561 Static Typing Support (`swiftpy/py.typed`):** Added the PEP 561 `py.typed` marker packaged into distributions, and updated `Model` / `ModelQueryBuilder[T]` fluent query annotations so repository chains (`await self.model.with_(...).where(...).first()` and `.get()`) preserve concrete model return types in Pyrefly, Mypy, and Pyright.
+- **Declarative Application Schemas (`swiftpy.schemas`):** Added zero-dependency declarative schema module exporting `BaseSchema`, `Schema` (alias of `BaseSchema`), `Field`, `SchemaField`, `SchemaFieldInfo`, `@field_validator`, and `@model_validator` with `@dataclass_transform(kw_only_default=True, field_specifiers=(Field, SchemaField, SchemaFieldInfo))`.
+  - Supports automatic type coercion (`str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, `Enum`, `IntEnum`, `Literal`, `Annotated`, unions, nested schemas, and container generics) and `Field(...)` constraints (`gt`, `ge`, `lt`, `le`, `multiple_of`, `min_length`, `max_length`, `pattern`, `strip_whitespace`, `to_lower`, `to_upper`, `alias`, `exclude`, `default_factory`), raising HTTP 422 `ValidationException` on failure.
+  - Added `.validate()`, `.from_dict()`, `.model_validate()`, `await .from_request()`, `.from_model()`, `.to_dict(exclude_none=..., exclude_unset=..., by_alias=...)`, `.model_dump()`, `.fields_set`, and `.is_set()`.
+- **HTTP Schema Auto-Injection & Serialization (`Router`, `Container`, `Application`, `Response`):** Route functions and controller handlers declaring a `BaseSchema` / `Schema` parameter automatically parse JSON, `application/x-www-form-urlencoded`, or `multipart/form-data` payloads into the validated schema before execution; unbound `BaseSchema` subclasses are excluded from DI auto-wiring; handlers returning `BaseSchema` (or `list[BaseSchema]`) auto-serialize to JSON (including `set` / `frozenset` -> JSON arrays via `_json_default`).
+- **ORM & Auth Interoperability:** `Model.create()`, `Model.force_create()`, `model.update()`, and `model.force_update()` accept `BaseSchema` instances directly (`to_dict()` on create with keyword overrides, `to_dict(exclude_unset=True)` on update to preserve omitted fields); `Auth.attempt()`, `Auth.attempt_when()`, and `Auth.once()` (along with `AuthManager` / `AuthProxy`) accept `BaseSchema` payloads; and `isset()` resolves canonical schema fields, aliases, nested schemas, and `__extra_fields__`.
+- **Schema Hardening & Performance:** `BaseSchema` tracks post-validation field mutations in `__fields_set__`, enforces `Annotated[T, Field(...)]` constraints inside generic collections, normalizes mixed `Decimal`/float bounds, rejects `_`-prefixed keys and prevents method shadowing under `extra = "allow"`, supports single-mapping and positional runtime constructors, skips `copy.deepcopy()` on immutable defaults, and avoids duplicate `request.input(_preload=True)` body parsing when handlers take both `Request` and `BaseSchema`/`FormRequest`.
+
+### Changed
+- **CLI Scaffolding (`make:schema`, `make:repository`, `swiftpy new`):** Updated `schema.stub` and starter `app/schemas/user_schema.py` to generate declarative `BaseSchema` DTOs (`UserCreateSchema` / `UserResponseSchema`), updated `repository.stub` with typed `model: type[YourModel]` guidance, and bumped the `swiftpy-framework` dependency floor to `>=0.3.7` (package version `0.3.7`).
+
+### Documentation
+- Updated Application Schemas, Validation & Form Requests, HTTP Routing, ORM Models, CLI & Testing, Application Architecture, and Installation Quick Start guides for `swiftpy.schemas`, typed repositories, and `0.3.7`.
+
+## [0.3.6] - 2026-11-24
+
+### Added
+- **Query Builder Predicates:** Added `where_column()`, correlated `where_exists()` / `where_not_exists()` (including OR variants), grouped `where_any()` / `where_all()` / `where_none()`, and `where_past()` / `where_future()` with ORM parity.
+- **JSON Query Support:** Added strict `column->path` expressions for `where()`, `where_in()` and query-builder `update()` keys, plus JSON containment, key-existence, and array-length helpers with ORM parity. JSON paths are bound as PostgreSQL `text[]`; JSON path updates do not create missing intermediate parents.
+- **Query Builder Unions & Row Locks:** Added `union()` / `union_all()` to `QueryBuilder`, plus `shared_lock()` / `lock_for_update()` on query builders and model queries. Row locks require an active transaction; unsupported lock combinations and union terminals raise `QueryError`.
+- **Query Debugging:** Added `to_raw_sql()`, `dump()`, `dump_raw_sql()`, `dd()`, and `dd_raw_sql()` to `QueryBuilder` and `ModelQueryBuilder`, plus the exported `QueryDumpError`. Rendered SQL and logged bindings are for development/debugging only and must not be executed or used to build queries.
+
+### Changed
+- **Packaging & Scaffolding:** Bumped `swiftpy-framework` and the `swiftpy new` dependency floor to `0.3.6`.
+
 ## [0.3.5] - 2026-11-23
 
 ### Added
