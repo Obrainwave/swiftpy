@@ -209,7 +209,7 @@ def test_make_service_request_resource_repository_schema(tmp_path: Path, monkeyp
     cli.run(["make:schema", "OrderSchema"])
     schema_path = tmp_path / "app" / "schemas" / "order_schema.py"
     assert schema_path.is_file()
-    assert "class OrderSchema:" in schema_path.read_text(encoding="utf-8")
+    assert "class OrderSchema(BaseSchema):" in schema_path.read_text(encoding="utf-8")
 
 
 def test_make_nested_namespaces_and_subdirectories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

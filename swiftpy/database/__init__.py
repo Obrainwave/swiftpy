@@ -3,6 +3,7 @@ from __future__ import annotations
 from swiftpy.database.exceptions import (
     DatabaseError,
     ModelNotFoundError,
+    QueryDumpError,
     RecordNotFoundError,
 )
 from swiftpy.database.migrations.blueprint import Blueprint
@@ -28,6 +29,7 @@ __all__ = [
     "Paginator",
     "Query",
     "QueryBuilder",
+    "QueryDumpError",
     "QueryError",
     "RecordNotFoundError",
     "Schema",

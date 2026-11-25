@@ -13,6 +13,7 @@ from swiftpy.database.orm.relationships import HasOne
 from swiftpy.helpers import isset
 from swiftpy.helpers.helper import isset as helper_isset
 from swiftpy.http.request import Request
+from swiftpy.schemas import BaseSchema, Field
 from swiftpy.validation.form_request import FormRequest
 from swiftpy.validation.validator import ValidatedData
 
@@ -362,3 +363,26 @@ async def test_isset_with_framework_types(tmp_path: Path) -> None:
     # Callable references typing check usage cleanly
     fn: Callable[[], Awaitable[None]] | None = None
     assert isset({"cb": fn}, "cb") is False
+
+    # BaseSchema: canonical fields, aliases, nested schemas, and extra="allow" safety
+    class _NestedMeta(BaseSchema):
+        extra = "allow"
+        region: str
+
+    class _ItemSchema(BaseSchema):
+        item_name: str = Field(..., alias="itemName")
+        notes: str | None = None
+        meta: _NestedMeta
+
+    item = _ItemSchema.validate(
+        {
+            "itemName": "Feed",
+            "meta": {"region": "north", "to_dict": "safe-extra"},
+        }
+    )
+    assert isset(item, "item_name") is True
+    assert isset(item, "itemName") is True
+    assert isset(item, "notes") is False
+    assert isset(item, "meta.region") is True
+    assert isset(item, "meta.to_dict") is True
+    assert isset(item, "__fields_set__") is False

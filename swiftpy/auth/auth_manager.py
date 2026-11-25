@@ -56,6 +56,7 @@ from swiftpy.database.identifiers import validate_identifier
 from swiftpy.database.orm.model import Model, ModelQueryBuilder
 from swiftpy.database.pool import DatabasePool
 from swiftpy.http.request import Request
+from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.hashing import Hash
 
 logger = logging.getLogger("swiftpy.auth.manager")
@@ -114,6 +115,16 @@ def _coerce_credential_value(user_cls: type[Model], column: str, value: Any) -> 
     ):
         return bool(value)
     return value
+
+
+def _coerce_credentials_mapping(
+    credentials: Mapping[Any, Any] | BaseSchema,
+) -> Mapping[Any, Any]:
+    if isinstance(credentials, BaseSchema):
+        return credentials.to_dict(exclude_unset=True)
+    if not isinstance(credentials, Mapping):
+        raise TypeError("credentials must be a mapping or BaseSchema.")
+    return credentials
 
 
 def _partition_credentials(
@@ -684,16 +695,15 @@ class AuthProxy:
 
     async def _verify_credentials_candidate(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
     ) -> tuple[bool, Model | None]:
-        if not isinstance(credentials, Mapping):
-            raise TypeError("credentials must be a mapping.")
-        if not credentials:
+        creds_map = _coerce_credentials_mapping(credentials)
+        if not creds_map:
             return False, None
 
         user_cls = self._resolve_user_model_class()
         column_filters, closures, raw_password, has_password_key = _partition_credentials(
-            credentials, user_cls
+            creds_map, user_cls
         )
         if not has_password_key:
             await Hash.check_async("", _DUMMY_BCRYPT_HASH)
@@ -727,19 +737,18 @@ class AuthProxy:
 
     async def _attempt_internal(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         callback: Callable[[Any], Any] | None = None,
         remember: bool = False,
         *,
         ip: str | None = None,
     ) -> bool:
-        if not isinstance(credentials, Mapping):
-            raise TypeError("credentials must be a mapping.")
+        creds_map = _coerce_credentials_mapping(credentials)
         if callback is not None and not callable(callback):
             raise TypeError("attempt_when callback must be callable.")
 
         guard_name = self._guard_name()
-        identifier = _extract_throttle_identifier(credentials)
+        identifier = _extract_throttle_identifier(creds_map)
         client_ip = _extract_client_ip(explicit_ip=ip)
         throttle = self._resolve_throttle()
 
@@ -759,12 +768,12 @@ class AuthProxy:
                 retry_after=retry_after,
             )
 
-        safe_creds = _sanitize_credentials_for_event(credentials)
+        safe_creds = _sanitize_credentials_for_event(creds_map)
         await dispatch_auth_event(
             Attempting(guard=guard_name, credentials=safe_creds, remember=bool(remember))
         )
 
-        matched, candidate = await self._verify_credentials_candidate(credentials)
+        matched, candidate = await self._verify_credentials_candidate(creds_map)
         if not matched or candidate is None:
             if throttle.enabled:
                 await throttle.hit(identifier, client_ip)
@@ -793,7 +802,7 @@ class AuthProxy:
 
     async def attempt(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         remember: bool = False,
         *,
         ip: str | None = None,
@@ -811,7 +820,7 @@ class AuthProxy:
 
     async def attempt_when(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         callback: Callable[[Any], Any],
         remember: bool = False,
         *,
@@ -922,18 +931,25 @@ class AuthProxy:
     loginUsingId = login_using_id
     login_sing_id = login_using_id
 
-    async def once(self, credentials: Mapping[Any, Any]) -> bool:
+    async def once(self, credentials: Mapping[Any, Any] | BaseSchema) -> bool:
         """
         Authenticate a user for the current request only without cookies,
         sessions, remember tokens, JWT persistence, or dispatching Login.
         """
         guard_name = self._guard_name()
+        creds_map = (
+            _coerce_credentials_mapping(credentials)
+            if isinstance(credentials, (Mapping, BaseSchema))
+            else None
+        )
         safe_creds = (
-            _sanitize_credentials_for_event(credentials)
-            if isinstance(credentials, Mapping)
+            _sanitize_credentials_for_event(creds_map)
+            if creds_map is not None
             else {}
         )
-        matched, candidate = await self._verify_credentials_candidate(credentials)
+        matched, candidate = await self._verify_credentials_candidate(
+            creds_map if creds_map is not None else credentials
+        )
         if not matched or candidate is None:
             await dispatch_auth_event(
                 Failed(guard=guard_name, user=candidate, credentials=safe_creds)
@@ -1475,7 +1491,7 @@ class AuthManager:
 
     async def attempt(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         remember: bool = False,
         *,
         guard_name: str | None = None,
@@ -1488,7 +1504,7 @@ class AuthManager:
 
     async def attempt_when(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         callback: Callable[[Any], Any],
         remember: bool = False,
         *,
@@ -1529,7 +1545,7 @@ class AuthManager:
 
     async def once(
         self,
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         *,
         guard_name: str | None = None,
     ) -> bool:
@@ -1621,7 +1637,7 @@ class Auth:
 
     @staticmethod
     async def attempt(
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         remember: bool = False,
         *,
         ip: str | None = None,
@@ -1631,7 +1647,7 @@ class Auth:
 
     @staticmethod
     async def attempt_when(
-        credentials: Mapping[Any, Any],
+        credentials: Mapping[Any, Any] | BaseSchema,
         callback: Callable[[Any], Any],
         remember: bool = False,
         *,
@@ -1658,7 +1674,7 @@ class Auth:
     login_sing_id = login_using_id
 
     @staticmethod
-    async def once(credentials: Mapping[Any, Any]) -> bool:
+    async def once(credentials: Mapping[Any, Any] | BaseSchema) -> bool:
         """Authenticate a user for a single request with no cookies/Login event."""
         return await AuthProxy().once(credentials)
 

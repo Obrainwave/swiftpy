@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from swiftpy.schemas import BaseSchema
 
 
-class {class_name}:
-    """{class_name} application data schema (rule map or structured DTO)."""
+class {class_name}(BaseSchema):
+    """{class_name} structured data schema."""
 
-    schema: dict[str, Any] = {
-        # "id": int,
-        # "name": str,
-    }
+    # Example with constraints (`from swiftpy.schemas import BaseSchema, Field`):
+    # id: int
+    # name: str = Field(..., min_length=1, max_length=100)

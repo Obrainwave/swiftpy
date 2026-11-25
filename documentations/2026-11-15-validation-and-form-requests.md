@@ -570,6 +570,22 @@ def register_validation_renderer(app: Application) -> None:
 
 ---
 
+## Choosing Between `BaseSchema` / `Schema` and `FormRequest`
+
+Both systems return HTTP `422` (`ValidationException`) automatically when annotated on route or controller handlers. Choose based on what each endpoint needs:
+
+| Need | Use `BaseSchema` / `Schema` (`swiftpy.schemas`) | Use `FormRequest` (`swiftpy.validation`) |
+|---|---|---|
+| **Static typing in Pyrefly / Mypy** | Full typed attribute access (`payload.movement_date`, `payload.good_eggs`) | Dictionary-like `form.validated()` (`ValidatedData`) |
+| **Schema definition style** | Type annotations + `Field(..., gt=0, max_length=100)` + `@field_validator` / `@model_validator` | String or rule-object DSL (`"required|email|unique:users,email"`) |
+| **Database checks (`unique` / `exists`)** | Validate in service/repository or pair with explicit checks | Built-in async `"unique:table,col"` and `"exists:table,col"` rules |
+| **Service & ORM DTO reuse** | Pass directly to services/repositories and `Model.create(payload)` / `model.update(payload)` | Primarily an HTTP request boundary wrapper |
+| **Nested & union schemas** | Native nested `BaseSchema`, `list[ItemSchema]`, `UUID`, `Decimal`, `date`, `Enum`, `Literal` | Wildcard keys (`"items.*.sku"`) |
+
+See [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md) for the complete `BaseSchema` / `Schema` guide.
+
+---
+
 ## Next Step
 
-Continue to [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md) to organize typed `@dataclass(slots=True)` input/output DTOs and `make:schema` validation rule classes across services, repositories, and routes.
+Continue to [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md) to organize strongly typed `BaseSchema` / `Schema` DTOs and `make:schema` contracts across routes, services, repositories, and ORM models.

@@ -322,6 +322,8 @@ class Container:
 
         if target in PRIMITIVE_TYPES or not inspect.isclass(target):
             return False
+        if getattr(target, "_is_swiftpy_schema", False):
+            return False
 
         if inspect.isabstract(target):
             return False

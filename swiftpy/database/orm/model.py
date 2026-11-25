@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import (
     Any,
     ClassVar,
+    NoReturn,
     Self,
     TypeVar,
     get_origin,
@@ -37,6 +38,7 @@ from swiftpy.database.pagination import Paginator, SimplePaginator
 from swiftpy.database.query_builder import Query, QueryBuilder, QueryError
 from swiftpy.database.transaction import get_active_connection
 from swiftpy.events.dispatcher import EventDispatcher
+from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.strings import pluralize, snake_case
 
 T = TypeVar("T", bound="Model")
@@ -68,30 +70,266 @@ class ModelQueryBuilder[T: Model]:
         self.builder = Query.table(model_cls.__table__)
         self._eager_loads: list[str] = []
 
-    def clone(self) -> Self:
+    def clone(self) -> ModelQueryBuilder[T]:
         """Create an independent copy of this ModelQueryBuilder."""
         cloned = self.__class__(self.model_cls)
         cloned.builder = self.builder.clone()
         cloned._eager_loads = list(self._eager_loads)
         return cloned
 
-    def allow_all(self) -> Self:
+    def to_sql(self, start_idx: int = 1) -> tuple[str, list[Any]]:
+        return self.builder.to_sql(start_idx)
+
+    def to_raw_sql(self) -> str:
+        return self.builder.to_raw_sql()
+
+    def dump(self) -> ModelQueryBuilder[T]:
+        self.builder.dump()
+        return self
+
+    def dump_raw_sql(self) -> ModelQueryBuilder[T]:
+        self.builder.dump_raw_sql()
+        return self
+
+    def dd(self) -> NoReturn:
+        self.builder.dd()
+
+    def dd_raw_sql(self) -> NoReturn:
+        self.builder.dd_raw_sql()
+
+    def allow_all(self) -> ModelQueryBuilder[T]:
         """Explicitly permit mass UPDATE or DELETE queries without a WHERE clause (Decision D-10)."""
         self.builder.allow_all()
         return self
 
-    def where(self, column: str, operator_or_value: Any, value: Any = _MISSING) -> Self:
+    def where(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[T]:
         if value is _MISSING:
             self.builder.where(column, operator_or_value)
         else:
             self.builder.where(column, operator_or_value, value)
         return self
 
-    def or_where(self, column: str, operator_or_value: Any, value: Any = _MISSING) -> Self:
+    def or_where(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[T]:
         if value is _MISSING:
             self.builder.or_where(column, operator_or_value)
         else:
             self.builder.or_where(column, operator_or_value, value)
+        return self
+
+    def where_column(
+        self, first: str, operator: str, second: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_column(first, operator, second, boolean=boolean)
+        return self
+
+    def or_where_column(
+        self, first: str, operator: str, second: str
+    ) -> ModelQueryBuilder[T]:
+        self.builder.or_where_column(first, operator, second)
+        return self
+
+    def where_exists(
+        self,
+        query: ModelQueryBuilder[Any] | QueryBuilder,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_exists(
+            query.builder if isinstance(query, ModelQueryBuilder) else query,
+            boolean=boolean,
+        )
+        return self
+
+    def where_not_exists(
+        self,
+        query: ModelQueryBuilder[Any] | QueryBuilder,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_not_exists(
+            query.builder if isinstance(query, ModelQueryBuilder) else query,
+            boolean=boolean,
+        )
+        return self
+
+    def or_where_exists(
+        self, query: ModelQueryBuilder[Any] | QueryBuilder
+    ) -> ModelQueryBuilder[T]:
+        self.builder.or_where_exists(
+            query.builder if isinstance(query, ModelQueryBuilder) else query
+        )
+        return self
+
+    def or_where_not_exists(
+        self, query: ModelQueryBuilder[Any] | QueryBuilder
+    ) -> ModelQueryBuilder[T]:
+        self.builder.or_where_not_exists(
+            query.builder if isinstance(query, ModelQueryBuilder) else query
+        )
+        return self
+
+    def where_any(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.where_any(columns, operator_or_value, boolean=boolean)
+        else:
+            self.builder.where_any(
+                columns, operator_or_value, value, boolean=boolean
+            )
+        return self
+
+    def where_all(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.where_all(columns, operator_or_value, boolean=boolean)
+        else:
+            self.builder.where_all(
+                columns, operator_or_value, value, boolean=boolean
+            )
+        return self
+
+    def where_none(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.where_none(columns, operator_or_value, boolean=boolean)
+        else:
+            self.builder.where_none(
+                columns, operator_or_value, value, boolean=boolean
+            )
+        return self
+
+    def or_where_any(
+        self, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.or_where_any(columns, operator_or_value)
+        else:
+            self.builder.or_where_any(columns, operator_or_value, value)
+        return self
+
+    def or_where_all(
+        self, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.or_where_all(columns, operator_or_value)
+        else:
+            self.builder.or_where_all(columns, operator_or_value, value)
+        return self
+
+    def or_where_none(
+        self, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.or_where_none(columns, operator_or_value)
+        else:
+            self.builder.or_where_none(columns, operator_or_value, value)
+        return self
+
+    def where_past(self, column: str, *, boolean: str = "AND") -> ModelQueryBuilder[T]:
+        self.builder.where_past(column, boolean=boolean)
+        return self
+
+    def where_future(self, column: str, *, boolean: str = "AND") -> ModelQueryBuilder[T]:
+        self.builder.where_future(column, boolean=boolean)
+        return self
+
+    def or_where_past(self, column: str) -> ModelQueryBuilder[T]:
+        self.builder.or_where_past(column)
+        return self
+
+    def or_where_future(self, column: str) -> ModelQueryBuilder[T]:
+        self.builder.or_where_future(column)
+        return self
+
+    def where_json_contains(
+        self, column: str, value: Any, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_json_contains(column, value, boolean=boolean)
+        return self
+
+    def where_json_doesnt_contain(
+        self, column: str, value: Any, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_json_doesnt_contain(column, value, boolean=boolean)
+        return self
+
+    def where_json_contains_key(
+        self, column: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_json_contains_key(column, boolean=boolean)
+        return self
+
+    def where_json_doesnt_contain_key(
+        self, column: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[T]:
+        self.builder.where_json_doesnt_contain_key(column, boolean=boolean)
+        return self
+
+    def where_json_length(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.where_json_length(
+                column, operator_or_value, boolean=boolean
+            )
+        else:
+            self.builder.where_json_length(
+                column, operator_or_value, value, boolean=boolean
+            )
+        return self
+
+    def or_where_json_contains(self, column: str, value: Any) -> ModelQueryBuilder[T]:
+        self.builder.or_where_json_contains(column, value)
+        return self
+
+    def or_where_json_doesnt_contain(
+        self, column: str, value: Any
+    ) -> ModelQueryBuilder[T]:
+        self.builder.or_where_json_doesnt_contain(column, value)
+        return self
+
+    def or_where_json_contains_key(self, column: str) -> ModelQueryBuilder[T]:
+        self.builder.or_where_json_contains_key(column)
+        return self
+
+    def or_where_json_doesnt_contain_key(self, column: str) -> ModelQueryBuilder[T]:
+        self.builder.or_where_json_doesnt_contain_key(column)
+        return self
+
+    def or_where_json_length(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[T]:
+        if value is _MISSING:
+            self.builder.or_where_json_length(column, operator_or_value)
+        else:
+            self.builder.or_where_json_length(column, operator_or_value, value)
         return self
 
     def where_group(
@@ -99,7 +337,7 @@ class ModelQueryBuilder[T: Model]:
         callback: Callable[[ModelQueryBuilder[T]], Any],
         *,
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Add a nested WHERE group with explicit boolean grouping (parentheses)."""
         def _adapted_callback(qb: QueryBuilder) -> Any:
             mqb = self.__class__(self.model_cls)
@@ -112,31 +350,31 @@ class ModelQueryBuilder[T: Model]:
     def or_where_group(
         self,
         callback: Callable[[ModelQueryBuilder[T]], Any],
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Add an OR nested WHERE group."""
         return self.where_group(callback, boolean="OR")
 
     def where_in(
         self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_in(column, values)
         return self
 
     def or_where_in(
         self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_in(column, values)
         return self
 
     def where_not_in(
         self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_not_in(column, values)
         return self
 
     def or_where_not_in(
         self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_not_in(column, values)
         return self
 
@@ -148,7 +386,7 @@ class ModelQueryBuilder[T: Model]:
         case_insensitive: bool = False,
         match: str = "contains",
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_like(
             column,
             value,
@@ -165,7 +403,7 @@ class ModelQueryBuilder[T: Model]:
         *,
         case_insensitive: bool = False,
         match: str = "contains",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_like(
             column, value, case_insensitive=case_insensitive, match=match
         )
@@ -178,7 +416,7 @@ class ModelQueryBuilder[T: Model]:
         *,
         match: str = "contains",
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_ilike(column, value, match=match, boolean=boolean)
         return self
 
@@ -188,51 +426,59 @@ class ModelQueryBuilder[T: Model]:
         value: str,
         *,
         match: str = "contains",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_ilike(column, value, match=match)
         return self
 
     def where_between(
         self, column: str, values: Sequence[Any], *, boolean: str = "AND"
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_between(column, values, boolean=boolean)
         return self
 
     def where_not_between(
         self, column: str, values: Sequence[Any], *, boolean: str = "AND"
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_not_between(column, values, boolean=boolean)
         return self
 
-    def or_where_between(self, column: str, values: Sequence[Any]) -> Self:
+    def or_where_between(
+        self, column: str, values: Sequence[Any]
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_between(column, values)
         return self
 
-    def or_where_not_between(self, column: str, values: Sequence[Any]) -> Self:
+    def or_where_not_between(
+        self, column: str, values: Sequence[Any]
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_not_between(column, values)
         return self
 
-    def where_null(self, column: str) -> Self:
+    def where_null(self, column: str) -> ModelQueryBuilder[T]:
         self.builder.where_null(column)
         return self
 
-    def or_where_null(self, column: str) -> Self:
+    def or_where_null(self, column: str) -> ModelQueryBuilder[T]:
         self.builder.or_where_null(column)
         return self
 
-    def where_not_null(self, column: str) -> Self:
+    def where_not_null(self, column: str) -> ModelQueryBuilder[T]:
         self.builder.where_not_null(column)
         return self
 
-    def or_where_not_null(self, column: str) -> Self:
+    def or_where_not_null(self, column: str) -> ModelQueryBuilder[T]:
         self.builder.or_where_not_null(column)
         return self
 
-    def where_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
+    def where_raw(
+        self, sql: str, bindings: Sequence[Any] | None = None
+    ) -> ModelQueryBuilder[T]:
         self.builder.where_raw(sql, bindings)
         return self
 
-    def or_where_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
+    def or_where_raw(
+        self, sql: str, bindings: Sequence[Any] | None = None
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_where_raw(sql, bindings)
         return self
 
@@ -243,43 +489,43 @@ class ModelQueryBuilder[T: Model]:
         operator: str,
         second: str,
         type_: str = "INNER",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.join(table, first, operator, second, type_=type_)
         return self
 
     def left_join(
         self, table: str, first: str, operator: str, second: str
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.left_join(table, first, operator, second)
         return self
 
     def right_join(
         self, table: str, first: str, operator: str, second: str
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.right_join(table, first, operator, second)
         return self
 
-    def with_(self, *relations: str) -> Self:
+    def with_(self, *relations: str) -> ModelQueryBuilder[T]:
         self._eager_loads.extend(relations)
         return self
 
-    def limit(self, value: int) -> Self:
+    def limit(self, value: int) -> ModelQueryBuilder[T]:
         self.builder.limit(value)
         return self
 
-    def offset(self, value: int) -> Self:
+    def offset(self, value: int) -> ModelQueryBuilder[T]:
         self.builder.offset(value)
         return self
 
-    def take(self, value: int) -> Self:
+    def take(self, value: int) -> ModelQueryBuilder[T]:
         self.builder.take(value)
         return self
 
-    def skip(self, value: int) -> Self:
+    def skip(self, value: int) -> ModelQueryBuilder[T]:
         self.builder.skip(value)
         return self
 
-    def group_by(self, *columns: str | Sequence[str]) -> Self:
+    def group_by(self, *columns: str | Sequence[str]) -> ModelQueryBuilder[T]:
         self.builder.group_by(*columns)
         return self
 
@@ -289,13 +535,13 @@ class ModelQueryBuilder[T: Model]:
         operator_or_value: Any,
         value: Any = _MISSING,
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.having(column, operator_or_value, value, boolean=boolean)
         return self
 
     def or_having(
         self, column: str, operator_or_value: Any, value: Any = _MISSING
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_having(column, operator_or_value, value)
         return self
 
@@ -304,72 +550,80 @@ class ModelQueryBuilder[T: Model]:
         sql: str,
         bindings: Sequence[Any] | None = None,
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.having_raw(sql, bindings, boolean=boolean)
         return self
 
     def or_having_raw(
         self, sql: str, bindings: list[Any] | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.or_having_raw(sql, bindings)
         return self
 
     def select_raw(
         self, sql: str, bindings: list[Any] | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.select_raw(sql, bindings)
         return self
 
     def select_count(
         self, column: str = "*", alias: str | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.select_count(column, alias)
         return self
 
     def select_sum(
         self, column: str, alias: str | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.select_sum(column, alias)
         return self
 
     def select_avg(
         self, column: str, alias: str | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.select_avg(column, alias)
         return self
 
     def select_min(
         self, column: str, alias: str | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.select_min(column, alias)
         return self
 
     def select_max(
         self, column: str, alias: str | None = None
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         self.builder.select_max(column, alias)
         return self
 
-    def distinct(self, *columns: str) -> Self:
+    def distinct(self, *columns: str) -> ModelQueryBuilder[T]:
         """Apply DISTINCT or DISTINCT ON (columns) to the query projection."""
         self.builder.distinct(*columns)
         return self
 
-    def order_by(self, column: str, direction: str = "ASC") -> Self:
+    def shared_lock(self) -> ModelQueryBuilder[T]:
+        self.builder.shared_lock()
+        return self
+
+    def lock_for_update(self) -> ModelQueryBuilder[T]:
+        self.builder.lock_for_update()
+        return self
+
+    def order_by(self, column: str, direction: str = "ASC") -> ModelQueryBuilder[T]:
         self.builder.order_by(column, direction)
         return self
 
-    def latest(self, column: str = "created_at") -> Self:
+    def latest(self, column: str = "created_at") -> ModelQueryBuilder[T]:
         """Order records descending by the specified column (default: created_at)."""
         self.builder.latest(column)
         return self
 
-    def oldest(self, column: str = "created_at") -> Self:
+    def oldest(self, column: str = "created_at") -> ModelQueryBuilder[T]:
         """Order records ascending by the specified column (default: created_at)."""
         self.builder.oldest(column)
         return self
 
-    def in_random_order(self) -> Self:
+    def in_random_order(self) -> ModelQueryBuilder[T]:
         """Order records randomly using PostgreSQL RANDOM()."""
         self.builder.in_random_order()
         return self
@@ -377,9 +631,9 @@ class ModelQueryBuilder[T: Model]:
     def when(
         self,
         condition: Any,
-        callback: Callable[[Self, Any], Any],
-        default: Callable[[Self, Any], Any] | None = None,
-    ) -> Self:
+        callback: Callable[[ModelQueryBuilder[T], Any], Any],
+        default: Callable[[ModelQueryBuilder[T], Any], Any] | None = None,
+    ) -> ModelQueryBuilder[T]:
         """Apply callback if condition is truthy, otherwise apply default callback if provided."""
         if condition:
             res = callback(self, condition)
@@ -392,13 +646,13 @@ class ModelQueryBuilder[T: Model]:
     def unless(
         self,
         condition: Any,
-        callback: Callable[[Self, Any], Any],
-        default: Callable[[Self, Any], Any] | None = None,
-    ) -> Self:
+        callback: Callable[[ModelQueryBuilder[T], Any], Any],
+        default: Callable[[ModelQueryBuilder[T], Any], Any] | None = None,
+    ) -> ModelQueryBuilder[T]:
         """Apply callback if condition is falsy, otherwise apply default callback if provided."""
         return self.when(not condition, callback, default)
 
-    def select(self, *columns: str) -> Self:
+    def select(self, *columns: str) -> ModelQueryBuilder[T]:
         self.builder.select(*columns)
         return self
 
@@ -570,6 +824,7 @@ class ModelQueryBuilder[T: Model]:
         """
         Execute the model query with length-aware pagination, counting total records/groups.
         """
+        self.builder._ensure_lock_has_transaction()
         if isinstance(page, bool) or not isinstance(page, int):
             raise TypeError("page must be an integer.")
         if page < 1:
@@ -585,6 +840,9 @@ class ModelQueryBuilder[T: Model]:
         count_builder.builder._limit_value = None
         count_builder.builder._offset_value = None
         count_builder.builder._order_column = None
+        count_builder.builder._order_name = None
+        count_builder.builder._order_random = False
+        count_builder.builder._lock = None
 
         if (
             count_builder.builder._groups
@@ -711,7 +969,7 @@ class ModelQueryBuilder[T: Model]:
         *,
         boolean: str = "AND",
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         if callback is not None:
             if not callable(callback):
                 raise TypeError("Relation query constraint callback must be callable.")
@@ -873,7 +1131,7 @@ class ModelQueryBuilder[T: Model]:
         *,
         boolean: str = "AND",
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Filter records by the existence/count of related models."""
         return self._apply_relation_existence(
             relation,
@@ -889,7 +1147,7 @@ class ModelQueryBuilder[T: Model]:
         operator: str = ">=",
         count: int = 1,
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Add an OR relationship existence/count condition."""
         return self.has(relation, operator, count, boolean="OR", callback=callback)
 
@@ -899,7 +1157,7 @@ class ModelQueryBuilder[T: Model]:
         *,
         boolean: str = "AND",
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Filter records that do not have matching related models."""
         return self.has(relation, "<", 1, boolean=boolean, callback=callback)
 
@@ -907,7 +1165,7 @@ class ModelQueryBuilder[T: Model]:
         self,
         relation: str,
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Add an OR negated relationship existence condition."""
         return self.doesnt_have(relation, boolean="OR", callback=callback)
 
@@ -919,7 +1177,7 @@ class ModelQueryBuilder[T: Model]:
         count: int = 1,
         *,
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Filter records by related model existence with an optional query callback."""
         return self.has(relation, operator, count, boolean=boolean, callback=callback)
 
@@ -929,7 +1187,7 @@ class ModelQueryBuilder[T: Model]:
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
         operator: str = ">=",
         count: int = 1,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Add an OR constrained relationship existence condition."""
         return self.where_has(relation, callback, operator, count, boolean="OR")
 
@@ -939,7 +1197,7 @@ class ModelQueryBuilder[T: Model]:
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
         *,
         boolean: str = "AND",
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Filter records lacking related models matching the optional query callback."""
         return self.doesnt_have(relation, boolean=boolean, callback=callback)
 
@@ -947,7 +1205,7 @@ class ModelQueryBuilder[T: Model]:
         self,
         relation: str,
         callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
-    ) -> Self:
+    ) -> ModelQueryBuilder[T]:
         """Add an OR negated constrained relationship existence condition."""
         return self.where_doesnt_have(relation, callback, boolean="OR")
 
@@ -1432,6 +1690,16 @@ class Model:
         return cls.query().distinct(*columns)
 
     @classmethod
+    def shared_lock(cls) -> ModelQueryBuilder[Self]:
+        """Lock matching rows for sharing inside a transaction."""
+        return cls.query().shared_lock()
+
+    @classmethod
+    def lock_for_update(cls) -> ModelQueryBuilder[Self]:
+        """Lock matching rows for update inside a transaction."""
+        return cls.query().lock_for_update()
+
+    @classmethod
     def where(
         cls, column: str, operator_or_value: Any, value: Any = _MISSING
     ) -> ModelQueryBuilder[Self]:
@@ -1446,6 +1714,242 @@ class Model:
         if value is _MISSING:
             return cls.query().or_where(column, operator_or_value)
         return cls.query().or_where(column, operator_or_value, value)
+
+    @classmethod
+    def where_column(
+        cls, first: str, operator: str, second: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Compare two columns in the model query."""
+        return cls.query().where_column(first, operator, second, boolean=boolean)
+
+    @classmethod
+    def or_where_column(
+        cls, first: str, operator: str, second: str
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR comparison between two columns."""
+        return cls.query().or_where_column(first, operator, second)
+
+    @classmethod
+    def where_exists(
+        cls,
+        query: ModelQueryBuilder[Any] | QueryBuilder,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Filter model rows by a query's existence."""
+        return cls.query().where_exists(query, boolean=boolean)
+
+    @classmethod
+    def where_not_exists(
+        cls,
+        query: ModelQueryBuilder[Any] | QueryBuilder,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Filter model rows by a query's non-existence."""
+        return cls.query().where_not_exists(query, boolean=boolean)
+
+    @classmethod
+    def or_where_exists(
+        cls, query: ModelQueryBuilder[Any] | QueryBuilder
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR query-existence filter."""
+        return cls.query().or_where_exists(query)
+
+    @classmethod
+    def or_where_not_exists(
+        cls, query: ModelQueryBuilder[Any] | QueryBuilder
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR query-non-existence filter."""
+        return cls.query().or_where_not_exists(query)
+
+    @classmethod
+    def where_any(
+        cls,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Match any of the listed columns."""
+        if value is _MISSING:
+            return cls.query().where_any(columns, operator_or_value, boolean=boolean)
+        return cls.query().where_any(
+            columns, operator_or_value, value, boolean=boolean
+        )
+
+    @classmethod
+    def where_all(
+        cls,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Match all of the listed columns."""
+        if value is _MISSING:
+            return cls.query().where_all(columns, operator_or_value, boolean=boolean)
+        return cls.query().where_all(
+            columns, operator_or_value, value, boolean=boolean
+        )
+
+    @classmethod
+    def where_none(
+        cls,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Match none of the listed columns."""
+        if value is _MISSING:
+            return cls.query().where_none(columns, operator_or_value, boolean=boolean)
+        return cls.query().where_none(
+            columns, operator_or_value, value, boolean=boolean
+        )
+
+    @classmethod
+    def or_where_any(
+        cls, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR match against any listed column."""
+        if value is _MISSING:
+            return cls.query().or_where_any(columns, operator_or_value)
+        return cls.query().or_where_any(columns, operator_or_value, value)
+
+    @classmethod
+    def or_where_all(
+        cls, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR match against all listed columns."""
+        if value is _MISSING:
+            return cls.query().or_where_all(columns, operator_or_value)
+        return cls.query().or_where_all(columns, operator_or_value, value)
+
+    @classmethod
+    def or_where_none(
+        cls, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR filter requiring all listed columns to differ."""
+        if value is _MISSING:
+            return cls.query().or_where_none(columns, operator_or_value)
+        return cls.query().or_where_none(columns, operator_or_value, value)
+
+    @classmethod
+    def where_past(
+        cls, column: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Filter values earlier than the current transaction timestamp."""
+        return cls.query().where_past(column, boolean=boolean)
+
+    @classmethod
+    def where_future(
+        cls, column: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Filter values later than the current transaction timestamp."""
+        return cls.query().where_future(column, boolean=boolean)
+
+    @classmethod
+    def or_where_past(cls, column: str) -> ModelQueryBuilder[Self]:
+        """Add an OR filter for values earlier than the current timestamp."""
+        return cls.query().or_where_past(column)
+
+    @classmethod
+    def or_where_future(cls, column: str) -> ModelQueryBuilder[Self]:
+        """Add an OR filter for values later than the current timestamp."""
+        return cls.query().or_where_future(column)
+
+    @classmethod
+    def where_json_contains(
+        cls, column: str, value: Any, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Filter rows whose JSON value contains the supplied JSON value."""
+        return cls.query().where_json_contains(column, value, boolean=boolean)
+
+    @classmethod
+    def where_json_doesnt_contain(
+        cls, column: str, value: Any, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Filter rows whose JSON value does not contain the supplied value."""
+        return cls.query().where_json_doesnt_contain(
+            column, value, boolean=boolean
+        )
+
+    @classmethod
+    def where_json_contains_key(
+        cls, column: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Filter rows where a JSON path exists."""
+        return cls.query().where_json_contains_key(column, boolean=boolean)
+
+    @classmethod
+    def where_json_doesnt_contain_key(
+        cls, column: str, *, boolean: str = "AND"
+    ) -> ModelQueryBuilder[Self]:
+        """Filter rows where a JSON path is missing or SQL NULL."""
+        return cls.query().where_json_doesnt_contain_key(
+            column, boolean=boolean
+        )
+
+    @classmethod
+    def where_json_length(
+        cls,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> ModelQueryBuilder[Self]:
+        """Compare a JSON array's length with an integer."""
+        if value is _MISSING:
+            return cls.query().where_json_length(
+                column, operator_or_value, boolean=boolean
+            )
+        return cls.query().where_json_length(
+            column, operator_or_value, value, boolean=boolean
+        )
+
+    @classmethod
+    def or_where_json_contains(
+        cls, column: str, value: Any
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR JSON containment filter."""
+        return cls.query().or_where_json_contains(column, value)
+
+    @classmethod
+    def or_where_json_doesnt_contain(
+        cls, column: str, value: Any
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR JSON non-containment filter."""
+        return cls.query().or_where_json_doesnt_contain(column, value)
+
+    @classmethod
+    def or_where_json_contains_key(
+        cls, column: str
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR JSON key-existence filter."""
+        return cls.query().or_where_json_contains_key(column)
+
+    @classmethod
+    def or_where_json_doesnt_contain_key(
+        cls, column: str
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR JSON missing-key filter."""
+        return cls.query().or_where_json_doesnt_contain_key(column)
+
+    @classmethod
+    def or_where_json_length(
+        cls, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> ModelQueryBuilder[Self]:
+        """Add an OR JSON array-length comparison."""
+        if value is _MISSING:
+            return cls.query().or_where_json_length(column, operator_or_value)
+        return cls.query().or_where_json_length(
+            column, operator_or_value, value
+        )
 
     @classmethod
     def where_group(
@@ -1989,13 +2493,36 @@ class Model:
                 setattr(self, col, val)
         self._mark_persisted([*insert_keys, *row.keys()])
 
-    @classmethod
-    async def create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
-        """Create and persist a new model instance, validating mass assignment rules."""
+    @staticmethod
+    def _extract_create_mapping(
+        args: tuple[Mapping[str, Any] | BaseSchema, ...],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize positional mapping or BaseSchema payload and keyword arguments."""
         data: dict[str, Any] = {}
         if args:
-            data.update(args[0])
+            if len(args) > 1:
+                raise TypeError(
+                    f"create() accepts at most 1 positional payload argument, got {len(args)}."
+                )
+            first = args[0]
+            if isinstance(first, BaseSchema):
+                data.update(first.to_dict())
+            elif isinstance(first, Mapping):
+                data.update(first)
+            else:
+                raise TypeError(
+                    f"create() expects a mapping or BaseSchema payload, got {type(first).__name__}."
+                )
         data.update(kwargs)
+        return data
+
+    @classmethod
+    async def create(
+        cls, *args: Mapping[str, Any] | BaseSchema, **kwargs: Any
+    ) -> Self:
+        """Create and persist a new model instance, validating mass assignment rules."""
+        data = cls._extract_create_mapping(args, kwargs)
 
         instance = cls()
         instance.fill(**data)
@@ -2012,12 +2539,11 @@ class Model:
         return instance
 
     @classmethod
-    async def force_create(cls, *args: dict[str, Any], **kwargs: Any) -> Self:
+    async def force_create(
+        cls, *args: Mapping[str, Any] | BaseSchema, **kwargs: Any
+    ) -> Self:
         """Create and persist a new model instance, bypassing fillable/guarded checks for trusted code."""
-        data: dict[str, Any] = {}
-        if args:
-            data.update(args[0])
-        data.update(kwargs)
+        data = cls._extract_create_mapping(args, kwargs)
 
         instance = cls()
         instance.force_fill(**data)
@@ -2089,22 +2615,25 @@ class Model:
 
     @staticmethod
     def _extract_update_mapping(
-        data: Mapping[str, Any] | _UnsetType,
+        data: Mapping[str, Any] | BaseSchema | _UnsetType,
         attributes: dict[str, Any],
     ) -> dict[str, Any]:
-        """Normalize positional mapping and keyword arguments for instance updates."""
+        """Normalize positional mapping/BaseSchema and keyword arguments for instance updates."""
         payload: dict[str, Any] = {}
         if not isinstance(data, _UnsetType):
-            if not isinstance(data, Mapping):
+            if isinstance(data, BaseSchema):
+                payload.update(data.to_dict(exclude_unset=True))
+            elif isinstance(data, Mapping):
+                for key, value in data.items():
+                    if not isinstance(key, str):
+                        raise TypeError(
+                            f"update() attribute keys must be str, got {type(key).__name__}."
+                        )
+                    payload[key] = value
+            else:
                 raise TypeError(
-                    f"update() expects a mapping of attributes, got {type(data).__name__}."
+                    f"update() expects a mapping or BaseSchema of attributes, got {type(data).__name__}."
                 )
-            for key, value in data.items():
-                if not isinstance(key, str):
-                    raise TypeError(
-                        f"update() attribute keys must be str, got {type(key).__name__}."
-                    )
-                payload[key] = value
         payload.update(attributes)
         return payload
 
@@ -2129,14 +2658,16 @@ class Model:
         return self
 
     @overload
-    async def update(self, data: Mapping[str, Any], /, **attributes: Any) -> Self: ...
+    async def update(
+        self, data: Mapping[str, Any] | BaseSchema, /, **attributes: Any
+    ) -> Self: ...
 
     @overload
     async def update(self, /, **attributes: Any) -> Self: ...
 
     async def update(
         self,
-        data: Mapping[str, Any] | _UnsetType = _UNSET,
+        data: Mapping[str, Any] | BaseSchema | _UnsetType = _UNSET,
         /,
         **attributes: Any,
     ) -> Self:
@@ -2146,7 +2677,7 @@ class Model:
 
     @overload
     async def force_update(
-        self, data: Mapping[str, Any], /, **attributes: Any
+        self, data: Mapping[str, Any] | BaseSchema, /, **attributes: Any
     ) -> Self: ...
 
     @overload
@@ -2154,7 +2685,7 @@ class Model:
 
     async def force_update(
         self,
-        data: Mapping[str, Any] | _UnsetType = _UNSET,
+        data: Mapping[str, Any] | BaseSchema | _UnsetType = _UNSET,
         /,
         **attributes: Any,
     ) -> Self:

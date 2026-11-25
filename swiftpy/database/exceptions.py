@@ -7,6 +7,10 @@ class DatabaseError(Exception):
     """Base exception for all database subsystem errors."""
 
 
+class QueryDumpError(DatabaseError):
+    """Raised by a ``dd`` query helper after logging its debugging output."""
+
+
 class RecordNotFoundError(DatabaseError, LookupError):
     """Raised when a specific raw query record is not found."""
 
@@ -37,6 +41,7 @@ class ModelNotFoundError(RecordNotFoundError):
 __all__ = [
     "DatabaseError",
     "ModelNotFoundError",
+    "QueryDumpError",
     "RecordNotFoundError",
 ]
 

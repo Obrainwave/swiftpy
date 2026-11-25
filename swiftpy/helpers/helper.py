@@ -18,6 +18,7 @@ from swiftpy.mail.manager import MailManager
 from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.queue.job import Job
 from swiftpy.scheduling.scheduler import Scheduler
+from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.hashing import (
     hash_password,
     hash_password_async,
@@ -249,6 +250,20 @@ def _resolve_isset_step(target: Any, key: Any) -> Any:
             return getattr(target, key, _MISSING)
         if isinstance(static_attr, property):
             return getattr(target, key, _MISSING)
+        return _MISSING
+
+    if isinstance(target, BaseSchema):
+        if not isinstance(key, str) or key.startswith("_"):
+            return _MISSING
+        cls = target.__class__
+        if key in cls.__schema_fields__:
+            return getattr(target, key, _MISSING)
+        canonical = cls.__schema_aliases__.get(key)
+        if canonical is not None:
+            return getattr(target, canonical, _MISSING)
+        extra_fields = getattr(target, "__extra_fields__", None)
+        if isinstance(extra_fields, Mapping) and key in extra_fields:
+            return extra_fields[key]
         return _MISSING
 
     if isinstance(target, Mapping):

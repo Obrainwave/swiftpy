@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import json
 import logging
 import math
 import sys
@@ -62,6 +61,7 @@ from swiftpy.queue.dispatcher import QueueDispatcher
 from swiftpy.scheduling.cron import resolve_timezone
 from swiftpy.scheduling.exceptions import InvalidScheduleError
 from swiftpy.scheduling.scheduler import Scheduler, ensure_memory_driver_allowed
+from swiftpy.schemas.base import BaseSchema, _extract_request_mapping
 from swiftpy.support.keys import (
     resolve_configured_app_key,
     validate_signing_key,
@@ -906,6 +906,7 @@ class Application:
                 controller_instance: Any = None
                 has_controller = False
                 call_kwargs: dict[str, Any] = {}
+                body_preloaded_data: dict[str, Any] | None = None
                 for spec in param_specs:
                     if spec.kind == "controller":
                         controller_instance = self.container.resolve(spec.annotation)
@@ -917,89 +918,11 @@ class Application:
                     elif spec.kind == "form":
                         ann: type[FormRequest] = spec.annotation
                         stop_first = bool(getattr(ann, "stop_on_first_error", False))
-                        content_type = request.headers.get("content-type", "")
-                        media_type = content_type.split(";", 1)[0].strip().lower()
-
-                        if media_type in (
-                            "application/x-www-form-urlencoded",
-                            "multipart/form-data",
-                        ):
-                            if media_type == "application/x-www-form-urlencoded":
-                                raw_body = await request.body()
-                                if not raw_body.strip():
-                                    raise ValidationException(
-                                        {"body": ["Request body is required."]},
-                                        single_error=stop_first,
-                                    )
-                            try:
-                                form_data = await request.form()
-                            except HttpException as exc:
-                                if exc.status_code == 400:
-                                    raise ValidationException(
-                                        {"body": [exc.message]},
-                                        single_error=stop_first,
-                                    ) from None
-                                raise
-                            except (ValueError, UnicodeDecodeError) as exc:
-                                raise ValidationException(
-                                    {"body": [str(exc)]},
-                                    single_error=stop_first,
-                                ) from None
-
-                            if (
-                                media_type == "multipart/form-data"
-                                and not form_data.fields_list
-                                and not form_data.files_list
-                            ):
-                                raise ValidationException(
-                                    {"body": ["Request body is required."]},
-                                    single_error=stop_first,
-                                )
-
-                            data: dict[str, Any] = {}
-                            for k, vals in form_data.fields_list.items():
-                                data[k] = vals[0] if len(vals) == 1 else list(vals)
-                            for k, flist in form_data.files_list.items():
-                                if k not in data:
-                                    data[k] = flist[0] if len(flist) == 1 else list(flist)
-                        else:
-                            raw_body = await request.body()
-                            if not raw_body.strip():
-                                raise ValidationException(
-                                    {"body": ["Request body is required."]},
-                                    single_error=stop_first,
-                                )
-                            try:
-                                raw_data = await request.json()
-                                if not isinstance(raw_data, dict):
-                                    raise ValidationException(
-                                        {
-                                            "body": [
-                                                "The request payload must be a JSON object."
-                                            ]
-                                        },
-                                        single_error=stop_first,
-                                    )
-                                data = raw_data
-                            except (
-                                json.JSONDecodeError,
-                                UnicodeDecodeError,
-                                ValueError,
-                            ):
-                                raise ValidationException(
-                                    {"body": ["Invalid JSON payload"]},
-                                    single_error=stop_first,
-                                ) from None
-                            except HttpException as exc:
-                                if (
-                                    exc.status_code == 400
-                                    and exc.message == "Invalid JSON payload"
-                                ):
-                                    raise ValidationException(
-                                        {"body": ["Invalid JSON payload"]},
-                                        single_error=stop_first,
-                                    ) from None
-                                raise
+                        data = await _extract_request_mapping(
+                            request,
+                            stop_on_first_error=stop_first,
+                        )
+                        body_preloaded_data = data
 
                         form_instance, rules, messages = ann.prepare_validation(
                             request=request, container=self.container
@@ -1024,6 +947,20 @@ class Application:
                         form_instance.request = request
                         form_instance.validation_result = result
                         call_kwargs[spec.name] = form_instance
+                    elif spec.kind == "schema":
+                        schema_cls: type[BaseSchema] = spec.annotation
+                        stop_first = bool(
+                            getattr(schema_cls, "stop_on_first_error", False)
+                        )
+                        data = await _extract_request_mapping(
+                            request,
+                            stop_on_first_error=stop_first,
+                        )
+                        body_preloaded_data = data
+                        call_kwargs[spec.name] = schema_cls._validate_mapping(
+                            data,
+                            stop_on_first_error=stop_first,
+                        )
                     elif spec.kind == "di":
                         call_kwargs[spec.name] = self.container.resolve(spec.annotation)
                     elif spec.kind == "file":
@@ -1042,7 +979,13 @@ class Application:
                         or (uses_has_file and _is_multipart_write_request(request))
                     )
                 ):
-                    await request.input(_preload=True)
+                    if body_preloaded_data is not None:
+                        merged_input = dict(request.query_params)
+                        merged_input.update(body_preloaded_data)
+                        request._input_cache = merged_input
+                        request._input_loaded = True
+                    else:
+                        await request.input(_preload=True)
 
                 if has_var_keyword:
                     for k, v in params.items():
@@ -1066,10 +1009,10 @@ class Application:
 
                 if isinstance(res, Response):
                     return res
-                if isinstance(res, (dict, list)):
+                if isinstance(res, (dict, list, BaseSchema)):
                     return json_response(res)
                 raise TypeError(
-                    f"Route handler must return a Response, dict, or list, got {type(res).__name__}"
+                    f"Route handler must return a Response, dict, list, or BaseSchema, got {type(res).__name__}"
                 )
             except ClientDisconnect:
                 raise

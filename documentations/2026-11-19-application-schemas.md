@@ -1,16 +1,18 @@
-# Application Schemas & DTOs (`app/schemas/`)
+# Application Schemas & Declarative DTOs (`swiftpy.schemas` & `app/schemas/`)
 
 ## Introduction
 
-In a SwiftPY project, `app/schemas/` holds your **application-layer Data Transfer Objects (DTOs) and API serialization contracts**—classes that define what shape goes *into* your service layer and what shape comes *out* in JSON responses.
+In SwiftPY, **`swiftpy.schemas`** provides native, zero-dependency declarative data schemas (**`BaseSchema`** / **`Schema`**) with automatic runtime type coercion, **`Field(...)`** constraint validation, custom **`@field_validator`** / **`@model_validator`** hooks, HTTP route/controller auto-injection, response JSON serialization, and ORM `Model` interoperability.
 
-Because SwiftPY also has **Database `Schema`/`Blueprint`** for PostgreSQL tables and **validation rule dicts** for request validation, keeping the three roles clear prevents common confusion:
+With **`@dataclass_transform`**, both **Pyrefly**, **Mypy (`--strict`)**, and **Pyright** understand every schema field and attribute statically—so controllers, services, and repositories get full autocomplete and type checking without third-party dependencies.
 
-| Layer | Location / Symbol | Responsibility |
+| Concern | Recommended Tool | Purpose |
 |---|---|---|
-| **Application Schemas / DTOs** | `app/schemas/` (`*Schema`) | Typed dataclasses & output serializers mapping validated input -> domain services -> JSON responses |
-| **Validation Rules & `FormRequest`** | `app/http/requests/` or inline `validate(request, rules)` | Parses, coerces, and validates untrusted JSON/form/query payloads (returns `422` on failure) |
-| **Database Schema** | `swiftpy.database.migrations.Schema` & `Blueprint` in `database/migrations/` | Creates and alters PostgreSQL tables, columns, indexes, and foreign keys |
+| **Typed API Request/Response DTOs** | `app/schemas/` (`BaseSchema` / `Schema`) | Strongly typed input coercion & constraint validation, HTTP handler auto-injection, `from_model()`, `to_dict()`, and direct `Model.create()` / `model.update()` |
+| **Rule-String / DB Validation** | `app/http/requests/` (`FormRequest`) or `validate()` | String/rule-object DSL including async `"unique:table,col"` and `"exists:table,col"` database checks |
+| **HTTP Response Transformers** | `app/http/resources/` (`*Resource`) | Tailored HTTP JSON formatting adapters wrapping ORM models or schemas |
+
+> **Naming Note:** `swiftpy.schemas.Schema` (alias of `BaseSchema`) and `swiftpy.schemas.Field` are for application DTOs, whereas `swiftpy.database.Schema` (migration DDL builder) and `swiftpy.database.orm.Field` (ORM column descriptors) belong to the database layer. Always import `Schema` / `BaseSchema` / `Field` from `swiftpy.schemas` inside `app/schemas/`.
 
 ---
 
@@ -22,252 +24,229 @@ When you scaffold a new project (`swiftpy new my_api`), SwiftPY creates [user_sc
 # app/schemas/user_schema.py
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any
+from swiftpy.schemas import BaseSchema, Field
 
 
-@dataclass(slots=True)
-class UserCreateSchema:
-    """Input validation DTO for user creation requests."""
+class UserCreateSchema(BaseSchema):
+    """Input validation schema for user creation requests."""
 
-    name: str
-    email: str
-    password: str
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., max_length=255)
+    password: str = Field(..., min_length=8)
 
 
-@dataclass(slots=True)
-class UserResponseSchema:
+class UserResponseSchema(BaseSchema):
     """Output serialization schema for user responses."""
 
     id: int
     name: str
     email: str
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+
+UserSchema = UserResponseSchema
 ```
 
 Create additional schema files in `app/schemas/` with the CLI:
 
 ```bash
-swiftpy make:schema OrderSchema
+uv run swiftpy make:schema OrderSchema
 # Creates app/schemas/order_schema.py
 
 # Or organize in subdirectories under app/schemas/
-swiftpy make:schema billing/InvoiceSchema
+uv run swiftpy make:schema billing/InvoiceSchema
 # Creates app/schemas/billing/invoice_schema.py
 ```
 
+The generated file subclasses `BaseSchema` cleanly:
+
 ```python
 # app/schemas/order_schema.py
 from __future__ import annotations
 
-from typing import Any
+from swiftpy.schemas import BaseSchema
 
 
-class OrderSchema:
-    """OrderSchema data schema."""
+class OrderSchema(BaseSchema):
+    """OrderSchema structured data schema."""
 
-    schema: dict[str, Any] = {
-        # "id": int,
-        # "name": str,
-    }
+    # Example with constraints (`from swiftpy.schemas import BaseSchema, Field`):
+    # id: int
+    # name: str = Field(..., min_length=1, max_length=100)
 ```
-
-From that starting point, you can either keep reusable validation rule dictionaries (`schema` / `RULES`) alongside your schema class or define `@dataclass(slots=True)` DTOs following `app/schemas/user_schema.py`.
 
 ---
 
-## Step-by-Step Usage Patterns
+## Defining Declarative Schemas (`BaseSchema` / `Schema` & `Field`)
 
-### 1. Output Serialization Schemas (`to_dict()` & `json_response()`)
-
-SwiftPY's JSON encoder (`encode_json()` inside `json_response()`, `created()`, and `dict`/`list` auto-JSON) automatically checks `hasattr(obj, "to_dict") and callable(obj.to_dict)`—and automatically formats nested `datetime`, `UUID`, `Decimal`, and `Enum` values as ISO strings / primitives while omitting any `__hidden__` fields.
-
-Add a `@classmethod def from_model(cls, user: User)` factory plus `to_dict()` on your response schema so routes and services never expose internal ORM columns (`password`, internal flags) or repeat mapping code:
+Import `BaseSchema` (or its alias `Schema`) and `Field` (or alias `SchemaField`) from `swiftpy.schemas`:
 
 ```python
-# app/schemas/user_schema.py
-from __future__ import annotations
+from datetime import date
+from decimal import Decimal
+from uuid import UUID
 
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Any, ClassVar
-
-from app.models.user import User
+from swiftpy.schemas import BaseSchema, Field, Schema
 
 
-@dataclass(slots=True)
-class UserCreateSchema:
-    """Typed input DTO passed into services."""
-
-    RULES: ClassVar[dict[str, str]] = {
-        "name": "required|str|min:2|max:100",
-        "email": "required|email:lowercase|max:255",
-        "password": "required|str|min:8",
-    }
-
-    name: str
-    email: str
-    password: str
+class EggSpoilageCreateRequest(BaseSchema):
+    movement_date: date
+    flock_id: UUID | None = None
+    spoiled_or_broken_eggs: int = Field(..., gt=0)
+    reference: str | None = Field(default=None, max_length=100)
+    notes: str | None = None
 
 
-@dataclass(slots=True)
-class UserResponseSchema:
-    """Typed public response schema with automatic JSON serialization."""
+class EggCollectionCreateRequest(Schema):
+    movement_date: date
+    flock_id: UUID | None = None
+    good_eggs: int = Field(..., ge=0)
+    cracked_eggs: int = Field(default=0, ge=0)
+    dirty_eggs: int = Field(default=0, ge=0)
+    spoiled_eggs: int = Field(default=0, ge=0)
+    reference: str | None = Field(default=None, max_length=100)
+    notes: str | None = None
+```
 
-    id: int
-    name: str
-    email: str
-    created_at: datetime | None = None
+### Supported Types & Coercion
 
+`BaseSchema` automatically coerces inbound JSON, URL-encoded form, and multipart values to your declared type annotations:
+
+- **Scalars:** `str`, `int` (rejecting `bool`), `float` (rejecting `bool`, `NaN`, and `Infinity`), `bool` (`"true"`, `"1"`, `"yes"`, `"on"` / `"false"`, `"0"`, `"no"`, `"off"`), `Decimal` (rejecting `bool`, `NaN`, and `Infinity`), `bytes`
+- **Dates & Identifiers:** `UUID`, ISO-8601 `date`, `datetime` (normalizing trailing `"Z"`), and `time`
+- **Enums & Literals:** `Enum`, `IntEnum`, and `Literal[...]`
+- **Containers & Nested Schemas:** `list[T]`, `Sequence[T]`, `set[T]`, `tuple[...]`, `dict[K, V]`, `Mapping[K, V]`, `T | None`, `Union[...]`, `Annotated[T, Field(...)]`, and nested `BaseSchema` subclasses (including dotted error keys such as `items.0.qty`)
+
+### `Field(...)` Constraints & Options
+
+| Argument | Description |
+|---|---|
+| `default` / `...` | Required when `...` (default); pass a default value (prefer `default=...` keyword when calling the constructor directly under `mypy --strict`) |
+| `default_factory` | Zero-arg callable invoked when the field is omitted (for example, `default_factory=uuid4` or `default_factory=list`) |
+| `gt`, `ge`, `lt`, `le` | Numeric comparisons (`int`, `float`, `Decimal`) |
+| `multiple_of` | Enforces `value % multiple_of == 0` |
+| `min_length`, `max_length` | Length checks for `str`, `bytes`, `list`, `tuple`, `set`, `dict` |
+| `pattern` | Regex `str` or compiled `re.Pattern[str]` matched with `search()` |
+| `strip_whitespace`, `to_lower`, `to_upper` | String normalization applied before length, regex, and custom validators |
+| `alias` | Alternate inbound key name accepted during validation and emitted by `to_dict(by_alias=True)` |
+| `exclude` | Omit field from `to_dict()` and JSON responses when `True` |
+
+### Class Options & Custom Validators
+
+```python
+from swiftpy.schemas import BaseSchema, Field, field_validator, model_validator
+
+
+class OrderCreateSchema(BaseSchema):
+    extra = "forbid"  # "ignore" (default), "forbid", or "allow"
+    stop_on_first_error = False  # True emits {"message": ..., "field": ...} on 422
+
+    sku: str = Field(..., to_upper=True, min_length=3)
+    quantity: int = Field(..., gt=0, le=100)
+    discount_code: str | None = Field(default=None, strip_whitespace=True)
+
+    @field_validator("discount_code")
     @classmethod
-    def from_model(cls, user: User) -> UserResponseSchema:
-        return cls(
-            id=int(user.id),
-            name=str(user.name),
-            email=str(user.email),
-            created_at=getattr(user, "created_at", None),
-        )
+    def normalize_code(cls, value: str | None) -> str | None:
+        if value == "EXPIRED":
+            raise ValueError("Discount code has expired.")
+        return value
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    @model_validator
+    def check_bulk_order(self) -> None:
+        if self.quantity < 10 and self.discount_code == "BULK":
+            raise ValueError("BULK discount requires at least 10 items.")
 ```
 
-Returning instances directly in `routes/api.py`:
+---
+
+## Automatic Route & Controller Injection
+
+Annotate a `BaseSchema` / `Schema` parameter on any route function or controller method. SwiftPY automatically parses the JSON, `application/x-www-form-urlencoded`, or `multipart/form-data` request body, coerces and validates it, and raises `ValidationException` (HTTP `422`) before your handler runs:
 
 ```python
-# routes/api.py
-from swiftpy.http.response import Response, created, json_response
-from swiftpy.http.router import Router
+# app/http/controllers/egg_collection_controller.py
+from uuid import UUID
 
-from app.models.user import User
-from app.schemas.user_schema import UserResponseSchema
-
-router = Router(prefix="/api")
+from swiftpy.http.response import Response, created
+from app.schemas.egg_schema import EggCollectionCreateRequest, EggCollectionResponse
+from app.services.egg_ledger_service import EggLedgerService
 
 
-@router.get("/users")
-async def list_users() -> Response:
-    users = await User.all()
-    payload = [UserResponseSchema.from_model(u) for u in users]
-    return json_response(payload)  # Calls .to_dict() and encodes datetimes automatically
+class EggCollectionController:
+    def __init__(self, service: EggLedgerService) -> None:
+        self.service = service
+
+    async def store(
+        self,
+        organization_id: UUID,
+        payload: EggCollectionCreateRequest,
+    ) -> Response:
+        entry = await self.service.record_collection(organization_id, payload)
+        return created(EggCollectionResponse.from_model(entry))
 ```
 
-### 2. Pairing Input DTOs with `FormRequest` or `validate()`
+Route handlers may also return a `BaseSchema` instance or `list[BaseSchema]` directly—SwiftPY's ASGI pipeline automatically wraps and encodes it into an `application/json` `Response` via `to_dict()`.
 
-SwiftPY keeps HTTP input validation explicit in **`FormRequest`** or **`await validate(request, ...)`**, then lets you build clean typed DTOs from the validated output:
+---
 
-#### With `validate(request, Schema.RULES)`
+## Services, Repositories & ORM `Model` Interoperability
 
-```python
-from swiftpy import Request, Response, validate
-from swiftpy.http.response import created
-from swiftpy.support.hashing import Hash
-from swiftpy.validation import ValidationException
-
-from app.schemas.user_schema import UserCreateSchema, UserResponseSchema
-from app.services.user_service import UserService
-
-
-@router.post("/users")
-async def create_user(request: Request, users: UserService) -> Response:
-    try:
-        validated = (
-            await validate(request, UserCreateSchema.RULES)
-        ).raise_if_failed().validated()
-    except ValidationException as exc:
-        raise exc.single()  # Or omit try/except to return all field errors
-
-    dto = UserCreateSchema(
-        name=validated.name,
-        email=validated.email,
-        password=await Hash.make_async(validated.password),
-    )
-    user = await users.create_user(
-        name=dto.name,
-        email=dto.email,
-        password_hash=dto.password,
-    )
-    return created(UserResponseSchema.from_model(user))
-```
-
-#### With `FormRequest` (`CreateUserRequest`)
-
-You can also share a schema dictionary or hydrate a DTO directly from `FormRequest.validated()`:
+Because `BaseSchema` instances carry statically typed attributes (`payload.movement_date`, `payload.good_eggs`, `payload.flock_id`), you can pass the validated schema directly from controllers into services and repositories:
 
 ```python
-# app/http/requests/create_user_request.py
-from swiftpy.validation import FormRequest
+import uuid
+from app.models.egg_stock_ledger import EggStockLedger
+from app.schemas.egg_schema import EggCollectionCreateRequest
 
-from app.schemas.user_schema import UserCreateSchema
 
+class EggLedgerRepository:
+    model: type[EggStockLedger] = EggStockLedger
 
-class CreateUserRequest(FormRequest):
-    schema = UserCreateSchema.RULES
-
-    def to_dto(self) -> UserCreateSchema:
-        data = self.validated()
-        return UserCreateSchema(
-            name=data.name,
-            email=data.email,
-            password=data.password,
+    async def record_collection(
+        self,
+        organization_id: uuid.UUID,
+        payload: EggCollectionCreateRequest,
+    ) -> EggStockLedger:
+        ref = payload.reference or f"EGG-COL-{payload.movement_date.strftime('%Y%m%d')}"
+        return await self.model.create(
+            payload,
+            id=uuid.uuid4(),
+            organization_id=organization_id,
+            movement_type="COLLECTION",
+            reference=ref,
         )
 ```
 
-Then route handlers stay tiny and strongly typed:
+### Key ORM & Serialization Helpers
 
-```python
-@router.post("/users")
-async def store_user(form: CreateUserRequest, users: UserService) -> Response:
-    dto = form.to_dto()
-    password_hash = await Hash.make_async(dto.password)
-    user = await users.create_user(dto.name, dto.email, password_hash)
-    return created(UserResponseSchema.from_model(user))
-```
-
-### 3. Using `make:schema`'s `.schema` Dict with `Validator`
-
-If you use the default `OrderSchema.schema` dictionary scaffolded by `swiftpy make:schema OrderSchema`, populate it with SwiftPY validation rule strings and pass it straight to `validate()` or `FormRequest.schema`:
-
-```python
-# app/schemas/order_schema.py
-from __future__ import annotations
-
-
-class OrderSchema:
-    schema = {
-        "customer_email": "required|email:lowercase",
-        "items": "required",
-        "items.*.sku": "required|str|min:3",
-        "items.*.qty": "required|int|min:1",
-    }
-```
-
-```python
-data = (await validate(request, OrderSchema.schema)).raise_if_failed().validated()
-```
+- **`Schema.from_model(model)`:** Hydrates a response schema from an ORM `Model` instance, dict, or plain object (respecting loaded relations without triggering lazy loads on unloaded relationships).
+- **`payload.to_dict(exclude_none=False, exclude_unset=False, by_alias=False)`:** Recursively converts schemas into dictionaries.
+- **`payload.is_set("field_name")` / `payload.fields_set`:** Inspects which fields were explicitly provided in the input payload (versus defaulted).
+- **`await Model.create(payload, ...)` / `await Model.force_create(payload, ...)`:** Extracts `payload.to_dict()` and merges any extra keyword overrides while enforcing `__fillable__` / `__guarded__` on `create()`.
+- **`await model.update(payload)` / `await model.force_update(payload)`:** Extracts `payload.to_dict(exclude_unset=True)` so partial `PATCH` schemas never overwrite omitted columns with defaults (post-validation field assignments also update `fields_set`).
+- **`await Auth.attempt(payload)` / `Auth.attempt_when(payload, fn)` / `Auth.once(payload)`:** Accepts validated `BaseSchema` login DTOs directly (`to_dict(exclude_unset=True)`).
+- **`isset(payload, "field_or_alias")`:** Resolves canonical fields, `Field(alias=...)` names, nested schemas (`"meta.region"`), and `extra = "allow"` attributes safely.
 
 ---
 
 ## `app/schemas/` vs. `app/http/resources/` (`make:resource`)
 
-Both `make:schema` and `make:resource` help structure API responses:
+Both `make:schema` and `make:resource` help structure API payloads:
 
-- **`app/schemas/` (`UserResponseSchema`, `OrderCreateSchema`):** Framework-agnostic typed `@dataclass(slots=True)` DTOs ideal when you want strict `mypy` field checking, shared input/output contracts between routes and `app/services/`, and reusable `RULES` dicts.
-- **`app/http/resources/` (`UserResource`):** HTTP-layer transformer wrappers (`UserResource(model_or_schema).to_dict()`, `UserResource.collection(items)`) geared toward shaping ORM models or service schemas cleanly for HTTP responses.
+- **`app/schemas/` (`BaseSchema` / `Schema`):** Declarative inbound validation and outbound response DTOs shared cleanly across HTTP handlers, services, repositories, and ORM models with full Pyrefly/Mypy typing.
+- **`app/http/resources/` (`UserResource`):** HTTP-layer presentation transformers (`UserResource(model_or_schema).to_dict()`, `UserResource.collection(items)`) for custom envelope formatting or computed API fields.
 
-SwiftPY's starter application wires these layers together via **`UserService -> UserResponseSchema -> UserResource -> UserController -> routes/api.py`**. See [Application Architecture & Project Structure](2026-11-21-application-architecture-and-project-structure.md) for the complete decision guide on when to use `Schema` vs. `FormRequest` vs. `Resource`.
+SwiftPY's starter application wires these layers cleanly via **`EggController` / `UserController -> UserService -> UserRepository -> UserResponseSchema`**. See [Application Architecture & Project Structure](2026-11-21-application-architecture-and-project-structure.md) for architectural boundaries across layers.
 
 ---
 
-## Common Pitfalls
+## Important Notes & Best Practices
 
-> [!IMPORTANT]
-> **1. Do not annotate route handler parameters with dataclass schemas directly:** SwiftPY's `Router` only injects `Request`, `FormRequest` subclasses, `UploadedFile`, URL path parameters, and DI container services. Writing `async def store(body: UserCreateSchema)` causes the DI container to try constructing `UserCreateSchema()` with missing constructor arguments (`RouteRegistrationError` / `ResolutionError`). Always extract/validate via `FormRequest` or `await validate(request, ...)` first.
+> **1. Plain `@dataclass` types vs. `BaseSchema` on routes:** Route parameter auto-validation and JSON body parsing apply only to `BaseSchema` / `Schema` subclasses and `FormRequest` subclasses. A plain Python `@dataclass` without a container binding will not parse request bodies and will fail route registration (`RouteRegistrationError`) if its constructor takes required arguments.
 
-> [!IMPORTANT]
-> **2. Always define `to_dict()` on `@dataclass` response schemas:** SwiftPY's `encode_json()` converts objects via `.to_dict()`, not `dataclasses.is_dataclass()`. Passing a raw `@dataclass` instance without a `to_dict()` method to `json_response()` or `created()` raises `TypeError: Object of type ... is not JSON serializable`.
+> **2. Keyword `default=` when instantiating schemas directly under `mypy --strict`:** In Python's `mypy --strict` plugin for `@dataclass_transform`, passing an optional default via keyword (`Field(default=None, max_length=100)`) allows mypy to recognize that field as optional when constructing `MySchema(...)` directly in Python code, whereas positional `Field(None, max_length=100)` works at runtime, via `MySchema.validate({...})`, via HTTP route injection, and in PEP 681 checkers such as Pyrefly and Pyright.
+
+> **3. Keep ORM imports vs. schema imports distinct:** Import `BaseSchema`, `Schema`, `Field`, `field_validator`, and `model_validator` from `swiftpy.schemas`; import ORM `Model` and column `Field` from `swiftpy.database.orm`.
 
 ---
 
