@@ -62,6 +62,11 @@ class MassAssignmentError(ValueError):
     """Raised when an attribute cannot be mass-assigned."""
 
 
+def _unwrap_builder_value(value: Any) -> Any:
+    """Extract the underlying QueryBuilder when a ModelQueryBuilder subquery is supplied."""
+    return value.builder if isinstance(value, ModelQueryBuilder) else value
+
+
 class ModelQueryBuilder[T: Model]:
     """Hydrates database records into strongly typed Active Record Model instances."""
 
@@ -106,18 +111,20 @@ class ModelQueryBuilder[T: Model]:
         self, column: str, operator_or_value: Any, value: Any = _MISSING
     ) -> ModelQueryBuilder[T]:
         if value is _MISSING:
-            self.builder.where(column, operator_or_value)
+            self.builder.where(column, _unwrap_builder_value(operator_or_value))
         else:
-            self.builder.where(column, operator_or_value, value)
+            self.builder.where(column, operator_or_value, _unwrap_builder_value(value))
         return self
 
     def or_where(
         self, column: str, operator_or_value: Any, value: Any = _MISSING
     ) -> ModelQueryBuilder[T]:
         if value is _MISSING:
-            self.builder.or_where(column, operator_or_value)
+            self.builder.or_where(column, _unwrap_builder_value(operator_or_value))
         else:
-            self.builder.or_where(column, operator_or_value, value)
+            self.builder.or_where(
+                column, operator_or_value, _unwrap_builder_value(value)
+            )
         return self
 
     def where_column(
@@ -355,27 +362,35 @@ class ModelQueryBuilder[T: Model]:
         return self.where_group(callback, boolean="OR")
 
     def where_in(
-        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[T]:
-        self.builder.where_in(column, values)
+        self.builder.where_in(column, _unwrap_builder_value(values))
         return self
 
     def or_where_in(
-        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[T]:
-        self.builder.or_where_in(column, values)
+        self.builder.or_where_in(column, _unwrap_builder_value(values))
         return self
 
     def where_not_in(
-        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[T]:
-        self.builder.where_not_in(column, values)
+        self.builder.where_not_in(column, _unwrap_builder_value(values))
         return self
 
     def or_where_not_in(
-        self, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[T]:
-        self.builder.or_where_not_in(column, values)
+        self.builder.or_where_not_in(column, _unwrap_builder_value(values))
         return self
 
     def where_like(
@@ -555,13 +570,13 @@ class ModelQueryBuilder[T: Model]:
         return self
 
     def or_having_raw(
-        self, sql: str, bindings: list[Any] | None = None
+        self, sql: str, bindings: Sequence[Any] | None = None
     ) -> ModelQueryBuilder[T]:
         self.builder.or_having_raw(sql, bindings)
         return self
 
     def select_raw(
-        self, sql: str, bindings: list[Any] | None = None
+        self, sql: str, bindings: Sequence[Any] | None = None
     ) -> ModelQueryBuilder[T]:
         self.builder.select_raw(sql, bindings)
         return self
@@ -715,13 +730,13 @@ class ModelQueryBuilder[T: Model]:
         return await self.builder.pluck(column, key=key)
 
     async def increment(
-        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+        self, column: str, amount: float = 1, extra: Mapping[str, Any] | None = None
     ) -> str:
         """Atomically increment a column in matching database rows."""
         return await self.builder.increment(column, amount, extra=extra)
 
     async def decrement(
-        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+        self, column: str, amount: float = 1, extra: Mapping[str, Any] | None = None
     ) -> str:
         """Atomically decrement a column in matching database rows."""
         return await self.builder.decrement(column, amount, extra=extra)
@@ -811,9 +826,9 @@ class ModelQueryBuilder[T: Model]:
 
     async def upsert(
         self,
-        values: list[dict[str, Any]],
-        unique_by: list[str] | str,
-        update_columns: list[str] | None = None,
+        values: Sequence[Mapping[str, Any]],
+        unique_by: Sequence[str] | str,
+        update_columns: Sequence[str] | None = None,
     ) -> int:
         """Perform a PostgreSQL INSERT ... ON CONFLICT (unique_by) DO UPDATE / DO NOTHING."""
         return await self.builder.upsert(values, unique_by, update_columns=update_columns)
@@ -912,7 +927,7 @@ class ModelQueryBuilder[T: Model]:
 
     async def insert_returning(
         self,
-        data: dict[str, Any],
+        data: Mapping[str, Any],
         *,
         returning: Sequence[str] | str | None = None,
         allow_default_values: bool = False,
@@ -922,23 +937,24 @@ class ModelQueryBuilder[T: Model]:
         )
 
     @overload
-    async def insert(self, data: dict[str, Any], *, returning: None = None) -> int: ...
+    async def insert(self, data: Mapping[str, Any], *, returning: None = None) -> int: ...
 
     @overload
     async def insert(
-        self, data: dict[str, Any], *, returning: Sequence[str] | str
+        self, data: Mapping[str, Any], *, returning: Sequence[str] | str
     ) -> Any: ...
 
     async def insert(
         self,
-        data: dict[str, Any],
+        data: Mapping[str, Any],
         *,
         returning: Sequence[str] | str | None = None,
     ) -> Any:
         return await self.builder.insert(data, returning=returning)
 
-    async def update(self, data: dict[str, Any]) -> str:
-        return await self.builder.update(data)
+    async def update(self, data: Mapping[str, Any] | BaseSchema) -> str:
+        payload = data.to_dict(exclude_unset=True) if isinstance(data, BaseSchema) else data
+        return await self.builder.update(payload)
 
     async def delete(self) -> str:
         return await self.builder.delete()
@@ -1570,7 +1586,8 @@ class Model:
             if isinstance(value, str):
                 clean_s = value.strip("[] \t\n\r")
                 if not clean_s:
-                    return []
+                    empty: list[float] = []
+                    return empty
                 try:
                     return [float(x.strip()) for x in clean_s.split(",") if x.strip()]
                 except (ValueError, TypeError):
@@ -1681,7 +1698,7 @@ class Model:
 
     @classmethod
     def select_raw(
-        cls, sql: str, bindings: list[Any] | None = None
+        cls, sql: str, bindings: Sequence[Any] | None = None
     ) -> ModelQueryBuilder[Self]:
         return cls.query().select_raw(sql, bindings)
 
@@ -1971,28 +1988,36 @@ class Model:
 
     @classmethod
     def where_in(
-        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        cls,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[Self]:
         """Add a WHERE IN clause to the query."""
         return cls.query().where_in(column, values)
 
     @classmethod
     def or_where_in(
-        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        cls,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[Self]:
         """Add an OR WHERE IN clause to the query."""
         return cls.query().or_where_in(column, values)
 
     @classmethod
     def where_not_in(
-        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        cls,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[Self]:
         """Add a WHERE NOT IN clause to the query."""
         return cls.query().where_not_in(column, values)
 
     @classmethod
     def or_where_not_in(
-        cls, column: str, values: list[Any] | tuple[Any, ...] | QueryBuilder
+        cls,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
     ) -> ModelQueryBuilder[Self]:
         """Add an OR WHERE NOT IN clause to the query."""
         return cls.query().or_where_not_in(column, values)
@@ -2201,8 +2226,8 @@ class Model:
     @classmethod
     async def first_or_create(
         cls,
-        attributes: dict[str, Any],
-        values: dict[str, Any] | None = None,
+        attributes: Mapping[str, Any],
+        values: Mapping[str, Any] | BaseSchema | None = None,
     ) -> Self:
         """Find the first matching record by attributes, or create it if not found."""
         query = cls.query()
@@ -2213,15 +2238,15 @@ class Model:
             return instance
 
         creation_data = dict(attributes)
-        if values:
-            creation_data.update(values)
+        if values is not None:
+            creation_data.update(cls._extract_create_mapping((values,), {}))
         return await cls.create(creation_data)
 
     @classmethod
     async def update_or_create(
         cls,
-        attributes: dict[str, Any],
-        values: dict[str, Any],
+        attributes: Mapping[str, Any],
+        values: Mapping[str, Any] | BaseSchema,
     ) -> Self:
         """Find the first matching record and update it with values, or create it if not found."""
         query = cls.query()
@@ -2229,20 +2254,21 @@ class Model:
             query = query.where(k, v)
         instance = await query.first()
         if instance is not None:
-            instance.fill(**values)
+            update_data = cls._extract_update_mapping(values, {})
+            instance.fill(**update_data)
             await instance.save()
             return instance
 
         creation_data = dict(attributes)
-        creation_data.update(values)
+        creation_data.update(cls._extract_create_mapping((values,), {}))
         return await cls.create(creation_data)
 
     @classmethod
     async def upsert(
         cls,
-        values: list[dict[str, Any]],
-        unique_by: list[str] | str,
-        update_columns: list[str] | None = None,
+        values: Sequence[Mapping[str, Any]],
+        unique_by: Sequence[str] | str,
+        update_columns: Sequence[str] | None = None,
     ) -> int:
         return await cls.query().upsert(values, unique_by, update_columns=update_columns)
 
@@ -2402,7 +2428,7 @@ class Model:
     def having_raw(
         cls,
         sql: str,
-        bindings: list[Any] | None = None,
+        bindings: Sequence[Any] | None = None,
         boolean: str = "AND",
     ) -> ModelQueryBuilder[Self]:
         """Add a raw HAVING condition to the model query."""
@@ -2410,7 +2436,7 @@ class Model:
 
     @classmethod
     def or_having_raw(
-        cls, sql: str, bindings: list[Any] | None = None
+        cls, sql: str, bindings: Sequence[Any] | None = None
     ) -> ModelQueryBuilder[Self]:
         """Add an OR raw HAVING condition to the model query."""
         return cls.query().or_having_raw(sql, bindings)
@@ -2733,7 +2759,7 @@ class Model:
         return self
 
     async def increment(
-        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+        self, column: str, amount: float = 1, extra: Mapping[str, Any] | None = None
     ) -> None:
         """
         Atomically increment a column in the database and refresh this instance.
@@ -2754,7 +2780,7 @@ class Model:
         await self.refresh()
 
     async def decrement(
-        self, column: str, amount: float = 1, extra: dict[str, Any] | None = None
+        self, column: str, amount: float = 1, extra: Mapping[str, Any] | None = None
     ) -> None:
         """
         Atomically decrement a column in the database and refresh this instance.
@@ -2975,7 +3001,7 @@ class Model:
         return f"<{self.__class__.__name__} {self.__primary_key__}={pk!r}>"
 
     def __eq__(self, other: object) -> bool:
-        if type(self) is not type(other):
+        if type(self) is not type(other) or not isinstance(other, Model):
             return False
         pk = self.get_primary_key()
         other_pk = other.get_primary_key()

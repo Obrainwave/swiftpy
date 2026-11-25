@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
-from swiftpy.database import QueryDumpError
+from swiftpy.database import (
+    Paginator,
+    Query,
+    QueryDumpError,
+    QueryError,
+    SimplePaginator,
+)
 from swiftpy.database.orm.fields import Field
 from swiftpy.database.orm.model import MassAssignmentError, Model, ModelQueryBuilder
 from swiftpy.database.orm.relationships import (
@@ -14,6 +22,7 @@ from swiftpy.database.orm.relationships import (
     HasOne,
 )
 from swiftpy.http.response import json_response
+from swiftpy.schemas import BaseSchema
 
 
 class Role(Model):
@@ -294,10 +303,20 @@ class _DocVersion(Model):
     __guarded__: ClassVar[list[str]] = []
 
 
-class _DocVersionRepository:
-    """Repository pattern verifying `self.model: type[Model]` preserves concrete types."""
+class _DocVersionCreateSchema(BaseSchema):
+    version: str
+    slug: str
+    sort_order: int = 0
 
-    model: type[_DocVersion] = _DocVersion
+
+class _DocGroupCreateSchema(BaseSchema):
+    name: str
+
+
+class _DocVersionRepository:
+    """Repository pattern verifying plain `model = _DocVersion` preserves concrete types."""
+
+    model = _DocVersion
 
     async def get_doc_version(self, version_id: int) -> _DocVersion:
         version = await self.model.with_("groups").where("id", version_id).first()
@@ -308,26 +327,136 @@ class _DocVersionRepository:
     async def get_doc_versions(self) -> list[_DocVersion]:
         return await self.model.with_("groups", "author").order_by("sort_order").get()
 
+    async def create_doc_version(self, data: _DocVersionCreateSchema) -> _DocVersion:
+        return await self.model.create(data)
 
-class _GenericRepository[M: Model]:
-    """Generic repository base preserving concrete Model type parameter across chains."""
+    async def update_doc_version(
+        self, version_id: int, data: _DocVersionCreateSchema
+    ) -> _DocVersion:
+        version = await self.model.find_or_fail(version_id)
+        return await version.update(data)
 
-    def __init__(self, model: type[M]) -> None:
-        self.model: type[M] = model
 
-    async def get_by_id(self, record_id: int) -> M:
-        item = await self.model.where("id", record_id).first()
-        if item is None:
-            raise LookupError("Not found")
-        return item
+class _InstanceDocVersionRepository:
+    """Repository assigning `self.model = _DocVersion` in `__init__`."""
 
-    async def list_ordered(self) -> list[M]:
-        return await self.model.order_by("id").get()
+    def __init__(self) -> None:
+        self.model = _DocVersion
+
+    async def get_all_ordered(self) -> list[_DocVersion]:
+        return await self.model.order_by("sort_order").get()
+
+    async def first_active(self) -> _DocVersion:
+        return await self.model.where("is_active", True).first_or_fail()
+
+
+async def _verify_direct_and_relationship_inference(v: _DocVersion) -> None:
+    """Static type-checker contract for direct Model, chain, and relation inference."""
+    versions: list[_DocVersion] = await (
+        _DocVersion.with_("groups", "author").order_by("sort_order").get()
+    )
+    created: _DocVersion = await _DocVersion.create({"version": "1.0", "slug": "v1"})
+    first: _DocVersion | None = await _DocVersion.where("id", 1).first()
+    found: _DocVersion | None = await _DocVersion.find(1)
+    found_req: _DocVersion = await _DocVersion.find_or_fail(1)
+    first_req: _DocVersion = await _DocVersion.where("is_active", True).first_or_fail()
+    updated: _DocVersion = await created.update({"slug": "v1-1"})
+    refreshed: _DocVersion = await updated.refresh()
+    paged: Paginator[_DocVersion] = await _DocVersion.with_("groups").paginate(
+        per_page=10, page=1
+    )
+    simple_paged: SimplePaginator[_DocVersion] = await (
+        _DocVersion.order_by("id").simple_paginate(per_page=10, page=1)
+    )
+
+    typed_attrs: dict[str, str] = {"slug": "v1"}
+    typed_vals: dict[str, str] = {"version": "1.0"}
+    ensured: _DocVersion = await _DocVersion.first_or_create(typed_attrs, typed_vals)
+    upserted: _DocVersion = await _DocVersion.update_or_create(typed_attrs, typed_vals)
+
+    id_list: list[int] = [1, 2, 3]
+    in_filtered: list[_DocVersion] = await (
+        _DocVersion.where_in("id", id_list).get()
+    )
+    subquery_filtered: list[_DocVersion] = await (
+        _DocVersion.where_in("id", _DocGroup.select("id").where("name", "Core")).get()
+    )
+
+    # Typed relationship awaiting and full query chaining without Any degradation
+    awaited_groups: list[_DocGroup] = await v.groups
+    chained_groups: list[_DocGroup] = await (
+        v.groups.where_in("id", id_list).latest("id").get()
+    )
+    first_group: _DocGroup | None = await v.groups.where("name", "Core").first()
+    req_group: _DocGroup = await v.groups.where("name", "Core").first_or_fail()
+    paged_groups: Paginator[_DocGroup] = await v.groups.order_by("id").paginate()
+    group_from_schema: _DocGroup = await v.groups.create(
+        _DocGroupCreateSchema(name="Guides")
+    )
+    lazy_group_builder: ModelQueryBuilder[_DocGroup] = _DocVersion.groups.build_lazy_query(v)
+
+    awaited_author: User | None = await v.author
+    filtered_author: User | None = await v.author.where_not_null("email")
+    req_author: User = await v.author.first_or_fail()
+
+    assert len(versions) >= 0
+    assert first is None or isinstance(first, _DocVersion)
+    assert found is None or isinstance(found, _DocVersion)
+    assert found_req is refreshed and first_req is ensured and upserted is found_req
+    assert in_filtered == subquery_filtered
+    assert paged.total >= 0 and simple_paged.per_page == 10
+    assert awaited_groups == chained_groups
+    assert first_group is None or first_group == req_group
+    assert paged_groups.total >= 0 and group_from_schema.name == "Guides"
+    assert lazy_group_builder is not None
+    assert awaited_author == filtered_author
+    assert req_author.email != ""
 
 
 def test_repository_query_chaining_type_preservation() -> None:
     """Verify repository methods preserve concrete model return types statically."""
     repo = _DocVersionRepository()
-    generic_repo = _GenericRepository(_DocVersion)
+    instance_repo = _InstanceDocVersionRepository()
     assert repo.model is _DocVersion
-    assert generic_repo.model is _DocVersion
+    assert instance_repo.model is _DocVersion
+
+    version = _DocVersion(id=1, version="0.3.7", slug="v0-3-7")
+    lazy_groups = _DocVersion.groups.build_lazy_query(version)
+    sql, bindings = (
+        lazy_groups.where_in("id", [10, 20])
+        .latest("id")
+        .to_sql()
+    )
+    assert '"typing_doc_groups"' in sql
+    assert bindings == [1, 10, 20]
+
+    sub_sql, sub_bindings = (
+        _DocVersion.where_in("id", _DocGroup.select("id").where("name", "Core"))
+        .to_sql()
+    )
+    assert " IN (SELECT " in sub_sql
+    assert sub_bindings == ["Core"]
+
+    where_sub_sql, where_sub_bindings = (
+        _DocVersion.where("id", "IN", _DocGroup.select("id").where("name", "Api"))
+        .to_sql()
+    )
+    assert " IN (SELECT " in where_sub_sql
+    assert where_sub_bindings == ["Api"]
+
+    # Non-string Sequence accepted; str/bytes/memoryview rejected by where_in
+    typed_seq: Sequence[int] = (1, 2)
+    seq_sql, seq_bindings = Query.table("typing_doc_versions").where_in("id", typed_seq).to_sql()
+    assert " IN ($1, $2)" in seq_sql
+    assert seq_bindings == [1, 2]
+
+    for bad_seq in ("12", b"12", memoryview(b"12")):
+        with pytest.raises(QueryError, match="requires a list, tuple, or QueryBuilder subquery"):
+            Query.table("typing_doc_versions").where("id", "IN", bad_seq)
+
+    # Read-only Mapping accepted in _compile_update_sets
+    sets, update_bindings = Query.table("typing_doc_versions")._compile_update_sets(
+        MappingProxyType({"slug": "proxy-slug"})
+    )
+    assert sets == ['"slug" = $1']
+    assert update_bindings == ["proxy-slug"]

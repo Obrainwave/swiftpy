@@ -47,7 +47,7 @@ Use the `make:*` commands to generate typed stubs conforming to SwiftPY's conven
 | `swiftpy make:api-key` | Config/table guidance + key generation | `--prefix`, `--pepper`, `-m` / `--migration`, `--path`, `--force` |
 
 > [!TIP]
-> Remember that `swiftpy make:schema` and starter projects scaffold strongly typed `swiftpy.schemas.BaseSchema` DTOs in `app/schemas/`. See [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md).
+> Remember that `swiftpy make:schema` and starter projects scaffold strongly typed `swiftpy.schemas.BaseSchema` DTOs in `app/schemas/` (see [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md)), and `swiftpy make:repository` creates zero-boilerplate repositories (`model = YourModel`) with full Pyrefly/Mypy inference out of the box (see [Active Record ORM & Relationships](2026-11-15-orm-models-and-relationships.md)).
 
 ### Migrations & Database Seeders
 
@@ -236,6 +236,18 @@ async def test_insert_is_rolled_back(db_transaction) -> None:
 
 > [!NOTE]
 > **Testing `Storage`:** SwiftPY does **not** include a `StorageFake` class. For storage unit/integration tests, configure a temporary `StorageConfig` using `pytest`'s `tmp_path` as the `"local"` disk root so files stay isolated and automatically cleaned up.
+
+### Static Type Checking (`pyrefly` & `mypy --strict`)
+
+SwiftPY ships a PEP 561 `py.typed` marker alongside generic ORM, relationship (`RelationshipQueryBuilder[T]`, `SingleRelationshipQueryBuilder[T]`), and `@dataclass_transform` `BaseSchema` annotations:
+
+```bash
+# Type-check application code strictly with Mypy
+uv run mypy --strict .
+
+# Type-check with Pyrefly (verifying no implicit Any leaks)
+uvx pyrefly check --error=no-any-return-implicit .
+```
 
 ---
 

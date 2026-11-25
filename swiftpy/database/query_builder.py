@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -39,6 +39,13 @@ _HAVING_AGGREGATE_RE = re.compile(
     r"^(COUNT|SUM|AVG|MIN|MAX)\(\s*(DISTINCT\s+)?(\*|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\)$",
     re.IGNORECASE,
 )
+
+
+def _is_non_string_sequence(value: Any) -> bool:
+    """Return True if value is a Sequence other than str, bytes, bytearray, or memoryview."""
+    return isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray, memoryview)
+    )
 
 
 def _validate_boolean(boolean: str, *, context: str = "WHERE") -> str:
@@ -640,7 +647,9 @@ class QueryBuilder:
                 f"Cannot compare NULL using operator '{operator}'. Use '=' / '!=' or where_null() / where_not_null()."
             )
 
-        if operator in {"IN", "NOT IN"} and not isinstance(value, (list, tuple, QueryBuilder)):
+        if operator in {"IN", "NOT IN"} and not (
+            _is_non_string_sequence(value) or isinstance(value, QueryBuilder)
+        ):
             raise QueryError(
                 f"Operator '{operator}' requires a list, tuple, or QueryBuilder subquery, got {type(value).__name__}."
             )
@@ -705,7 +714,7 @@ class QueryBuilder:
                 )
             encoded = value
         else:
-            if not isinstance(value, (list, tuple)):
+            if not _is_non_string_sequence(value):
                 raise QueryError(
                     f"Operator '{operator}' requires a list or tuple of JSON scalars."
                 )
@@ -1010,7 +1019,7 @@ class QueryBuilder:
     def where_in(
         self,
         column: str,
-        values: list[Any] | tuple[Any, ...] | QueryBuilder,
+        values: Sequence[Any] | QueryBuilder,
         *,
         boolean: str = "AND",
     ) -> QueryBuilder:
@@ -1020,7 +1029,7 @@ class QueryBuilder:
     def or_where_in(
         self,
         column: str,
-        values: list[Any] | tuple[Any, ...] | QueryBuilder,
+        values: Sequence[Any] | QueryBuilder,
     ) -> QueryBuilder:
         """Add an OR WHERE column IN (...) clause."""
         return self.where_in(column, values, boolean="OR")
@@ -1028,7 +1037,7 @@ class QueryBuilder:
     def where_not_in(
         self,
         column: str,
-        values: list[Any] | tuple[Any, ...] | QueryBuilder,
+        values: Sequence[Any] | QueryBuilder,
         *,
         boolean: str = "AND",
     ) -> QueryBuilder:
@@ -1038,7 +1047,7 @@ class QueryBuilder:
     def or_where_not_in(
         self,
         column: str,
-        values: list[Any] | tuple[Any, ...] | QueryBuilder,
+        values: Sequence[Any] | QueryBuilder,
     ) -> QueryBuilder:
         """Add an OR WHERE column NOT IN (...) clause."""
         return self.where_not_in(column, values, boolean="OR")
@@ -1588,7 +1597,7 @@ class QueryBuilder:
                 idx + len(sub_bindings),
             )
 
-        if operator in {"IN", "NOT IN"} and isinstance(value, (list, tuple)):
+        if operator in {"IN", "NOT IN"} and _is_non_string_sequence(value):
             if not value:
                 return (boolean, "FALSE" if operator == "IN" else "TRUE"), [], idx
             placeholders = [f"${idx + i}" for i in range(len(value))]
@@ -2222,13 +2231,13 @@ class QueryBuilder:
 
     async def insert_returning(
         self,
-        data: dict[str, Any],
+        data: Mapping[str, Any],
         *,
         returning: Sequence[str] | str | None = None,
         allow_default_values: bool = False,
     ) -> dict[str, Any]:
         """Insert a row and return the RETURNING row as a dictionary."""
-        if not isinstance(data, dict) or (not data and not allow_default_values):
+        if not isinstance(data, Mapping) or (not data and not allow_default_values):
             raise QueryError("Cannot execute INSERT with empty data dictionary.")
 
         if returning is None or returning == "*":
@@ -2281,16 +2290,16 @@ class QueryBuilder:
             await self._release(conn)
 
     @overload
-    async def insert(self, data: dict[str, Any], *, returning: None = None) -> int: ...
+    async def insert(self, data: Mapping[str, Any], *, returning: None = None) -> int: ...
 
     @overload
     async def insert(
-        self, data: dict[str, Any], *, returning: Sequence[str] | str
+        self, data: Mapping[str, Any], *, returning: Sequence[str] | str
     ) -> Any: ...
 
     async def insert(
         self,
-        data: dict[str, Any],
+        data: Mapping[str, Any],
         *,
         returning: Sequence[str] | str | None = None,
     ) -> Any:
@@ -2312,7 +2321,7 @@ class QueryBuilder:
         return 0
 
     def _compile_update_sets(
-        self, data: dict[str, Any]
+        self, data: Mapping[str, Any]
     ) -> tuple[list[str], list[Any]]:
         bindings: list[Any] = []
         sets: list[str] = []
@@ -2369,11 +2378,11 @@ class QueryBuilder:
             sets.append(f"{quoted_column} = {expression}")
         return sets, bindings
 
-    async def update(self, data: dict[str, Any]) -> str:
+    async def update(self, data: Mapping[str, Any]) -> str:
         self._ensure_not_union("update")
         if self._lock is not None:
             raise QueryError("A row lock cannot be used with UPDATE.")
-        if not isinstance(data, dict) or not data:
+        if not isinstance(data, Mapping) or not data:
             raise QueryError("Cannot execute UPDATE with empty data dictionary.")
 
         if not self._where_clauses and not self._wheres and not self._raw_wheres and not self._allow_all:
@@ -2425,7 +2434,7 @@ class QueryBuilder:
         self,
         column: str,
         amount: float = 1,
-        extra: dict[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> str:
         """Atomically increment a column's value by amount."""
         self._ensure_not_union("increment")
@@ -2480,7 +2489,7 @@ class QueryBuilder:
         self,
         column: str,
         amount: float = 1,
-        extra: dict[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> str:
         """Atomically decrement a column's value by amount."""
         self._ensure_not_union("decrement")
@@ -2617,9 +2626,9 @@ class QueryBuilder:
 
     async def upsert(
         self,
-        values: list[dict[str, Any]],
-        unique_by: list[str] | str,
-        update_columns: list[str] | None = None,
+        values: Sequence[Mapping[str, Any]],
+        unique_by: Sequence[str] | str,
+        update_columns: Sequence[str] | None = None,
     ) -> int:
         """
         Perform a PostgreSQL INSERT ... ON CONFLICT (unique_by) DO UPDATE / DO NOTHING.
@@ -2628,12 +2637,12 @@ class QueryBuilder:
         self._ensure_not_union("upsert")
         if self._lock is not None:
             raise QueryError("A row lock cannot be used with UPSERT.")
-        if not values or not isinstance(values, list):
+        if not values or not _is_non_string_sequence(values):
             raise QueryError("upsert() requires a non-empty list of dictionary rows.")
 
-        first_keys = set(values[0].keys()) if isinstance(values[0], dict) else set()
+        first_keys = set(values[0].keys()) if isinstance(values[0], Mapping) else set()
         for i, row in enumerate(values):
-            if not isinstance(row, dict) or not row:
+            if not isinstance(row, Mapping) or not row:
                 raise QueryError("Each row in values must be a non-empty dictionary.")
             if set(row.keys()) != first_keys:
                 raise QueryError(
@@ -2674,7 +2683,7 @@ class QueryBuilder:
         if update_columns is None:
             update_cols = [c for c in columns if c not in unique_cols]
         else:
-            update_cols = update_columns
+            update_cols = list(update_columns)
 
         safe_update_cols = [
             validate_identifier(c, allow_dotted=False, allow_wildcard=False)

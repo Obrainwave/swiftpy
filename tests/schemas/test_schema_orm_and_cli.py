@@ -13,7 +13,11 @@ from app.schemas.user_schema import (
 )
 from swiftpy.console.cli import CLI
 from swiftpy.database.orm import Field as OrmField
-from swiftpy.database.orm import Model
+from swiftpy.database.orm import HasMany, Model
+from swiftpy.database.orm.registry import (
+    restore_model_registry,
+    snapshot_model_registry,
+)
 from swiftpy.schemas import BaseSchema, Field
 from swiftpy.validation.exceptions import ValidationException
 
@@ -191,3 +195,129 @@ def test_make_schema_and_new_project_scaffold_use_base_schema(
         )
     assert "name" in exc.value.errors
     assert "password" in exc.value.errors
+
+
+async def test_query_builder_and_relation_methods_accept_base_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snap = snapshot_model_registry()
+    try:
+        class _ChildGroup(Model):
+            __table__ = "schema_child_groups"
+            __guarded__: ClassVar[list[str]] = []
+            id: int | None = None
+            version_id: int = 0
+            name: str = ""
+            title: str = "untitled"
+
+        class _ParentVersion(Model):
+            __table__ = "schema_parent_versions"
+            __guarded__: ClassVar[list[str]] = []
+            id: int = 1
+            slug: str = "v1"
+            notes: str = "init"
+            children = HasMany(_ChildGroup, foreign_key="version_id")
+
+        class _ParentCreateSchema(BaseSchema):
+            slug: str
+            notes: str = "created-note"
+
+        class _ParentPatchSchema(BaseSchema):
+            slug: str | None = None
+            notes: str | None = None
+
+        class _ChildCreateSchema(BaseSchema):
+            name: str
+            title: str = "default-title"
+
+        class _ChildPatchSchema(BaseSchema):
+            name: str | None = None
+            title: str | None = None
+
+        captured_inserts: list[dict[str, Any]] = []
+        captured_updates: list[dict[str, Any]] = []
+
+        parent_mqb = _ParentVersion.query()
+        first_queue: list[Any] = [None]
+
+        async def _fake_parent_first() -> Any:
+            return first_queue.pop(0) if first_queue else None
+
+        async def _fake_parent_insert_returning(
+            data: dict[str, Any],
+            *,
+            returning: Any = None,
+            allow_default_values: bool = False,
+        ) -> dict[str, Any]:
+            _ = (returning, allow_default_values)
+            captured_inserts.append(dict(data))
+            return {"id": 55, **data}
+
+        async def _fake_parent_update(data: dict[str, Any]) -> str:
+            captured_updates.append(dict(data))
+            return "UPDATE 1"
+
+        monkeypatch.setattr(parent_mqb, "first", _fake_parent_first)
+        monkeypatch.setattr(
+            parent_mqb.builder, "insert_returning", _fake_parent_insert_returning
+        )
+        monkeypatch.setattr(parent_mqb.builder, "update", _fake_parent_update)
+        monkeypatch.setattr(_ParentVersion, "query", classmethod(lambda cls: parent_mqb))
+
+        patch = _ParentPatchSchema.validate({"slug": "v1-patch"})
+        res = await _ParentVersion.where("id", 1).update(patch)
+        assert res == "UPDATE 1"
+        assert captured_updates[-1] == {"slug": "v1-patch"}
+
+        ensured = await _ParentVersion.first_or_create(
+            {"id": 55},
+            _ParentCreateSchema.validate({"slug": "created"}),
+        )
+        assert ensured.id == 55
+        assert captured_inserts[-1]["slug"] == "created"
+        assert captured_inserts[-1]["notes"] == "created-note"
+
+        existing = _ParentVersion(id=55, slug="old", notes="keep")
+        existing._mark_persisted(["id", "slug", "notes"])
+        first_queue.append(existing)
+        updated_parent = await _ParentVersion.update_or_create({"id": 55}, patch)
+        assert updated_parent.slug == "v1-patch"
+        assert updated_parent.notes == "keep"
+        assert captured_updates[-1] == {"slug": "v1-patch"}
+
+        # RelationshipQueryBuilder.create(BaseSchema) and .update(BaseSchema)
+        child_mqb = _ChildGroup.query()
+
+        async def _fake_child_insert_returning(
+            data: dict[str, Any],
+            *,
+            returning: Any = None,
+            allow_default_values: bool = False,
+        ) -> dict[str, Any]:
+            _ = (returning, allow_default_values)
+            captured_inserts.append(dict(data))
+            return {"id": 77, **data}
+
+        async def _fake_child_update(data: dict[str, Any]) -> str:
+            captured_updates.append(dict(data))
+            return "UPDATE 1"
+
+        monkeypatch.setattr(
+            child_mqb.builder, "insert_returning", _fake_child_insert_returning
+        )
+        monkeypatch.setattr(child_mqb.builder, "update", _fake_child_update)
+        monkeypatch.setattr(_ChildGroup, "query", classmethod(lambda cls: child_mqb))
+
+        child = await existing.children.create(_ChildCreateSchema(name="Core"))
+        assert child.id == 77
+        assert child.version_id == 55
+        assert child.name == "Core"
+        assert child.title == "default-title"
+
+        rel_upd = await existing.children.update(
+            _ChildPatchSchema.validate({"name": "Updated"})
+        )
+        assert rel_upd == "UPDATE 1"
+        assert captured_updates[-1] == {"name": "Updated"}
+    finally:
+        restore_model_registry(snap)

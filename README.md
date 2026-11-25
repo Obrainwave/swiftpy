@@ -66,6 +66,7 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Release v0.3.5: Client IP Detection & Native Task Scheduler** | Fail-safe `request.ip()` / `Request.ip()` / `websocket.ip()` & `LoginThrottle` IP trust via `TRUSTED_PROXIES`, zero-dependency 5-field cron + `ZoneInfo` scheduler (`Schedule` / `Scheduler`), Redis crash recovery (`_CLAIM_DUE_LUA` / `_RECLAIM_PENDING_LUA`), worker overlap locks, `schedule:list`/`run`/`work` | ✅ Completed |
 | **Release v0.3.6: Query Builder Helpers** | `where_column()`, correlated `where_exists()`, `where_any()`/`where_all()`/`where_none()`, `where_past()`/`where_future()`, JSON `column->path` queries & updates, `union()`/`union_all()`, `shared_lock()`/`lock_for_update()`, debug helpers (`to_raw_sql()`, `dump()`, `dd()`) with ORM parity | ✅ Completed |
 | **Release v0.3.7: Declarative Schemas (`swiftpy.schemas`) & Pyrefly/PEP 561 Typing** | `swiftpy/py.typed` PEP 561 marker, `Model` / `ModelQueryBuilder[T]` fluent generic preservation, `BaseSchema` / `Schema` & `Field(...)` constraints, `@field_validator` / `@model_validator`, Router/Controller auto-injection & JSON serialization, ORM `create()`/`update()` schema interop, `make:schema` & `swiftpy new` updates | ✅ Completed |
+| **Release v0.3.8: Zero-Boilerplate ORM & Relationship Static Typing** | Source-level `Relation[T]` / `RelationshipQueryBuilder[T]` / `SingleRelationshipQueryBuilder[T]` type propagation (`await v.relation` & full query chains), zero-ceremony `model = YourModel` repositories, covariant `Mapping` / non-string `Sequence` & `ModelQueryBuilder` subqueries, and `BaseSchema` parity on `ModelQueryBuilder.update`, `first_or_create`, `update_or_create`, and relationship `.create()`/`.update()` | ✅ Completed |
 
 *See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md), [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md), and [`documentations/2026-11-22-task-scheduling.md`](./documentations/2026-11-22-task-scheduling.md) for the complete documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
@@ -683,9 +684,10 @@ docker compose exec app swiftpy migrate
 # Run full pytest test suite (requires PostgreSQL + Redis running)
 uv run pytest -vv -ra --timeout=120 --timeout-method=thread
 
-# Static type checking with Mypy in strict mode
+# Static type checking with Mypy in strict mode & Pyrefly
 uv run --with jinja2 --with aiosmtplib mypy swiftpy
 uv run mypy --explicit-package-bases .
+uvx pyrefly check --python-interpreter-path .venv/bin/python --error=no-any-return-implicit swiftpy/database/ tests/typing/
 
 # Linting with Ruff
 uv run ruff check .

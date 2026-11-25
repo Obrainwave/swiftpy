@@ -151,7 +151,7 @@ my_api/
 │   ├── models/             # Active Record ORM models (User)
 │   ├── providers/          # Auto-discovered service providers
 │   ├── repositories/       # Data access layer
-│   ├── schemas/            # Typed dataclasses/schemas (see Application Schemas guide)
+│   ├── schemas/            # Declarative BaseSchema DTOs (see Application Schemas guide)
 │   └── services/           # Business logic services (UserService starter)
 ├── config/                 # Configuration files loading .env via env() / env_bool()
 ├── database/
@@ -171,7 +171,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.3.0, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.3.8, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -325,7 +325,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.3.7",
+       "swiftpy-framework>=0.3.8",
        # ...
    ]
    ```
@@ -355,7 +355,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.3.1"
+python -m pip install --upgrade "swiftpy-framework>=0.3.8"
 swiftpy --version
 ```
 

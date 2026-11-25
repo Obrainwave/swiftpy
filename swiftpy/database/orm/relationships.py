@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Sequence
-from typing import TYPE_CHECKING, Any, Self, overload
+from collections.abc import Awaitable, Callable, Generator, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, NoReturn, Self, cast, overload
 
 from swiftpy.database.orm.registry import _MODEL_REGISTRY
 from swiftpy.database.query_builder import Column, Query, QueryError
@@ -10,6 +10,9 @@ from swiftpy.support.strings import snake_case
 
 if TYPE_CHECKING:
     from swiftpy.database.orm.model import Model, ModelQueryBuilder
+    from swiftpy.database.pagination import Paginator, SimplePaginator
+    from swiftpy.database.query_builder import QueryBuilder
+    from swiftpy.schemas.base import BaseSchema
 
 
 _MISSING = object()
@@ -47,7 +50,7 @@ class Relation[T: Model]:
         foreign_key: str | None = None,
         local_key: str | None = None,
     ) -> None:
-        self._related_cls: type[Model] | None = None
+        self._related_cls: type[T] | None = None
         if isinstance(related_model, str):
             self.related_model_name = related_model
         else:
@@ -70,6 +73,12 @@ class Relation[T: Model]:
         if self.owner_cls is not None:
             return getattr(self.owner_cls, "__primary_key__", "id")
         return "id"
+
+    def _get_target_model_typed(self) -> type[T]:
+        """Resolve the typed related Model class for strongly typed query construction."""
+        if self._related_cls is not None:
+            return self._related_cls
+        return cast(type[T], self.get_target_model())
 
     def get_target_model(self) -> type[Model]:
         """Resolve the related Model class, preferring direct class references and module scope."""
@@ -99,11 +108,11 @@ class Relation[T: Model]:
         """Batch load related models for instances in a single query."""
         raise NotImplementedError
 
-    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
+    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[T]:
         """Construct a query builder scoped to this relationship."""
         raise NotImplementedError
 
-    def _build_query_builder(self, instance: Model) -> RelationshipQueryBuilder[T]:
+    def _build_query_builder(self, instance: Model) -> _BaseRelationshipQueryBuilder[T]:
         """Build the appropriate relationship query builder for an unloaded relation."""
         builder = self.build_lazy_query(instance)
         return RelationshipQueryBuilder(instance, self, builder)
@@ -123,6 +132,10 @@ class Relation[T: Model]:
 
 class ManyRelation[T: Model](Relation[T]):
     """Base descriptor for to-many Active Record relationships."""
+
+    def _build_query_builder(self, instance: Model) -> RelationshipQueryBuilder[T]:
+        builder = self.build_lazy_query(instance)
+        return RelationshipQueryBuilder(instance, self, builder)
 
     @overload
     def __get__(self, instance: None, owner: type[Model] | None = None) -> Self: ...
@@ -241,8 +254,8 @@ class HasMany[T: Model](ManyRelation[T]):
             key = getattr(inst, local_key, None)
             inst._loaded_relations[self.name] = LoadedList(grouped.get(key, []))
 
-    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
-        target_model = self.get_target_model()
+    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[T]:
+        target_model = self._get_target_model_typed()
         owner_name = (
             self.owner_cls.__name__
             if self.owner_cls is not None
@@ -321,8 +334,8 @@ class HasOne[T: Model](SingleRelation[T]):
             key = getattr(inst, local_key, None)
             inst._loaded_relations[self.name] = mapped.get(key, None)
 
-    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
-        target_model = self.get_target_model()
+    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[T]:
+        target_model = self._get_target_model_typed()
         owner_name = (
             self.owner_cls.__name__
             if self.owner_cls is not None
@@ -397,8 +410,8 @@ class BelongsTo[T: Model](SingleRelation[T]):
             key = getattr(inst, fk, None)
             inst._loaded_relations[self.name] = mapped.get(key, None)
 
-    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
-        target_model = self.get_target_model()
+    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[T]:
+        target_model = self._get_target_model_typed()
         fk = self.foreign_key or f"{snake_case(self.name)}_id"
         owner_key = self._resolve_owner_key(target_model)
         val = getattr(instance, fk, None)
@@ -520,8 +533,8 @@ class BelongsToMany[T: Model](ManyRelation[T]):
             key = getattr(inst, parent_key, None)
             inst._loaded_relations[self.name] = LoadedList(grouped.get(key, []))
 
-    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[Any]:
-        target = self.get_target_model()
+    def build_lazy_query(self, instance: Model) -> ModelQueryBuilder[T]:
+        target = self._get_target_model_typed()
         parent_cls = (
             self.owner_cls if self.owner_cls is not None else instance.__class__
         )
@@ -546,15 +559,8 @@ class BelongsToMany[T: Model](ManyRelation[T]):
         return builder
 
 
-class RelationshipQueryBuilder[T: Model]:
-    """Scoped query builder for an Active Record relationship.
-
-    Lazily awaitable when explicitly queried (e.g. `await user.posts` or
-    `await user.posts.where("published", True).get()`).
-
-    Synchronous data access (such as iterating, `len()`, or accessing model attributes)
-    raises `RelationNotLoadedError` to prevent silent N+1 query antipatterns.
-    """
+class _BaseRelationshipQueryBuilder[T: Model]:
+    """Shared typed query builder and guard logic for Active Record relationships."""
 
     def __init__(
         self,
@@ -583,6 +589,35 @@ class RelationshipQueryBuilder[T: Model]:
             )
         return RelationNotLoadedError(msg)
 
+    def clone(self) -> Self:
+        """Create an independent copy of this scoped relationship query builder."""
+        return self.__class__(self._instance, self._relation, self._builder.clone())
+
+    def to_sql(self, start_idx: int = 1) -> tuple[str, list[Any]]:
+        return self._builder.to_sql(start_idx)
+
+    def to_raw_sql(self) -> str:
+        return self._builder.to_raw_sql()
+
+    def dump(self) -> Self:
+        self._builder.dump()
+        return self
+
+    def dump_raw_sql(self) -> Self:
+        self._builder.dump_raw_sql()
+        return self
+
+    def dd(self) -> NoReturn:
+        self._builder.dd()
+
+    def dd_raw_sql(self) -> NoReturn:
+        self._builder.dd_raw_sql()
+
+    def allow_all(self) -> Self:
+        """Explicitly permit mass UPDATE or DELETE queries without extra filters."""
+        self._builder.allow_all()
+        return self
+
     def where(self, column: str, operator_or_value: Any, value: Any = _MISSING) -> Self:
         if value is _MISSING:
             self._builder.where(column, operator_or_value)
@@ -590,32 +625,572 @@ class RelationshipQueryBuilder[T: Model]:
             self._builder.where(column, operator_or_value, value)
         return self
 
+    def or_where(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.or_where(column, operator_or_value)
+        else:
+            self._builder.or_where(column, operator_or_value, value)
+        return self
+
+    def where_column(
+        self, first: str, operator: str, second: str, *, boolean: str = "AND"
+    ) -> Self:
+        self._builder.where_column(first, operator, second, boolean=boolean)
+        return self
+
+    def or_where_column(self, first: str, operator: str, second: str) -> Self:
+        self._builder.or_where_column(first, operator, second)
+        return self
+
+    def where_exists(
+        self,
+        query: ModelQueryBuilder[Any] | QueryBuilder,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_exists(query, boolean=boolean)
+        return self
+
+    def where_not_exists(
+        self,
+        query: ModelQueryBuilder[Any] | QueryBuilder,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_not_exists(query, boolean=boolean)
+        return self
+
+    def or_where_exists(self, query: ModelQueryBuilder[Any] | QueryBuilder) -> Self:
+        self._builder.or_where_exists(query)
+        return self
+
+    def or_where_not_exists(self, query: ModelQueryBuilder[Any] | QueryBuilder) -> Self:
+        self._builder.or_where_not_exists(query)
+        return self
+
+    def where_any(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.where_any(columns, operator_or_value, boolean=boolean)
+        else:
+            self._builder.where_any(columns, operator_or_value, value, boolean=boolean)
+        return self
+
+    def where_all(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.where_all(columns, operator_or_value, boolean=boolean)
+        else:
+            self._builder.where_all(columns, operator_or_value, value, boolean=boolean)
+        return self
+
+    def where_none(
+        self,
+        columns: Sequence[str],
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.where_none(columns, operator_or_value, boolean=boolean)
+        else:
+            self._builder.where_none(columns, operator_or_value, value, boolean=boolean)
+        return self
+
+    def or_where_any(
+        self, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.or_where_any(columns, operator_or_value)
+        else:
+            self._builder.or_where_any(columns, operator_or_value, value)
+        return self
+
+    def or_where_all(
+        self, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.or_where_all(columns, operator_or_value)
+        else:
+            self._builder.or_where_all(columns, operator_or_value, value)
+        return self
+
+    def or_where_none(
+        self, columns: Sequence[str], operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.or_where_none(columns, operator_or_value)
+        else:
+            self._builder.or_where_none(columns, operator_or_value, value)
+        return self
+
+    def where_past(self, column: str, *, boolean: str = "AND") -> Self:
+        self._builder.where_past(column, boolean=boolean)
+        return self
+
+    def where_future(self, column: str, *, boolean: str = "AND") -> Self:
+        self._builder.where_future(column, boolean=boolean)
+        return self
+
+    def or_where_past(self, column: str) -> Self:
+        self._builder.or_where_past(column)
+        return self
+
+    def or_where_future(self, column: str) -> Self:
+        self._builder.or_where_future(column)
+        return self
+
+    def where_json_contains(
+        self, column: str, value: Any, *, boolean: str = "AND"
+    ) -> Self:
+        self._builder.where_json_contains(column, value, boolean=boolean)
+        return self
+
+    def where_json_doesnt_contain(
+        self, column: str, value: Any, *, boolean: str = "AND"
+    ) -> Self:
+        self._builder.where_json_doesnt_contain(column, value, boolean=boolean)
+        return self
+
+    def where_json_contains_key(self, column: str, *, boolean: str = "AND") -> Self:
+        self._builder.where_json_contains_key(column, boolean=boolean)
+        return self
+
+    def where_json_doesnt_contain_key(
+        self, column: str, *, boolean: str = "AND"
+    ) -> Self:
+        self._builder.where_json_doesnt_contain_key(column, boolean=boolean)
+        return self
+
+    def where_json_length(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.where_json_length(column, operator_or_value, boolean=boolean)
+        else:
+            self._builder.where_json_length(
+                column, operator_or_value, value, boolean=boolean
+            )
+        return self
+
+    def or_where_json_contains(self, column: str, value: Any) -> Self:
+        self._builder.or_where_json_contains(column, value)
+        return self
+
+    def or_where_json_doesnt_contain(self, column: str, value: Any) -> Self:
+        self._builder.or_where_json_doesnt_contain(column, value)
+        return self
+
+    def or_where_json_contains_key(self, column: str) -> Self:
+        self._builder.or_where_json_contains_key(column)
+        return self
+
+    def or_where_json_doesnt_contain_key(self, column: str) -> Self:
+        self._builder.or_where_json_doesnt_contain_key(column)
+        return self
+
+    def or_where_json_length(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        if value is _MISSING:
+            self._builder.or_where_json_length(column, operator_or_value)
+        else:
+            self._builder.or_where_json_length(column, operator_or_value, value)
+        return self
+
+    def where_group(
+        self,
+        callback: Callable[[ModelQueryBuilder[T]], Any],
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_group(callback, boolean=boolean)
+        return self
+
+    def or_where_group(self, callback: Callable[[ModelQueryBuilder[T]], Any]) -> Self:
+        self._builder.or_where_group(callback)
+        return self
+
+    def where_in(
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
+    ) -> Self:
+        self._builder.where_in(column, values)
+        return self
+
+    def or_where_in(
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
+    ) -> Self:
+        self._builder.or_where_in(column, values)
+        return self
+
+    def where_not_in(
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
+    ) -> Self:
+        self._builder.where_not_in(column, values)
+        return self
+
+    def or_where_not_in(
+        self,
+        column: str,
+        values: Sequence[Any] | QueryBuilder | ModelQueryBuilder[Any],
+    ) -> Self:
+        self._builder.or_where_not_in(column, values)
+        return self
+
+    def where_like(
+        self,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_like(
+            column,
+            value,
+            case_insensitive=case_insensitive,
+            match=match,
+            boolean=boolean,
+        )
+        return self
+
+    def or_where_like(
+        self,
+        column: str,
+        value: str,
+        *,
+        case_insensitive: bool = False,
+        match: str = "contains",
+    ) -> Self:
+        self._builder.or_where_like(
+            column, value, case_insensitive=case_insensitive, match=match
+        )
+        return self
+
+    def where_ilike(
+        self,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_ilike(column, value, match=match, boolean=boolean)
+        return self
+
+    def or_where_ilike(
+        self,
+        column: str,
+        value: str,
+        *,
+        match: str = "contains",
+    ) -> Self:
+        self._builder.or_where_ilike(column, value, match=match)
+        return self
+
+    def where_between(
+        self, column: str, values: Sequence[Any], *, boolean: str = "AND"
+    ) -> Self:
+        self._builder.where_between(column, values, boolean=boolean)
+        return self
+
+    def where_not_between(
+        self, column: str, values: Sequence[Any], *, boolean: str = "AND"
+    ) -> Self:
+        self._builder.where_not_between(column, values, boolean=boolean)
+        return self
+
+    def or_where_between(self, column: str, values: Sequence[Any]) -> Self:
+        self._builder.or_where_between(column, values)
+        return self
+
+    def or_where_not_between(self, column: str, values: Sequence[Any]) -> Self:
+        self._builder.or_where_not_between(column, values)
+        return self
+
     def where_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
         self._builder.where_raw(sql, bindings)
+        return self
+
+    def or_where_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
+        self._builder.or_where_raw(sql, bindings)
         return self
 
     def where_null(self, column: str) -> Self:
         self._builder.where_null(column)
         return self
 
+    def or_where_null(self, column: str) -> Self:
+        self._builder.or_where_null(column)
+        return self
+
     def where_not_null(self, column: str) -> Self:
         self._builder.where_not_null(column)
+        return self
+
+    def or_where_not_null(self, column: str) -> Self:
+        self._builder.or_where_not_null(column)
+        return self
+
+    def join(
+        self,
+        table: str,
+        first: str,
+        operator: str,
+        second: str,
+        type_: str = "INNER",
+    ) -> Self:
+        self._builder.join(table, first, operator, second, type_=type_)
+        return self
+
+    def left_join(self, table: str, first: str, operator: str, second: str) -> Self:
+        self._builder.left_join(table, first, operator, second)
+        return self
+
+    def right_join(self, table: str, first: str, operator: str, second: str) -> Self:
+        self._builder.right_join(table, first, operator, second)
+        return self
+
+    def with_(self, *relations: str) -> Self:
+        self._builder.with_(*relations)
         return self
 
     def order_by(self, column: str, direction: str = "ASC") -> Self:
         self._builder.order_by(column, direction)
         return self
 
+    def latest(self, column: str = "created_at") -> Self:
+        self._builder.latest(column)
+        return self
+
+    def oldest(self, column: str = "created_at") -> Self:
+        self._builder.oldest(column)
+        return self
+
+    def in_random_order(self) -> Self:
+        self._builder.in_random_order()
+        return self
+
     def limit(self, value: int) -> Self:
         self._builder.limit(value)
+        return self
+
+    def offset(self, value: int) -> Self:
+        self._builder.offset(value)
+        return self
+
+    def take(self, value: int) -> Self:
+        self._builder.take(value)
+        return self
+
+    def skip(self, value: int) -> Self:
+        self._builder.skip(value)
+        return self
+
+    def group_by(self, *columns: str | Sequence[str]) -> Self:
+        self._builder.group_by(*columns)
+        return self
+
+    def having(
+        self,
+        column: str,
+        operator_or_value: Any,
+        value: Any = _MISSING,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.having(column, operator_or_value, value, boolean=boolean)
+        return self
+
+    def or_having(
+        self, column: str, operator_or_value: Any, value: Any = _MISSING
+    ) -> Self:
+        self._builder.or_having(column, operator_or_value, value)
+        return self
+
+    def having_raw(
+        self,
+        sql: str,
+        bindings: Sequence[Any] | None = None,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.having_raw(sql, bindings, boolean=boolean)
+        return self
+
+    def or_having_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
+        self._builder.or_having_raw(sql, bindings)
         return self
 
     def select(self, *columns: str) -> Self:
         self._builder.select(*columns)
         return self
 
-    def with_(self, *relations: str) -> Self:
-        self._builder.with_(*relations)
+    def select_raw(self, sql: str, bindings: Sequence[Any] | None = None) -> Self:
+        self._builder.select_raw(sql, bindings)
+        return self
+
+    def select_count(self, column: str = "*", alias: str | None = None) -> Self:
+        self._builder.select_count(column, alias)
+        return self
+
+    def select_sum(self, column: str, alias: str | None = None) -> Self:
+        self._builder.select_sum(column, alias)
+        return self
+
+    def select_avg(self, column: str, alias: str | None = None) -> Self:
+        self._builder.select_avg(column, alias)
+        return self
+
+    def select_min(self, column: str, alias: str | None = None) -> Self:
+        self._builder.select_min(column, alias)
+        return self
+
+    def select_max(self, column: str, alias: str | None = None) -> Self:
+        self._builder.select_max(column, alias)
+        return self
+
+    def distinct(self, *columns: str) -> Self:
+        self._builder.distinct(*columns)
+        return self
+
+    def shared_lock(self) -> Self:
+        self._builder.shared_lock()
+        return self
+
+    def lock_for_update(self) -> Self:
+        self._builder.lock_for_update()
+        return self
+
+    def when(
+        self,
+        condition: Any,
+        callback: Callable[[Self, Any], Any],
+        default: Callable[[Self, Any], Any] | None = None,
+    ) -> Self:
+        """Apply callback if condition is truthy, otherwise apply default callback if provided."""
+        if condition:
+            res = callback(self, condition)
+            return res if isinstance(res, self.__class__) else self
+        if default is not None:
+            res = default(self, condition)
+            return res if isinstance(res, self.__class__) else self
+        return self
+
+    def unless(
+        self,
+        condition: Any,
+        callback: Callable[[Self, Any], Any],
+        default: Callable[[Self, Any], Any] | None = None,
+    ) -> Self:
+        """Apply callback if condition is falsy, otherwise apply default callback if provided."""
+        return self.when(not condition, callback, default)
+
+    def has(
+        self,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        self._builder.has(relation, operator, count, boolean=boolean, callback=callback)
+        return self
+
+    def or_has(
+        self,
+        relation: str,
+        operator: str = ">=",
+        count: int = 1,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        self._builder.or_has(relation, operator, count, callback=callback)
+        return self
+
+    def doesnt_have(
+        self,
+        relation: str,
+        *,
+        boolean: str = "AND",
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        self._builder.doesnt_have(relation, boolean=boolean, callback=callback)
+        return self
+
+    def or_doesnt_have(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        self._builder.or_doesnt_have(relation, callback=callback)
+        return self
+
+    def where_has(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        operator: str = ">=",
+        count: int = 1,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_has(
+            relation, callback, operator, count, boolean=boolean
+        )
+        return self
+
+    def or_where_has(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        operator: str = ">=",
+        count: int = 1,
+    ) -> Self:
+        self._builder.or_where_has(relation, callback, operator, count)
+        return self
+
+    def where_doesnt_have(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+        *,
+        boolean: str = "AND",
+    ) -> Self:
+        self._builder.where_doesnt_have(relation, callback, boolean=boolean)
+        return self
+
+    def or_where_doesnt_have(
+        self,
+        relation: str,
+        callback: Callable[[ModelQueryBuilder[Any]], Any] | None = None,
+    ) -> Self:
+        self._builder.or_where_doesnt_have(relation, callback)
         return self
 
     async def get(self) -> list[T]:
@@ -626,6 +1201,10 @@ class RelationshipQueryBuilder[T: Model]:
         """Fetch the first record matching the relationship scope."""
         return await self._builder.first()
 
+    async def first_or_fail(self) -> T:
+        """Fetch the first related record or raise ModelNotFoundError."""
+        return await self._builder.first_or_fail()
+
     async def count(self, column: str = "*") -> int:
         """Return the count of related records."""
         return await self._builder.count(column)
@@ -633,6 +1212,83 @@ class RelationshipQueryBuilder[T: Model]:
     async def exists(self) -> bool:
         """Return True if at least one related record exists."""
         return await self._builder.exists()
+
+    async def sum(self, column: str) -> Any:
+        return await self._builder.sum(column)
+
+    async def min(self, column: str) -> Any:
+        return await self._builder.min(column)
+
+    async def max(self, column: str) -> Any:
+        return await self._builder.max(column)
+
+    async def avg(self, column: str) -> Any:
+        return await self._builder.avg(column)
+
+    async def value(self, column: str) -> Any | None:
+        return await self._builder.value(column)
+
+    @overload
+    async def pluck(self, column: str, key: None = None) -> list[Any]: ...
+
+    @overload
+    async def pluck(self, column: str, key: str) -> dict[Any, Any]: ...
+
+    async def pluck(
+        self, column: str, key: str | None = None
+    ) -> list[Any] | dict[Any, Any]:
+        if key is None:
+            return await self._builder.pluck(column)
+        return await self._builder.pluck(column, key)
+
+    async def increment(
+        self, column: str, amount: float = 1, extra: Mapping[str, Any] | None = None
+    ) -> str:
+        return await self._builder.increment(column, amount, extra=extra)
+
+    async def decrement(
+        self, column: str, amount: float = 1, extra: Mapping[str, Any] | None = None
+    ) -> str:
+        return await self._builder.decrement(column, amount, extra=extra)
+
+    async def chunk(
+        self,
+        count: int,
+        callback: Callable[[list[T]], Awaitable[bool | None] | bool | None],
+    ) -> bool:
+        return await self._builder.chunk(count, callback)
+
+    async def chunk_by_id(
+        self,
+        count: int,
+        callback: Callable[[list[T]], Awaitable[bool | None] | bool | None],
+        column: str | None = None,
+    ) -> bool:
+        return await self._builder.chunk_by_id(count, callback, column=column)
+
+    async def upsert(
+        self,
+        values: Sequence[Mapping[str, Any]],
+        unique_by: Sequence[str] | str,
+        update_columns: Sequence[str] | None = None,
+    ) -> int:
+        return await self._builder.upsert(values, unique_by, update_columns=update_columns)
+
+    async def paginate(
+        self, per_page: int = 15, page: int = 1
+    ) -> Paginator[T]:
+        return await self._builder.paginate(per_page=per_page, page=page)
+
+    async def simple_paginate(
+        self, per_page: int = 15, page: int = 1
+    ) -> SimplePaginator[T]:
+        return await self._builder.simple_paginate(per_page=per_page, page=page)
+
+    async def update(self, data: Mapping[str, Any] | BaseSchema) -> str:
+        return await self._builder.update(data)
+
+    async def delete(self) -> str:
+        return await self._builder.delete()
 
     async def attach(self, model_or_id: Any, **pivot_extra: Any) -> None:
         """Attach a related model to this parent model in the pivot table."""
@@ -697,12 +1353,11 @@ class RelationshipQueryBuilder[T: Model]:
             for item in ids_or_models:
                 await self.attach(item)
 
-    async def create(self, *args: dict[str, Any], **kwargs: Any) -> T:
+    async def create(
+        self, *args: Mapping[str, Any] | BaseSchema, **kwargs: Any
+    ) -> T:
         """Create a new model instance pre-bound to this relationship."""
-        data: dict[str, Any] = {}
-        if args:
-            data.update(args[0])
-        data.update(kwargs)
+        data = self._builder.model_cls._extract_create_mapping(args, kwargs)
 
         if isinstance(self._relation, (HasMany, HasOne)):
             owner_name = (
@@ -713,18 +1368,14 @@ class RelationshipQueryBuilder[T: Model]:
             fk = self._relation.foreign_key or f"{snake_case(owner_name)}_id"
             local_key = self._relation._resolve_local_key(self._instance)
             data[fk] = getattr(self._instance, local_key, None)
-            return await self._builder.model_cls.create(**data)
+            return await self._builder.model_cls.create(data)
 
         if isinstance(self._relation, BelongsToMany):
             raise NotImplementedError(
                 "create() would leave the new row unlinked; use attach()."
             )
 
-        return await self._builder.model_cls.create(**data)
-
-    def __await__(self) -> Generator[Any, None, Any]:
-        """Allow directly awaiting the relation query builder."""
-        return self.get().__await__()
+        return await self._builder.model_cls.create(data)
 
     def __iter__(self) -> Iterator[T]:
         raise self._not_loaded_error()
@@ -761,7 +1412,22 @@ class RelationshipQueryBuilder[T: Model]:
         raise self._not_loaded_error(name)
 
 
-class SingleRelationshipQueryBuilder[T: Model](RelationshipQueryBuilder[T]):
+class RelationshipQueryBuilder[T: Model](_BaseRelationshipQueryBuilder[T]):
+    """Scoped query builder for an Active Record relationship.
+
+    Lazily awaitable when explicitly queried (e.g. `await user.posts` or
+    `await user.posts.where("published", True).get()`).
+
+    Synchronous data access (such as iterating, `len()`, or accessing model attributes)
+    raises `RelationNotLoadedError` to prevent silent N+1 query antipatterns.
+    """
+
+    def __await__(self) -> Generator[Any, None, list[T]]:
+        """Allow directly awaiting the relation query builder."""
+        return self.get().__await__()
+
+
+class SingleRelationshipQueryBuilder[T: Model](_BaseRelationshipQueryBuilder[T]):
     """Scoped query builder for singular Active Record relationships (HasOne / BelongsTo)."""
 
     def __await__(self) -> Generator[Any, None, T | None]:
@@ -805,7 +1471,7 @@ class RelationDescriptor[TRel: Relation[Any]]:
 
     def __get__(
         self, instance: Model | None, owner: type[Model] | None = None
-    ) -> TRel | RelationshipQueryBuilder[Any] | Sequence[Model] | Model | None:
+    ) -> TRel | _BaseRelationshipQueryBuilder[Any] | Sequence[Model] | Model | None:
         if instance is None:
             return self._relation
 
