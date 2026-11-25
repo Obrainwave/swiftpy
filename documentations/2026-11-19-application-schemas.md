@@ -200,7 +200,7 @@ from app.schemas.egg_schema import EggCollectionCreateRequest
 
 
 class EggLedgerRepository:
-    model: type[EggStockLedger] = EggStockLedger
+    model = EggStockLedger
 
     async def record_collection(
         self,
@@ -215,6 +215,14 @@ class EggLedgerRepository:
             movement_type="COLLECTION",
             reference=ref,
         )
+
+    async def update_notes(
+        self, entry_id: uuid.UUID, patch: EggCollectionPatchRequest
+    ) -> EggStockLedger | None:
+        entry = await self.model.find(entry_id)
+        if entry is None:
+            return None
+        return await entry.update(patch)
 ```
 
 ### Key ORM & Serialization Helpers
@@ -222,8 +230,9 @@ class EggLedgerRepository:
 - **`Schema.from_model(model)`:** Hydrates a response schema from an ORM `Model` instance, dict, or plain object (respecting loaded relations without triggering lazy loads on unloaded relationships).
 - **`payload.to_dict(exclude_none=False, exclude_unset=False, by_alias=False)`:** Recursively converts schemas into dictionaries.
 - **`payload.is_set("field_name")` / `payload.fields_set`:** Inspects which fields were explicitly provided in the input payload (versus defaulted).
-- **`await Model.create(payload, ...)` / `await Model.force_create(payload, ...)`:** Extracts `payload.to_dict()` and merges any extra keyword overrides while enforcing `__fillable__` / `__guarded__` on `create()`.
-- **`await model.update(payload)` / `await model.force_update(payload)`:** Extracts `payload.to_dict(exclude_unset=True)` so partial `PATCH` schemas never overwrite omitted columns with defaults (post-validation field assignments also update `fields_set`).
+- **`await Model.create(payload, ...)` / `await Model.force_create(payload, ...)` / `await parent.children.create(payload, ...)`:** Extracts `payload.to_dict()` and merges any extra keyword overrides while enforcing `__fillable__` / `__guarded__` on `create()`.
+- **`await model.update(payload)` / `await model.force_update(payload)` / `await Model.where(...).update(payload)` / `await parent.children.update(payload)`:** Extracts `payload.to_dict(exclude_unset=True)` so partial `PATCH` schemas never overwrite omitted columns with defaults (post-validation field assignments also update `fields_set`).
+- **`await Model.first_or_create(attrs, payload)` / `await Model.update_or_create(attrs, payload)`:** Accepts `BaseSchema` payloads alongside covariant `Mapping[str, Any]` dictionaries (`to_dict()` when creating, `to_dict(exclude_unset=True)` when updating an existing row).
 - **`await Auth.attempt(payload)` / `Auth.attempt_when(payload, fn)` / `Auth.once(payload)`:** Accepts validated `BaseSchema` login DTOs directly (`to_dict(exclude_unset=True)`).
 - **`isset(payload, "field_or_alias")`:** Resolves canonical fields, `Field(alias=...)` names, nested schemas (`"meta.region"`), and `extra = "allow"` attributes safely.
 

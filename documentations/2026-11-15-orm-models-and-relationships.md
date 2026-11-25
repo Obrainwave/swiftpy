@@ -255,33 +255,47 @@ Dirty-tracking safeguards:
 - If the model defines `updated_at`, saving a dirty existing record refreshes `updated_at` to `datetime.now(UTC)` automatically.
 - If you load a partial subset of columns with `.select("id", "title")`, SwiftPY records only the selected columns in its original snapshot. Calling `await post.save()` after modifying `post.title` updates only `title` and never clobbers unselected database columns.
 
-#### Typed Repository Pattern (`Model` Class Attribute)
+#### Repositories & Static Type Inference
 
-When wrapping ORM queries inside repository classes, annotate `model` explicitly with `type[YourModel]` (or parameterize a generic repository base with `T = TypeVar("T", bound=Model)` / `class BaseRepository[T: Model]`) so Pyrefly and `mypy --strict` preserve concrete model types through `.with_(...).where(...).first()` and `.get()`:
+SwiftPY's `Model`, `ModelQueryBuilder`, and relationship builders preserve concrete model types end-to-end across chains in Pyrefly, Mypy (`--strict`), and Pyright—without requiring generic repository base classes, `TypeVar`, `Self`, or explicit `model: type[...]` annotations in application code:
 
 ```python
-from typing import TypeVar
-
-from swiftpy.database.orm import Model
-
-T = TypeVar("T", bound=Model)
+from swiftpy.database.orm import BelongsTo, HasMany, Model
 
 
-class BaseRepository(Generic[T]):  # or class BaseRepository[T: Model]: in Python 3.12+
-    model: type[T]
+class DocVersion(Model):
+    __table__ = "doc_versions"
+    id: int
+    version: str
+    slug: str
+    sort_order: int = 0
+    groups = HasMany(DocGroup, foreign_key="version_id")
+    author = BelongsTo(User, foreign_key="author_id")
 
-    async def find_or_fail(self, record_id: int) -> T:
-        row = await self.model.where("id", record_id).first()
-        if row is None:
-            raise NotFoundError(f"{self.model.__name__} not found")
-        return row
 
+class DocVersionRepository:
+    model = DocVersion
 
-class DocVersionRepository(BaseRepository[DocVersion]):
-    model: type[DocVersion] = DocVersion
+    async def get_doc_version(self, version_id: int) -> DocVersion:
+        version = await self.model.with_("groups").where("id", version_id).first()
+        if not version:
+            raise NotFoundError("Version not found")
+        return version
 
     async def get_doc_versions(self) -> list[DocVersion]:
         return await self.model.with_("groups", "author").order_by("sort_order").get()
+
+    async def create_doc_version(self, payload: DocVersionCreateSchema) -> DocVersion:
+        return await self.model.create(payload)
+```
+
+Direct `Model` calls and class-based relationships (`HasMany(DocGroup)`, `BelongsTo(User)`, `HasOne(Profile)`, `BelongsToMany(Role)`) preserve concrete return types across `await` and chained builders:
+
+```python
+versions: list[DocVersion] = await DocVersion.with_("groups", "author").order_by("sort_order").get()
+first: DocVersion | None = await DocVersion.where("id", 1).first()
+groups: list[DocGroup] = await versions[0].groups.where_in("id", [1, 2]).latest("id").get()
+author: User | None = await versions[0].author
 ```
 
 #### Query Builder Methods on `Model`
@@ -305,7 +319,7 @@ active_authors = await (
     .limit(25)
 )
 
-# Find-or-create / update-or-create / upsert
+# Find-or-create / update-or-create / bulk update / upsert (accepts Mapping or BaseSchema)
 tag = await Tag.first_or_create(
     {"slug": "async"},
     values={"name": "Async Python"},
@@ -314,6 +328,7 @@ profile = await Profile.update_or_create(
     {"user_id": user.id},
     values={"bio": "Building with SwiftPY"},
 )
+await User.where("id", user.id).update(patch_schema)
 await Tag.upsert(
     [{"slug": "async", "name": "AsyncIO"}, {"slug": "typing", "name": "Strict Typing"}],
     unique_by=["slug"],
@@ -336,12 +351,13 @@ completed = await User.where("needs_digest", True).chunk_by_id(200, send_digest_
 
 #### Column, JSON, Existence & Time Filters
 
-The ORM forwards these filters through `ModelQueryBuilder` and model classmethods. `where_exists()` accepts either another model query or a core `QueryBuilder`; use the real outer table name in a correlated `where_column()` condition:
+The ORM forwards these filters through `ModelQueryBuilder` and model classmethods. `where_exists()` and `where_in()` / `where_not_in()` (plus `or_` variants and `where(col, "IN", ...)`) accept either another `ModelQueryBuilder` subquery, a core `QueryBuilder` subquery, or any non-string `Sequence` (`list`, `tuple`, custom `Sequence`; `str`, `bytes`, `bytearray`, and `memoryview` raise `QueryError`). Write operations (`insert`, `insert_returning`, `update`, `upsert`, `increment`, `decrement`, `first_or_create`, `update_or_create`) accept covariant `Mapping[str, Any]` inputs cleanly without type casts. Use the real outer table name in a correlated `where_column()` condition:
 
 ```python
 users_with_posts = User.where_exists(
     Post.query().where_column("posts.user_id", "=", "users.id")
 )
+authors = User.where_in("id", Post.select("user_id").where("published", True))
 active_users = User.where_any(["email", "name"], "ada").where_future("created_at")
 ```
 
@@ -450,7 +466,7 @@ class Tag(Model):
 > - **Recommended pattern:** Export and import all your domain models together in `app/models/__init__.py` (or import the related model modules at the top of `main.py` / your service module before executing queries).
 > - If two different modules define models with the **same class name** (for example `billing.models.Item` and `inventory.models.Item`), string lookup raises:
 >   `RuntimeError: Model name 'Item' is ambiguous: ... Pass the class itself instead of a string.`
->   In that case (or whenever imports are not circular), import and pass the target model class directly: `items = HasMany(BillingItem)`.
+>   In that case (or whenever imports are not circular), import and pass the target model class directly (`items = HasMany(BillingItem)`), which also gives static type checkers exact target-model types (`await order.items -> list[BillingItem]`).
 
 > **Note on relationship keys & pivot tables:** `HasOne`, `HasMany`, and `BelongsTo` all accept `(related_model, foreign_key=None, local_key=None)`. When `foreign_key` is omitted on `BelongsTo`, SwiftPY infers `<relation_attribute_name>_id` (so `user = BelongsTo("User")` uses `"user_id"`, whereas `author = BelongsTo("User", foreign_key="user_id")` explicitly maps `author` to `user_id`). `BelongsToMany` accepts `(related_model, pivot_table=None, foreign_pivot_key=None, related_pivot_key=None, parent_key=None, related_key=None)`; when `pivot_table` is omitted, SwiftPY sorts the two snake-case model names alphabetically and joins them with `_` (e.g. `"post_tag"`).
 
@@ -496,17 +512,24 @@ mixed = await User.where("is_admin", True).or_where_doesnt_have("posts").get()
 
 #### Async Lazy Queries vs `RelationNotLoadedError`
 
-By default (`prevent_lazy_loading = False`), accessing an **unloaded** relationship attribute returns a `RelationshipQueryBuilder` (for `HasMany`/`BelongsToMany`) or `SingleRelationshipQueryBuilder` (for `HasOne`/`BelongsTo`):
+By default (`prevent_lazy_loading = False`), accessing an **unloaded** relationship attribute returns a `RelationshipQueryBuilder[T]` (for `HasMany`/`BelongsToMany`) or `SingleRelationshipQueryBuilder[T]` (for `HasOne`/`BelongsTo`), forwarding the full set of `ModelQueryBuilder` fluent and terminal methods while preserving concrete `Model` types:
 
 ```python
 user = await User.find_or_fail(1)
 
-# Async query works explicitly (and lets you refine the query)
-published_posts = await user.posts.where("published", True).latest().get()
+# Awaiting directly returns list[Post] (or Profile | None for HasOne/BelongsTo)
+posts = await user.posts
 profile = await user.profile
 
-# Creating a child record through HasMany/HasOne sets the foreign key automatically
+# Refine relationship queries with full ModelQueryBuilder method parity
+published_posts = await user.posts.where("published", True).latest("id").get()
+filtered_posts = await user.posts.where_in("id", [1, 2]).paginate(per_page=10, page=1)
+required_profile = await user.profile.where_not_null("bio").first_or_fail()
+
+# Creating or updating child records through a relation accepts kwargs, mappings, or BaseSchema
 new_post = await user.posts.create(title="First Post", body="Hello!")
+new_from_schema = await user.posts.create(create_post_schema)
+await user.posts.where("id", new_post.id).update(patch_post_schema)
 ```
 
 However, trying to use an unloaded relationship **synchronously**—such as `for p in user.posts`, `len(user.posts)`, `bool(user.posts)`, `user.posts[0]`, or `user.profile.bio`—raises **`RelationNotLoadedError`** rather than silently executing blocking I/O inside an async event loop.

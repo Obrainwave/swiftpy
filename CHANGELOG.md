@@ -4,6 +4,21 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-25
+
+### Added
+- **Source-Level ORM & Relationship Static Typing (`Model`, `ModelQueryBuilder[T]`, `RelationshipQueryBuilder[T]`, `SingleRelationshipQueryBuilder[T]`):** Propagated concrete `Model` types through `Relation._related_cls`, `_get_target_model_typed()`, `Relation.build_lazy_query() -> ModelQueryBuilder[T]`, `_BaseRelationshipQueryBuilder[T]` (explicit typed forwarding for all `ModelQueryBuilder[T]` fluent and terminal methods), `RelationshipQueryBuilder[T].__await__() -> Generator[Any, None, list[T]]`, and `SingleRelationshipQueryBuilder[T].__await__() -> Generator[Any, None, T | None]`. Application repositories (`model = YourModel`), direct model query chains (`DocVersion.with_(...).order_by(...).get()`), and relationship chains infer concrete return types in Pyrefly (including `no-any-return-implicit`), Mypy (`--strict`), and Pyright without requiring user-side `Generic`, `TypeVar`, `Self`, or `model: type[...]` boilerplate.
+- **Covariant Inputs & Schema Parity Across Query Builders and Relations:** Widened `QueryBuilder` / `ModelQueryBuilder` / `Model` filter and write APIs (`where_in`, `or_where_in`, `where_not_in`, `or_where_not_in`, `insert`, `insert_returning`, `update`, `upsert`, `increment`, `decrement`, `first_or_create`, `update_or_create`, `select_raw`, `having_raw`, `or_having_raw`) to accept covariant `Mapping[str, Any]` / non-string `Sequence[Any]` and `ModelQueryBuilder[Any]` subqueries while continuing to reject `str`/`bytes`/`bytearray`/`memoryview` in `IN`/`NOT IN`. Added `BaseSchema` support to `ModelQueryBuilder.update()`, `Model.first_or_create()`, `Model.update_or_create()`, `RelationshipQueryBuilder.create()`, and `RelationshipQueryBuilder.update()`.
+
+### Fixed
+- **Pyrefly ORM Compliance (`swiftpy/database/orm/model.py`):** Annotated empty vector return in `_coerce_db_value()` and guarded `isinstance(other, Model)` in `Model.__eq__()` so `swiftpy/database/` passes Pyrefly cleanly.
+
+### Changed
+- **Packaging & Scaffolding:** Bumped `swiftpy-framework` to `0.3.8` (`pyproject.toml`, `uv.lock`), bumped the `swiftpy new` dependency floor to `"swiftpy-framework>=0.3.8"`, and simplified `repository.stub` to zero-boilerplate `model = YourModel` repository guidance.
+
+### Documentation
+- Updated [ORM Models & Relationships](documentations/2026-11-15-orm-models-and-relationships.md), [Application Schemas](documentations/2026-11-19-application-schemas.md), [Database Pool, Query Builder & Transactions](documentations/2026-11-15-database-query-builder-and-migrations.md), [CLI & Testing](documentations/2026-11-19-cli-and-testing.md), [Application Architecture & Project Structure](documentations/2026-11-21-application-architecture-and-project-structure.md), [Installation & Quick Start](documentations/2026-11-14-installation-quick-start.md), and [README.md](README.md) for zero-boilerplate repository typing, typed relationship chains, `BaseSchema` query-builder/relation interop, covariant `Mapping`/`Sequence` inputs, Pyrefly/Mypy commands, and `>=0.3.8`.
+
 ## [0.3.7] - 2026-11-25
 
 ### Added

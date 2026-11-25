@@ -24,7 +24,7 @@ def test_new_command_templates_hardened(
     assert "pyproject.toml" in dockerfile
 
     pyproject = (app_dir / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"swiftpy-framework>=0.3.7"' in pyproject
+    assert '"swiftpy-framework>=0.3.8"' in pyproject
 
     dockerignore = (app_dir / ".dockerignore").read_text(encoding="utf-8")
     assert "public/storage" in dockerignore

@@ -168,7 +168,7 @@ Key filtering methods:
 
 - **Equality & comparison:** `.where(col, val)` (`=`), `.where(col, op, val)` (allows `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE`, `ILIKE`, `IN`, `NOT IN`), and `.or_where(...)`.
 - **`NULL` handling:** `.where("deleted_at", None)` compiles to `IS NULL` and `.where("deleted_at", "!=", None)` compiles to `IS NOT NULL` (or use `.where_null()`, `.or_where_null()`, `.where_not_null()`, `.or_where_not_null()`). Passing `None` with `<`, `>`, `LIKE`, or `IN` raises `QueryError`.
-- **Lists & subqueries:** `.where_in(col, values)`, `.or_where_in(...)`, `.where_not_in(...)`, `.or_where_not_in(...)`. Empty lists compile safely (`IN []` -> `WHERE FALSE`; `NOT IN []` -> `WHERE TRUE`).
+- **Lists & subqueries:** `.where_in(col, values)`, `.or_where_in(...)`, `.where_not_in(...)`, `.or_where_not_in(...)`. Accepts any non-string `Sequence` (`list`, `tuple`, or custom `Sequence`) as well as `QueryBuilder` subqueries; passing `str`, `bytes`, `bytearray`, or `memoryview` raises `QueryError`. Empty sequences compile safely (`IN []` -> `WHERE FALSE`; `NOT IN []` -> `WHERE TRUE`).
 - **Ranges:** `.where_between(col, (min_v, max_v))`, `.where_not_between(...)`, `.or_where_between(...)`, `.or_where_not_between(...)`.
 - **Multi-column comparisons:** `.where_any(columns, operator, value)`, `.where_all(...)`, and `.where_none(...)` compare the same value against a non-empty list/tuple of columns. `where_any` matches one or more columns, `where_all` requires every comparison, and `where_none` negates the OR group. Each value is bound separately; the one-argument form defaults to equality.
 - **Column comparisons & existence:** `.where_column("orders.user_id", "=", "users.id")` compares two validated identifiers. `.where_exists(query)` / `.where_not_exists(query)` accept a `QueryBuilder`, including a correlated subquery; use the outer table's real name in `where_column`. Table aliases are not supported, and the subquery must use a different table.
@@ -374,6 +374,7 @@ await Query.table("events").where("processed", False).chunk_by_id(500, process_p
 
 - Use `.chunk_by_id(size, callback, column="id")` whenever rows might be updated or deleted while iterating (cursor advances by `column > last_id`); `.chunk(size, callback)` paginates via `OFFSET`/`LIMIT`.
 - Both `Query.table("...")` `.update(...)`, `.delete()`, `.increment(...)`, and `.decrement(...)` **refuse to run without a `WHERE` clause** (`QueryError`) unless you explicitly call `.allow_all()`.
+- `.insert()`, `.insert_returning()`, `.update()`, `.increment()` / `.decrement()` (`extra`), and `.upsert()` accept any `Mapping[str, Any]` (and `Sequence[Mapping[str, Any]]` / `Sequence[str]` on `upsert()`), so read-only mappings (such as `MappingProxyType`) and narrowed dictionary types (`dict[str, str]`) type-check cleanly without casts.
 
 ---
 

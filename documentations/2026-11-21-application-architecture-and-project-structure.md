@@ -89,7 +89,7 @@ my_app/
 - **`app/providers/` — Service Providers:** `register()` and `boot()` hooks auto-discovered on startup to bind interfaces, configure clients, and wire shared singletons.
 - **`app/schemas/` — Data Contracts & Structured DTOs:** Holds typed `swiftpy.schemas.BaseSchema` / `Schema` DTOs (`make:schema`), such as `UserCreateSchema` and `UserResponseSchema`, with automatic HTTP body validation, `Field(...)` constraints, `from_model()`, and `to_dict()`. See [Application Schemas](2026-11-19-application-schemas.md).
 - **`app/models/` — ORM Models:** Defines tables (`__table__`), primary keys, `__fillable__` / `__hidden__` guards, and relationships (`HasOne`, `HasMany`, `BelongsTo`, `BelongsToMany`). See [ORM Models & Relationships](2026-11-15-orm-models-and-relationships.md).
-- **`app/repositories/` — Data Access Abstraction:** Isolates complex query compositions, reporting aggregates, eager loading, or swappable persistence logic from services. For straightforward CRUD, calling ORM `Model` methods directly inside a service or simple controller is completely fine.
+- **`app/repositories/` — Data Access Abstraction:** Isolates complex query compositions, reporting aggregates, eager loading, or swappable persistence logic from services (`swiftpy make:repository UserRepository`). Ordinary repositories only need `model = YourModel` to preserve full static type inference across query chains. For straightforward CRUD, calling ORM `Model` methods directly inside a service or simple controller is completely fine.
 - **`app/services/` — Business Logic:** Coordinates domain rules, multi-model updates, database transactions, domain event dispatching, background jobs, mailers, and external integrations. Services return domain `Model` instances or explicit `Schema` DTOs — never HTTP `Response` objects.
 
 ### 3. Comparing `Request`, `Schema`, `Resource`, and `Model`
@@ -281,25 +281,19 @@ app/modules/
 # app/schemas/post_schema.py
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any
+from swiftpy.schemas import BaseSchema, Field
 
 
-@dataclass(slots=True)
-class CreatePostSchema:
-    title: str
-    body: str
+class CreatePostSchema(BaseSchema):
+    title: str = Field(..., min_length=3, max_length=200)
+    body: str = Field(..., min_length=1)
     author_id: int
 
 
-@dataclass(slots=True)
-class PostResponseSchema:
+class PostResponseSchema(BaseSchema):
     id: int
     title: str
     author_id: int
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 ```
 
 ```python
@@ -312,12 +306,8 @@ from app.schemas.post_schema import CreatePostSchema, PostResponseSchema
 
 class PostService:
     async def create_post(self, payload: CreatePostSchema) -> PostResponseSchema:
-        post = await Post.create(
-            title=payload.title,
-            body=payload.body,
-            author_id=payload.author_id,
-        )
-        return PostResponseSchema(id=post.id, title=post.title, author_id=post.author_id)
+        post = await Post.create(payload)
+        return PostResponseSchema.from_model(post)
 ```
 
 ```python
