@@ -85,6 +85,10 @@ jobs:
           uv run mypy .
           uv run mypy --explicit-package-bases .
 
+      - name: Run Pyrefly
+        run: |
+          uvx pyrefly check --python-interpreter-path .venv/bin/python --error=no-any-return-implicit swiftpy/database/ config/ app/ routes/ database/ main.py tests/typing/
+
       - name: Dependency security audit
         run: uv run --no-sync --with pip-audit pip-audit --desc on
 
@@ -101,6 +105,7 @@ jobs:
           (
             cd /tmp && /tmp/swiftpy-wheel-smoke/bin/python -c '
           import asyncio
+          import pathlib
           import swiftpy
           import swiftpy.testing
           from swiftpy import Application, Request, json_response
@@ -108,6 +113,7 @@ jobs:
           from swiftpy.ai.embeddings import EmbeddingsClient, generate_deterministic_embedding
 
           assert hasattr(swiftpy, "ai")
+          assert (pathlib.Path(swiftpy.__file__).resolve().parent / "py.typed").is_file()
           app = Application(auto_discover_providers=False)
 
           @app.get("/smoke")
@@ -189,4 +195,11 @@ jobs:
                       out, _ = proc.communicate(timeout=5)
               assert ok, out
           '
-          rm -rf /tmp/swiftpy-wheel-smoke
+          rm -rf /tmp/swiftpy-pyrefly-smoke && mkdir -p /tmp/swiftpy-pyrefly-smoke
+          (
+            cd /tmp/swiftpy-pyrefly-smoke
+            /tmp/swiftpy-wheel-smoke/bin/swiftpy new ci_smoke_api
+            cd ci_smoke_api
+            uvx pyrefly check --python-interpreter-path /tmp/swiftpy-wheel-smoke/bin/python --error=no-any-return-implicit .
+          )
+          rm -rf /tmp/swiftpy-pyrefly-smoke /tmp/swiftpy-wheel-smoke
