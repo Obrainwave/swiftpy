@@ -4,6 +4,27 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
+### Added
+- **Migration Alteration & Introspection Helpers (`swiftpy/database/migrations/schema.py`, `blueprint.py`):**
+  - Added `Schema.has_columns(table, columns) -> bool` and `Schema.has_index(table, index, type_=None, *, type=None) -> bool` using parameterized PostgreSQL catalog queries (`information_schema.columns` and `pg_index` / `pg_class` / `pg_am` / `pg_attribute`) supporting unqualified or schema-qualified (`"schema.table"`) lookups (also supported in `Schema.has_table` / `Schema.has_column`), index names, exact ordered column sequences, partial indexes, expression indexes (by name), and constraint (`"primary"`, `"unique"`) or PostgreSQL access-method (`"btree"`, `"gin"`, ...) filters.
+  - Added `Blueprint.binary(name)` (`BYTEA`) with PostgreSQL hex default literal formatting (`'\x...'::bytea`) for `bytes`/`bytearray`/`memoryview` defaults, and verified `Blueprint.jsonb(name)` (`JSONB`).
+  - Widened `Blueprint.drop_column(*names: str | Sequence[str])` so callers can pass either variadic column names or column lists/tuples (`table.drop_column(["votes", "avatar", "location"])`).
+  - Added `ColumnDefinition.change()` and `ColumnDefinition.using(expression)` with PostgreSQL `ALTER COLUMN` compilation in `SchemaGrammar._compile_modify_column` (drops omitted column check constraints, defaults, and comments cleanly; idempotently refreshes `.unique()` constraints; emits `TYPE ... [USING ...]`, `SET`/`DROP NOT NULL`, `SET DEFAULT`, `unsigned`/`enum` check constraints, unique/index constraints, and `COMMENT ON COLUMN`). Added explicit guards rejecting `.change()`/`.using()` inside `Schema.create` and `.change()` on auto-incrementing identity columns.
+- **Model Factories & Seeders Interop (`swiftpy/database/factories.py`, `swiftpy/database/orm/model.py`, `swiftpy/__init__.py`):**
+  - Added typed `Factory[T]`, `FactoryBatch[T]`, `Fake`, and `Sequence` (with typed `@overload`s for index callbacks and `.state()` callbacks) utilities plus `Model.factory(count=None)` (`Model.factory() -> Factory[Self]` returning `Self`; `Model.factory(n)` / `.count(n) -> FactoryBatch[Self]` returning `list[Self]`).
+  - Wrapped `Factory._create_many()` inside re-entrant `db.transaction()` (with savepoints inside nested transactions) so partial/nested relationship or hook failures roll back atomically with zero orphaned records, added a call-scoped recursion depth guard (`_MAX_FACTORY_DEPTH`) raising `RecursionError` on circular factory definitions, hardened `.for_()` / `.has()` / `.has_<relation>()` validation and package-scoped convention discovery (`database/factories/<subpkg>/<model>_factory.py` & `Model.__factory__` checks), and cleaned up unawaited coroutines on async hook misuse during sync `.make()`.
+  - Supports `.definition()`, custom state helper methods via `.state(...)`, `.sequence(...)`, `Sequence(idx_callback)`, `.seed(int)`, `.raw()`, `.make()`, `await .create()`, sync/async `.after_making()` and `.after_creating()` hooks, nested factory attribute references, `.has()` / dynamic `.has_<relation>()` (`HasMany`/`HasOne`), `.has_attached()` (`BelongsToMany` pivot attributes), `.for_()` / `.for_<relation>()` (`BelongsTo`), and factory resolution via `Model.__factory__`, `_FACTORY_REGISTRY`, disk convention discovery (`database/factories/<model>_factory.py`), and `_DefaultModelFactory` fallback (all strictly Pythonic `snake_case`, no `camelCase` aliases).
+- **CLI Factory Generators (`swiftpy/console/commands/make.py`, `swiftpy/console/stubs/factory.stub`):**
+  - Added `swiftpy make:factory <Name>` (`--model`, `--path`, `--force`) writing to `database/factories/` and added `-f` / `--factory` and `--factory-path` flags to `swiftpy make:model`. Starter projects created with `swiftpy new` intentionally do not pre-create `database/factories/` until a factory is generated.
+
+### Changed
+- Bumped `swiftpy-framework` package version (`pyproject.toml`), `swiftpy new` dependency floor (`swiftpy/console/commands/new.py`), and `tests/console/test_phase9_cli_remediation.py` to `0.4.0`.
+
+### Documentation
+- Updated [Database Schema, `Blueprint` & Migrations](documentations/2026-11-19-database-schema-and-blueprint.md), [Database Query Builder, Migrations & Seeders](documentations/2026-11-15-database-query-builder-and-migrations.md), [Active Record ORM & Relationships](documentations/2026-11-15-orm-models-and-relationships.md), [CLI & Testing](documentations/2026-11-19-cli-and-testing.md), [Installation & Quick Start](documentations/2026-11-14-installation-quick-start.md), and [README.md](README.md) with v0.4.0 migration helpers, model factories, CLI commands, and upgrade instructions.
+
 ## [0.3.9] - 2026-11-27
 
 ### Changed
@@ -19,7 +40,7 @@ All notable changes to SwiftPY will be documented in this file.
   - Added `Run Pyrefly` and isolated wheel `py.typed` + `swiftpy new` Pyrefly smoke-test verification to `.github/workflows/ci.yml`.
 
 ### Documentation
-- Updated [ORM Models & Relationships](documentations/2026-11-15-orm-models-and-relationships.md), [Installation & Quick Start](documentations/2026-11-14-installation-quick-start.md), [CLI & Testing](documentations/2026-11-19-cli-and-testing.md), and [README.md](README.md) with guidance on `ClassVar`-free model metadata (`__fillable__`, `__guarded__`, `__hidden__`), host IDE `.venv` setup for Dockerized projects, and avoiding global `ignore_missing_imports = true` with Pyrefly.
+- Updated [ORM Models & Relationships](documentations/2026-11-15-orm-models-and-relationships.md), [Installation & Quick Start](documentations/2026-11-14-installation-quick-start.md), [CLI & Testing](documentations/2026-11-19-cli-and-testing.md), and [README.md](README.md) with guidance on `ClassVar`-free model metadata (`__fillable__`, `__guarded__`, `__hidden__`), zero-`.venv` host Python installation (`python -m pip install -U swiftpy-framework`) for Dockerized IDE type checking, and avoiding global `ignore_missing_imports = true` with Pyrefly.
 
 ## [0.3.8] - 2026-11-25
 

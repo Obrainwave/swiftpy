@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+from typing import Any
+
+from swiftpy.database.factories import Factory
+
+from {model_import} import {model_class}
+
+
+class {class_name}(Factory[{model_class}]):
+    """Model factory for generating {model_class} records."""
+
+    model = {model_class}
+
+    def definition(self) -> dict[str, Any]:
+        return {
+            # "name": self.fake.name(),
+        }

@@ -11,6 +11,8 @@ import pytest
 
 import swiftpy
 from swiftpy.database import (
+    Factory,
+    FactoryBatch,
     Paginator,
     Query,
     QueryDumpError,
@@ -454,6 +456,32 @@ async def _verify_direct_and_relationship_inference(v: _DocVersion) -> None:
     )
     req_author: User = assert_type(await v.author.first_or_fail(), User)
 
+    # Model Factory static typing contracts (single -> T, count() -> list[T])
+    user_factory: Factory[User] = assert_type(User.factory(), Factory[User])
+    made_user: User = assert_type(user_factory.make(), User)
+    created_user: User = assert_type(await User.factory().create(), User)
+    user_batch: FactoryBatch[User] = assert_type(
+        User.factory().count(50),
+        FactoryBatch[User],
+    )
+    made_users: list[User] = assert_type(user_batch.make(), list[User])
+    created_users_with_posts: list[User] = assert_type(
+        await User.factory().count(50).has_posts(1).create(),
+        list[User],
+    )
+    created_counted: list[User] = assert_type(
+        await User.factory(10).create(),
+        list[User],
+    )
+    post_for_user: Post = assert_type(
+        await Post.factory().for_(created_user).create(),
+        Post,
+    )
+    users_with_roles: list[User] = assert_type(
+        await User.factory().count(3).has(Role, 2).create(),
+        list[User],
+    )
+
     repo = _DocVersionRepository()
     assert_type(await repo.get_doc_version(1), _DocVersion)
     assert_type(await repo.get_doc_versions(), list[_DocVersion])
@@ -470,6 +498,12 @@ async def _verify_direct_and_relationship_inference(v: _DocVersion) -> None:
     assert lazy_group_builder is not None
     assert awaited_author == filtered_author
     assert req_author.email != ""
+    assert made_user.email != ""
+    assert len(made_users) == 50
+    assert len(created_users_with_posts) == 50
+    assert len(created_counted) == 10
+    assert post_for_user.user_id == created_user.id
+    assert len(users_with_roles) == 3
 
 
 def test_repository_query_chaining_type_preservation() -> None:

@@ -103,7 +103,7 @@ def test_new_command_scaffolds_complete_structure(
     assert (app_dir / "app" / "jobs" / "send_notification_job.py").is_file()
     assert (app_dir / "app" / "mail" / "welcome_email.py").is_file()
 
-    # 6. Verify database migrations and seeders
+    # 6. Verify database migrations and seeders (and no default factories scaffolded)
     assert (
         app_dir
         / "database"
@@ -111,6 +111,7 @@ def test_new_command_scaffolds_complete_structure(
         / "2026_01_01_000000_create_users_table.py"
     ).is_file()
     assert (app_dir / "database" / "seeders" / "database_seeder.py").is_file()
+    assert not (app_dir / "database" / "factories").exists()
 
     # 7. Verify dedicated views (admin views removed)
     assert (app_dir / "views" / "mail" / "template.html").is_file()
@@ -343,10 +344,11 @@ def test_generated_project_passes_ruff_and_mypy(
     bin_dir = Path(sys.executable).parent
     repo_root = Path(__file__).resolve().parents[2]
 
-    # Generated CLI models and AI/HTTP artifacts inside the project must pass ruff and strict mypy
+    # Generated CLI models, factories, and AI/HTTP artifacts inside the project must pass ruff and strict mypy
     monkeypatch.chdir(app_dir)
-    CLI().run(["make:model", "Article", "-m"])
+    CLI().run(["make:model", "Article", "-m", "-f"])
     CLI().run(["make:model", "Billing/Invoice"])
+    CLI().run(["make:factory", "UserFactory"])
     CLI().run(["make:controller", "PostController"])
     CLI().run(["make:resource", "PostResource"])
     CLI().run(["make:service", "PostService"])

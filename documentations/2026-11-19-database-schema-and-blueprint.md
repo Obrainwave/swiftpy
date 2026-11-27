@@ -86,8 +86,16 @@ Supported `Schema` methods:
 | `Schema.table` | `await Schema.table(table_name, callback)` | Alters an existing table (`ALTER TABLE` / `CREATE INDEX` / `DROP INDEX`). |
 | `Schema.drop` | `await Schema.drop(table_name)` | Executes `DROP TABLE "<table_name>";`. |
 | `Schema.drop_if_exists` | `await Schema.drop_if_exists(table_name)` | Executes `DROP TABLE IF EXISTS "<table_name>";`. |
-| `Schema.has_table` | `await Schema.has_table(table_name) -> bool` | Checks PostgreSQL metadata for the existence of `table_name`. |
-| `Schema.has_column` | `await Schema.has_column(table_name, column_name) -> bool` | Checks whether `column_name` exists on `table_name`. |
+| `Schema.has_table` | `await Schema.has_table(table_name) -> bool` | Checks PostgreSQL metadata for the existence of `table_name` (supports optional `"schema.table"` syntax). |
+| `Schema.has_column` | `await Schema.has_column(table_name, column_name) -> bool` | Checks whether `column_name` exists on `table_name` (supports optional `"schema.table"` syntax). |
+| `Schema.has_columns` | `await Schema.has_columns(table_name, columns) -> bool` | Checks whether all listed column names exist on `table_name` (supports lists/tuples and `"schema.table"`). |
+| `Schema.has_index` | `await Schema.has_index(table_name, index, type_=None, *, type=None) -> bool` | Checks PostgreSQL metadata whether an index name or exact ordered column sequence exists on `table_name` (`"schema.table"` supported). |
+
+> [!NOTE]
+> **`Schema.has_index` matching & filter semantics:**
+> - **Constraint filters vs access methods:** Passing `type="primary"` or `type="unique"` checks PostgreSQL constraint flags (`indisprimary` / `indisunique`, noting that PostgreSQL primary keys also have `indisunique=True`). Passing a PostgreSQL index access method such as `"btree"`, `"gin"`, `"gist"`, or `"hash"` filters `pg_am.amname` instead.
+> - **Column order, partial indexes & expression indexes:** Matching by column list (`["org_id", "slug"]`) requires the exact indexed column sequence in order; partial indexes (`CREATE INDEX ... WHERE ...`) are counted, while expression indexes match by index name rather than plain column names.
+> - **Minimum PostgreSQL version:** SwiftPY migration introspection and DDL compilation target **PostgreSQL 16+** (`pgvector/pgvector:pg16` in CI and starter projects).
 
 > [!NOTE]
 > SwiftPY does **not** implement `Schema.rename(...)`. If you need to rename a table, use `SchemaGrammar` or execute explicit PostgreSQL DDL carefully rather than calling `Schema.rename`.
@@ -139,10 +147,11 @@ Every column name and identifier passes through `validate_identifier()` before S
 | `table.timestamps(tz=True)` | `created_at` & `updated_at` | Adds both `created_at` and `updated_at` (`TIMESTAMPTZ` by default, `DEFAULT CURRENT_TIMESTAMP`). |
 | `table.soft_deletes(name="deleted_at", tz=True)` | Nullable timestamp | Adds a nullable deletion marker column (`deleted_at` by default). |
 
-### JSON & pgvector Columns
+### Binary, JSON & pgvector Columns
 
 | Method | PostgreSQL DDL | Notes |
 |---|---|---|
+| `table.binary(name)` | `BYTEA` | Variable-length binary byte string (supports `bytes`/`bytearray`/`memoryview` `.default(...)` compiled as PostgreSQL hex literals). |
 | `table.json(name)` | `JSON` | Raw JSON text storage. |
 | `table.jsonb(name)` | `JSONB` | Binary decomposed JSON (recommended on PostgreSQL). |
 | `table.vector(name, dimensions=1536)` | `vector(dimensions)` | pgvector column (ensure `CREATE EXTENSION IF NOT EXISTS vector;` is enabled first). |
@@ -167,8 +176,10 @@ table.timestamp("synced_at").nullable().default(raw("CURRENT_TIMESTAMP")).index(
 | `.unique(name=None)` | Adds a `UNIQUE` column or named table constraint. |
 | `.index(name=None)` | Creates a standalone `CREATE INDEX` statement after table creation/alteration. |
 | `.primary()` | Marks the column as `PRIMARY KEY` (for non-serial keys like `uuid`). |
-| `.comment(text)` | Emits PostgreSQL `COMMENT ON COLUMN` after table creation/alteration. |
+| `.comment(text)` | Emits PostgreSQL `COMMENT ON COLUMN` after table creation/alteration (set `None` when modifying to clear on PostgreSQL). |
 | `.unsigned()` | Emits a non-negative `CHECK ("col" >= 0)` constraint for numeric columns. |
+| `.change()` | Inside `Schema.table(...)`, compiles PostgreSQL `ALTER COLUMN` statements to change an existing column's type, nullability, default, constraints, indexes, and comment (any omitted modifier is dropped/reset cleanly). |
+| `.using(expression)` | Adds a PostgreSQL `USING <expression>` cast clause to `ALTER COLUMN ... TYPE` when combined with `.change()` (accepts a SQL expression string or `raw(...)`). |
 
 > [!WARNING]
 > **No `.after()` modifier on PostgreSQL:** `ColumnDefinition` does **not** define `.after("other_column")`. PostgreSQL appends new columns at the end of the table row during `ALTER TABLE ... ADD COLUMN` and ignores physical column positioning hints.
@@ -223,15 +234,24 @@ def define(table: Blueprint) -> None:
 
 When compiling `Schema.table(name, fn)`, `SchemaGrammar` orders statements safely within the blueprint so drops run cleanly before renames and new columns/constraints:
 
-1. **Drops:** `drop_foreign(name)`, `drop_unique(name)`, `drop_index(name)`, `drop_column(*names)` (each compiled with `IF EXISTS`)
+1. **Drops:** `drop_foreign(name)`, `drop_unique(name)`, `drop_index(name)`, `drop_column(*names)` (each compiled with `IF EXISTS`; `drop_column` accepts variadic strings like `drop_column("a", "b")` or a sequence like `drop_column(["a", "b"])`)
 2. **Renames:** `rename_column(from_name, to_name)` (`ALTER TABLE ... RENAME COLUMN ... TO ...`)
-3. **Additions:** new columns (`ALTER TABLE ... ADD COLUMN ...`), standalone indexes, column comments, composite indexes/uniques, and foreign keys.
+3. **Modifications & Additions:** existing column `.change()` definitions (`ALTER COLUMN ... TYPE ... [USING ...]`, nullability, default, constraints, comment) and new columns (`ALTER TABLE ... ADD COLUMN ...`), standalone indexes, column comments, composite indexes/uniques, and foreign keys.
 
 ```python
+from swiftpy.database.migrations import raw
+
+
 class UpdateOrdersTable(Migration):
     async def up(self) -> None:
+        if not await Schema.has_columns("orders", ["user_id", "total_amount"]):
+            return
+
         def alter(table: Blueprint) -> None:
             table.rename_column("total_amount", "subtotal_amount")
+            table.string("notes", length=500).nullable().change()
+            table.integer("external_ref").using(raw("external_ref::integer")).change()
+            table.binary("payload").nullable()
             table.decimal("tax_amount", precision=12, scale=2).default(0)
             table.string("tracking_code", length=64).nullable().index("idx_orders_tracking_code")
 
@@ -239,11 +259,26 @@ class UpdateOrdersTable(Migration):
 
     async def down(self) -> None:
         def revert(table: Blueprint) -> None:
+            if not isinstance(table, Blueprint):
+                return
             table.drop_index("idx_orders_tracking_code")
-            table.drop_column("tracking_code", "tax_amount")
+            table.drop_column(["tracking_code", "tax_amount", "payload"])
             table.rename_column("subtotal_amount", "total_amount")
 
-        await Schema.table("orders", revert)
+        if await Schema.has_index("orders", "idx_orders_tracking_code"):
+            await Schema.table("orders", revert)
+```
+
+> [!NOTE]
+> **Declarative `.change()` semantics:** When modifying an existing column with `.change()`, SwiftPY treats the chained column definition as the full target specification for that column. Any previously attached `DEFAULT`, column `CHECK` (such as `.unsigned()`), `NOT NULL`, or `COMMENT` that you omit from the `.change()` call is dropped cleanly, so **redeclare every modifier you want to retain**. Use `.using(...)` on PostgreSQL whenever the type cast is not implicit (for example `VARCHAR` to `INTEGER`).
+
+Preserving all existing modifiers while resizing or updating a column:
+
+```python
+def preserve_modifiers(table: Blueprint) -> None:
+    # Retain NOT NULL (default), unsigned check, default(1), unique, and comment when resizing/modifying:
+    table.integer("votes").unsigned().default(1).comment("Total votes").change()
+    table.string("email", length=320).unique().comment("Primary contact").change()
 ```
 
 ---
