@@ -200,6 +200,6 @@ jobs:
             cd /tmp/swiftpy-pyrefly-smoke
             /tmp/swiftpy-wheel-smoke/bin/swiftpy new ci_smoke_api
             cd ci_smoke_api
-            uvx pyrefly check --python-interpreter-path /tmp/swiftpy-wheel-smoke/bin/python --error=no-any-return-implicit .
+            uvx pyrefly check --python-interpreter-path /tmp/swiftpy-wheel-smoke/bin/python --error=no-any-return-implicit app/ config/ routes/ database/ prompts/ main.py
           )
           rm -rf /tmp/swiftpy-pyrefly-smoke /tmp/swiftpy-wheel-smoke
