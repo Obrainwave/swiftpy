@@ -26,8 +26,9 @@ Use the `make:*` commands to generate typed stubs conforming to SwiftPY's conven
 
 | Command | Default Destination | Extra Options |
 |---|---|---|
-| `swiftpy make:model <Name>` | `app/models/` | `-m` / `--migration`, `--table <table>`, `--migration-path <dir>`, `--path`, `--force` |
+| `swiftpy make:model <Name>` | `app/models/` | `-m` / `--migration`, `-f` / `--factory`, `--table <table>`, `--migration-path <dir>`, `--factory-path <dir>`, `--path`, `--force` |
 | `swiftpy make:migration <name>` | `database/migrations/` | `--create <table>`, `--table <table>`, `--path`, `--force` |
+| `swiftpy make:factory <Name>` | `database/factories/` | `--model <Model>`, `--path`, `--force` |
 | `swiftpy make:controller <Name>` | `app/http/controllers/` | `--path`, `--force` |
 | `swiftpy make:resource <Name>` | `app/http/resources/` | `--path`, `--force` |
 | `swiftpy make:request <Name>` | `app/http/requests/` | `--path`, `--force` |
@@ -245,13 +246,14 @@ SwiftPY ships a PEP 561 `py.typed` marker inside the built wheel alongside gener
 # Type-check application code strictly with Mypy
 uv run mypy --strict .
 
-# Type-check with Pyrefly using your project's .venv interpreter
-uvx pyrefly check --python-interpreter-path .venv/bin/python --error=no-any-return-implicit .
+# Type-check with Pyrefly
+pyrefly check --error=no-any-return-implicit .
 ```
 
 Key configuration rules for Pyrefly, Mypy, and Ruff (configured automatically by `swiftpy new` in `pyproject.toml`):
 
-- **Never set global `ignore_missing_imports = true` under `[tool.mypy]`:** When no `pyrefly.toml` is present, Pyrefly automatically imports `[tool.mypy]` settings from `pyproject.toml`. A global `ignore_missing_imports = true` suppresses `[missing-import]` diagnostics when an IDE interpreter lacks `swiftpy-framework` (for example, on a Windows host when dependencies were only installed inside Docker) and silently turns `Model` into `Unknown`—causing every repository query chain to fail with `Returning implicit Any [no-any-return-implicit]` (`where: Unknown`, `doc: Unknown`). Scope `ignore_missing_imports = true` only to untyped third-party libraries via `[[tool.mypy.overrides]]`:
+- **Install `swiftpy-framework` on your host Python for zero-setup Dockerized IDE type checking:** When running your app in Docker on Windows, macOS, or Linux, your IDE and Pyrefly run on the host OS outside the Docker container. Installing `swiftpy-framework` once into your host Python (`python -m pip install -U swiftpy-framework`) makes SwiftPY's `py.typed` definitions available globally to your IDE — so you do not need a `.venv`, `.devcontainer`, or custom `.vscode/settings.json` in your project folder. (If you prefer per-project virtual environments instead of a host install, run `uv sync` in the project and pass `--python-interpreter-path .venv/bin/python` or select `.venv` in your IDE.)
+- **Never set global `ignore_missing_imports = true` under `[tool.mypy]`:** When no `pyrefly.toml` is present, Pyrefly automatically imports `[tool.mypy]` settings from `pyproject.toml`. A global `ignore_missing_imports = true` suppresses `[missing-import]` diagnostics when an IDE interpreter lacks `swiftpy-framework` and silently turns `Model` into `Unknown`—causing every repository query chain to fail with `Returning implicit Any [no-any-return-implicit]` (`where: Unknown`, `doc: Unknown`). Scope `ignore_missing_imports = true` only to untyped third-party libraries via `[[tool.mypy.overrides]]`:
   ```toml
   [tool.mypy]
   strict = true

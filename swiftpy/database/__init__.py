@@ -6,6 +6,7 @@ from swiftpy.database.exceptions import (
     QueryDumpError,
     RecordNotFoundError,
 )
+from swiftpy.database.factories import Factory, FactoryBatch, Fake, Sequence
 from swiftpy.database.migrations.blueprint import Blueprint
 from swiftpy.database.migrations.schema import Schema
 from swiftpy.database.pagination import Paginator, SimplePaginator
@@ -25,6 +26,9 @@ __all__ = [
     "Database",
     "DatabaseError",
     "DatabasePool",
+    "Factory",
+    "FactoryBatch",
+    "Fake",
     "ModelNotFoundError",
     "Paginator",
     "Query",
@@ -34,6 +38,7 @@ __all__ = [
     "RecordNotFoundError",
     "Schema",
     "Seeder",
+    "Sequence",
     "SimplePaginator",
     "TransactionClosedError",
     "TransactionConnection",

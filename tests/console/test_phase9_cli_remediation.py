@@ -24,7 +24,7 @@ def test_new_command_templates_hardened(
     assert "pyproject.toml" in dockerfile
 
     pyproject = (app_dir / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"swiftpy-framework>=0.3.9"' in pyproject
+    assert '"swiftpy-framework>=0.4.0"' in pyproject
 
     dockerignore = (app_dir / ".dockerignore").read_text(encoding="utf-8")
     assert "public/storage" in dockerignore
@@ -99,20 +99,46 @@ def test_make_command_flags_force_and_migration_path(
     assert len(list(tmp_path.glob("*_create_api_keys_table.py"))) == 1
 
     custom_mig_dir = tmp_path / "custom_migrations"
+    custom_fac_dir = tmp_path / "custom_factories"
     cli.run(
         [
             "make:model",
             "Widget",
             "-m",
+            "-f",
             "--path",
             str(tmp_path / "custom_models"),
             "--migration-path",
             str(custom_mig_dir),
+            "--factory-path",
+            str(custom_fac_dir),
             "--force",
         ]
     )
     assert (tmp_path / "custom_models" / "widget.py").is_file()
     assert len(list(custom_mig_dir.glob("*_create_widgets_table.py"))) == 1
+    widget_fac = custom_fac_dir / "widget_factory.py"
+    assert widget_fac.is_file()
+    widget_fac_src = widget_fac.read_text(encoding="utf-8")
+    assert "class WidgetFactory(Factory[Widget]):" in widget_fac_src
+    assert "model = Widget" in widget_fac_src
+
+    cli.run(
+        [
+            "make:factory",
+            "Order",
+            "--model",
+            "app.models.sales.Order",
+            "--path",
+            str(custom_fac_dir),
+            "--force",
+        ]
+    )
+    order_fac = custom_fac_dir / "order_factory.py"
+    assert order_fac.is_file()
+    order_fac_src = order_fac.read_text(encoding="utf-8")
+    assert "from app.models.sales import Order" in order_fac_src
+    assert "class OrderFactory(Factory[Order]):" in order_fac_src
 
 
 def test_start_command_preserves_port_zero() -> None:

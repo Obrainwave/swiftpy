@@ -349,6 +349,18 @@ class MakeCommand:
             help="The directory where the generated migration should be saved (defaults to database/migrations)",
         )
         parser_model.add_argument(
+            "-f",
+            "--factory",
+            action="store_true",
+            help="Create a new model factory file for the model",
+        )
+        parser_model.add_argument(
+            "--factory-path",
+            dest="factory_path",
+            default=None,
+            help="The directory where the generated factory should be saved (defaults to database/factories)",
+        )
+        parser_model.add_argument(
             "--force",
             action="store_true",
             help="Overwrite the model if it already exists",
@@ -707,6 +719,36 @@ class MakeCommand:
             _handler=MakeCommand.handle_seeder,
         )
 
+        # 16b. make:factory
+        parser_factory = subparsers.add_parser(
+            "make:factory",
+            help="Create a new Model Factory class",
+        )
+        parser_factory.add_argument(
+            "name",
+            help="The name of the factory (e.g., UserFactory or User)",
+        )
+        parser_factory.add_argument(
+            "--model",
+            dest="model",
+            default=None,
+            help="The Model class associated with the factory (e.g., User or app.models.user.User)",
+        )
+        parser_factory.add_argument(
+            "--path",
+            dest="path",
+            default=None,
+            help="The directory where the factory should be saved (defaults to database/factories)",
+        )
+        parser_factory.add_argument(
+            "--force",
+            action="store_true",
+            help="Overwrite the factory if it already exists",
+        )
+        parser_factory.set_defaults(
+            _handler=MakeCommand.handle_factory,
+        )
+
         # 17. make:agent
         parser_agent = subparsers.add_parser(
             "make:agent",
@@ -919,6 +961,15 @@ class MakeCommand:
             )
             MakeCommand.handle_migration(mig_args)
 
+        if getattr(args, "factory", False):
+            factory_args = argparse.Namespace(
+                name=raw_name,
+                model=raw_name,
+                path=getattr(args, "factory_path", None),
+                force=bool(getattr(args, "force", False)),
+            )
+            MakeCommand.handle_factory(factory_args)
+
     @staticmethod
     def handle_api_key(args: argparse.Namespace) -> None:
         """Handle make:api-key command execution (P2-A2 requirement 5)."""
@@ -1105,6 +1156,68 @@ class MakeCommand:
             override_path=getattr(args, "path", None),
             force=bool(getattr(args, "force", False)),
             item_type="Seeder",
+        )
+
+    @staticmethod
+    def handle_factory(args: argparse.Namespace) -> None:
+        """Handle make:factory command execution."""
+        raw_name = str(args.name).strip()
+        dir_segments, snake_name, class_name = _validate_and_split_name(
+            raw_name,
+            item_type="Factory",
+            allow_nested=True,
+        )
+        if not snake_name.endswith("_factory"):
+            snake_name = f"{snake_name}_factory"
+        if not class_name.endswith("Factory"):
+            class_name = f"{class_name}Factory"
+
+        raw_model: str | None = getattr(args, "model", None)
+        trimmed_model = raw_model.strip() if raw_model is not None else ""
+        if trimmed_model:
+            if "." in trimmed_model:
+                parts = trimmed_model.split(".")
+                if len(parts) < 2 or any(
+                    not part or not _SEGMENT_PATTERN.fullmatch(part) for part in parts
+                ):
+                    raise SystemExit(f"Invalid model import path: {raw_model!r}")
+                model_import = ".".join(parts[:-1])
+                model_class = parts[-1]
+            else:
+                m_dirs, m_snake, m_class = _validate_and_split_name(
+                    trimmed_model,
+                    item_type="Model",
+                    allow_nested=True,
+                )
+                model_import = ".".join(["app", "models", *m_dirs, m_snake])
+                model_class = m_class
+        else:
+            inferred_leaf = snake_name.removesuffix("_factory")
+            if not inferred_leaf:
+                raise SystemExit(
+                    f"Unable to infer model name from {raw_name!r}; pass --model <Model>."
+                )
+            model_import = ".".join(["app", "models", *dir_segments, inferred_leaf])
+            model_class = _pascal_case(inferred_leaf)
+
+        content = (
+            get_stub("factory")
+            .replace("{class_name}", class_name)
+            .replace("{model_import}", model_import)
+            .replace("{model_class}", model_class)
+        )
+        override_path = getattr(args, "path", None)
+        base_dir = (
+            Path(override_path) if override_path else Path.cwd() / "database" / "factories"
+        )
+        _write_scaffold_file(
+            raw_name=raw_name,
+            base_dir=base_dir,
+            dir_segments=dir_segments,
+            filename=f"{snake_name}.py",
+            content=content,
+            force=bool(getattr(args, "force", False)),
+            item_type="Factory",
         )
 
     @staticmethod

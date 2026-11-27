@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import inspect
 import json
 import logging
@@ -8,6 +9,7 @@ import math
 from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import (
+    TYPE_CHECKING,
     Any,
     ClassVar,
     NoReturn,
@@ -41,9 +43,27 @@ from swiftpy.events.dispatcher import EventDispatcher
 from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.strings import pluralize, snake_case
 
+if TYPE_CHECKING:
+    from swiftpy.database.factories import (
+        Factory,
+        FactoryBatch,
+    )
+    from swiftpy.database.factories import (
+        Sequence as FactorySequence,
+    )
+
 T = TypeVar("T", bound="Model")
 _TRelModel = TypeVar("_TRelModel", bound="Model")
 _MISSING = object()
+_factory_resolver: Callable[[type[Any]], Factory[Any]] | None = None
+
+
+def _set_factory_resolver(
+    resolver: Callable[[type[Any]], Factory[Any]],
+) -> None:
+    """Register the model factory resolver once `swiftpy.database.factories` loads."""
+    global _factory_resolver
+    _factory_resolver = resolver
 
 
 class _UnsetType:
@@ -997,11 +1017,11 @@ class ModelQueryBuilder[T: Model]:
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ValueError("Relation existence count must be a non-negative integer.")
 
-        normalized_op = "=" if operator == "==" else str(operator).strip()
+        normalized_op = "=" if operator == "==" else operator.strip()
         if normalized_op not in {">=", ">", "=", "<", "<=", "!="}:
             raise ValueError(f"Unsupported relation count operator: {operator!r}")
 
-        boolean_upper = str(boolean).strip().upper()
+        boolean_upper = boolean.strip().upper()
         if boolean_upper not in {"AND", "OR"}:
             raise ValueError(f"Unsupported boolean operator: {boolean!r}")
 
@@ -1294,6 +1314,7 @@ class Model:
     __fillable__: ClassVar[set[str] | list[str] | tuple[str, ...] | None] = None
     __guarded__: ClassVar[set[str] | list[str] | tuple[str, ...] | None] = None
     __hidden__: ClassVar[set[str] | list[str] | tuple[str, ...]] = ()
+    __factory__: ClassVar[type[Factory[Any]] | None] = None
     strict_events: ClassVar[bool] = False
     prevent_lazy_loading: ClassVar[bool] = False
 
@@ -1638,6 +1659,55 @@ class Model:
     def query(cls) -> ModelQueryBuilder[Self]:
         """Return a new query builder for this model."""
         return ModelQueryBuilder(cls)
+
+    @overload
+    @classmethod
+    def factory(
+        cls,
+        count: None = None,
+        state: Mapping[str, Any]
+        | BaseSchema
+        | FactorySequence
+        | Callable[..., Mapping[str, Any]]
+        | None = None,
+    ) -> Factory[Self]: ...
+
+    @overload
+    @classmethod
+    def factory(
+        cls,
+        count: int,
+        state: Mapping[str, Any]
+        | BaseSchema
+        | FactorySequence
+        | Callable[..., Mapping[str, Any]]
+        | None = None,
+    ) -> FactoryBatch[Self]: ...
+
+    @classmethod
+    def factory(
+        cls,
+        count: int | None = None,
+        state: Mapping[str, Any]
+        | BaseSchema
+        | FactorySequence
+        | Callable[..., Mapping[str, Any]]
+        | None = None,
+    ) -> Factory[Self] | FactoryBatch[Self]:
+        """Return a model factory configured for this Model class."""
+        if _factory_resolver is None:
+            fac_mod = importlib.import_module("swiftpy.database.factories")
+            resolver = getattr(fac_mod, "resolve_factory_for_model", None)
+            if callable(resolver):
+                _set_factory_resolver(resolver)
+        if _factory_resolver is None:
+            raise RuntimeError("Model factory resolver is not initialized.")
+        factory: Factory[Self] = _factory_resolver(cls)
+        if state is not None:
+            factory = factory.state(state)
+        if count is not None:
+            return factory.count(count)
+        return factory
 
     @classmethod
     async def find(cls, id: Any) -> Self | None:

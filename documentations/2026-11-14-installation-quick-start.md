@@ -98,31 +98,30 @@ Use this path for full-stack APIs with config files, migrations, ORM models, sto
 
 ### 1. Scaffold the Project
 
-Do **not** run `python -m pip install swiftpy-framework` globally outside a virtual environment — user-site installs can clash with global packages (such as `pyopenssl` / `cryptography`) and, on Windows, leave `swiftpy.exe` in `AppData\...\Scripts` off `PATH`.
+From the workspace parent directory where you want your `my_api` folder created, choose **one** of these two ways to scaffold your project:
 
-From the workspace parent directory where you want your `my_api` folder created, generate the project with **one** of these isolated options:
+- **Recommended (especially for Dockerized development on Windows, macOS, or Linux) — Install `swiftpy-framework` on your host Python:**
 
-- **With `uvx` (recommended — no `.venv` clutter or global installs):**
+  ```bash
+  python -m pip install --upgrade pip
+  python -m pip install -U swiftpy-framework
+  swiftpy --version
+  swiftpy new my_api
+  cd my_api
+  ```
+
+  **Why this is recommended:** When you run your application inside Docker (Option A below), your code editor (VS Code, Antigravity, Cursor, PyCharm) and its type checkers (**Pyrefly**, **Pylance**, **Mypy**) still run on your host OS (e.g., Windows). Installing `swiftpy-framework` once into your host Python makes both the `swiftpy` CLI and SwiftPY's `py.typed` type definitions available globally to your IDE — so **every Dockerized SwiftPY project works out of the box with zero Pyrefly errors and without needing a `.venv`, `.devcontainer`, or custom `.vscode/settings.json` in your project folder**.
+
+  *(Note: If Windows prints a warning that `Scripts` is not on your `PATH`, either add that `Scripts` folder to your Windows `PATH` or run `python -m swiftpy.console.cli new my_api`.)*
+
+- **Alternative (if you prefer not to install packages into your host Python) — Use `uvx` or a dedicated virtual environment:**
 
   ```bash
   uvx --from swiftpy-framework swiftpy new my_api
   cd my_api
   ```
 
-- **With `python -m venv` + `pip`:**
-
-  ```bash
-  python -m venv .cli-venv
-  source .cli-venv/bin/activate   # Windows PowerShell: .cli-venv\Scripts\Activate.ps1
-  python -m pip install --upgrade pip
-  python -m pip install swiftpy-framework
-  swiftpy --version
-  swiftpy new my_api
-  deactivate
-  cd my_api
-  ```
-
-  *(In Option A you can delete `.cli-venv` afterward; in Option B you create `my_api/.venv` next, or you can keep one parent `.venv` active instead. If `swiftpy` was already installed in user site-packages without `Scripts` on `PATH`, invoke `python -m swiftpy.console.cli new my_api`.)*
+  *(Note: Because `uvx` runs in a temporary cache and deletes itself afterward, if you use `uvx` you will need to create a local `.venv` inside `my_api` with `uv sync` so your host IDE can find `swiftpy`.)*
 
 Pass `--force` only if overwriting an existing non-empty directory (existing `.env` files are preserved when `--force` is used).
 
@@ -171,7 +170,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.3.9, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.4.0, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -186,10 +185,10 @@ Now choose **ONE** of the two run modes below (Option A **or** Option B).
 
 ### Option A: Fully Dockerized (App + PostgreSQL + Redis in Docker)
 
-Use this mode if you want Docker to run the application and backing services — **you do not need to install PostgreSQL or Redis on your host.**
+Use this mode if you want Docker to run everything — **you do not need a `.venv` folder in your project, `.devcontainer`, or local PostgreSQL/Redis on your host.**
 
-> **Host IDE Autocomplete & Pyrefly / Mypy Type Checking (Windows, macOS, Linux):**
-> Docker installs `swiftpy-framework` inside the Linux container image, whereas your code editor (VS Code, Antigravity, Cursor, PyCharm) and its type-checking extensions (**Pyrefly**, **Mypy**, **Pylance**) run on your host OS unless you attach via Dev Containers. To get full IDE type inference on the host without running a local server, create the local virtual environment once with `uv sync` (or `python -m venv .venv && .venv/bin/pip install -e .`) and select `.venv` as your editor's Python interpreter (in multi-folder workspaces such as `workspace/backend`, point `.vscode/settings.json` `python.defaultInterpreterPath` at `${workspaceFolder}/backend/.venv/Scripts/python.exe` on Windows or `${workspaceFolder}/backend/.venv/bin/python` on macOS/Linux).
+> **Zero-Setup IDE Autocomplete & Pyrefly Type Checking:**
+> Because you installed `swiftpy-framework` on your host Python in Step 1 (`python -m pip install -U swiftpy-framework`), your host IDE (Pyrefly, Pylance, Mypy) automatically finds `swiftpy` in your system Python — no project `.venv`, `.devcontainer`, or `.vscode/settings.json` configuration is needed. (Only create a project `.venv` with `uv sync` if you skipped the host install and used `uvx` instead.)
 
 1. Inside `my_api`, review `.env` (optional — defaults already work out of the box with Compose).
 2. Build and start `app`, `postgres`, and `redis`:
@@ -328,7 +327,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.3.9",
+       "swiftpy-framework>=0.4.0",
        # ...
    ]
    ```
@@ -348,6 +347,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
      ```
 
    - The target version of `swiftpy-framework` must already be published on PyPI before running `docker compose build`. To test an unreleased local framework build in Docker, build a wheel (`uv build --wheel`), copy the `.whl` into your project's build context, and `pip install` that wheel in `Dockerfile`.
+   - **Keep your host IDE in sync:** Also run `python -m pip install -U "swiftpy-framework>=0.4.0"` on your host machine so your IDE and Pyrefly pick up any new APIs or type annotations from the upgraded release.
 
 ### Local Virtual Environment Projects (Option B / Minimal App)
 
@@ -358,7 +358,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.3.9"
+python -m pip install --upgrade "swiftpy-framework>=0.4.0"
 swiftpy --version
 ```
 

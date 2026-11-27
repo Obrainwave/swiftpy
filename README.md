@@ -68,6 +68,7 @@ All core architectural, storage, AI, and security hardening phases have been com
 | **Release v0.3.7: Declarative Schemas (`swiftpy.schemas`) & Pyrefly/PEP 561 Typing** | `swiftpy/py.typed` PEP 561 marker, `Model` / `ModelQueryBuilder[T]` fluent generic preservation, `BaseSchema` / `Schema` & `Field(...)` constraints, `@field_validator` / `@model_validator`, Router/Controller auto-injection & JSON serialization, ORM `create()`/`update()` schema interop, `make:schema` & `swiftpy new` updates | ✅ Completed |
 | **Release v0.3.8: Zero-Boilerplate ORM & Relationship Static Typing** | Source-level `Relation[T]` / `RelationshipQueryBuilder[T]` / `SingleRelationshipQueryBuilder[T]` type propagation (`await v.relation` & full query chains), zero-ceremony `model = YourModel` repositories, covariant `Mapping` / non-string `Sequence` & `ModelQueryBuilder` subqueries, and `BaseSchema` parity on `ModelQueryBuilder.update`, `first_or_create`, `update_or_create`, and relationship `.create()`/`.update()` | ✅ Completed |
 | **Release v0.3.9: Pyrefly/Mypy Scaffolding Hardening & `ClassVar`-Free Model Guidance** | Removed global `ignore_missing_imports = true` from `swiftpy new` `[tool.mypy]` (replaced with scoped `[[tool.mypy.overrides]]` so Pyrefly surfaces `[missing-import]` instead of silent `Model: Unknown` / `[no-any-return-implicit]`), expanded `RUF012` per-file ignores across `app/models/`, `app/**/models/`, and `tests/`, added `typing.assert_type` + `py.typed` wheel-packaging regression tests, and documented host IDE setup & `ClassVar`-free model metadata | ✅ Completed |
+| **Release v0.4.0: Migration Alteration/Introspection Helpers & Model Factories** | `Schema.has_columns()`, `Schema.has_index()`, `Blueprint.binary()` (`BYTEA`), `Blueprint.drop_column()` sequence support, declarative `ColumnDefinition.change()` + `.using(expr)` PostgreSQL `ALTER COLUMN` compiler, typed `Factory[T]` / `FactoryBatch[T]` / `Fake` / `Sequence` & `Model.factory()` with `.state()`, `.sequence()`, `.has()` / `.has_<rel>()`, `.has_attached()`, `.for_()`, plus `swiftpy make:factory` & `make:model -f` | ✅ Completed |
 
 *See [`documentations/2026-11-14-installation-quick-start.md`](./documentations/2026-11-14-installation-quick-start.md), [`documentations/2026-11-21-application-architecture-and-project-structure.md`](./documentations/2026-11-21-application-architecture-and-project-structure.md), and [`documentations/2026-11-22-task-scheduling.md`](./documentations/2026-11-22-task-scheduling.md) for the complete documentation series and [`CHANGELOG.md`](./CHANGELOG.md) for release notes.*
 
@@ -325,6 +326,8 @@ class CreatePostsTable(Migration):
         await Schema.drop_if_exists("posts")
 ```
 
+Also supports column alterations inside `Schema.table(...)` via `.change()` and `.using(expr)`, `table.binary(name)` (`BYTEA`), `table.drop_column(["col_a", "col_b"])`, and schema introspection via `Schema.has_columns(table, [...])` and `Schema.has_index(table, index, type=...)`.
+
 ### 7. Asynchronous Queues & Background Jobs
 
 Define background jobs with automatic JSON serialization, HMAC envelope signing, retry with backoff, and dead letter queue routing:
@@ -474,9 +477,10 @@ swiftpy migrate:rollback
 swiftpy migrate:reset
 swiftpy db:seed
 
-# Scaffold migrations, models, requests, schemas, API keys, mailables, and more
+# Scaffold migrations, models, factories, requests, schemas, API keys, mailables, and more
 swiftpy make:migration create_posts_table
-swiftpy make:model Post --migration
+swiftpy make:model Post --migration --factory
+swiftpy make:factory PostFactory --model Post
 swiftpy make:request RegisterRequest
 swiftpy make:schema OrderSchema
 swiftpy make:mail WelcomeEmail

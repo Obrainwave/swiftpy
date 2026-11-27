@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 from swiftpy.console.cli import CLI
 from swiftpy.console.stubs import STUBS_DIR, get_stub
+from swiftpy.database.factories import (
+    Factory,
+    restore_factory_registry,
+    snapshot_factory_registry,
+)
 
 
 def test_stubs_directory_and_files_exist() -> None:
@@ -34,6 +41,7 @@ def test_stubs_directory_and_files_exist() -> None:
         "listener.stub",
         "provider.stub",
         "seeder.stub",
+        "factory.stub",
         "agent.stub",
         "tool.stub",
         "prompt.stub",
@@ -46,9 +54,9 @@ def test_stubs_directory_and_files_exist() -> None:
 
 
 def test_all_stubs_render_and_compile() -> None:
-    """Verify that all 23 stubs render cleanly without unresolved placeholders and compile to valid Python."""
+    """Verify that all 24 stubs render cleanly without unresolved placeholders and compile to valid Python."""
     stub_files = list(STUBS_DIR.glob("*.stub"))
-    assert len(stub_files) == 23
+    assert len(stub_files) == 24
 
     for stub_path in stub_files:
         content = stub_path.read_text(encoding="utf-8")
@@ -57,6 +65,8 @@ def test_all_stubs_render_and_compile() -> None:
             .replace("{table_name}", "sample_table")
             .replace("{tool_name}", "sample_tool")
             .replace("{prompt_name}", "sample_prompt")
+            .replace("{model_import}", "app.models.sample")
+            .replace("{model_class}", "SampleModel")
         )
         # Ensure no unreplaced template placeholders remain
         unresolved = re.findall(r"\{[a-zA-Z0-9_]+\}", rendered)
@@ -505,6 +515,122 @@ def test_make_ai_generators_security_and_force_flags(
     custom_prompts = tmp_path / "custom_prompts"
     cli.run(["make:prompt", "triage.v1", "--path", str(custom_prompts)])
     assert (custom_prompts / "triage.v1.py").is_file()
+
+
+def test_make_factory_and_make_model_factory_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    cli = CLI()
+
+    # 1. Explicit Factory suffix infers model app.models.post.Post
+    cli.run(["make:factory", "PostFactory"])
+    post_factory = tmp_path / "database" / "factories" / "post_factory.py"
+    assert post_factory.is_file()
+    post_content = post_factory.read_text(encoding="utf-8")
+    assert "from app.models.post import Post" in post_content
+    assert "class PostFactory(Factory[Post]):" in post_content
+    assert "model = Post" in post_content
+
+    # 2. Nested factory without suffix + dotted --model import path
+    cli.run(
+        [
+            "make:factory",
+            "Billing/Invoice",
+            "--model",
+            "app.billing.models.Invoice",
+        ]
+    )
+    invoice_factory = tmp_path / "database" / "factories" / "Billing" / "invoice_factory.py"
+    assert invoice_factory.is_file()
+    invoice_content = invoice_factory.read_text(encoding="utf-8")
+    assert "from app.billing.models import Invoice" in invoice_content
+    assert "class InvoiceFactory(Factory[Invoice]):" in invoice_content
+
+    # 3. Overwrite protection and --force
+    with pytest.raises(SystemExit, match="already exists"):
+        cli.run(["make:factory", "PostFactory"])
+    cli.run(["make:factory", "PostFactory", "--force"])
+    assert post_factory.is_file()
+
+    # 4. Path traversal rejection and custom --path
+    for bad_name in ("../Escape", "/abs/Factory", "bad..name"):
+        with pytest.raises(SystemExit):
+            cli.run(["make:factory", bad_name])
+
+    custom_dir = tmp_path / "custom_factories"
+    cli.run(["make:factory", "Tag", "--path", str(custom_dir)])
+    assert (custom_dir / "tag_factory.py").is_file()
+
+    # 5. make:model -f / --factory and --factory-path
+    cli.run(["make:model", "Article", "-f"])
+    assert (tmp_path / "app" / "models" / "article.py").is_file()
+    article_factory = tmp_path / "database" / "factories" / "article_factory.py"
+    assert article_factory.is_file()
+    article_factory_content = article_factory.read_text(encoding="utf-8")
+    assert "from app.models.article import Article" in article_factory_content
+    assert "class ArticleFactory(Factory[Article]):" in article_factory_content
+
+    cli.run(["make:model", "Order", "--factory", "--factory-path", str(custom_dir)])
+    assert (tmp_path / "app" / "models" / "order.py").is_file()
+    assert (custom_dir / "order_factory.py").is_file()
+
+    # 6. Exact `make:factory User`, `make:model User -f`, `make:model Author --factory`,
+    #    collision guard, invalid identifiers, and importing + running User.factory()
+    cli.run(["make:model", "User", "-f"])
+    assert (tmp_path / "app" / "models" / "user.py").is_file()
+    user_factory_file = tmp_path / "database" / "factories" / "user_factory.py"
+    assert user_factory_file.is_file()
+
+    # Running make:factory User without --force fails cleanly
+    with pytest.raises(SystemExit, match="already exists"):
+        cli.run(["make:factory", "User"])
+    cli.run(["make:factory", "User", "--force"])
+    assert user_factory_file.is_file()
+
+    # make:model Author --factory creates model + factory
+    cli.run(["make:model", "Author", "--factory"])
+    assert (tmp_path / "app" / "models" / "author.py").is_file()
+    author_factory_file = tmp_path / "database" / "factories" / "author_factory.py"
+    assert author_factory_file.is_file()
+
+    # Invalid factory/model identifiers rejected
+    for bad_ident in ("", "../Escape", "Bad Name", "123Invalid", "foo;bar"):
+        with pytest.raises(SystemExit):
+            cli.run(["make:factory", bad_ident])
+
+    # Package the generated tmp_path app and verify User.factory().make() works cleanly
+    (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "app" / "models" / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    reg_snap = snapshot_factory_registry()
+    saved_mods = {
+        k: v
+        for k, v in list(sys.modules.items())
+        if k in {"app", "database"} or k.startswith(("app.", "database.", "_swiftpy_factories"))
+    }
+    for k in saved_mods:
+        sys.modules.pop(k, None)
+
+    try:
+        user_mod = importlib.import_module("app.models.user")
+        user_cls = user_mod.User
+
+        resolved = user_cls.factory()
+        assert isinstance(resolved, Factory)
+        assert type(resolved).__name__ == "UserFactory"
+        assert resolved._model_cls is user_cls
+        made_user = resolved.make()
+        assert isinstance(made_user, user_cls)
+    finally:
+        restore_factory_registry(reg_snap)
+        for k in list(sys.modules):
+            if k in {"app", "database"} or k.startswith(
+                ("app.", "database.", "_swiftpy_factories")
+            ):
+                sys.modules.pop(k, None)
+        sys.modules.update(saved_mods)
 
 
 

@@ -547,10 +547,10 @@ class CreateArticlesAndTags(Migration):
 Supported `Blueprint` methods:
 
 - **Primary keys & IDs:** `id(name="id")` (`BIGSERIAL PRIMARY KEY`), `increments(name="id")` (`SERIAL PRIMARY KEY`), `big_increments(name="id")` (`BIGSERIAL PRIMARY KEY`), or table-level composite `table.primary(["user_id", "role_id"], name=...)`.
-- **Column types:** `uuid()`, `string(name, length=255)`, `text()` (unbounded `TEXT`, up to ~1 GB in PostgreSQL), `medium_text()` and `long_text()` (aliases for `text()` since PostgreSQL has no separate size variants), `enum(name, values)` (`VARCHAR(255)` with a named `{table}_{col}_check` `CHECK` constraint), `integer()`, `big_integer()`, `small_integer()`, `boolean()`, `decimal(name, precision=8, scale=2)`, `float()`, `json()`, `jsonb()`, `date()`, `time()`, `timestamp(name, tz=True)`, `timestamps(tz=True)`, `soft_deletes(name="deleted_at", tz=True)`, `vector(name, dimensions=1536)` (for `pgvector`).
-- **Column modifiers:** `.nullable(True)`, `.default(value)` (use `raw("CURRENT_TIMESTAMP")` or `raw("gen_random_uuid()")` for SQL expressions; passing raw SQL keyword strings emits a `DeprecationWarning`), `.unique(name=None)`, `.index(name=None)`, `.primary()`, `.comment("text")`, `.unsigned()` (`CHECK ("col" >= 0)`). Column positioning via `.after()` is intentionally not implemented because PostgreSQL only appends added columns to the end of a table.
+- **Column types:** `uuid()`, `string(name, length=255)`, `text()` (unbounded `TEXT`, up to ~1 GB in PostgreSQL), `medium_text()` and `long_text()` (aliases for `text()` since PostgreSQL has no separate size variants), `enum(name, values)` (`VARCHAR(255)` with a named `{table}_{col}_check` `CHECK` constraint), `integer()`, `big_integer()`, `small_integer()`, `boolean()`, `decimal(name, precision=8, scale=2)`, `float()`, `binary(name)` (`BYTEA`), `json()`, `jsonb()`, `date()`, `time()`, `timestamp(name, tz=True)`, `timestamps(tz=True)`, `soft_deletes(name="deleted_at", tz=True)`, `vector(name, dimensions=1536)` (for `pgvector`).
+- **Column modifiers:** `.nullable(True)`, `.default(value)` (use `raw("CURRENT_TIMESTAMP")` or `raw("gen_random_uuid()")` for SQL expressions; passing raw SQL keyword strings emits a `DeprecationWarning`), `.unique(name=None)`, `.index(name=None)`, `.primary()`, `.comment("text")`, `.unsigned()` (`CHECK ("col" >= 0)`), `.change()` (modify an existing column cleanly inside `Schema.table`), and `.using(expr)` (`USING` cast clause for `.change()`). Column positioning via `.after()` is intentionally not implemented because PostgreSQL only appends added columns to the end of a table.
 - **Indexes & Foreign Keys:** `table.unique(cols, name=None)`, `table.index(cols, name=None)`, `table.foreign(col, name=None).references("id").on("users").cascade_on_delete()` (also `.null_on_delete()`, `.cascade_on_update()`, `.on_delete(...)`, `.on_update(...)`), or one-call `table.foreign_key(column, references, on, on_delete=..., on_update=..., name=None)`.
-- **Altering & Inspecting Tables:** `await Schema.table("articles", fn)` supports `drop_column(*names)`, `rename_column(old, new)`, `drop_index(name)`, `drop_unique(name)`, and `drop_foreign(name)` alongside adding new columns/indexes/foreign keys. Drops always execute before renames and adds, so a single `Schema.table` call can drop and re-add a constraint or column cleanly. You can also check `await Schema.has_table("articles")` and `await Schema.has_column("articles", "title")`.
+- **Altering & Inspecting Tables:** `await Schema.table("articles", fn)` supports `.change()` (modifying column types/nullability/defaults/constraints in place), `drop_column(*names)` (accepting variadic strings or sequences such as `["col_a", "col_b"]`), `rename_column(old, new)`, `drop_index(name)`, `drop_unique(name)`, and `drop_foreign(name)` alongside adding new columns/indexes/foreign keys. Drops always execute before renames and adds/modifications, so a single `Schema.table` call can drop and re-add a constraint or column cleanly. You can also inspect schema state with `await Schema.has_table("articles")`, `await Schema.has_column("articles", "title")`, `await Schema.has_columns("articles", ["title", "body"])`, and `await Schema.has_index("articles", "idx_articles_title")`.
 
 ### Running Migrations with the CLI
 
@@ -627,7 +627,11 @@ from database.seeders.user_seeder import UserSeeder
 class DatabaseSeeder(Seeder):
     async def run(self) -> None:
         await self.call(UserSeeder)
+        # Seed sample data cleanly with Model Factories:
+        # await User.factory().count(25).has_posts(3).create()
 ```
+
+Generate a factory for any model with `swiftpy make:factory UserFactory` (or `swiftpy make:model Post -f`); see [Model Factories](2026-11-15-orm-models-and-relationships.md#model-factories-factory-fake--sequence) for `Factory`, `Fake`, `Sequence`, states, and relationship helpers.
 
 ### Running Seeders
 

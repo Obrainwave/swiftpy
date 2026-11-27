@@ -29,6 +29,7 @@ ALLOWED_COLUMN_TYPES: frozenset[str] = frozenset(
         "medium_text",
         "long_text",
         "enum",
+        "binary",
         "integer",
         "big_integer",
         "small_integer",
@@ -121,6 +122,42 @@ def raw(sql: str) -> DefaultRaw:
     return DefaultRaw(sql)
 
 
+def _has_balanced_sql_delimiters(expr: str) -> bool:
+    """Verify single quotes, double quotes, and parentheses are balanced in a SQL expression."""
+    in_single = False
+    in_double = False
+    paren_depth = 0
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and expr[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                if i + 1 < n and expr[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = False
+        else:
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth -= 1
+                if paren_depth < 0:
+                    return False
+        i += 1
+    return not in_single and not in_double and paren_depth == 0
+
+
 class ColumnDefinition:
     """Represents a fluent column definition inside a table blueprint."""
 
@@ -141,10 +178,13 @@ class ColumnDefinition:
         self.default_val: Any = _UNSET
         self.is_index: bool = False
         self.index_name: str | None = None
+        self.unique_name: str | None = None
         self.dimensions: int | None = None
         self.enum_values: tuple[str, ...] | None = None
         self.comment_text: str | None = None
         self.is_unsigned: bool = False
+        self.is_change: bool = False
+        self.using_expression: str | None = None
 
     def nullable(self, value: bool = True) -> Self:
         """Specify whether the column may accept NULL values."""
@@ -171,7 +211,10 @@ class ColumnDefinition:
         """Add a unique constraint or index for this column."""
         self.is_unique = True
         if name:
-            self.index_name = validate_identifier(name)
+            validated = validate_identifier(name)
+            self.unique_name = validated
+            if not self.is_index and self.index_name is None:
+                self.index_name = validated
         return self
 
     def index(self, name: str | None = None) -> Self:
@@ -179,6 +222,8 @@ class ColumnDefinition:
         self.is_index = True
         if name:
             self.index_name = validate_identifier(name)
+        elif self.unique_name is not None and self.index_name == self.unique_name:
+            self.index_name = None
         return self
 
     def primary(self) -> Self:
@@ -194,6 +239,38 @@ class ColumnDefinition:
     def unsigned(self) -> Self:
         """Mark an integer column as unsigned."""
         self.is_unsigned = True
+        return self
+
+    def change(self) -> Self:
+        """Mark this column definition to modify an existing column via Schema.table()."""
+        self.is_change = True
+        return self
+
+    def using(self, expression: str | DefaultRaw) -> Self:
+        """Specify a PostgreSQL USING cast expression when changing a column's type."""
+        raw_expr = expression.sql if isinstance(expression, DefaultRaw) else expression
+        if not isinstance(raw_expr, str):
+            raise TypeError(
+                f"USING expression must be a str or raw() expression, got {type(expression).__name__}"
+            )
+        stripped = raw_expr.strip()
+        if not stripped:
+            raise ValueError("USING expression must be a non-empty string.")
+        if (
+            "\x00" in stripped
+            or ";" in stripped
+            or "--" in stripped
+            or "/*" in stripped
+            or "*/" in stripped
+        ):
+            raise ValueError(
+                "Invalid USING expression: semicolons, comments, and NUL bytes are not allowed."
+            )
+        if not _has_balanced_sql_delimiters(stripped):
+            raise ValueError(
+                "Invalid USING expression: unbalanced quotes or parentheses."
+            )
+        self.using_expression = stripped
         return self
 
 
@@ -335,6 +412,10 @@ class Blueprint:
         """Alias for text(); PostgreSQL TEXT is unbounded (up to ~1 GB)."""
         return self.text(name)
 
+    def binary(self, name: str) -> ColumnDefinition:
+        """Create a binary/BLOB column (compiled to PostgreSQL BYTEA)."""
+        return self._add_column(name, "binary")
+
     def enum(self, name: str, values: Sequence[str]) -> ColumnDefinition:
         """Create a VARCHAR column constrained by a CHECK (col IN (...)) constraint."""
         validated_values = _validate_enum_values(values)
@@ -461,10 +542,24 @@ class Blueprint:
 
     # --- Alter Operations ---
 
-    def drop_column(self, *names: str) -> Self:
+    def drop_column(self, *names: str | Sequence[str]) -> Self:
         """Drop one or more columns from an existing table."""
-        for n in names:
-            self.drop_columns_list.append(validate_identifier(n))
+        if not names:
+            raise ValueError("drop_column() requires at least one column name.")
+        for entry in names:
+            if isinstance(entry, Sequence) and not isinstance(
+                entry, (str, bytes, bytearray, memoryview)
+            ):
+                if len(entry) == 0:
+                    raise ValueError("drop_column() column list must not be empty.")
+                for name in entry:
+                    self.drop_columns_list.append(validate_identifier(name))
+            elif isinstance(entry, str):
+                self.drop_columns_list.append(validate_identifier(entry))
+            else:
+                raise TypeError(
+                    f"Column name must be a str or sequence of str, got {type(entry).__name__}"
+                )
         return self
 
     def rename_column(self, from_name: str, to_name: str) -> Self:
