@@ -1375,7 +1375,8 @@ def _parse_proxy_env(raw: Any) -> Any:
         return raw
     stripped = raw.strip()
     if not stripped:
-        return []
+        empty: list[str] = []
+        return empty
     if stripped.startswith("[") and stripped.endswith("]"):
         try:
             parsed = json.loads(stripped)
@@ -1681,7 +1682,7 @@ version = "0.1.0"
 description = "A SwiftPY web application"
 requires-python = ">=3.12"
 dependencies = [
-    "swiftpy-framework>=0.3.8",
+    "swiftpy-framework>=0.3.9",
     "uvicorn[standard]>=0.52.4",
     "asyncpg>=0.30.0",
     "redis>=8.1.0",
@@ -1708,11 +1709,19 @@ testpaths = ["tests"]
 [tool.mypy]
 strict = true
 explicit_package_bases = true
-follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*", "aiosmtplib", "aiosmtplib.*", "jinja2", "jinja2.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["redis.*"]
+disallow_untyped_calls = false
 
 [tool.ruff.lint.per-file-ignores]
 "app/models/**/*.py" = ["RUF012"]
+"app/**/models/**/*.py" = ["RUF012"]
+"tests/**/*.py" = ["RUF012"]
 """
 
 

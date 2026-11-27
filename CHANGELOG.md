@@ -4,6 +4,23 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-27
+
+### Changed
+- **Scaffolding Static Analysis Hardening (`swiftpy/console/commands/new.py`, `pyproject.toml`):**
+  - Replaced global `ignore_missing_imports = true` and `follow_imports = "silent"` under `[tool.mypy]` in `swiftpy new` (`_get_pyproject_toml`) with scoped `[[tool.mypy.overrides]]` for untyped third-party packages (`asyncpg`, `aiosmtplib`, `jinja2`, and `disallow_untyped_calls = false` for `redis.*`). Because Pyrefly imports `[tool.mypy]` when `pyrefly.toml` is absent, removing global `ignore_missing_imports = true` ensures Pyrefly immediately reports `[missing-import]` when a host IDE interpreter lacks `swiftpy-framework` instead of silently replacing `Model` with `Unknown` and triggering misleading `[no-any-return-implicit]` errors on repository methods.
+  - Expanded `[tool.ruff.lint.per-file-ignores]` in `pyproject.toml` and `swiftpy new` to cover `"app/models/**/*.py" = ["RUF012"]`, `"app/**/models/**/*.py" = ["RUF012"]`, and `"tests/**/*.py" = ["RUF012"]`, allowing models in standard, feature-grouped, and test directories to define `__fillable__ = [...]`, `__guarded__ = [...]`, and `__hidden__ = [...]` without `typing.ClassVar`.
+  - Bumped `swiftpy-framework` package version and `swiftpy new` dependency floor to `0.3.9`.
+
+### Added
+- **Static Typing, Wheel Packaging & GitHub CI Pyrefly Gates (`tests/typing/test_orm_typing.py`, `tests/console/test_new_command.py`, `.github/workflows/ci.yml`):**
+  - Added `typing.assert_type` assertions across direct `Model` query chains, repository methods, and relationship chains (`HasMany`, `BelongsTo`) verified under both `mypy --strict` and `pyrefly check --error=no-any-return-implicit`.
+  - Added `test_py_typed_marker_present_in_package_and_wheel_config` verifying `swiftpy/py.typed` exists on disk, in Hatchling wheel config, and inside built wheel artifacts (`dist/swiftpy_framework-*.whl`).
+  - Added `Run Pyrefly` and isolated wheel `py.typed` + `swiftpy new` Pyrefly smoke-test verification to `.github/workflows/ci.yml`.
+
+### Documentation
+- Updated [ORM Models & Relationships](documentations/2026-11-15-orm-models-and-relationships.md), [Installation & Quick Start](documentations/2026-11-14-installation-quick-start.md), [CLI & Testing](documentations/2026-11-19-cli-and-testing.md), and [README.md](README.md) with guidance on `ClassVar`-free model metadata (`__fillable__`, `__guarded__`, `__hidden__`), host IDE `.venv` setup for Dockerized projects, and avoiding global `ignore_missing_imports = true` with Pyrefly.
+
 ## [0.3.8] - 2026-11-25
 
 ### Added

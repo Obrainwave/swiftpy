@@ -171,7 +171,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.3.8, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.3.9, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -186,7 +186,10 @@ Now choose **ONE** of the two run modes below (Option A **or** Option B).
 
 ### Option A: Fully Dockerized (App + PostgreSQL + Redis in Docker)
 
-Use this mode if you want Docker to run everything — **you do not need to create a `.venv`, install Python packages locally, or install Postgres/Redis on your host.**
+Use this mode if you want Docker to run the application and backing services — **you do not need to install PostgreSQL or Redis on your host.**
+
+> **Host IDE Autocomplete & Pyrefly / Mypy Type Checking (Windows, macOS, Linux):**
+> Docker installs `swiftpy-framework` inside the Linux container image, whereas your code editor (VS Code, Antigravity, Cursor, PyCharm) and its type-checking extensions (**Pyrefly**, **Mypy**, **Pylance**) run on your host OS unless you attach via Dev Containers. To get full IDE type inference on the host without running a local server, create the local virtual environment once with `uv sync` (or `python -m venv .venv && .venv/bin/pip install -e .`) and select `.venv` as your editor's Python interpreter (in multi-folder workspaces such as `workspace/backend`, point `.vscode/settings.json` `python.defaultInterpreterPath` at `${workspaceFolder}/backend/.venv/Scripts/python.exe` on Windows or `${workspaceFolder}/backend/.venv/bin/python` on macOS/Linux).
 
 1. Inside `my_api`, review `.env` (optional — defaults already work out of the box with Compose).
 2. Build and start `app`, `postgres`, and `redis`:
@@ -325,7 +328,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.3.8",
+       "swiftpy-framework>=0.3.9",
        # ...
    ]
    ```
@@ -355,7 +358,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.3.8"
+python -m pip install --upgrade "swiftpy-framework>=0.3.9"
 swiftpy --version
 ```
 

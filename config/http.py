@@ -13,7 +13,8 @@ def _parse_proxy_env(raw: Any) -> Any:
         return raw
     stripped = raw.strip()
     if not stripped:
-        return []
+        empty: list[str] = []
+        return empty
     if stripped.startswith("[") and stripped.endswith("]"):
         try:
             parsed = json.loads(stripped)

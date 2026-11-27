@@ -484,8 +484,12 @@ def test_scaffolded_packaging_and_plain_mypy_config(
     assert "[build-system]" in pyproject
     assert "[tool.setuptools.packages.find]" in pyproject
     assert "[tool.mypy]" in pyproject
+    assert "[[tool.mypy.overrides]]" in pyproject
+    assert 'follow_imports = "silent"' not in pyproject
     assert "[tool.ruff.lint.per-file-ignores]" in pyproject
     assert '"app/models/**/*.py" = ["RUF012"]' in pyproject
+    assert '"app/**/models/**/*.py" = ["RUF012"]' in pyproject
+    assert '"tests/**/*.py" = ["RUF012"]' in pyproject
 
     compose = (app_dir / "docker-compose.yml").read_text(encoding="utf-8")
     assert compose.startswith("name: pkg_app\n")

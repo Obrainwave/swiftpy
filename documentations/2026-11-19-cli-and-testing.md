@@ -239,15 +239,39 @@ async def test_insert_is_rolled_back(db_transaction) -> None:
 
 ### Static Type Checking (`pyrefly` & `mypy --strict`)
 
-SwiftPY ships a PEP 561 `py.typed` marker alongside generic ORM, relationship (`RelationshipQueryBuilder[T]`, `SingleRelationshipQueryBuilder[T]`), and `@dataclass_transform` `BaseSchema` annotations:
+SwiftPY ships a PEP 561 `py.typed` marker inside the built wheel alongside generic ORM (`ModelQueryBuilder[T]`), relationship (`RelationshipQueryBuilder[T]`, `SingleRelationshipQueryBuilder[T]`), and `@dataclass_transform` `BaseSchema` annotations:
 
 ```bash
 # Type-check application code strictly with Mypy
 uv run mypy --strict .
 
-# Type-check with Pyrefly (verifying no implicit Any leaks)
-uvx pyrefly check --error=no-any-return-implicit .
+# Type-check with Pyrefly using your project's .venv interpreter
+uvx pyrefly check --python-interpreter-path .venv/bin/python --error=no-any-return-implicit .
 ```
+
+Key configuration rules for Pyrefly, Mypy, and Ruff (configured automatically by `swiftpy new` in `pyproject.toml`):
+
+- **Never set global `ignore_missing_imports = true` under `[tool.mypy]`:** When no `pyrefly.toml` is present, Pyrefly automatically imports `[tool.mypy]` settings from `pyproject.toml`. A global `ignore_missing_imports = true` suppresses `[missing-import]` diagnostics when an IDE interpreter lacks `swiftpy-framework` (for example, on a Windows host when dependencies were only installed inside Docker) and silently turns `Model` into `Unknown`—causing every repository query chain to fail with `Returning implicit Any [no-any-return-implicit]` (`where: Unknown`, `doc: Unknown`). Scope `ignore_missing_imports = true` only to untyped third-party libraries via `[[tool.mypy.overrides]]`:
+  ```toml
+  [tool.mypy]
+  strict = true
+  explicit_package_bases = true
+
+  [[tool.mypy.overrides]]
+  module = ["asyncpg", "asyncpg.*", "aiosmtplib", "aiosmtplib.*", "jinja2", "jinja2.*"]
+  ignore_missing_imports = true
+
+  [[tool.mypy.overrides]]
+  module = ["redis.*"]
+  disallow_untyped_calls = false
+  ```
+- **No `ClassVar` needed on model metadata (`__fillable__`, `__guarded__`, `__hidden__`):** `Model` declares `__table__`, `__primary_key__`, `__fillable__`, `__guarded__`, and `__hidden__` as `ClassVar[...]` on the base class, so subclasses inherit `ClassVar` automatically when written as plain unannotated assignments (`__guarded__ = ["id", "created_at", "updated_at"]`, `__fillable__ = ["name"]`, `__guarded__ = []`). Scaffolded projects also configure Ruff per-file ignores so `RUF012` never demands `ClassVar` on model or test files:
+  ```toml
+  [tool.ruff.lint.per-file-ignores]
+  "app/models/**/*.py" = ["RUF012"]
+  "app/**/models/**/*.py" = ["RUF012"]
+  "tests/**/*.py" = ["RUF012"]
+  ```
 
 ---
 
