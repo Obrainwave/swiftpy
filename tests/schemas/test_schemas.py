@@ -55,7 +55,7 @@ class EggCollectionCreateRequest(Schema):
 
 class _SampleLedgerModel(Model):
     __table__ = "sample_ledgers"
-    __guarded__ = []  # noqa: RUF012
+    __guarded__ = []
 
     id: UUID
     movement_date: date

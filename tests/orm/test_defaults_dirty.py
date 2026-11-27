@@ -26,7 +26,7 @@ class DefaultDemoModel(Model):
     name: str
     tags: list[str] = Field(default_factory=list)
     metadata_map: dict[str, Any] = Field(default_factory=dict)
-    direct_list: list[int] = []  # noqa: RUF012  # Testing mutable class default isolation
+    direct_list: list[int] = []  # Testing mutable class default isolation
     generated_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     sequence_num: int = Field(default_factory=_counter)
     __guarded__: ClassVar[list[str]] = []

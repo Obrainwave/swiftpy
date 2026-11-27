@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from swiftpy.database.orm import Model
+from swiftpy.database.orm import HasOne, Model
 
 
 class User(Model):
@@ -24,3 +24,5 @@ class User(Model):
     remember_token: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    profile = HasOne("Profile", foreign_key="user_id")

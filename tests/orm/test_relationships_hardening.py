@@ -202,7 +202,7 @@ def test_string_relationship_target_requires_import_before_resolution() -> None:
 
         class OrderOwner(Model):
             __table__ = "test_order_owners"
-            __fillable__ = ["name"]  # noqa: RUF012
+            __fillable__ = ["name"]
             id: int
             name: str
             items = HasMany("LateImportedItem", foreign_key="owner_id")
@@ -213,7 +213,7 @@ def test_string_relationship_target_requires_import_before_resolution() -> None:
 
         class LateImportedItem(Model):
             __table__ = "test_late_imported_items"
-            __fillable__ = ["owner_id", "label"]  # noqa: RUF012
+            __fillable__ = ["owner_id", "label"]
             id: int
             owner_id: int
             label: str

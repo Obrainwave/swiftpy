@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import tomllib
+import zipfile
 from collections.abc import Sequence
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar
+from typing import Any, ClassVar, assert_type
 
 import pytest
 
+import swiftpy
 from swiftpy.database import (
     Paginator,
     Query,
@@ -29,7 +33,7 @@ class Role(Model):
     __table__ = "typing_roles"
     id: int
     name: str
-    __guarded__: ClassVar[list[str]] = []
+    __guarded__ = []
 
 
 class Profile(Model):
@@ -38,7 +42,7 @@ class Profile(Model):
     user_id: int
     bio: str
     user = BelongsTo("User", foreign_key="user_id")
-    __guarded__: ClassVar[list[str]] = []
+    __guarded__ = []
 
 
 class Post(Model):
@@ -48,7 +52,7 @@ class Post(Model):
     title: str
     published: bool = True
     user = BelongsTo("User", foreign_key="user_id")
-    __guarded__: ClassVar[list[str]] = []
+    __guarded__ = []
 
 
 class User(Model):
@@ -62,7 +66,7 @@ class User(Model):
     posts = HasMany("Post", foreign_key="user_id")
     profile = HasOne("Profile", foreign_key="user_id")
     roles = BelongsToMany("Role", pivot_table="typing_user_roles")
-    __hidden__: ClassVar[tuple[str, ...]] = ("is_admin",)
+    __hidden__ = ("is_admin",)
     __guarded__: ClassVar[list[str]] = []
 
 
@@ -218,7 +222,7 @@ async def test_static_typing_contracts() -> None:
 
 class AuthorNoClassVar(Model):
     __table__ = "typing_authors_nocv"
-    __fillable__ = ["name"]  # noqa: RUF012
+    __fillable__ = ["name"]
     id: int
     name: str
     articles = HasMany("ArticleNoClassVar", foreign_key="author_id")
@@ -227,8 +231,8 @@ class AuthorNoClassVar(Model):
 class ArticleNoClassVar(Model):
     __table__ = "typing_articles_nocv"
     __primary_key__ = "id"
-    __fillable__ = ["author_id", "title"]  # noqa: RUF012
-    __hidden__ = ["internal_note"]  # noqa: RUF012
+    __fillable__ = ["author_id", "title"]
+    __hidden__ = ["internal_note"]
     strict_events = True
     prevent_lazy_loading = False
 
@@ -241,7 +245,7 @@ class ArticleNoClassVar(Model):
 
 class OpenArticleNoClassVar(Model):
     __table__ = "typing_open_articles_nocv"
-    __guarded__ = []  # noqa: RUF012
+    __guarded__ = []
     id: int
     title: str
 
@@ -288,7 +292,7 @@ class _DocGroup(Model):
     __table__ = "typing_doc_groups"
     id: int
     name: str
-    __guarded__: ClassVar[list[str]] = []
+    __guarded__ = []
 
 
 class _DocVersion(Model):
@@ -300,7 +304,7 @@ class _DocVersion(Model):
     is_active: bool = True
     groups = HasMany(_DocGroup, foreign_key="version_id")
     author = BelongsTo(User, foreign_key="author_id")
-    __guarded__: ClassVar[list[str]] = []
+    __guarded__ = []
 
 
 class _DocVersionCreateSchema(BaseSchema):
@@ -352,52 +356,107 @@ class _InstanceDocVersionRepository:
 
 async def _verify_direct_and_relationship_inference(v: _DocVersion) -> None:
     """Static type-checker contract for direct Model, chain, and relation inference."""
-    versions: list[_DocVersion] = await (
-        _DocVersion.with_("groups", "author").order_by("sort_order").get()
+    versions: list[_DocVersion] = assert_type(
+        await _DocVersion.with_("groups", "author").order_by("sort_order").get(),
+        list[_DocVersion],
     )
-    created: _DocVersion = await _DocVersion.create({"version": "1.0", "slug": "v1"})
-    first: _DocVersion | None = await _DocVersion.where("id", 1).first()
-    found: _DocVersion | None = await _DocVersion.find(1)
-    found_req: _DocVersion = await _DocVersion.find_or_fail(1)
-    first_req: _DocVersion = await _DocVersion.where("is_active", True).first_or_fail()
-    updated: _DocVersion = await created.update({"slug": "v1-1"})
-    refreshed: _DocVersion = await updated.refresh()
-    paged: Paginator[_DocVersion] = await _DocVersion.with_("groups").paginate(
-        per_page=10, page=1
+    created: _DocVersion = assert_type(
+        await _DocVersion.create({"version": "1.0", "slug": "v1"}),
+        _DocVersion,
     )
-    simple_paged: SimplePaginator[_DocVersion] = await (
-        _DocVersion.order_by("id").simple_paginate(per_page=10, page=1)
+    first: _DocVersion | None = assert_type(
+        await _DocVersion.where("id", 1).first(),
+        _DocVersion | None,
+    )
+    found: _DocVersion | None = assert_type(
+        await _DocVersion.find(1),
+        _DocVersion | None,
+    )
+    found_req: _DocVersion = assert_type(
+        await _DocVersion.find_or_fail(1),
+        _DocVersion,
+    )
+    first_req: _DocVersion = assert_type(
+        await _DocVersion.where("is_active", True).first_or_fail(),
+        _DocVersion,
+    )
+    updated: _DocVersion = assert_type(
+        await created.update({"slug": "v1-1"}),
+        _DocVersion,
+    )
+    refreshed: _DocVersion = assert_type(
+        await updated.refresh(),
+        _DocVersion,
+    )
+    paged: Paginator[_DocVersion] = assert_type(
+        await _DocVersion.with_("groups").paginate(per_page=10, page=1),
+        Paginator[_DocVersion],
+    )
+    simple_paged: SimplePaginator[_DocVersion] = assert_type(
+        await _DocVersion.order_by("id").simple_paginate(per_page=10, page=1),
+        SimplePaginator[_DocVersion],
     )
 
     typed_attrs: dict[str, str] = {"slug": "v1"}
     typed_vals: dict[str, str] = {"version": "1.0"}
-    ensured: _DocVersion = await _DocVersion.first_or_create(typed_attrs, typed_vals)
-    upserted: _DocVersion = await _DocVersion.update_or_create(typed_attrs, typed_vals)
+    ensured: _DocVersion = assert_type(
+        await _DocVersion.first_or_create(typed_attrs, typed_vals),
+        _DocVersion,
+    )
+    upserted: _DocVersion = assert_type(
+        await _DocVersion.update_or_create(typed_attrs, typed_vals),
+        _DocVersion,
+    )
 
     id_list: list[int] = [1, 2, 3]
-    in_filtered: list[_DocVersion] = await (
-        _DocVersion.where_in("id", id_list).get()
+    in_filtered: list[_DocVersion] = assert_type(
+        await _DocVersion.where_in("id", id_list).get(),
+        list[_DocVersion],
     )
-    subquery_filtered: list[_DocVersion] = await (
-        _DocVersion.where_in("id", _DocGroup.select("id").where("name", "Core")).get()
+    subquery_filtered: list[_DocVersion] = assert_type(
+        await _DocVersion.where_in(
+            "id", _DocGroup.select("id").where("name", "Core")
+        ).get(),
+        list[_DocVersion],
     )
 
     # Typed relationship awaiting and full query chaining without Any degradation
-    awaited_groups: list[_DocGroup] = await v.groups
-    chained_groups: list[_DocGroup] = await (
-        v.groups.where_in("id", id_list).latest("id").get()
+    awaited_groups: list[_DocGroup] = assert_type(await v.groups, list[_DocGroup])
+    chained_groups: list[_DocGroup] = assert_type(
+        await v.groups.where_in("id", id_list).latest("id").get(),
+        list[_DocGroup],
     )
-    first_group: _DocGroup | None = await v.groups.where("name", "Core").first()
-    req_group: _DocGroup = await v.groups.where("name", "Core").first_or_fail()
-    paged_groups: Paginator[_DocGroup] = await v.groups.order_by("id").paginate()
-    group_from_schema: _DocGroup = await v.groups.create(
-        _DocGroupCreateSchema(name="Guides")
+    first_group: _DocGroup | None = assert_type(
+        await v.groups.where("name", "Core").first(),
+        _DocGroup | None,
     )
-    lazy_group_builder: ModelQueryBuilder[_DocGroup] = _DocVersion.groups.build_lazy_query(v)
+    req_group: _DocGroup = assert_type(
+        await v.groups.where("name", "Core").first_or_fail(),
+        _DocGroup,
+    )
+    paged_groups: Paginator[_DocGroup] = assert_type(
+        await v.groups.order_by("id").paginate(),
+        Paginator[_DocGroup],
+    )
+    group_from_schema: _DocGroup = assert_type(
+        await v.groups.create(_DocGroupCreateSchema(name="Guides")),
+        _DocGroup,
+    )
+    lazy_group_builder: ModelQueryBuilder[_DocGroup] = assert_type(
+        _DocVersion.groups.build_lazy_query(v),
+        ModelQueryBuilder[_DocGroup],
+    )
 
-    awaited_author: User | None = await v.author
-    filtered_author: User | None = await v.author.where_not_null("email")
-    req_author: User = await v.author.first_or_fail()
+    awaited_author: User | None = assert_type(await v.author, User | None)
+    filtered_author: User | None = assert_type(
+        await v.author.where_not_null("email"),
+        User | None,
+    )
+    req_author: User = assert_type(await v.author.first_or_fail(), User)
+
+    repo = _DocVersionRepository()
+    assert_type(await repo.get_doc_version(1), _DocVersion)
+    assert_type(await repo.get_doc_versions(), list[_DocVersion])
 
     assert len(versions) >= 0
     assert first is None or isinstance(first, _DocVersion)
@@ -460,3 +519,30 @@ def test_repository_query_chaining_type_preservation() -> None:
     )
     assert sets == ['"slug" = $1']
     assert update_bindings == ["proxy-slug"]
+
+
+def test_py_typed_marker_present_in_package_and_wheel_config() -> None:
+    """Ensure PEP 561 py.typed marker exists in the swiftpy package and wheel packaging config."""
+    pkg_dir = Path(swiftpy.__file__).resolve().parent
+    py_typed = pkg_dir / "py.typed"
+    assert py_typed.is_file(), "swiftpy/py.typed PEP 561 marker must exist in package"
+
+    repo_root = pkg_dir.parent
+    pyproject_path = repo_root / "pyproject.toml"
+    if pyproject_path.is_file():
+        cfg = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        wheel_pkgs = (
+            cfg.get("tool", {})
+            .get("hatch", {})
+            .get("build", {})
+            .get("targets", {})
+            .get("wheel", {})
+            .get("packages", [])
+        )
+        assert "swiftpy" in wheel_pkgs
+
+    dist_dir = repo_root / "dist"
+    if dist_dir.is_dir():
+        for whl in dist_dir.glob("swiftpy_framework-*.whl"):
+            with zipfile.ZipFile(whl) as zf:
+                assert "swiftpy/py.typed" in zf.namelist()

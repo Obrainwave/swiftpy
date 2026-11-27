@@ -88,7 +88,11 @@ class User(Model):
     updated_at: datetime | None = None
 ```
 
-You do **not** need `typing.ClassVar` on model configuration attributes (`__table__`, `__primary_key__`, `__fillable__`, `__guarded__`, `__hidden__`, `strict_events`, `prevent_lazy_loading`) or relationship descriptors—the `Model` base class already supplies those metadata declarations for static type checkers, and new projects (`swiftpy new`) configure Ruff's `per-file-ignores` for `app/models/**/*.py` (`RUF012`) automatically. Existing models that still annotate with `ClassVar` continue to work identically.
+You do **not** need `typing.ClassVar` on model configuration attributes (`__table__`, `__primary_key__`, `__fillable__`, `__guarded__`, `__hidden__`, `strict_events`, `prevent_lazy_loading`) or relationship descriptors:
+
+- **How it works in Mypy & Pyrefly:** The `Model` base class already declares `__table__`, `__primary_key__`, `__fillable__`, `__guarded__`, and `__hidden__` as `ClassVar[...]` (and `Model.__init_subclass__` skips all `__`-prefixed attributes when discovering database columns). By PEP 526, subclasses that assign `__fillable__ = ["name", "email"]`, `__guarded__ = ["id", "created_at", "updated_at"]`, `__guarded__ = []`, or `__hidden__ = ["password"]` **without a type annotation** inherit `ClassVar` automatically.
+- **Do not annotate metadata attributes without `ClassVar`:** Always write `__guarded__ = ["id"]` or `__fillable__ = ["name"]` as plain unannotated assignments (do **not** write `__guarded__: list[str] = ["id"]`, which Python type checkers reject as an instance variable overriding `Model`'s `ClassVar`). Existing models that explicitly write `__guarded__: ClassVar[list[str]] = []` continue to work identically.
+- **How it works in Ruff (`RUF012`):** Scaffolded projects (`swiftpy new`) configure `[tool.ruff.lint.per-file-ignores]` for `"app/models/**/*.py" = ["RUF012"]`, `"app/**/models/**/*.py" = ["RUF012"]`, and `"tests/**/*.py" = ["RUF012"]` so Ruff never demands `ClassVar` on mutable list metadata in model or test files.
 
 Your application template ships a starter `User` model in `app/models/user.py` that already sets `__primary_key__ = "id"`, `__fillable__ = ["name", "email", "password", "is_admin"]`, and `__hidden__ = ["password"]`.
 
@@ -297,6 +301,11 @@ first: DocVersion | None = await DocVersion.where("id", 1).first()
 groups: list[DocGroup] = await versions[0].groups.where_in("id", [1, 2]).latest("id").get()
 author: User | None = await versions[0].author
 ```
+
+> **Repository & IDE Type-Checking Best Practices:**
+> - **Assign the model class, not an instance:** Set `model = DocVersion` on the repository class (or `self.model = DocVersion` in `__init__(self) -> None:`), never `self.model = DocVersion()` (which instantiates an unsaved model object on every repository initialization).
+> - **Handle nullable `.first()` and `.find()` lookups:** `.first()` and `.find()` return `T | None`. In repository methods declared to return `-> T`, either check `if not record: raise NotFoundError(...)` before returning or call `.first_or_fail()` / `.find_or_fail()`.
+> - **Ensure your host IDE interpreter has `swiftpy-framework` installed:** Even if you run your app inside Docker, host IDE extensions (Pyrefly, Mypy, Pylance) execute on your host OS and require a local `.venv` (`uv sync`). Never set global `ignore_missing_imports = true` under `[tool.mypy]` in `pyproject.toml`—Pyrefly imports `[tool.mypy]` when `pyrefly.toml` is absent and will silently turn unresolved `Model` imports into `Unknown` (`[no-any-return-implicit]`) instead of reporting a missing import.
 
 #### Query Builder Methods on `Model`
 
