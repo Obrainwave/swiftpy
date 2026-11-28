@@ -4,6 +4,31 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-28
+
+### Added
+- **Inline Request Validation & Route Parameter Helpers (`swiftpy/http/request.py`, `swiftpy/core/application.py`, `swiftpy/validation/form_request.py`):**
+  - Added `await request.validate(schema, messages=None, *, registry=None, stop_on_first_error=False) -> ValidatedData` on `Request`, automatically validating request payloads, raising `ValidationException` (HTTP 422) on failure, and returning `ValidatedData` (supporting both dict and attribute access).
+  - Populated `request.path_params` during HTTP and WebSocket dispatch in `Application` and added `request.route(param=None, default=None)` and `FormRequest.route(param=None, default=None)` so controllers and dynamic `FormRequest.rules()` methods can read route parameters cleanly (`"validate"`, `"route"`, and `"path_params"` added to `Request._RESERVED_INPUT_ATTRS`).
+- **Unique Validation Enhancements (`swiftpy/validation/rules/unique.py`, `swiftpy/validation/rules/registry.py`):**
+  - Added fluent `UniqueRule.ignore(ignore_id, id_column=None)` and support for `Model`, `AuthUser`, and `CurrentUser` instances passed as `ignore_id` (automatically inferring `__primary_key__` and primary key value), while explicitly rejecting boolean `ignore_id` values (`TypeError`).
+  - Normalized `"NULL"`, `"null"`, `"None"`, and empty `""` `ignore_id` tokens in `_parse_unique` without shifting `id_column` positionally (e.g. `unique:users,email,NULL,user_id`), and rejected empty 4th `id_column` tokens (`unique:users,email,1,`) or extra trailing positional tokens (`unique:users,email,1,id,extra`) with `ConfigurationError`.
+  - Optimized `UniqueRule._fetchval_unique` to execute a single query on the common integer-PK update path (`f"unique:users,email,{id}"`) by binding canonical integer strings as `int` first and falling back to `str`/`int` coercion on `(asyncpg.DataError, TypeError)`.
+- **Strict Default `auth().user()` / `Auth.user()` & Explicit `user_or_fail()` (`swiftpy/auth/auth_manager.py`):**
+  - Enforced strict runtime behavior matching `@overload` static types on `AuthProxy.user()` and `Auth.user()`: default `auth().user()` and `Auth.user()` (`nullable: Literal[False] = False -> AuthUser`) raise `AuthenticationError("Unauthenticated.")` when unauthenticated or when the active guard mismatches the requested guard, while `nullable=True` (`-> AuthUser | None`) returns `None`.
+  - Added `auth().user_or_fail() -> AuthUser` and `Auth.user_or_fail() -> AuthUser` for explicit fail-closed access.
+  - Hardened `AuthUser.id` custom `__primary_key__` fallback, `AuthProxy._resolve_user` rejection of empty or all-sensitive dicts, model-aware string PK preservation in `_build_auth_user_from_dict` (`_expects_int_pk`), `is_sensitive_key(...)` stripping across dict/model hydration, and `_is_logged_out()` enforcement in `_adopt_request_state_user()`, `current_user_model()`, `current_user()`, and `AuthProxy._resolve_user()`.
+
+### Fixed
+- **Static Typing (`Pyrefly[missing-attribute]` / `mypy --strict`) & CI Typing Gates (`swiftpy/auth/auth_manager.py`, `swiftpy/http/request.py`, `swiftpy/validation/validator.py`, `swiftpy/__init__.py`, `.github/workflows/ci.yml`):**
+  - Eliminated `Object of class NoneType has no attribute id` errors on `auth().user().id`, `Auth.user().id`, and legacy facade calls with aligned `@overload` contracts and runtime enforcement, backed by dedicated `tests/typing/test_auth_typing.py` and `tests/typing/test_validation_typing.py` CI checks in both `mypy --strict` and `pyrefly check` (including installed-wheel typing smoke checks).
+  - Widened `Request.validate`, `validate()`, and `Validator.__init__` annotations to accept `Mapping[str, Any]` schemas and `Mapping[str, str] | None` custom error message mappings.
+  - Updated `swiftpy/__init__.py` `TYPE_CHECKING`, `_EXPORT_MAP`, and `__all__` entries for `AuthProxy`, `AuthUser`, `AuthenticationError`, `current_user_model`, and `set_user_model`.
+  - Broke the `swiftpy.http.request` <-> `swiftpy.validation` / `swiftpy.schemas.base` circular import chain cleanly at top-of-file imports (`_is_swiftpy_request` TypeGuard marker).
+
+### Changed
+- Bumped `swiftpy-framework` package version (`pyproject.toml`), `swiftpy new` dependency floor (`swiftpy/console/commands/new.py`), `tests/console/test_phase9_cli_remediation.py`, [Installation & Quick Start](documentations/2026-11-14-installation-quick-start.md), [Validation & Form Requests](documentations/2026-11-15-validation-and-form-requests.md), [Authentication & Security](documentations/2026-11-15-authentication-and-security.md), and [README.md](README.md) to `0.4.1`.
+
 ## [0.4.0] - 2026-11-27
 
 ### Added

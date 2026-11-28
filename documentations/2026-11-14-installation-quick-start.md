@@ -170,7 +170,7 @@ my_api/
 ├── docker-compose.yml      # name: my_api; app, postgres (pgvector:pg16), & redis services
 ├── Dockerfile
 ├── main.py                 # Entrypoint: GET /, /api router, register_exception_handlers(app)
-└── pyproject.toml          # Configured with swiftpy-framework>=0.4.0, setuptools, & mypy strict settings
+└── pyproject.toml          # Configured with swiftpy-framework>=0.4.1, setuptools, & mypy strict settings
 ```
 
 What `swiftpy new my_api` configures automatically:
@@ -327,7 +327,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
    name = "my_api"
    version = "0.1.0"
    dependencies = [
-       "swiftpy-framework>=0.4.0",
+       "swiftpy-framework>=0.4.1",
        # ...
    ]
    ```
@@ -347,7 +347,7 @@ The scaffolded `Dockerfile` reads `[project].dependencies` from your project's `
      ```
 
    - The target version of `swiftpy-framework` must already be published on PyPI before running `docker compose build`. To test an unreleased local framework build in Docker, build a wheel (`uv build --wheel`), copy the `.whl` into your project's build context, and `pip install` that wheel in `Dockerfile`.
-   - **Keep your host IDE in sync:** Also run `python -m pip install -U "swiftpy-framework>=0.4.0"` on your host machine so your IDE and Pyrefly pick up any new APIs or type annotations from the upgraded release.
+   - **Keep your host IDE in sync:** Also run `python -m pip install -U "swiftpy-framework>=0.4.1"` on your host machine so your IDE and Pyrefly pick up any new APIs or type annotations from the upgraded release.
 
 ### Local Virtual Environment Projects (Option B / Minimal App)
 
@@ -358,7 +358,7 @@ If running without Docker, upgrade inside your activated `.venv`:
 uv sync --upgrade-package swiftpy-framework
 
 # Or with pip
-python -m pip install --upgrade "swiftpy-framework>=0.4.0"
+python -m pip install --upgrade "swiftpy-framework>=0.4.1"
 swiftpy --version
 ```
 

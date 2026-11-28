@@ -10,7 +10,7 @@ import time
 import types
 import weakref
 from collections.abc import Callable, Iterator, Mapping
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, Union, get_args, get_origin, overload
 
 from swiftpy.auth.api_key_guard import ApiKeyGuard
 from swiftpy.auth.events import (
@@ -276,7 +276,17 @@ class AuthUser(dict[str, Any]):
     def id(self) -> Any:
         """Return the user primary key or token subject identifier."""
         val = self.get("id")
-        return val if val is not None else self.get("sub")
+        if val is not None:
+            return val
+        if self._model is not None:
+            pk_attr = str(getattr(self._model, "__primary_key__", "id"))
+            pk_val = self.get(pk_attr)
+            if pk_val is not None:
+                return pk_val
+            model_pk = getattr(self._model, pk_attr, None)
+            if model_pk is not None:
+                return model_pk
+        return self.get("sub")
 
     @property
     def email(self) -> Any:
@@ -317,6 +327,18 @@ class AuthUser(dict[str, Any]):
         return f"AuthUser({super().__repr__()})"
 
 
+def _is_logged_out() -> bool:
+    """Return True if the current task Context or active Request state has been logged out."""
+    if Context.get(CONTEXT_LOGGED_OUT_KEY):
+        return True
+    req = Context.get("request")
+    return bool(
+        isinstance(req, Request)
+        and isinstance(req.state, dict)
+        and req.state.get(CONTEXT_LOGGED_OUT_KEY)
+    )
+
+
 def _adopt_request_state_user() -> Any:
     """
     Adopt a user already stored in `request.state` or `Context['auth.user']` (for example
@@ -324,16 +346,10 @@ def _adopt_request_state_user() -> Any:
     credentials: authentication stays with guards (`JWTGuard`, `require_jwt`), which also
     enforce token revocation.
     """
-    if Context.get(CONTEXT_LOGGED_OUT_KEY):
+    if _is_logged_out():
         return None
 
     req = Context.get("request")
-    if (
-        isinstance(req, Request)
-        and isinstance(req.state, dict)
-        and req.state.get(CONTEXT_LOGGED_OUT_KEY)
-    ):
-        return None
 
     existing = Context.get(_CONTEXT_USER_KEY)
     if existing is not None:
@@ -363,26 +379,36 @@ def _build_auth_user_from_dict(raw: dict[str, Any]) -> AuthUser:
         data: dict[str, Any] = {}
         defaults = getattr(user_cls, "__field_defaults__", {})
         factories = getattr(user_cls, "__field_factories__", {})
+        pk_name = str(getattr(user_cls, "__primary_key__", "id"))
 
         for field_name, field_type in user_cls.__fields__.items():
-            if field_name in hidden_fields:
+            if field_name in hidden_fields or is_sensitive_key(field_name):
                 continue
             if field_name in raw:
                 val = raw[field_name]
-                if field_type in (int, "int") or (field_name == "id" and isinstance(val, str) and val.isdigit()):
+                if field_type in (int, "int") or (
+                    field_name == pk_name
+                    and _expects_int_pk(field_type)
+                    and isinstance(val, str)
+                    and val.isdigit()
+                ):
                     try:
                         val = int(val)
                     except (ValueError, TypeError):
                         pass
                 data[field_name] = val
-            elif field_name == "id" and "sub" in raw:
+            elif field_name == pk_name and "sub" in raw:
                 val = raw["sub"]
-                if field_type in (int, "int") or (isinstance(val, str) and val.isdigit()):
+                if field_type in (int, "int") or (
+                    _expects_int_pk(field_type)
+                    and isinstance(val, str)
+                    and val.isdigit()
+                ):
                     try:
                         val = int(val)
                     except (ValueError, TypeError):
                         pass
-                data["id"] = val
+                data[pk_name] = val
             elif field_name in factories:
                 data[field_name] = factories[field_name]()
             elif field_name in defaults:
@@ -391,12 +417,21 @@ def _build_auth_user_from_dict(raw: dict[str, Any]) -> AuthUser:
                 data[field_name] = None
 
         for k, v in raw.items():
-            if k not in hidden_fields and k not in _SENSITIVE_KEYS and k not in data:
-                data[k] = v
+            k_str = str(k)
+            if (
+                k_str not in hidden_fields
+                and not is_sensitive_key(k_str)
+                and k_str not in data
+            ):
+                data[k_str] = v
 
         return AuthUser(data, model=None)
 
-    clean = {k: v for k, v in raw.items() if k not in _SENSITIVE_KEYS}
+    clean = {
+        str(k): v
+        for k, v in raw.items()
+        if not is_sensitive_key(str(k))
+    }
     if "id" not in clean and "sub" in clean:
         sub_val = clean["sub"]
         if isinstance(sub_val, str) and sub_val.isdigit():
@@ -421,14 +456,19 @@ def _build_auth_user_from_model(model: Any) -> AuthUser:
     fields_config = getattr(model, "__fields__", {})
     hidden_fields = set(getattr(model, "__hidden__", ()) or ())
     for f in fields_config:
-        if f not in hidden_fields and f not in data:
+        if f not in hidden_fields and not is_sensitive_key(str(f)) and f not in data:
             data[f] = getattr(model, f, None)
 
     ctx_payload = Context.get(_CONTEXT_USER_KEY)
     if isinstance(ctx_payload, dict):
         for k, v in ctx_payload.items():
-            if k not in hidden_fields and k not in _SENSITIVE_KEYS and k not in data:
-                data[k] = v
+            k_str = str(k)
+            if (
+                k_str not in hidden_fields
+                and not is_sensitive_key(k_str)
+                and k_str not in data
+            ):
+                data[k_str] = v
 
     return AuthUser(data, model=model_inst)
 
@@ -469,6 +509,8 @@ def current_user_model() -> Any | None:
     Retrieve the authenticated ORM Model instance for the current request task.
     Returns None if no model has been stored via set_user_model().
     """
+    if _is_logged_out():
+        return None
     model = Context.get(_CONTEXT_USER_MODEL_KEY)
     if model is not None:
         return model
@@ -487,14 +529,9 @@ class AuthProxy:
     def __init__(self, guard: str | None = None) -> None:
         self._guard = guard
 
-    def user(self) -> AuthUser | None:
-        """
-        Return the authenticated user for the current request task.
-
-        Returns an `AuthUser` containing all declared fields of the User model
-        with all `__hidden__` fields excluded. Returns `None` if unauthenticated
-        or if the active guard does not match the requested guard.
-        """
+    def _resolve_user(self) -> AuthUser | None:
+        if _is_logged_out():
+            return None
         if Context.get(_CONTEXT_USER_KEY) is None and Context.get(_CONTEXT_USER_MODEL_KEY) is None:
             _adopt_request_state_user()
 
@@ -519,13 +556,47 @@ class AuthProxy:
             return _build_auth_user_from_model(raw_user)
 
         if isinstance(raw_user, dict):
-            return _build_auth_user_from_dict(raw_user)
+            if not any(not is_sensitive_key(str(k)) for k in raw_user):
+                return None
+            built = _build_auth_user_from_dict(raw_user)
+            return built if built.is_authenticated else None
 
         return None
 
+    @overload
+    def user(self, *, nullable: Literal[False] = False) -> AuthUser: ...
+
+    @overload
+    def user(self, *, nullable: Literal[True]) -> AuthUser | None: ...
+
+    def user(self, *, nullable: bool = False) -> AuthUser | None:
+        """
+        Return the authenticated user for the current request task.
+
+        Returns an `AuthUser` containing all declared fields of the User model
+        with all `__hidden__` fields excluded. When unauthenticated (or when
+        the active guard does not match the requested guard), raises
+        `AuthenticationError` unless `nullable=True` is passed (which returns
+        `None`). Equivalent strict access is also available via `user_or_fail()`.
+        """
+        resolved = self._resolve_user()
+        if resolved is None and not nullable:
+            raise AuthenticationError("Unauthenticated.")
+        return resolved
+
+    def user_or_fail(self) -> AuthUser:
+        """
+        Return the authenticated user for the current request task, raising
+        `AuthenticationError` if unauthenticated.
+        """
+        resolved = self._resolve_user()
+        if resolved is None:
+            raise AuthenticationError("Unauthenticated.")
+        return resolved
+
     def check(self) -> bool:
         """Return True if the current request task has an authenticated user."""
-        return self.user() is not None
+        return self._resolve_user() is not None
 
     def guest(self) -> bool:
         """Return True if the current request task is unauthenticated."""
@@ -533,7 +604,7 @@ class AuthProxy:
 
     def id(self) -> Any | None:
         """Return the primary key identifier of the authenticated user, or None."""
-        u = self.user()
+        u = self._resolve_user()
         return u.id if u is not None else None
 
     async def authenticate(self, request: Request | None = None) -> Any:
@@ -1379,6 +1450,8 @@ def current_user() -> Any:
     Retrieve the authenticated user payload/record for the current request task.
     Returns None if unauthenticated.
     """
+    if _is_logged_out():
+        return None
     user = Context.get("__swiftpy_current_user__")
     if user is None:
         user = _adopt_request_state_user()
@@ -1588,10 +1661,29 @@ class Auth:
         """Return an AuthProxy bound to ``name`` (or the default guard)."""
         return AuthProxy(guard=name)
 
+    @overload
     @staticmethod
-    def user() -> AuthUser | None:
-        """Return the authenticated user for the current task, or None."""
-        return AuthProxy().user()
+    def user(*, nullable: Literal[False] = False) -> AuthUser: ...
+
+    @overload
+    @staticmethod
+    def user(*, nullable: Literal[True]) -> AuthUser | None: ...
+
+    @staticmethod
+    def user(*, nullable: bool = False) -> AuthUser | None:
+        """
+        Return the authenticated user for the current task, raising
+        `AuthenticationError` if unauthenticated unless `nullable=True`.
+        """
+        resolved = AuthProxy()._resolve_user()
+        if resolved is None and not nullable:
+            raise AuthenticationError("Unauthenticated.")
+        return resolved
+
+    @staticmethod
+    def user_or_fail() -> AuthUser:
+        """Return the authenticated user for the current task, raising AuthenticationError if unauthenticated."""
+        return AuthProxy().user_or_fail()
 
     @staticmethod
     def check() -> bool:

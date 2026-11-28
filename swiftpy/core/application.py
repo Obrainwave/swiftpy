@@ -1652,6 +1652,8 @@ class Application:
             if route is None:
                 return not_found()
 
+            request.path_params = dict(params)
+
             if route.max_body_size is not None:
                 request.max_body_size = route.max_body_size
             if route.max_content_length is not None:
@@ -1739,6 +1741,7 @@ class Application:
                             max_json_depth=self.max_json_depth,
                             config=self.config,
                         )
+                        handshake_request.path_params = dict(params)
                         Context.set("request", handshake_request)
                         all_middleware = list(self._middleware) + list(route.middleware)
                         if all_middleware:

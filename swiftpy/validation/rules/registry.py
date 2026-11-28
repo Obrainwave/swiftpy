@@ -100,17 +100,32 @@ def _parse_unique(v: str) -> UniqueRule:
         )
     table = parts[0]
     column = parts[1]
-    ignore_id: Any = None
-    id_column: str = "id"
+    extra_positional: list[str] = []
     case_insensitive = False
-    if len(parts) > 2:
-        for extra in parts[2:]:
-            if extra.lower() == "ci":
-                case_insensitive = True
-            elif ignore_id is None:
-                ignore_id = extra if extra != "" else None
-            elif id_column == "id":
-                id_column = extra
+    for extra in parts[2:]:
+        if extra.lower() == "ci":
+            case_insensitive = True
+        else:
+            extra_positional.append(extra)
+
+    if len(extra_positional) > 2:
+        raise ConfigurationError(
+            f"unique rule accepts at most table, column, ignore_id, and id_column arguments (got '{v}')"
+        )
+
+    ignore_id: Any = None
+    id_column: str | None = None
+    if len(extra_positional) >= 1:
+        raw_ignore = extra_positional[0]
+        if raw_ignore.lower() not in {"", "null", "none"}:
+            ignore_id = raw_ignore
+    if len(extra_positional) == 2:
+        if not extra_positional[1]:
+            raise ConfigurationError(
+                f"unique rule id_column argument must not be empty (got '{v}')"
+            )
+        id_column = extra_positional[1]
+
     return UniqueRule(
         table=table,
         column=column,

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 from weakref import WeakKeyDictionary
 
 from swiftpy.core.config import ConfigurationError
 from swiftpy.core.container import Container, get_container
-from swiftpy.http.request import Request
 from swiftpy.validation.rules.registry import RuleRegistry, default_registry
 from swiftpy.validation.validator import ValidatedData, ValidationResult
+
+if TYPE_CHECKING:
+    from swiftpy.http.request import Request
 
 
 class FormRequest:
@@ -282,6 +284,15 @@ class FormRequest:
     def all(self) -> dict[str, Any]:
         """Return all raw input parameters."""
         return dict(self.raw_data)
+
+    def route(self, param: str | None = None, default: Any = None) -> Any:
+        """Return a route path parameter from the underlying Request, or `default` if unavailable."""
+        if self.request is None:
+            if param is None:
+                empty: dict[str, Any] = {}
+                return empty
+            return default
+        return self.request.route(param, default)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
