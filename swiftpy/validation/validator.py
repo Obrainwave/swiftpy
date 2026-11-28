@@ -5,11 +5,10 @@ import copy
 import inspect
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self, TypeGuard
 from weakref import WeakKeyDictionary
 
 from swiftpy.database.transaction import get_active_connection
-from swiftpy.http.request import Request
 from swiftpy.validation.exceptions import (
     ValidationException,
     _extract_first_error,
@@ -34,6 +33,9 @@ from swiftpy.validation.rules.exists import ExistsRule
 from swiftpy.validation.rules.registry import RuleRegistry, default_registry
 from swiftpy.validation.rules.required import NullableRule, RequiredRule
 from swiftpy.validation.rules.unique import UniqueRule
+
+if TYPE_CHECKING:
+    from swiftpy.http.request import Request
 
 _RULE_INVOKER_CACHE: WeakKeyDictionary[
     type, dict[tuple[str, Any], tuple[int, bool]]
@@ -357,15 +359,15 @@ class Validator:
     def __init__(
         self,
         data: dict[str, Any] | Any,
-        schema: dict[str, Any],
+        schema: Mapping[str, Any],
         registry: RuleRegistry | None = None,
-        messages: dict[str, str] | None = None,
+        messages: Mapping[str, str] | None = None,
         *,
         stop_on_first_error: bool = False,
     ) -> None:
         self.is_payload_dict = isinstance(data, dict)
         self.data: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
-        self.schema = schema
+        self.schema: dict[str, Any] = dict(schema)
         self.registry = registry or default_registry
         self.messages: dict[str, str] = dict(messages) if messages else {}
         self.stop_on_first_error = bool(stop_on_first_error)
@@ -686,11 +688,15 @@ class Validator:
         return f"The {field_name} field is invalid."
 
 
+def _is_request_instance(value: Any) -> TypeGuard[Request]:
+    return getattr(type(value), "_is_swiftpy_request", False) is True
+
+
 async def validate(
     data: dict[str, Any] | Request | Any,
-    schema: dict[str, Any],
+    schema: Mapping[str, Any],
     registry: RuleRegistry | None = None,
-    messages: dict[str, str] | None = None,
+    messages: Mapping[str, str] | None = None,
     *,
     stop_on_first_error: bool = False,
 ) -> ValidationResult:
@@ -699,7 +705,7 @@ async def validate(
     returning a typed ValidationResult.
     """
     payload: Any = data
-    if isinstance(data, Request):
+    if _is_request_instance(data):
         loaded = await data.input()
         payload = None if getattr(data, "_non_dict_payload", False) else loaded
 

@@ -255,3 +255,156 @@ async def test_validate_concurrent_requests_isolation() -> None:
     for i, res in enumerate(results, start=1):
         res.assert_ok()
         assert res.json() == {"id": i, "tag": f"t-{i}"}
+
+
+@pytest.mark.asyncio
+async def test_request_validate_and_route_helpers_and_attr_safety() -> None:
+    app = Application(auto_discover_providers=False)
+
+    @app.put("/items/{item_id}/tags/{tag}")
+    async def update_item(request: Request, item_id: int, tag: str) -> Response:
+        all_params = request.route()
+        assert all_params == {"item_id": item_id, "tag": tag}
+        assert request.route("missing", "fallback") == "fallback"
+
+        validated = await request.validate(
+            {
+                "name": "required|str|min:2",
+                "qty": "required|int|min:1",
+            },
+            messages={"name.min": "Item name too short."},
+        )
+        # Reserved attributes cannot be hijacked by user JSON keys
+        assert callable(request.validate)
+        assert callable(request.route)
+        assert isinstance(request.path_params, dict)
+        return json_response(
+            {
+                "item_id": request.route("item_id"),
+                "tag": request.route("tag"),
+                "name": validated.name,
+                "qty": validated.qty,
+            }
+        )
+
+    @app.post("/items/single-error")
+    async def single_error_validate(request: Request) -> Response:
+        validated = await request.validate(
+            {"email": "required|email", "name": "required|str|min:3"},
+            stop_on_first_error=True,
+        )
+        return json_response(validated)
+
+    client = TestClient(app)
+
+    ok_res = await client.put(
+        "/items/42/tags/books",
+        json={
+            "name": "Widget",
+            "qty": "3",
+            "validate": "shadow-attempt",
+            "route": "shadow-attempt",
+            "path_params": "shadow-attempt",
+        },
+    )
+    ok_res.assert_ok()
+    assert ok_res.json() == {"item_id": 42, "tag": "books", "name": "Widget", "qty": 3}
+
+    bad_res = await client.put("/items/42/tags/books", json={"name": "X", "qty": 0})
+    assert bad_res.status_code == 422
+    assert bad_res.json() == {
+        "errors": {
+            "name": ["Item name too short."],
+            "qty": ["The qty field must be at least 1."],
+        }
+    }
+
+    single_res = await client.post(
+        "/items/single-error", json={"email": "not-email", "name": "a"}
+    )
+    assert single_res.status_code == 422
+    assert single_res.json() == {
+        "message": "The email field must be a valid email address.",
+        "field": "email",
+    }
+
+    non_dict_res = await client.post("/items/single-error", json=[1, 2])
+    assert non_dict_res.status_code == 422
+    assert non_dict_res.json()["field"] == "body"
+
+
+def test_form_request_route_default_when_no_request() -> None:
+    form = PostFormRequest()
+    assert form.route() == {}
+    assert form.route("id") is None
+    assert form.route("id", 99) == 99
+
+
+@pytest.mark.asyncio
+async def test_request_validate_nested_stripping_multiple_rules_and_abort_side_effects() -> None:
+    app = Application(auto_discover_providers=False)
+    mutated: list[str] = []
+
+    @app.post("/orders")
+    async def create_order(request: Request) -> Response:
+        validated = await request.validate(
+            {
+                "users": "required",
+                "users.*.email": "required|email:lowercase",
+                "code": "required|str|min:4|max:6|regex:^[A-Z0-9]+$",
+                "items": "required",
+                "items.*.sku": "required|str|min:2",
+                "items.*.qty": "required|int|min:1",
+                "lines": "required",
+                "lines.*.qty": "required|int|min:1",
+            }
+        )
+        mutated.append("saved")
+        return json_response(
+            {
+                "validated": validated,
+                "keys": sorted(validated.keys()),
+                "first_user_email": validated.users[0].email,
+                "first_qty": validated["items"][0]["qty"],
+                "line_qty": validated.lines[0].qty,
+            }
+        )
+
+    client = TestClient(app)
+
+    # 1. Valid payload strips extra top-level & nested fields, normalizes email, and coerces ints
+    raw_payload = {
+        "users": [{"email": "BUYER@EXAMPLE.COM", "admin_override": True}],
+        "code": "ORD99",
+        "items": [{"sku": "SKU1", "qty": "3", "ignored": "x"}],
+        "lines": [{"qty": "7"}],
+        "unexpected_top_level": "drop-me",
+    }
+    ok_res = await client.post("/orders", json=raw_payload)
+    ok_res.assert_ok()
+    body = ok_res.json()
+    assert body["keys"] == ["code", "items", "lines", "users"]
+    assert "unexpected_top_level" not in body["validated"]
+    assert body["first_user_email"] == "buyer@example.com"
+    assert body["first_qty"] == 3
+    assert body["line_qty"] == 7
+    assert mutated == ["saved"]
+
+    # 2. Validation failure on multiple rules reports all failures and NEVER runs handler logic after validate()
+    bad_res = await client.post(
+        "/orders",
+        json={
+            "users": [{"email": "not-email"}],
+            "code": "ab!",
+            "items": [{"sku": "S", "qty": "0"}],
+            "lines": [{"qty": "0"}],
+        },
+    )
+    assert bad_res.status_code == 422
+    errs = bad_res.json()["errors"]
+    assert "users.0.email" in errs
+    assert len(errs["code"]) == 2  # min:4 AND regex failed cleanly together
+    assert "items.0.sku" in errs
+    assert "items.0.qty" in errs
+    assert "lines.0.qty" in errs
+    assert mutated == ["saved"]  # Handler side effect did not execute on failure

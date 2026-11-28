@@ -24,7 +24,7 @@ def test_new_command_templates_hardened(
     assert "pyproject.toml" in dockerfile
 
     pyproject = (app_dir / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"swiftpy-framework>=0.4.0"' in pyproject
+    assert '"swiftpy-framework>=0.4.1"' in pyproject
 
     dockerignore = (app_dir / ".dockerignore").read_text(encoding="utf-8")
     assert "public/storage" in dockerignore
@@ -170,10 +170,13 @@ def test_queue_commands_app_lifecycle_and_bounded_limit(
     startup_mock = AsyncMock()
     shutdown_mock = AsyncMock()
     work_mock = AsyncMock()
+    def _load_fake_app(_target: str) -> Application:
+        return fake_app
+
     monkeypatch.setattr(fake_app, "startup", startup_mock)
     monkeypatch.setattr(fake_app, "shutdown", shutdown_mock)
     monkeypatch.setattr(
-        "swiftpy.console.commands.queue.load_application", lambda _target: fake_app
+        "swiftpy.console.commands.queue.load_application", _load_fake_app
     )
     monkeypatch.setattr("swiftpy.console.commands.queue.QueueWorker.work", work_mock)
 

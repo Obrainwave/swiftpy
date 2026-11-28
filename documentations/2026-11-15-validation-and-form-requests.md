@@ -166,9 +166,31 @@ If a client submits extra unvalidated keys such as `{"name": "Jane", "is_admin":
 
 ---
 
-## Standalone Validation with `validate()` & `Validator`
+## Inline Validation with `await request.validate()` & Standalone `validate()`
 
-Use `await validate(data_or_request, schema, ...)` (or `Validator(data, schema, ...).validate()`) in services, WebSocket handlers, background jobs, or routes. Passing a `Request` instance directly reads JSON, form, or query input automatically based on HTTP method and `Content-Type`:
+For inline controller and route validation, call `await request.validate(schema, messages=None, *, stop_on_first_error=False)`. It validates query, JSON, or form input automatically, raises `ValidationException` (`HTTP 422`) on failure, and returns `ValidatedData` (supporting both dict indexing and dot access):
+
+```python
+from __future__ import annotations
+
+from swiftpy.http.request import Request
+from swiftpy.http.response import Response, json_response
+from swiftpy.http.router import Router
+
+router = Router()
+
+
+@router.put("/users/{id}")
+async def update_user(request: Request, id: int) -> Response:
+    validated = await request.validate({
+        "email": f"required|email|unique:users,email,{id}",
+    })
+    return json_response({"id": id, "email": validated.email})
+```
+
+You can also read matched route path parameters via `request.route("id")` (or `self.route("id")` inside a dynamic `FormRequest.rules()` method).
+
+Or use `await validate(data_or_request, schema, ...)` (`Validator(data, schema, ...).validate()`) when you want a `ValidationResult` instead of raising immediately in services, WebSocket handlers, or background jobs:
 
 ```python
 from __future__ import annotations
@@ -348,20 +370,22 @@ def build_update_user_rules(user_id: int) -> dict[str, Any]:
     }
 ```
 
-### Rule Arguments in String Syntax
+### Rule Arguments in String Syntax & Fluent `.ignore()`
 
 - **`exists:<table>,<column>`**: Passes if at least one matching row exists.
 - **`unique:<table>,<column>[,<ignore_id>][,<id_column>][,ci]`**: Passes if no matching row exists:
   - `unique:users,email` — exact match against `users.email`.
-  - `unique:users,email,42` — ignore the row where `id = 42`.
-  - `unique:users,email,42,user_uuid` — ignore the row where `user_uuid = 42`.
+  - `f"unique:users,email,{id}"` — ignore the row where `id = id` (stringified integer, UUID, or string primary keys are coerced cleanly; `"NULL"`, `"None"`, or empty strings keep `ignore_id=None` without shifting `id_column`).
+  - `unique:users,email,42,user_uuid` or `unique:users,email,NULL,user_uuid` — use custom ID column `user_uuid`.
   - `unique:users,email,ci` or `unique:users,email,42,ci` — case-insensitive match via `LOWER("email") = LOWER($1)`.
+  - `unique("users", "email").ignore(user_or_id, id_column=...)` — fluent helper also accepting a `Model` (auto-inferring `__primary_key__`) or `AuthUser` / `CurrentUser` instance.
 
 ### Connection Resolution, Transactions & Safety
 
 - **Connection pool resolution:** Both `UniqueRule` and `ExistsRule` resolve `DatabasePool` automatically from the application `Container` (or accept an explicit `pool=` argument).
 - **Transaction & SAVEPOINT safety:** When executed inside `async with db.transaction():`, both rules reuse the active transaction connection (seeing uncommitted writes in the same transaction) and wrap each check in a sub-transaction (`SAVEPOINT`) so a database type mismatch (such as passing `"abc"` for an integer column) returns a clean `422` validation failure without poisoning the outer transaction.
 - **SQL injection defense:** Table and column identifiers are checked by `validate_identifier()` at rule construction time, rejecting unsafe identifiers upfront with `ValueError`, and field values are always bound as `$1` / `$2` parameters.
+- **Database `UNIQUE` constraints remain mandatory under concurrency:** Application-level `unique` checks query PostgreSQL before inserting or updating, so two concurrent requests can still pass pre-write validation before either commits. Always declare a real database `UNIQUE` constraint (such as `table.string("email").unique()` in migrations) as your final integrity guarantee.
 - **Empty values:** When a value is `None` or `""`, `ExistsRule` and `UniqueRule` return `True` — always pair them with `required` when the field cannot be omitted or blank.
 
 ---

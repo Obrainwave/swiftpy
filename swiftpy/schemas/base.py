@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum, IntEnum
 from types import UnionType
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     ClassVar,
@@ -30,9 +31,11 @@ from uuid import UUID
 from swiftpy.database.orm.fields import _MISSING as _ORM_MISSING
 from swiftpy.database.orm.fields import FieldInfo as OrmFieldInfo
 from swiftpy.http.exceptions import HttpException
-from swiftpy.http.request import Request
 from swiftpy.schemas.fields import _MISSING, Field, SchemaField, SchemaFieldInfo
 from swiftpy.validation.exceptions import ValidationException
+
+if TYPE_CHECKING:
+    from swiftpy.http.request import Request
 
 F = TypeVar("F", bound=Callable[..., Any])
 _INT_RE = re.compile(r"^[+-]?[0-9]+$")

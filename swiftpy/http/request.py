@@ -11,7 +11,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from urllib.parse import parse_qs, unquote
 
 from swiftpy.core.config import Config
@@ -30,6 +30,11 @@ from swiftpy.http.exceptions import (
     HttpException,
     PayloadTooLargeError,
 )
+from swiftpy.validation.validator import ValidatedData
+from swiftpy.validation.validator import validate as _validate_input
+
+if TYPE_CHECKING:
+    from swiftpy.validation.rules.registry import RuleRegistry
 
 DEFAULT_MAX_BODY_SIZE: int = 2 * 1024 * 1024  # 2 MiB
 DEFAULT_MAX_CONTENT_LENGTH: int = 2 * 1024 * 1024  # 2 MiB
@@ -210,6 +215,7 @@ class _ClientIPMethod:
 
 
 class Request:
+    _is_swiftpy_request: ClassVar[bool] = True
     _RESERVED_INPUT_ATTRS: ClassVar[frozenset[str]] = frozenset(
         {
             "admin_user",
@@ -221,10 +227,13 @@ class Request:
             "ip",
             "is_admin",
             "is_authenticated",
+            "path_params",
             "root_path",
+            "route",
             "server",
             "session",
             "user",
+            "validate",
         }
     )
 
@@ -265,6 +274,7 @@ class Request:
         self._input_cache: dict[str, Any] = {}
         self._non_dict_payload: bool = False
 
+        self.path_params: dict[str, Any] = {}
         self.state: dict[str, Any] = {}
 
     def _resolve_trusted_proxies(self) -> TrustedProxies:
@@ -649,6 +659,33 @@ class Request:
     def has(self, key: str) -> bool:
         """Return True if an input parameter exists in the current request input."""
         return key in self._current_input_mapping()
+
+    def route(self, param: str | None = None, default: Any = None) -> Any:
+        """Return a specific matched route path parameter, or all path parameters if omitted."""
+        if param is None:
+            return dict(self.path_params)
+        return self.path_params.get(param, default)
+
+    async def validate(
+        self,
+        schema: Mapping[str, Any],
+        messages: Mapping[str, str] | None = None,
+        *,
+        registry: RuleRegistry | None = None,
+        stop_on_first_error: bool = False,
+    ) -> ValidatedData:
+        """
+        Validate incoming request input against `schema`, raising
+        `ValidationException` (HTTP 422) on failure and returning `ValidatedData`.
+        """
+        result = await _validate_input(
+            self,
+            schema,
+            registry=registry,
+            messages=messages,
+            stop_on_first_error=stop_on_first_error,
+        )
+        return result.raise_if_failed().validated()
 
     def __getattr__(self, name: str) -> Any:
         if not name.startswith("_") and name not in self._RESERVED_INPUT_ATTRS:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, ClassVar
 
@@ -7,18 +8,28 @@ import pytest
 
 from swiftpy import TestClient
 from swiftpy.auth import (
+    Auth,
+    AuthenticationError,
     AuthProxy,
     AuthUser,
     CurrentUser,
     JWTIssuer,
     auth,
+    current_user,
     current_user_model,
     set_user_model,
 )
+from swiftpy.auth_manager import Auth as LegacyAuth
 from swiftpy.auth_manager import auth as top_level_auth
 from swiftpy.core.application import Application
+from swiftpy.core.container import bind_container
 from swiftpy.core.context import Context
 from swiftpy.database.orm import Model
+from swiftpy.database.orm.registry import (
+    _MODEL_REGISTRY,
+    restore_model_registry,
+    snapshot_model_registry,
+)
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
 
@@ -73,8 +84,16 @@ def test_auth_unauthenticated() -> None:
     proxy = auth()
     assert proxy.check() is False
     assert proxy.guest() is True
-    assert proxy.user() is None
+    assert proxy.user(nullable=True) is None
     assert proxy.id() is None
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        proxy.user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        Auth.user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        LegacyAuth.user()
+    assert Auth.user(nullable=True) is None
+    assert LegacyAuth.user(nullable=True) is None
 
 
 def test_auth_user_with_model_instance() -> None:
@@ -136,35 +155,42 @@ def test_auth_user_with_model_instance() -> None:
 
 
 def test_auth_user_hydrates_declared_fields_from_dict_and_excludes_hidden() -> None:
-    # Raw payload in Context (e.g. from JWT or sanitised DB row)
-    payload = {
-        "sub": "42",
-        "name": "Bob",
-        "email": "bob@example.com",
-        "password": "should_be_omitted",
-        "is_admin": False,
-        "extra_claim": "member",
-    }
-    Context.set("__swiftpy_current_user__", payload)
+    snap = snapshot_model_registry()
+    for model_name in list(_MODEL_REGISTRY):
+        if model_name != "DummyUser" and model_name.lower().endswith("user"):
+            _MODEL_REGISTRY.pop(model_name, None)
+    try:
+        # Raw payload in Context (e.g. from JWT or sanitised DB row)
+        payload = {
+            "sub": "42",
+            "name": "Bob",
+            "email": "bob@example.com",
+            "password": "should_be_omitted",
+            "is_admin": False,
+            "extra_claim": "member",
+        }
+        Context.set("__swiftpy_current_user__", payload)
 
-    current = auth().user()
-    assert current is not None
-    assert auth().check() is True
-    assert auth().id() == 42  # Coerced to int matching DummyUser.id: int
+        current = auth().user()
+        assert current is not None
+        assert auth().check() is True
+        assert auth().id() == 42  # Coerced to int matching DummyUser.id: int
 
-    # All declared fields are present
-    assert current.name == "Bob"
-    assert current.email == "bob@example.com"
-    assert current.is_admin is False
+        # All declared fields are present
+        assert current.name == "Bob"
+        assert current.email == "bob@example.com"
+        assert current.is_admin is False
 
-    # Extra non-sensitive claim is retained
-    assert current["extra_claim"] == "member"
+        # Extra non-sensitive claim is retained
+        assert current["extra_claim"] == "member"
 
-    # Hidden field is strictly excluded
-    assert "password" not in current
-    assert current.get("password") is None
-    with pytest.raises(AttributeError):
-        _ = current.password
+        # Hidden field is strictly excluded
+        assert "password" not in current
+        assert current.get("password") is None
+        with pytest.raises(AttributeError):
+            _ = current.password
+    finally:
+        restore_model_registry(snap)
 
 
 def test_auth_guard_isolation() -> None:
@@ -185,7 +211,11 @@ def test_auth_guard_isolation() -> None:
 
     # Asking for "jwt" guard must fail because active guard is "api_key"
     assert auth("jwt").check() is False
-    assert auth("jwt").user() is None
+    assert auth("jwt").user(nullable=True) is None
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        auth("jwt").user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        auth("jwt").user_or_fail()
 
     # Default proxy (no guard specified) matches any active authenticated user
     assert auth().check() is True
@@ -373,7 +403,7 @@ async def test_current_user_and_auth_immediately_available_when_access_token_is_
     async def profile_without_guard(current: CurrentUser) -> Response:
         # With auth.passive_resolution enabled, a valid Bearer access_token populates CurrentUser & auth()
         # even without middleware=[JWTGuard]. CurrentUser.id stays the raw `sub` string (as with JWTGuard).
-        u = auth().user()
+        u = auth().user(nullable=True)
         return json_response(
             {
                 "is_authenticated": current.is_authenticated,
@@ -417,3 +447,222 @@ async def test_current_user_and_auth_immediately_available_when_access_token_is_
         assert body3["auth_check"] is True
         assert body3["auth_id"] == 99
         assert body3["email"] == "katherine@example.com"
+
+
+def test_auth_user_direct_attribute_typing_nullable_and_user_or_fail() -> None:
+    """Verify `auth().user().id`, `Auth.user().id`, `nullable=True`, and `user_or_fail()` behavior."""
+    assert auth().user(nullable=True) is None
+    assert Auth.user(nullable=True) is None
+    assert top_level_auth().user(nullable=True) is None
+    assert LegacyAuth.user(nullable=True) is None
+
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        auth().user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        Auth.user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        top_level_auth().user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        LegacyAuth.user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        auth().user_or_fail()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        Auth.user_or_fail()
+
+    user = DummyUser(
+        id=55,
+        name="Ada",
+        email="ada@example.com",
+        password="secret",
+        is_admin=True,
+    )
+    set_user_model(user, guard="jwt")
+
+    # Direct access without None narrowing works at static check time and runtime
+    assert auth().user().id == 55
+    assert auth().user().email == "ada@example.com"
+    assert auth().user().name == "Ada"
+    assert Auth.user().id == 55
+    assert Auth.user().email == "ada@example.com"
+    assert top_level_auth().user().id == 55
+    assert LegacyAuth.user().id == 55
+    assert "password" not in auth().user()
+
+    assert auth().user_or_fail().id == 55
+    assert Auth.user_or_fail().id == 55
+    assert auth().user(nullable=True) is not None
+    assert Auth.user(nullable=True) is not None
+
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        auth("api_key").user()
+    with pytest.raises(AuthenticationError, match="Unauthenticated"):
+        auth("api_key").user_or_fail()
+    assert auth("api_key").user(nullable=True) is None
+
+
+@pytest.mark.asyncio
+async def test_auth_strict_and_nullable_concurrent_task_isolation() -> None:
+    """Verify strict `auth().user()`, `user(nullable=True)`, and HTTP 401 isolation across concurrent tasks."""
+    secret = "concurrent-task-isolation-secret-at-least-32-bytes!"
+    app = Application(
+        config={
+            "app": {"name": "AuthConcurrentTest", "env": "testing", "debug": False},
+            "auth": {
+                "blacklist_enabled": False,
+                "passive_resolution": True,
+                "defaults": {"guard": "jwt"},
+                "guards": {
+                    "jwt": {
+                        "secret": secret,
+                        "algorithm": "HS256",
+                        "access_token_ttl": 300,
+                        "refresh_token_ttl": 3600,
+                    }
+                },
+            },
+        },
+        auto_discover_providers=False,
+    )
+
+    @app.get("/strict-me")
+    async def strict_me() -> Response:
+        u = auth().user()
+        facade_u = Auth.user()
+        legacy_u = top_level_auth().user()
+        assert facade_u.id == u.id
+        assert legacy_u.id == u.id
+        assert "password" not in u
+        await asyncio.sleep(0.01)
+        return json_response({"id": auth().user().id, "email": Auth.user().email})
+
+    @app.get("/nullable-me")
+    async def nullable_me() -> Response:
+        u = auth().user(nullable=True)
+        facade_u = Auth.user(nullable=True)
+        await asyncio.sleep(0.01)
+        return json_response(
+            {
+                "authenticated": u is not None,
+                "id": u.id if u is not None else None,
+                "facade_id": facade_u.id if facade_u is not None else None,
+            }
+        )
+
+    issuer = app.container.resolve(JWTIssuer)
+    with bind_container(app.container):
+        tok_1 = issuer.issue_access_token(
+            101,
+            claims={"email": "u101@example.com", "password": "secret"},
+        )
+        Context.clear()
+        tok_2 = issuer.issue_access_token(
+            202,
+            claims={"email": "u202@example.com", "password": "secret"},
+        )
+        Context.clear()
+
+    client = TestClient(app)
+    res_1, res_2, res_unauth_strict, res_unauth_nullable, res_1_nullable = (
+        await asyncio.gather(
+            client.get("/strict-me", headers={"Authorization": f"Bearer {tok_1}"}),
+            client.get("/strict-me", headers={"Authorization": f"Bearer {tok_2}"}),
+            client.get("/strict-me"),
+            client.get("/nullable-me"),
+            client.get("/nullable-me", headers={"Authorization": f"Bearer {tok_1}"}),
+        )
+    )
+
+    res_1.assert_ok()
+    assert res_1.json() == {"id": 101, "email": "u101@example.com"}
+
+    res_2.assert_ok()
+    assert res_2.json() == {"id": 202, "email": "u202@example.com"}
+
+    assert res_unauth_strict.status_code == 401
+    assert res_unauth_nullable.status_code == 200
+    assert res_unauth_nullable.json() == {
+        "authenticated": False,
+        "id": None,
+        "facade_id": None,
+    }
+    res_1_nullable.assert_ok()
+    assert res_1_nullable.json() == {
+        "authenticated": True,
+        "id": 101,
+        "facade_id": 101,
+    }
+
+
+def test_auth_audit_custom_pk_empty_dict_str_pk_sensitive_keys_and_logout_state() -> None:
+    """Verify audit fixes: custom PK on AuthUser.id, empty/all-sensitive dicts, str PK preservation, sensitive suffixes, and request.state logout."""
+    snap = snapshot_model_registry()
+    try:
+        # 1. Custom __primary_key__ model exposes .id via auth().user().id and auth().id()
+        class CustomUuidUser(Model):
+            __table__ = "custom_uuid_users"
+            __primary_key__ = "user_uuid"
+            __fillable__: ClassVar[list[str]] = ["user_uuid", "email"]
+
+            user_uuid: str
+            email: str
+
+        custom_u = CustomUuidUser(user_uuid="uuid-abc-123", email="custom@example.com")
+        set_user_model(custom_u)
+        Context.set("__swiftpy_current_user__", {"user_uuid": "uuid-abc-123", "email": "custom@example.com", "reset_token": "tok", "oauth_secret": "sec"})
+        assert auth().user().id == "uuid-abc-123"
+        assert auth().id() == "uuid-abc-123"
+        assert "reset_token" not in auth().user()
+        assert "oauth_secret" not in auth().user()
+
+        # 2. Empty dict or dict with only sensitive keys must be treated as unauthenticated
+        Context.clear()
+        Context.set("__swiftpy_current_user__", {})
+        assert auth().check() is False
+        assert auth().user(nullable=True) is None
+        with pytest.raises(AuthenticationError, match="Unauthenticated"):
+            auth().user()
+
+        Context.set("__swiftpy_current_user__", {"password": "pw", "reset_token": "tok", "api_secret": "sec"})
+        assert auth().check() is False
+        assert auth().user(nullable=True) is None
+        with pytest.raises(AuthenticationError, match="Unauthenticated"):
+            auth().user()
+
+        # 3. String-typed primary key with leading zeroes ("0042") is not corrupted into int 42
+        Context.clear()
+        for model_name in list(_MODEL_REGISTRY):
+            if model_name.lower().endswith("user"):
+                _MODEL_REGISTRY.pop(model_name, None)
+
+        class StringIdUser(Model):
+            __table__ = "string_id_users"
+            __primary_key__ = "id"
+            __fillable__: ClassVar[list[str]] = ["id", "email"]
+
+            id: str
+            email: str
+
+        Context.set(
+            "__swiftpy_current_user__",
+            {"sub": "0042", "email": "strid@example.com", "custom_password": "hidden", "key_hash": "hidden"},
+        )
+        hydrated = auth().user()
+        assert hydrated.id == "0042"
+        assert isinstance(hydrated.id, str)
+        assert "custom_password" not in hydrated
+        assert "key_hash" not in hydrated
+
+        # 4. Immediate post-logout invalidation via request.state even if task Context still has user keys
+        req = _make_dummy_request()
+        Context.set("request", req)
+        set_user_model(custom_u)
+        assert auth().check() is True
+        req.state["__swiftpy_logged_out__"] = True
+        assert current_user() is None
+        assert current_user_model() is None
+        assert auth().check() is False
+        assert auth().user(nullable=True) is None
+        with pytest.raises(AuthenticationError, match="Unauthenticated"):
+            auth().user()
+    finally:
+        restore_model_registry(snap)

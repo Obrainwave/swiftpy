@@ -84,6 +84,7 @@ jobs:
           uv run mypy swiftpy
           uv run mypy .
           uv run mypy --explicit-package-bases .
+          uv run mypy --strict tests/typing/
 
       - name: Run Pyrefly
         run: |
@@ -195,11 +196,46 @@ jobs:
                       out, _ = proc.communicate(timeout=5)
               assert ok, out
           '
+          ROOT_DIR="$(pwd)"
           rm -rf /tmp/swiftpy-pyrefly-smoke && mkdir -p /tmp/swiftpy-pyrefly-smoke
           (
             cd /tmp/swiftpy-pyrefly-smoke
             /tmp/swiftpy-wheel-smoke/bin/swiftpy new ci_smoke_api
             cd ci_smoke_api
-            uvx pyrefly check --python-interpreter-path /tmp/swiftpy-wheel-smoke/bin/python --error=no-any-return-implicit app/ config/ routes/ database/ prompts/ main.py
+            cat <<'EOF' > v041_typing_contract_smoke.py
+          from __future__ import annotations
+
+          from typing import assert_type
+
+          from swiftpy import Auth, AuthProxy, AuthUser, Request, UniqueRule, ValidatedData, unique
+          from swiftpy.auth import auth
+          from swiftpy.auth_manager import Auth as LegacyAuth
+          from swiftpy.auth_manager import auth as legacy_auth
+
+
+          def check_auth_contracts() -> AuthUser:
+              _proxy = assert_type(auth(), AuthProxy)
+              _user = assert_type(auth().user(), AuthUser)
+              _uid = auth().user().id
+              _facade_id = Auth.user().id
+              _legacy_id = legacy_auth().user().id
+              _legacy_facade_id = LegacyAuth.user().id
+              _nullable = assert_type(auth().user(nullable=True), AuthUser | None)
+              _facade_nullable = assert_type(Auth.user(nullable=True), AuthUser | None)
+              _strict = assert_type(auth().user_or_fail(), AuthUser)
+              _ = (_proxy, _user, _uid, _facade_id, _legacy_id, _legacy_facade_id, _nullable, _facade_nullable, _strict)
+              return auth().user()
+
+
+          async def check_validation_contracts(request: Request, user_id: int) -> ValidatedData:
+              _rule = assert_type(unique("users", "email").ignore(user_id), UniqueRule)
+              _ = _rule
+              return assert_type(
+                  await request.validate({"email": f"required|email|unique:users,email,{user_id}"}),
+                  ValidatedData,
+              )
+          EOF
+            uvx pyrefly check --python-interpreter-path /tmp/swiftpy-wheel-smoke/bin/python --error=no-any-return-implicit app/ config/ routes/ database/ prompts/ main.py v041_typing_contract_smoke.py
+            PYTHONPATH= "$ROOT_DIR/.venv/bin/mypy" --python-executable /tmp/swiftpy-wheel-smoke/bin/python --strict v041_typing_contract_smoke.py
           )
           rm -rf /tmp/swiftpy-pyrefly-smoke /tmp/swiftpy-wheel-smoke
