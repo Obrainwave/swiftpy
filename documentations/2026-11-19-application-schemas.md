@@ -228,7 +228,8 @@ class EggLedgerRepository:
 ### Key ORM & Serialization Helpers
 
 - **`Schema.from_model(model)`:** Hydrates a response schema from an ORM `Model` instance, dict, or plain object (respecting loaded relations without triggering lazy loads on unloaded relationships).
-- **`payload.to_dict(exclude_none=False, exclude_unset=False, by_alias=False)`:** Recursively converts schemas into dictionaries.
+- **`FormRequest[YourSchema]` & `request.validate(YourSchema)`:** Parameterize `class CreateItemRequest(FormRequest[YourSchema]):` (or pass `schema_cls=YourSchema` to `request.validate(rules, schema_cls=YourSchema)`, or call `request.validated(YourSchema)` / `request.to_schema(YourSchema)`) when combining `FormRequest` database rules (`unique:...`, `exists:...`) with typed `BaseSchema` service DTOs.
+- **`payload.to_dict(exclude_none=False, exclude_unset=False, by_alias=False)`:** Recursively converts schemas into dictionaries (also supports `payload["field"]`, `payload.get("field")`, `"field" in payload`, and `payload.validated()` for `ValidatedData` interoperability).
 - **`payload.is_set("field_name")` / `payload.fields_set`:** Inspects which fields were explicitly provided in the input payload (versus defaulted).
 - **`await Model.create(payload, ...)` / `await Model.force_create(payload, ...)` / `await parent.children.create(payload, ...)`:** Extracts `payload.to_dict()` and merges any extra keyword overrides while enforcing `__fillable__` / `__guarded__` on `create()`.
 - **`await model.update(payload)` / `await model.force_update(payload)` / `await Model.where(...).update(payload)` / `await parent.children.update(payload)`:** Extracts `payload.to_dict(exclude_unset=True)` so partial `PATCH` schemas never overwrite omitted columns with defaults (post-validation field assignments also update `fields_set`).

@@ -4,6 +4,21 @@ All notable changes to SwiftPY will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1.post1] - 2026-11-28
+
+### Added
+- **`FormRequest[BaseSchema]` & `ValidatedData` / `BaseSchema` Interoperability (`swiftpy/validation/form_request.py`, `swiftpy/validation/validator.py`, `swiftpy/http/request.py`, `swiftpy/schemas/base.py`, `swiftpy/core/application.py`, `swiftpy/http/router.py`):**
+  - Made `FormRequest[SchemaT_co]` covariant and generic (defaulting unparameterized subclasses to `Any` on PEP 696 checkers so existing controllers passing `form.validated()` into `BaseSchema` services check cleanly, while `class MyRequest(FormRequest[MySchema]):` and inline `form: FormRequest[MySchema]` infer and return concrete `MySchema` both statically and at runtime).
+  - Added automatic `FormRequest.__init_subclass__` binding to `cls.schema_model`, HTTP pipeline hydration (`Application._wrap_handler` + `Router._analyze_handler`), `FormRequest.to_schema(MySchema)`, and overloaded `FormRequest.validated(MySchema)` so `FormRequest` rules (e.g. `unique:...`, mass-assignment filtering) flow straight into typed `BaseSchema` coercion and validation.
+  - Added `ValidationResult.validated(MySchema)`, `await request.validate(MySchema)`, and `await request.validate(rules, schema_cls=MySchema)`.
+  - Added `to_dict()`, `model_dump()`, `fields_set`, `is_set()`, `to_schema()`, and omitted declared-rule-field `None` fallback on `ValidatedData`, plus `__getitem__`, `__contains__`, `get()`, and `validated()` on `BaseSchema` (without claiming `items`/`keys`/`values` attribute names so payload fields remain unobstructed).
+
+### Fixed
+- **Standalone Imports, Auth Static Cleanup, CI Wheel Smoke Check & Version Bump (`swiftpy/database/orm/model.py`, `swiftpy/database/factories.py`, `swiftpy/auth/auth_manager.py`, `.github/workflows/ci.yml`, `pyproject.toml`, `swiftpy/console/commands/new.py`):**
+  - Moved `BaseSchema` runtime imports in `swiftpy/database/orm/model.py` and `swiftpy/database/factories.py` under `TYPE_CHECKING` (`_is_schema_instance` TypeGuard) so importing `swiftpy.schemas` standalone in a fresh interpreter never fails with a circular `ImportError`.
+  - Fixed `[implicit-any-empty-container]` on `data: dict[str, Any]` in `swiftpy/auth/auth_manager.py`, `[implicit-any-lambda]` in `tests/console/test_phase9_cli_remediation.py`, and fixed `.github/workflows/ci.yml` wheel-smoke `mypy` execution to pass `--python-executable /tmp/swiftpy-wheel-smoke/bin/python` instead of triggering PyPI resolution via `uv run`.
+  - Bumped `swiftpy-framework` package version and `swiftpy new` dependency floor to `0.4.1.post1`.
+
 ## [0.4.1] - 2026-11-28
 
 ### Added

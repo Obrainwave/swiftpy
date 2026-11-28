@@ -2,10 +2,22 @@ from __future__ import annotations
 
 from typing import Any, assert_type
 
-from swiftpy import Auth, AuthProxy, AuthUser
+from swiftpy import Auth, AuthProxy, AuthUser, FormRequest
 from swiftpy.auth import auth
 from swiftpy.auth_manager import Auth as LegacyAuth
 from swiftpy.auth_manager import auth as legacy_auth
+
+
+class _TypedLoginForm(FormRequest):
+    pass
+
+
+async def _verify_auth_attempt_form_request_typing(form: _TypedLoginForm) -> bool:
+    _ok1 = assert_type(await Auth.attempt(form), bool)
+    _ok2 = assert_type(await auth().attempt(form), bool)
+    _ok3 = assert_type(await Auth.once(form), bool)
+    _ = (_ok1, _ok2)
+    return _ok3
 
 
 def _verify_auth_typing_contracts() -> None:

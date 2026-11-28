@@ -951,12 +951,13 @@ class Router:
                     )
                 continue
 
+            ann_origin = get_origin(ann)
             if isinstance(ann, type) and issubclass(ann, Request):
                 specs.append(ParamSpec(name=name, kind="request", annotation=ann))
             elif isinstance(ann, type) and issubclass(ann, UploadedFile):
                 specs.append(ParamSpec(name=name, kind="file", annotation=ann))
             elif (
-                get_origin(ann) is list
+                ann_origin is list
                 and get_args(ann)
                 and isinstance(get_args(ann)[0], type)
                 and issubclass(get_args(ann)[0], UploadedFile)
@@ -964,7 +965,9 @@ class Router:
                 specs.append(ParamSpec(name=name, kind="files", annotation=ann))
             elif name in route.param_names:
                 specs.append(ParamSpec(name=name, kind="path", annotation=ann))
-            elif isinstance(ann, type) and issubclass(ann, FormRequest):
+            elif (isinstance(ann, type) and issubclass(ann, FormRequest)) or (
+                isinstance(ann_origin, type) and issubclass(ann_origin, FormRequest)
+            ):
                 specs.append(ParamSpec(name=name, kind="form", annotation=ann))
             elif isinstance(ann, type) and issubclass(ann, BaseSchema):
                 specs.append(ParamSpec(name=name, kind="schema", annotation=ann))

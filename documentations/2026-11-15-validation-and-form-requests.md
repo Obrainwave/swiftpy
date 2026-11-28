@@ -594,17 +594,53 @@ def register_validation_renderer(app: Application) -> None:
 
 ---
 
-## Choosing Between `BaseSchema` / `Schema` and `FormRequest`
+## Choosing Between & Combining `BaseSchema` / `Schema` and `FormRequest`
 
-Both systems return HTTP `422` (`ValidationException`) automatically when annotated on route or controller handlers. Choose based on what each endpoint needs:
+Both systems return HTTP `422` (`ValidationException`) automatically when annotated on route or controller handlers—and you can combine them cleanly so `FormRequest.validated()` returns a typed `BaseSchema` instance.
+
+### Option 1: Parameterize `FormRequest[MySchema]` (Recommended When Combining DB Rules + Schema DTOs)
+
+When a controller uses database validation rules (`unique:...`, `exists:...`) alongside a typed service DTO (`BaseSchema`), parameterize `FormRequest[MySchema]`:
+
+```python
+from __future__ import annotations
+
+from typing import Any
+
+from swiftpy.schemas import BaseSchema, Field
+from swiftpy.validation import FormRequest
+
+
+class DocVersionCreate(BaseSchema):
+    version: str = Field(..., strip_whitespace=True, min_length=1)
+    title: str
+    notes: str | None = None
+
+
+class DocVersionCreateRequest(FormRequest[DocVersionCreate]):
+    def rules(self) -> dict[str, Any]:
+        return {
+            "version": "required|str|unique:doc_versions,version",
+            "title": "required|str",
+            "notes": "nullable|str",
+        }
+```
+
+- **Static typing (`Pyrefly` / `mypy --strict`):** `request.validated()` infers `DocVersionCreate`, matching `DocVersionService.create_doc_version(self, data: DocVersionCreate)` directly.
+- **Runtime pipeline:** SwiftPY validates `rules()` first (preserving `FormRequest` mass-assignment filtering), then validates and coerces the cleaned payload into `DocVersionCreate` before entering your handler (`422` if either step fails).
+- **Explicit conversion helpers:** For unparameterized `FormRequest` subclasses, `ValidatedData`, `ValidationResult`, or `await request.validate(...)`:
+  - `request.validated(DocVersionCreate)` / `request.to_schema(DocVersionCreate)`
+  - `await request.validate(DocVersionCreate)` or `await request.validate(rules, schema_cls=DocVersionCreate)`
+  - `(await validate(request, rules)).raise_if_failed().validated(DocVersionCreate)`
+  - `validated_data.to_schema(DocVersionCreate)` (`ValidatedData` also implements `.to_dict()`, `.model_dump()`, `.fields_set`, and `.is_set()` for runtime parity)
 
 | Need | Use `BaseSchema` / `Schema` (`swiftpy.schemas`) | Use `FormRequest` (`swiftpy.validation`) |
 |---|---|---|
-| **Static typing in Pyrefly / Mypy** | Full typed attribute access (`payload.movement_date`, `payload.good_eggs`) | Dictionary-like `form.validated()` (`ValidatedData`) |
+| **Static typing in Pyrefly / Mypy** | Full typed attribute access (`payload.movement_date`, `payload.good_eggs`) | Typed `MySchema` via `FormRequest[MySchema]`, or `ValidatedData` mapping/dot access |
 | **Schema definition style** | Type annotations + `Field(..., gt=0, max_length=100)` + `@field_validator` / `@model_validator` | String or rule-object DSL (`"required|email|unique:users,email"`) |
-| **Database checks (`unique` / `exists`)** | Validate in service/repository or pair with explicit checks | Built-in async `"unique:table,col"` and `"exists:table,col"` rules |
-| **Service & ORM DTO reuse** | Pass directly to services/repositories and `Model.create(payload)` / `model.update(payload)` | Primarily an HTTP request boundary wrapper |
-| **Nested & union schemas** | Native nested `BaseSchema`, `list[ItemSchema]`, `UUID`, `Decimal`, `date`, `Enum`, `Literal` | Wildcard keys (`"items.*.sku"`) |
+| **Database checks (`unique` / `exists`)** | Combine with `FormRequest[MySchema]` or `await request.validate(..., schema_cls=MySchema)` | Built-in async `"unique:table,col"` and `"exists:table,col"` rules |
+| **Service & ORM DTO reuse** | Pass directly to services/repositories and `Model.create(payload)` / `model.update(payload)` | Return `MySchema` directly from `form.validated()` when parameterized as `FormRequest[MySchema]` |
+| **Nested & union schemas** | Native nested `BaseSchema`, `list[ItemSchema]`, `UUID`, `Decimal`, `date`, `Enum`, `Literal` | Wildcard keys (`"items.*.sku"`) or `FormRequest[MySchema]` |
 
 See [Application Schemas (`app/schemas`)](2026-11-19-application-schemas.md) for the complete `BaseSchema` / `Schema` guide.
 

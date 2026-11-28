@@ -14,6 +14,7 @@ from typing import (
     ClassVar,
     NoReturn,
     Self,
+    TypeGuard,
     TypeVar,
     get_origin,
     get_type_hints,
@@ -40,7 +41,6 @@ from swiftpy.database.pagination import Paginator, SimplePaginator
 from swiftpy.database.query_builder import Query, QueryBuilder, QueryError
 from swiftpy.database.transaction import get_active_connection
 from swiftpy.events.dispatcher import EventDispatcher
-from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.strings import pluralize, snake_case
 
 if TYPE_CHECKING:
@@ -51,11 +51,16 @@ if TYPE_CHECKING:
     from swiftpy.database.factories import (
         Sequence as FactorySequence,
     )
+    from swiftpy.schemas.base import BaseSchema
 
 T = TypeVar("T", bound="Model")
 _TRelModel = TypeVar("_TRelModel", bound="Model")
 _MISSING = object()
 _factory_resolver: Callable[[type[Any]], Factory[Any]] | None = None
+
+
+def _is_schema_instance(value: Any) -> TypeGuard[BaseSchema]:
+    return getattr(type(value), "_is_swiftpy_schema", False) is True
 
 
 def _set_factory_resolver(
@@ -973,8 +978,13 @@ class ModelQueryBuilder[T: Model]:
         return await self.builder.insert(data, returning=returning)
 
     async def update(self, data: Mapping[str, Any] | BaseSchema) -> str:
-        payload = data.to_dict(exclude_unset=True) if isinstance(data, BaseSchema) else data
-        return await self.builder.update(payload)
+        if _is_schema_instance(data):
+            return await self.builder.update(data.to_dict(exclude_unset=True))
+        if isinstance(data, Mapping):
+            return await self.builder.update(data)
+        raise TypeError(
+            f"update() expects a mapping or BaseSchema, got {type(data).__name__}."
+        )
 
     async def delete(self) -> str:
         return await self.builder.delete()
@@ -2602,7 +2612,7 @@ class Model:
                     f"create() accepts at most 1 positional payload argument, got {len(args)}."
                 )
             first = args[0]
-            if isinstance(first, BaseSchema):
+            if _is_schema_instance(first):
                 data.update(first.to_dict())
             elif isinstance(first, Mapping):
                 data.update(first)
@@ -2717,7 +2727,7 @@ class Model:
         """Normalize positional mapping/BaseSchema and keyword arguments for instance updates."""
         payload: dict[str, Any] = {}
         if not isinstance(data, _UnsetType):
-            if isinstance(data, BaseSchema):
+            if _is_schema_instance(data):
                 payload.update(data.to_dict(exclude_unset=True))
             elif isinstance(data, Mapping):
                 for key, value in data.items():

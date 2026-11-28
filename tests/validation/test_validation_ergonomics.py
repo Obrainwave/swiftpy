@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 from typing import Any, ClassVar
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from swiftpy.core.application import Application
 from swiftpy.http.request import Request
 from swiftpy.http.response import Response, json_response
+from swiftpy.schemas import BaseSchema, Field, model_validator
 from swiftpy.testing.http_client import TestClient
 from swiftpy.validation import (
     FormRequest,
@@ -408,3 +410,279 @@ async def test_request_validate_nested_stripping_multiple_rules_and_abort_side_e
     assert "items.0.qty" in errs
     assert "lines.0.qty" in errs
     assert mutated == ["saved"]  # Handler side effect did not execute on failure
+
+
+@pytest.mark.asyncio
+async def test_form_request_and_schema_runtime_agreement_and_mass_assignment() -> None:
+    """Verify FormRequest[BaseSchema], schema_model, ValidatedData parity helpers, and request.validate(Schema)."""
+
+    class DocVersionCreate(BaseSchema):
+        version: str = Field(..., strip_whitespace=True, min_length=2)
+        title: str = Field(..., strip_whitespace=True, min_length=2)
+        release_date: date
+        notes: str | None = Field(default=None, max_length=200)
+        is_published: bool = False
+
+        @model_validator
+        def check_title_not_reserved(self) -> None:
+            if self.title.lower() == "forbidden":
+                raise ValueError("Reserved document title.")
+
+    class DocVersionCreateRequest(FormRequest[DocVersionCreate]):
+        def rules(self) -> dict[str, Any]:
+            return {
+                "version": "required|str",
+                "title": "required|str",
+                "release_date": "required|str",
+                "notes": "nullable|str",
+            }
+
+    class ChildDocVersionRequest(DocVersionCreateRequest):
+        pass
+
+    class DirectSchemaOnlyRequest(FormRequest[DocVersionCreate]):
+        pass
+
+    class UnparameterizedRequest(FormRequest):
+        def rules(self) -> dict[str, Any]:
+            return {
+                "version": "required|str",
+                "title": "required|str",
+                "release_date": "required|str",
+                "notes": "nullable|str",
+            }
+
+    class _Service:
+        def __init__(self) -> None:
+            self.received: list[Any] = []
+
+        async def create_doc_version(self, data: DocVersionCreate) -> dict[str, Any]:
+            self.received.append(data)
+            return {
+                "is_schema": isinstance(data, DocVersionCreate),
+                "version": data["version"],
+                "title": data.get("title"),
+                "release_date": str(data.release_date),
+                "notes": data.notes,
+                "is_published": data.is_published,
+                "dumped": data.to_dict(exclude_unset=True),
+                "has_version": "version" in data,
+                "is_set_notes": data.is_set("notes"),
+                "is_set_title": data.is_set("title"),
+            }
+
+    service = _Service()
+    app = Application(auto_discover_providers=False)
+
+    @app.post("/docs/typed")
+    async def store_typed(req: DocVersionCreateRequest) -> Response:
+        validated = req.validated()
+        assert isinstance(validated, DocVersionCreate)
+        return json_response(await service.create_doc_version(validated), status_code=201)
+
+    @app.post("/docs/child")
+    async def store_child(req: ChildDocVersionRequest) -> Response:
+        return json_response(await service.create_doc_version(req.validated()), status_code=201)
+
+    @app.post("/docs/schema-only")
+    async def store_schema_only(req: DirectSchemaOnlyRequest) -> Response:
+        return json_response(await service.create_doc_version(req.validated()), status_code=201)
+
+    @app.post("/docs/inline-generic")
+    async def store_inline_generic(req: FormRequest[DocVersionCreate]) -> Response:
+        return json_response(await service.create_doc_version(req.validated()), status_code=201)
+
+    @app.post("/docs/untyped")
+    async def store_untyped(req: UnparameterizedRequest) -> Response:
+        raw_validated = req.validated()
+        assert isinstance(raw_validated, ValidatedData)
+        # Omitted declared optional rule fields resolve to None via dot access
+        assert raw_validated.notes is None
+        with pytest.raises(AttributeError):
+            _ = raw_validated.undeclared_attr
+        return json_response(
+            {
+                "version": raw_validated.version,
+                "to_dict": raw_validated.to_dict(exclude_unset=True),
+                "model_dump": raw_validated.model_dump(exclude_none=True),
+                "fields_set": sorted(raw_validated.fields_set),
+                "has_title": raw_validated.is_set("title"),
+                "schema_title": req.validated(DocVersionCreate).title,
+            },
+            status_code=201,
+        )
+
+    @app.post("/docs/request-validate-schema")
+    async def store_via_request_validate(request: Request) -> Response:
+        dto = await request.validate(
+            {
+                "version": "required|str",
+                "title": "required|str",
+                "release_date": "required|str",
+                "notes": "nullable|str",
+            },
+            schema_cls=DocVersionCreate,
+        )
+        assert isinstance(dto, DocVersionCreate)
+        return json_response(await service.create_doc_version(dto), status_code=201)
+
+    @app.post("/docs/request-validate-direct")
+    async def store_via_direct_schema(request: Request) -> Response:
+        dto = await request.validate(DocVersionCreate)
+        assert isinstance(dto, DocVersionCreate)
+        return json_response(dto.validated(), status_code=201)
+
+    client = TestClient(app)
+
+    # 1. Typed FormRequest strips unvalidated is_published (mass assignment) AND hydrates BaseSchema
+    res_typed = await client.post(
+        "/docs/typed",
+        json={
+            "version": "  1.0.0  ",
+            "title": "  Initial Release ",
+            "release_date": "2026-11-28",
+            "is_published": True,  # NOT in DocVersionCreateRequest.rules(), so stripped before schema
+        },
+    )
+    assert res_typed.status_code == 201
+    assert res_typed.json() == {
+        "is_schema": True,
+        "version": "1.0.0",
+        "title": "Initial Release",
+        "release_date": "2026-11-28",
+        "notes": None,
+        "is_published": False,
+        "dumped": {
+            "version": "1.0.0",
+            "title": "Initial Release",
+            "release_date": "2026-11-28",
+        },
+        "has_version": True,
+        "is_set_notes": False,
+        "is_set_title": True,
+    }
+
+    # 2. Schema-level constraint / model_validator fails with HTTP 422 before handler runs
+    bad_schema_res = await client.post(
+        "/docs/typed",
+        json={
+            "version": "v2",
+            "title": "forbidden",
+            "release_date": "2026-11-28",
+        },
+    )
+    assert bad_schema_res.status_code == 422
+    assert bad_schema_res.json()["errors"] == {"__root__": ["Reserved document title."]}
+
+    # 3. Subclass inheritance, schema-only FormRequest[Schema], and inline FormRequest[Schema]
+    for path in ("/docs/child", "/docs/schema-only", "/docs/inline-generic", "/docs/request-validate-schema"):
+        ok_res = await client.post(
+            path,
+            json={"version": "2.0", "title": "Docs v2", "release_date": "2026-11-28"},
+        )
+        assert ok_res.status_code == 201, path
+        assert ok_res.json()["is_schema"] is True
+        assert ok_res.json()["release_date"] == "2026-11-28"
+
+    # 4. Unparameterized FormRequest returns ValidatedData with BaseSchema parity helpers
+    untyped_res = await client.post(
+        "/docs/untyped",
+        json={"version": "1.0", "title": "Manual", "release_date": "2026-11-28"},
+    )
+    assert untyped_res.status_code == 201
+    assert untyped_res.json()["fields_set"] == ["release_date", "title", "version"]
+    assert untyped_res.json()["has_title"] is True
+    assert untyped_res.json()["schema_title"] == "Manual"
+
+    # 5. request.validate(BaseSchemaClass) validates directly and serializes BaseSchema cleanly
+    direct_res = await client.post(
+        "/docs/request-validate-direct",
+        json={"version": "3.0", "title": "Direct", "release_date": "2026-11-28"},
+    )
+    assert direct_res.status_code == 201
+    assert direct_res.json()["version"] == "3.0"
+
+    # 6. Manual construction & explicit invalid schema_model guard
+    manual_req = DocVersionCreateRequest(
+        data={"version": "1.1", "title": "Unit", "release_date": "2026-11-28"}
+    )
+    manual_validated = manual_req.validated()
+    assert isinstance(manual_validated, DocVersionCreate)
+    assert manual_validated.release_date == date(2026, 11, 28)
+
+    with pytest.raises(TypeError, match="BaseSchema subclass"):
+        type("_BadBoundRequest", (FormRequest,), {"schema_model": dict})
+
+    # 7. Alias cleanup, unset schema defaults omitted from form.data, and cache invalidation on form.data mutation
+    class _AliasedSchema(BaseSchema):
+        release_date: date = Field(..., alias="releaseDate")
+        title: str
+        is_admin: bool = False
+
+    class _AliasedFormRequest(FormRequest[_AliasedSchema]):
+        def rules(self) -> dict[str, Any]:
+            return {
+                "releaseDate": "required|str",
+                "title": "required|str",
+            }
+
+    @app.post("/docs/aliased")
+    async def store_aliased(req: _AliasedFormRequest) -> Response:
+        # Unset schema default is NOT injected into req.data (preventing accidental mass-assignment overwrites)
+        assert "is_admin" not in req.data
+        # Raw alias key is replaced by canonical schema field key in req.data
+        assert "releaseDate" not in req.data
+        assert req.data["release_date"] == date(2026, 11, 28)
+        # Attribute fallback still resolves defaulted schema attribute via _validated_schema
+        assert req.is_admin is False
+        return json_response({"keys": sorted(req.data.keys()), "is_admin": req.is_admin})
+
+    aliased_res = await client.post(
+        "/docs/aliased",
+        json={"releaseDate": "2026-11-28", "title": "Aliased"},
+    )
+    assert aliased_res.status_code == 200
+    assert aliased_res.json() == {
+        "keys": ["release_date", "title"],
+        "is_admin": False,
+    }
+
+    # Cache invalidation when form.data is mutated after form.validated()
+    mut_req = DocVersionCreateRequest(
+        data={"version": "1.0", "title": "First", "release_date": "2026-11-28"}
+    )
+    first_dto = mut_req.validated()
+    assert first_dto.title == "First"
+    mut_req.data["title"] = "Second"
+    second_dto = mut_req.validated()
+    assert second_dto.title == "Second"
+
+    # stop_on_first_error propagates into schema_cls validation in Request.validate / ValidationResult.validated
+    @app.post("/docs/single-schema-err")
+    async def store_single_schema_err(request: Request) -> Response:
+        await request.validate(
+            {"version": "required|str", "title": "required|str", "release_date": "required|str"},
+            stop_on_first_error=True,
+            schema_cls=DocVersionCreate,
+        )
+        return json_response({"ok": True})
+
+    single_schema_res = await client.post(
+        "/docs/single-schema-err",
+        json={"version": "x", "title": "y", "release_date": "not-a-date"},
+    )
+    assert single_schema_res.status_code == 422
+    assert "field" in single_schema_res.json()
+    assert "message" in single_schema_res.json()
+
+    # ValidatedData.to_dict() unwraps nested BaseSchema instances and tuples
+    nested_vd = ValidatedData(
+        {
+            "doc": first_dto,
+            "pair": (first_dto,),
+        }
+    )
+    dumped_nested = nested_vd.to_dict(exclude_unset=True)
+    assert isinstance(dumped_nested["doc"], dict)
+    assert dumped_nested["doc"]["title"] == "First"
+    assert isinstance(dumped_nested["pair"][0], dict)

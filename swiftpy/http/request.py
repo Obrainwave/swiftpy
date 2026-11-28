@@ -11,7 +11,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast, overload
 from urllib.parse import parse_qs, unquote
 
 from swiftpy.core.config import Config
@@ -34,7 +34,20 @@ from swiftpy.validation.validator import ValidatedData
 from swiftpy.validation.validator import validate as _validate_input
 
 if TYPE_CHECKING:
+    from swiftpy.schemas.base import BaseSchema
     from swiftpy.validation.rules.registry import RuleRegistry
+
+_TargetSchemaT = TypeVar("_TargetSchemaT", bound="BaseSchema")
+
+
+def _has_concrete_schema_marker(value: object) -> bool:
+    return (
+        isinstance(value, type)
+        and getattr(value, "_is_swiftpy_schema", False) is True
+        and any(
+            getattr(b, "_is_swiftpy_schema", False) is True for b in value.__mro__[1:]
+        )
+    )
 
 DEFAULT_MAX_BODY_SIZE: int = 2 * 1024 * 1024  # 2 MiB
 DEFAULT_MAX_CONTENT_LENGTH: int = 2 * 1024 * 1024  # 2 MiB
@@ -666,6 +679,17 @@ class Request:
             return dict(self.path_params)
         return self.path_params.get(param, default)
 
+    @overload
+    async def validate(
+        self,
+        schema: type[_TargetSchemaT],
+        messages: Mapping[str, str] | None = None,
+        *,
+        registry: RuleRegistry | None = None,
+        stop_on_first_error: bool = False,
+    ) -> _TargetSchemaT: ...
+
+    @overload
     async def validate(
         self,
         schema: Mapping[str, Any],
@@ -673,19 +697,53 @@ class Request:
         *,
         registry: RuleRegistry | None = None,
         stop_on_first_error: bool = False,
-    ) -> ValidatedData:
+        schema_cls: type[_TargetSchemaT],
+    ) -> _TargetSchemaT: ...
+
+    @overload
+    async def validate(
+        self,
+        schema: Mapping[str, Any],
+        messages: Mapping[str, str] | None = None,
+        *,
+        registry: RuleRegistry | None = None,
+        stop_on_first_error: bool = False,
+        schema_cls: None = None,
+    ) -> ValidatedData: ...
+
+    async def validate(
+        self,
+        schema: Mapping[str, Any] | type[_TargetSchemaT],
+        messages: Mapping[str, str] | None = None,
+        *,
+        registry: RuleRegistry | None = None,
+        stop_on_first_error: bool = False,
+        schema_cls: type[_TargetSchemaT] | None = None,
+    ) -> ValidatedData | _TargetSchemaT:
         """
-        Validate incoming request input against `schema`, raising
-        `ValidationException` (HTTP 422) on failure and returning `ValidatedData`.
+        Validate incoming request input against a rule mapping or `BaseSchema` class,
+        raising `ValidationException` (HTTP 422) on failure.
         """
-        result = await _validate_input(
+        if isinstance(schema, Mapping):
+            result = await _validate_input(
+                self,
+                schema,
+                registry=registry,
+                messages=messages,
+                stop_on_first_error=stop_on_first_error,
+            )
+            passed = result.raise_if_failed()
+            if schema_cls is not None:
+                return passed.validated(schema_cls)
+            return passed.validated()
+        if not _has_concrete_schema_marker(schema):
+            raise TypeError(
+                f"Expected a validation mapping or BaseSchema subclass, got {schema!r}."
+            )
+        return await schema.from_request(
             self,
-            schema,
-            registry=registry,
-            messages=messages,
             stop_on_first_error=stop_on_first_error,
         )
-        return result.raise_if_failed().validated()
 
     def __getattr__(self, name: str) -> Any:
         if not name.startswith("_") and name not in self._RESERVED_INPUT_ATTRS:

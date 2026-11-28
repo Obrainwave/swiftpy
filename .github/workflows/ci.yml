@@ -207,10 +207,24 @@ jobs:
 
           from typing import assert_type
 
-          from swiftpy import Auth, AuthProxy, AuthUser, Request, UniqueRule, ValidatedData, unique
+          from swiftpy import Auth, AuthProxy, AuthUser, BaseSchema, FormRequest, Request, UniqueRule, ValidatedData, unique
           from swiftpy.auth import auth
           from swiftpy.auth_manager import Auth as LegacyAuth
           from swiftpy.auth_manager import auth as legacy_auth
+
+
+          class DocVersionCreate(BaseSchema):
+              version: str
+              title: str
+
+
+          class DocVersionCreateRequest(FormRequest[DocVersionCreate]):
+              pass
+
+
+          class DocVersionService:
+              async def create_doc_version(self, data: DocVersionCreate) -> DocVersionCreate:
+                  return data
 
 
           def check_auth_contracts() -> AuthUser:
@@ -227,9 +241,15 @@ jobs:
               return auth().user()
 
 
-          async def check_validation_contracts(request: Request, user_id: int) -> ValidatedData:
+          async def check_validation_contracts(
+              request: Request,
+              user_id: int,
+              form: DocVersionCreateRequest,
+              service: DocVersionService,
+          ) -> ValidatedData:
               _rule = assert_type(unique("users", "email").ignore(user_id), UniqueRule)
-              _ = _rule
+              _doc = assert_type(await service.create_doc_version(form.validated()), DocVersionCreate)
+              _ = (_rule, _doc)
               return assert_type(
                   await request.validate({"email": f"required|email|unique:users,email,{user_id}"}),
                   ValidatedData,

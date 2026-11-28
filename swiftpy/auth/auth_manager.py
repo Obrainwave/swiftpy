@@ -10,7 +10,16 @@ import time
 import types
 import weakref
 from collections.abc import Callable, Iterator, Mapping
-from typing import Annotated, Any, Literal, Union, get_args, get_origin, overload
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+    overload,
+)
 
 from swiftpy.auth.api_key_guard import ApiKeyGuard
 from swiftpy.auth.events import (
@@ -58,6 +67,9 @@ from swiftpy.database.pool import DatabasePool
 from swiftpy.http.request import Request
 from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.hashing import Hash
+
+if TYPE_CHECKING:
+    from swiftpy.validation.form_request import FormRequest
 
 logger = logging.getLogger("swiftpy.auth.manager")
 
@@ -118,12 +130,24 @@ def _coerce_credential_value(user_cls: type[Model], column: str, value: Any) -> 
 
 
 def _coerce_credentials_mapping(
-    credentials: Mapping[Any, Any] | BaseSchema,
+    credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
 ) -> Mapping[Any, Any]:
     if isinstance(credentials, BaseSchema):
-        return credentials.to_dict(exclude_unset=True)
+        fields_set = credentials.fields_set
+        out: dict[str, Any] = {}
+        for fname in credentials.__class__.__schema_field_order__:
+            if fname in fields_set:
+                out[fname] = getattr(credentials, fname)
+        extra_fields = getattr(credentials, "__extra_fields__", None)
+        if isinstance(extra_fields, Mapping):
+            out.update(extra_fields)
+        return out
+    if getattr(type(credentials), "_is_swiftpy_form_request", False) is True:
+        raw_form_data = getattr(credentials, "data", None)
+        if isinstance(raw_form_data, Mapping):
+            return dict(raw_form_data)
     if not isinstance(credentials, Mapping):
-        raise TypeError("credentials must be a mapping or BaseSchema.")
+        raise TypeError("credentials must be a mapping, BaseSchema, or FormRequest.")
     return credentials
 
 
@@ -766,7 +790,7 @@ class AuthProxy:
 
     async def _verify_credentials_candidate(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
     ) -> tuple[bool, Model | None]:
         creds_map = _coerce_credentials_mapping(credentials)
         if not creds_map:
@@ -808,7 +832,7 @@ class AuthProxy:
 
     async def _attempt_internal(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         callback: Callable[[Any], Any] | None = None,
         remember: bool = False,
         *,
@@ -873,7 +897,7 @@ class AuthProxy:
 
     async def attempt(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         remember: bool = False,
         *,
         ip: str | None = None,
@@ -891,7 +915,7 @@ class AuthProxy:
 
     async def attempt_when(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         callback: Callable[[Any], Any],
         remember: bool = False,
         *,
@@ -1002,15 +1026,22 @@ class AuthProxy:
     loginUsingId = login_using_id
     login_sing_id = login_using_id
 
-    async def once(self, credentials: Mapping[Any, Any] | BaseSchema) -> bool:
+    async def once(
+        self,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
+    ) -> bool:
         """
         Authenticate a user for the current request only without cookies,
         sessions, remember tokens, JWT persistence, or dispatching Login.
         """
         guard_name = self._guard_name()
+        is_supported = (
+            isinstance(credentials, (Mapping, BaseSchema))
+            or getattr(type(credentials), "_is_swiftpy_form_request", False) is True
+        )
         creds_map = (
             _coerce_credentials_mapping(credentials)
-            if isinstance(credentials, (Mapping, BaseSchema))
+            if is_supported
             else None
         )
         safe_creds = (
@@ -1564,7 +1595,7 @@ class AuthManager:
 
     async def attempt(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         remember: bool = False,
         *,
         guard_name: str | None = None,
@@ -1577,7 +1608,7 @@ class AuthManager:
 
     async def attempt_when(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         callback: Callable[[Any], Any],
         remember: bool = False,
         *,
@@ -1618,7 +1649,7 @@ class AuthManager:
 
     async def once(
         self,
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         *,
         guard_name: str | None = None,
     ) -> bool:
@@ -1729,7 +1760,7 @@ class Auth:
 
     @staticmethod
     async def attempt(
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         remember: bool = False,
         *,
         ip: str | None = None,
@@ -1739,7 +1770,7 @@ class Auth:
 
     @staticmethod
     async def attempt_when(
-        credentials: Mapping[Any, Any] | BaseSchema,
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
         callback: Callable[[Any], Any],
         remember: bool = False,
         *,
@@ -1766,7 +1797,9 @@ class Auth:
     login_sing_id = login_using_id
 
     @staticmethod
-    async def once(credentials: Mapping[Any, Any] | BaseSchema) -> bool:
+    async def once(
+        credentials: Mapping[Any, Any] | BaseSchema | FormRequest[Any],
+    ) -> bool:
         """Authenticate a user for a single request with no cookies/Login event."""
         return await AuthProxy().once(credentials)
 

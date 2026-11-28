@@ -151,10 +151,10 @@ class SchemaFieldInfo:
                 f"Field constraint 'pattern' must be str or re.Pattern, got {type(pattern).__name__}."
             )
 
-        self.strip_whitespace = bool(strip_whitespace)
-        self.to_lower = bool(to_lower)
-        self.to_upper = bool(to_upper)
-        self.exclude = bool(exclude)
+        self.strip_whitespace = strip_whitespace
+        self.to_lower = to_lower
+        self.to_upper = to_upper
+        self.exclude = exclude
 
     @property
     def is_required(self) -> bool:
