@@ -279,7 +279,7 @@ class AuthUser(dict[str, Any]):
         if val is not None:
             return val
         if self._model is not None:
-            pk_attr = str(getattr(self._model, "__primary_key__", "id"))
+            pk_attr = getattr(self._model, "__primary_key__", "id")
             pk_val = self.get(pk_attr)
             if pk_val is not None:
                 return pk_val
@@ -417,20 +417,19 @@ def _build_auth_user_from_dict(raw: dict[str, Any]) -> AuthUser:
                 data[field_name] = None
 
         for k, v in raw.items():
-            k_str = str(k)
             if (
-                k_str not in hidden_fields
-                and not is_sensitive_key(k_str)
-                and k_str not in data
+                k not in hidden_fields
+                and not is_sensitive_key(k)
+                and k not in data
             ):
-                data[k_str] = v
+                data[k] = v
 
         return AuthUser(data, model=None)
 
     clean = {
-        str(k): v
+        k: v
         for k, v in raw.items()
-        if not is_sensitive_key(str(k))
+        if not is_sensitive_key(k)
     }
     if "id" not in clean and "sub" in clean:
         sub_val = clean["sub"]
@@ -444,6 +443,7 @@ def _build_auth_user_from_dict(raw: dict[str, Any]) -> AuthUser:
 
 
 def _build_auth_user_from_model(model: Any) -> AuthUser:
+    data: dict[str, Any]
     if hasattr(model, "to_dict") and callable(model.to_dict):
         data = model.to_dict()
     elif isinstance(model, dict):
@@ -841,7 +841,7 @@ class AuthProxy:
 
         safe_creds = _sanitize_credentials_for_event(creds_map)
         await dispatch_auth_event(
-            Attempting(guard=guard_name, credentials=safe_creds, remember=bool(remember))
+            Attempting(guard=guard_name, credentials=safe_creds, remember=remember)
         )
 
         matched, candidate = await self._verify_credentials_candidate(creds_map)
@@ -980,7 +980,7 @@ class AuthProxy:
 
         await dispatch_auth_event(Authenticated(guard=guard_name, user=user))
         await dispatch_auth_event(
-            Login(guard=guard_name, user=user, remember=bool(remember))
+            Login(guard=guard_name, user=user, remember=remember)
         )
         return user
 

@@ -196,6 +196,7 @@ jobs:
                       out, _ = proc.communicate(timeout=5)
               assert ok, out
           '
+          ROOT_DIR="$(pwd)"
           rm -rf /tmp/swiftpy-pyrefly-smoke && mkdir -p /tmp/swiftpy-pyrefly-smoke
           (
             cd /tmp/swiftpy-pyrefly-smoke
@@ -235,6 +236,6 @@ jobs:
               )
           EOF
             uvx pyrefly check --python-interpreter-path /tmp/swiftpy-wheel-smoke/bin/python --error=no-any-return-implicit app/ config/ routes/ database/ prompts/ main.py v041_typing_contract_smoke.py
-            uv run --python /tmp/swiftpy-wheel-smoke/bin/python --with mypy mypy --strict v041_typing_contract_smoke.py
+            PYTHONPATH= "$ROOT_DIR/.venv/bin/mypy" --python-executable /tmp/swiftpy-wheel-smoke/bin/python --strict v041_typing_contract_smoke.py
           )
           rm -rf /tmp/swiftpy-pyrefly-smoke /tmp/swiftpy-wheel-smoke
