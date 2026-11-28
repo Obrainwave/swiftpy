@@ -5,7 +5,7 @@ import inspect
 import json
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
@@ -834,7 +834,7 @@ async def _extract_request_mapping(
                     single_error=stop_on_first_error,
                 ) from None
             raise
-        except (ValueError, UnicodeDecodeError) as exc:
+        except ValueError as exc:
             raise ValidationException(
                 {"body": [str(exc)]},
                 single_error=stop_on_first_error,
@@ -1338,7 +1338,7 @@ class BaseSchema:
         stop_first = (
             bool(getattr(cls, "stop_on_first_error", False))
             if stop_on_first_error is None
-            else bool(stop_on_first_error)
+            else stop_on_first_error
         )
         instance = cls.__new__(cls)
         return cls._populate_instance(
@@ -1362,7 +1362,7 @@ class BaseSchema:
             stop_first = (
                 bool(getattr(cls, "stop_on_first_error", False))
                 if stop_on_first_error is None
-                else bool(stop_on_first_error)
+                else stop_on_first_error
             )
             raise ValidationException(
                 {"body": ["The request payload must be a JSON object."]},
@@ -1404,7 +1404,7 @@ class BaseSchema:
         stop_first = (
             bool(getattr(cls, "stop_on_first_error", False))
             if stop_on_first_error is None
-            else bool(stop_on_first_error)
+            else stop_on_first_error
         )
         payload = await _extract_request_mapping(
             request,
@@ -1499,6 +1499,51 @@ class BaseSchema:
         """Return True if `field_name` was explicitly supplied in input data."""
         raw: set[str] = getattr(self, "__fields_set__", set())
         return field_name in raw
+
+    def _lookup_schema_item(self, key: str) -> Any:
+        if not isinstance(key, str) or key.startswith("_"):
+            return _MISSING
+        cls = self.__class__
+        if key in cls.__schema_fields__:
+            return getattr(self, key, _MISSING)
+        canonical = cls.__schema_aliases__.get(key)
+        if canonical is not None:
+            return getattr(self, canonical, _MISSING)
+        extra_fields = getattr(self, "__extra_fields__", None)
+        if isinstance(extra_fields, Mapping) and key in extra_fields:
+            return extra_fields[key]
+        return _MISSING
+
+    def __getitem__(self, key: str) -> Any:
+        val = self._lookup_schema_item(key)
+        if val is _MISSING:
+            raise KeyError(key)
+        return val
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        return self._lookup_schema_item(key) is not _MISSING
+
+    def __iter__(self) -> Iterator[str]:
+        for fname in self.__class__.__schema_field_order__:
+            cfield = self.__class__.__schema_fields__[fname]
+            if not cfield.field_info.exclude:
+                yield fname
+        extra_fields = getattr(self, "__extra_fields__", None)
+        if isinstance(extra_fields, Mapping):
+            for ek in extra_fields:
+                if isinstance(ek, str):
+                    yield ek
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return a declared schema field, alias, or extra field value, or `default`."""
+        val = self._lookup_schema_item(key)
+        return default if val is _MISSING else val
+
+    def validated(self) -> Self:
+        """Return this validated schema instance (interoperability helper with FormRequest)."""
+        return self
 
     def __eq__(self, other: object) -> bool:
         if type(self) is not type(other):

@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from swiftpy import Auth, Hash
+from swiftpy import Auth, FormRequest, Hash
 from swiftpy.auth.events import Attempting, Failed, Login
 from swiftpy.core.application import Application
 from swiftpy.core.config import Config
@@ -55,6 +55,20 @@ class _LoginCredentialsSchema(BaseSchema):
     email: str = Field(..., to_lower=True, strip_whitespace=True)
     password: str = Field(..., min_length=6)
     tenant_id: str | None = None
+
+
+class _ExcludedPasswordLoginSchema(BaseSchema):
+    email: str = Field(..., to_lower=True, strip_whitespace=True)
+    password: str = Field(..., min_length=6, exclude=True)
+    tenant_id: str | None = None
+
+
+class _LoginFormRequest(FormRequest[_ExcludedPasswordLoginSchema]):
+    def rules(self) -> dict[str, Any]:
+        return {
+            "email": "required|email",
+            "password": "required|str|min:6",
+        }
 
 
 @pytest.fixture(autouse=True)
@@ -182,3 +196,22 @@ async def test_auth_attempt_once_and_attempt_when_accept_base_schema(
         body = res.json()
         assert body["user_id"] == 42
         assert isinstance(body["access_token"], str) and body["access_token"]
+
+    # 5. BaseSchema with password Field(..., exclude=True) and FormRequest instances work with Auth.attempt / once
+    excluded_creds = _ExcludedPasswordLoginSchema.validate(
+        {"email": "ada@example.com", "password": "super-secret-123"}
+    )
+    assert "password" not in excluded_creds.to_dict()
+    Context.clear()
+    assert await Auth.attempt(excluded_creds) is True
+    assert Auth.id() == 42
+
+    form_creds = _LoginFormRequest(
+        data={"email": "ada@example.com", "password": "super-secret-123"}
+    )
+    Context.clear()
+    assert await Auth.attempt(form_creds) is True
+    assert Auth.id() == 42
+    Context.clear()
+    assert await Auth.once(form_creds) is True
+    assert Auth.id() == 42

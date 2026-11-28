@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from datetime import date as DateType
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     ClassVar,
     Self,
@@ -39,8 +40,14 @@ from swiftpy.database.orm.relationships import (
 )
 from swiftpy.database.query_builder import Query
 from swiftpy.database.transaction import db
-from swiftpy.schemas.base import BaseSchema
 from swiftpy.support.strings import snake_case
+
+if TYPE_CHECKING:
+    from swiftpy.schemas.base import BaseSchema
+
+
+def _is_schema_instance(value: Any) -> TypeGuard[BaseSchema]:
+    return getattr(type(value), "_is_swiftpy_schema", False) is True
 
 _MAX_FACTORY_DEPTH: int = 24
 _FACTORY_DEPTH: ContextVar[int] = ContextVar("swiftpy_factory_depth", default=0)
@@ -545,7 +552,7 @@ def _extract_mapping_payload(
 ) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     if payload is not None:
-        if isinstance(payload, BaseSchema):
+        if _is_schema_instance(payload):
             merged.update(payload.to_dict())
         elif isinstance(payload, Mapping):
             merged.update(payload)
@@ -911,7 +918,7 @@ class Factory[T: Model]:
         """Apply state overrides (mapping, BaseSchema, Sequence, or callback) to generated models."""
         cloned = self._clone()
         if state is not None:
-            if isinstance(state, BaseSchema):
+            if _is_schema_instance(state):
                 cloned._states.append(state.to_dict())
             elif isinstance(state, (Mapping, Sequence)) or callable(state):
                 cloned._states.append(state)

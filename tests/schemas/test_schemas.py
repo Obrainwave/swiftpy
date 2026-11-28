@@ -441,6 +441,18 @@ def test_extra_allow_blocks_private_keys_and_method_shadowing() -> None:
     assert s.__dict__["tag"] == "vip"
     assert "to_dict" not in s.__dict__
     assert "validate" not in s.__dict__
+    assert s["name"] == "Ada"
+    assert s["tag"] == "vip"
+    assert s["to_dict"] == "shadow-attempt"
+    assert s.get("tag") == "vip"
+    assert s.get("missing", "fallback") == "fallback"
+    assert "tag" in s
+    assert "_secret" not in s
+    assert s.validated() is s
+    assert list(s) == ["name", "to_dict", "validate", "tag"]
+    with pytest.raises(KeyError):
+        _ = s["missing"]
+
     dumped: dict[str, Any] = s.to_dict()
     assert dumped == {
         "name": "Ada",

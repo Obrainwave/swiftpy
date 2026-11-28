@@ -67,7 +67,7 @@ from swiftpy.support.keys import (
     validate_signing_key,
 )
 from swiftpy.validation.exceptions import ValidationException
-from swiftpy.validation.form_request import FormRequest
+from swiftpy.validation.form_request import FormRequest, unwrap_form_annotation
 from swiftpy.validation.validator import validate
 from swiftpy.websockets.connection import (
     WebSocketConnection,
@@ -916,15 +916,17 @@ class Application:
                     elif spec.kind == "path":
                         call_kwargs[spec.name] = params[spec.name]
                     elif spec.kind == "form":
-                        ann: type[FormRequest] = spec.annotation
-                        stop_first = bool(getattr(ann, "stop_on_first_error", False))
+                        form_cls, bound_schema_cls = unwrap_form_annotation(
+                            spec.annotation
+                        )
+                        stop_first = bool(getattr(form_cls, "stop_on_first_error", False))
                         data = await _extract_request_mapping(
                             request,
                             stop_on_first_error=stop_first,
                         )
                         body_preloaded_data = data
 
-                        form_instance, rules, messages = ann.prepare_validation(
+                        form_instance, rules, messages = form_cls.prepare_validation(
                             request=request, container=self.container
                         )
                         instance_stop_first = bool(
@@ -946,6 +948,15 @@ class Application:
                         form_instance.raw_data = data
                         form_instance.request = request
                         form_instance.validation_result = result
+                        form_instance._schema_fields = result.schema_fields
+                        if bound_schema_cls is not None:
+                            use_raw = (
+                                not rules and form_cls.rules is FormRequest.rules
+                            )
+                            form_instance._hydrate_bound_schema(
+                                bound_schema_cls,
+                                use_raw_data=use_raw,
+                            )
                         call_kwargs[spec.name] = form_instance
                     elif spec.kind == "schema":
                         schema_cls: type[BaseSchema] = spec.annotation

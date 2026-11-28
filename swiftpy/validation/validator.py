@@ -5,7 +5,7 @@ import copy
 import inspect
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Self, TypeGuard
+from typing import TYPE_CHECKING, Any, Self, TypeGuard, TypeVar, overload
 from weakref import WeakKeyDictionary
 
 from swiftpy.database.transaction import get_active_connection
@@ -36,6 +36,17 @@ from swiftpy.validation.rules.unique import UniqueRule
 
 if TYPE_CHECKING:
     from swiftpy.http.request import Request
+    from swiftpy.schemas.base import BaseSchema
+
+_TargetSchemaT = TypeVar("_TargetSchemaT", bound="BaseSchema")
+
+
+def _is_schema_subclass(value: object) -> bool:
+    return (
+        isinstance(value, type)
+        and getattr(value, "_is_swiftpy_schema", False) is True
+        and any(getattr(b, "_is_swiftpy_schema", False) is True for b in value.__mro__[1:])
+    )
 
 _RULE_INVOKER_CACHE: WeakKeyDictionary[
     type, dict[tuple[str, Any], tuple[int, bool]]
@@ -129,24 +140,73 @@ def _to_validated_value(value: Any) -> Any:
     return value
 
 
-class ValidatedData(dict[str, Any]):
-    """Dictionary subclass supporting attribute access (`data.field`) for validated payloads."""
+def _unwrap_validated_value(
+    value: Any,
+    *,
+    exclude_none: bool = False,
+    exclude_unset: bool = False,
+    by_alias: bool = False,
+) -> Any:
+    if isinstance(value, ValidatedData):
+        return value.to_dict(
+            exclude_none=exclude_none,
+            exclude_unset=exclude_unset,
+            by_alias=by_alias,
+        )
+    if getattr(type(value), "_is_swiftpy_schema", False) is True:
+        return value.to_dict(
+            exclude_none=exclude_none,
+            exclude_unset=exclude_unset,
+            by_alias=by_alias,
+        )
+    if isinstance(value, list):
+        return [
+            _unwrap_validated_value(
+                item,
+                exclude_none=exclude_none,
+                exclude_unset=exclude_unset,
+                by_alias=by_alias,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _unwrap_validated_value(
+                item,
+                exclude_none=exclude_none,
+                exclude_unset=exclude_unset,
+                by_alias=by_alias,
+            )
+            for item in value
+        )
+    return value
 
-    __slots__ = ()
+
+class ValidatedData(dict[str, Any]):
+    """Dictionary subclass supporting attribute access (`data.field`) and BaseSchema helpers."""
+
+    __slots__ = ("_declared_fields",)
 
     def __init__(
         self,
         mapping: Mapping[str, Any] | Iterable[tuple[str, Any]] = (),
+        *,
+        _declared_fields: Iterable[str] | None = None,
         **kwargs: Any,
     ) -> None:
         raw = dict(mapping)
         if kwargs:
             raw.update(kwargs)
+        object.__setattr__(self, "_declared_fields", frozenset(_declared_fields or ()))
         super().__init__({k: _to_validated_value(v) for k, v in raw.items()})
 
     def __getattr__(self, name: str) -> Any:
-        if not name.startswith("_") and name in self:
-            return self[name]
+        if not name.startswith("_"):
+            if name in self:
+                return self[name]
+            declared: frozenset[str] = getattr(self, "_declared_fields", frozenset())
+            if name in declared:
+                return None
         raise AttributeError(
             f"'{type(self).__name__}' object has no attribute '{name}'"
         )
@@ -167,7 +227,67 @@ class ValidatedData(dict[str, Any]):
         )
 
     def copy(self) -> ValidatedData:
-        return ValidatedData(self)
+        declared: frozenset[str] = getattr(self, "_declared_fields", frozenset())
+        return ValidatedData(self, _declared_fields=declared)
+
+    def to_dict(
+        self,
+        *,
+        exclude_none: bool = False,
+        exclude_unset: bool = False,
+        by_alias: bool = False,
+    ) -> dict[str, Any]:
+        """Serialize validated fields into plain dictionaries (`BaseSchema` parity)."""
+        out: dict[str, Any] = {}
+        for key, val in self.items():
+            if exclude_none and val is None:
+                continue
+            out[key] = _unwrap_validated_value(
+                val,
+                exclude_none=exclude_none,
+                exclude_unset=exclude_unset,
+                by_alias=by_alias,
+            )
+        return out
+
+    def model_dump(
+        self,
+        *,
+        exclude_none: bool = False,
+        exclude_unset: bool = False,
+        by_alias: bool = False,
+    ) -> dict[str, Any]:
+        """Compatibility alias for `to_dict()`."""
+        return self.to_dict(
+            exclude_none=exclude_none,
+            exclude_unset=exclude_unset,
+            by_alias=by_alias,
+        )
+
+    @property
+    def fields_set(self) -> frozenset[str]:
+        """Return the set of field names present in this validated payload."""
+        return frozenset(self.keys())
+
+    def is_set(self, field_name: str) -> bool:
+        """Return True if `field_name` is present in this validated payload."""
+        return field_name in self
+
+    def to_schema(
+        self,
+        schema_cls: type[_TargetSchemaT],
+        *,
+        stop_on_first_error: bool | None = None,
+    ) -> _TargetSchemaT:
+        """Validate and hydrate this payload into the target `BaseSchema` class."""
+        if not _is_schema_subclass(schema_cls):
+            raise TypeError(
+                f"Expected a BaseSchema subclass, got {schema_cls!r}."
+            )
+        return schema_cls.validate(
+            self,
+            stop_on_first_error=stop_on_first_error,
+        )
 
 
 @dataclass(slots=True)
@@ -180,6 +300,7 @@ class ValidationResult:
     errors: dict[str, list[str]] = field(default_factory=dict)
     validated_data: dict[str, Any] = field(default_factory=dict)
     _single_error: bool = field(default=False, repr=False)
+    schema_fields: tuple[str, ...] = field(default=(), repr=False)
 
     def passes(self) -> bool:
         """Return True if all validation rules passed."""
@@ -214,9 +335,27 @@ class ValidationResult:
             flattened.extend(field_errors)
         return flattened
 
-    def validated(self) -> ValidatedData:
-        """Return a ValidatedData copy supporting both dict and attribute access."""
-        return ValidatedData(self.validated_data)
+    @overload
+    def validated(self, schema: None = None) -> ValidatedData: ...
+
+    @overload
+    def validated(self, schema: type[_TargetSchemaT]) -> _TargetSchemaT: ...
+
+    def validated(
+        self,
+        schema: type[_TargetSchemaT] | None = None,
+    ) -> ValidatedData | _TargetSchemaT:
+        """Return a `ValidatedData` copy, or validate into `schema` when provided."""
+        data = ValidatedData(
+            self.validated_data,
+            _declared_fields=self.schema_fields,
+        )
+        if schema is not None:
+            return data.to_schema(
+                schema,
+                stop_on_first_error=True if self._single_error else None,
+            )
+        return data
 
     def raise_if_failed(self) -> Self:
         """Raise ValidationException if validation failed, or return self for chaining."""
@@ -368,9 +507,16 @@ class Validator:
         self.is_payload_dict = isinstance(data, dict)
         self.data: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
         self.schema: dict[str, Any] = dict(schema)
+        self._declared_fields: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                k
+                for k in self.schema
+                if "*" not in k and "." not in k
+            )
+        )
         self.registry = registry or default_registry
         self.messages: dict[str, str] = dict(messages) if messages else {}
-        self.stop_on_first_error = bool(stop_on_first_error)
+        self.stop_on_first_error = stop_on_first_error
         self._db_rule_lock = asyncio.Lock()
 
     async def validate(self) -> ValidationResult:
@@ -385,6 +531,7 @@ class Validator:
                 errors={"body": ["The request body must be a JSON object."]},
                 validated_data={},
                 _single_error=self.stop_on_first_error,
+                schema_fields=self._declared_fields,
             )
 
         direct_fields: list[tuple[str, list[Any]]] = []
@@ -439,6 +586,7 @@ class Validator:
                     errors={first_k: [errors[first_k][0]]},
                     validated_data={},
                     _single_error=True,
+                    schema_fields=self._declared_fields,
                 )
             results: list[tuple[tuple[str | int, ...], tuple[str, list[str], Any]]] = []
             for field_name, path_keys, rules, present, raw_val, template_field in all_targets:
@@ -455,6 +603,7 @@ class Validator:
                         errors={res[0]: [res[1][0]]},
                         validated_data={},
                         _single_error=True,
+                        schema_fields=self._declared_fields,
                     )
                 results.append((path_keys, res))
         elif get_active_connection() is not None:
@@ -500,6 +649,8 @@ class Validator:
             is_valid=len(errors) == 0,
             errors=errors,
             validated_data=validated_data,
+            _single_error=self.stop_on_first_error,
+            schema_fields=self._declared_fields,
         )
 
     async def _validate_field(
@@ -670,12 +821,12 @@ class Validator:
                 for alias in aliases:
                     key = f"{target_field}.{alias}"
                     if key in self.messages:
-                        return str(self.messages[key])
+                        return self.messages[key]
                 if target_field in self.messages:
-                    return str(self.messages[target_field])
+                    return self.messages[target_field]
             for alias in aliases:
                 if alias in self.messages:
-                    return str(self.messages[alias])
+                    return self.messages[alias]
 
         if hasattr(rule, "message"):
             attr = rule.message
